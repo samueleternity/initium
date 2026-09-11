@@ -214,6 +214,8 @@ from newton_associative_scan import (
     pack_state,
     unpack_state,
     deer_quasi_newton_solve,
+    deer_adjoint_scan,
+    _batched_step_fn,
 )
 from stochastic_write_head_v2 import StochasticWriteHead
 
@@ -332,6 +334,82 @@ def _inject_fixed_noise(eps_source):
         yield
     finally:
         torch.randn_like = original_randn_like
+
+
+
+class _DEERImplicitSolve(torch.autograd.Function):
+    """Bridges the no-grad quasi-DEER forward solve back into autograd via
+    implicit differentiation instead of unrolling backprop through the
+    Newton iteration (see newton_associative_scan.py's deer_adjoint_scan).
+    Memory no longer scales with deer_max_newton_iters / deer_jac_chunk_size
+    / deer_jac_sample_batch_size -- those now only affect the forward solve,
+    which builds no autograd graph at all.
+    """
+
+    @staticmethod
+    def forward(ctx, per_sample_step, x_seq, init_state_vec, model, solver_kwargs):
+        y, diag_jac, diagnostics = deer_quasi_newton_solve(
+            per_sample_step, x_seq, init_state_vec, **solver_kwargs
+        )
+        ctx.save_for_backward(y, diag_jac, init_state_vec, x_seq)
+        ctx.per_sample_step = per_sample_step
+        ctx.model = model
+        ctx.step_sample_batch_size = (
+            solver_kwargs.get("step_sample_batch_size")
+            or solver_kwargs.get("jac_sample_batch_size", 1)
+        )
+        model._last_deer_diagnostics = diagnostics
+        return y
+
+    @staticmethod
+    def backward(ctx, grad_y):
+        y, diag_jac, init_state_vec, x_seq = ctx.saved_tensors
+        per_sample_step = ctx.per_sample_step
+        model = ctx.model
+        B, T, D = y.shape
+        X = x_seq.shape[-1]
+
+        mu = deer_adjoint_scan(diag_jac, grad_y)  # (B, T, D)
+
+        x_seq_leaf = x_seq.detach().requires_grad_(True)
+        params = [p for p in model.parameters() if p.requires_grad]
+        need_init_grad = init_state_vec.requires_grad
+
+        # Same reason the forward solve silences it: this re-evaluation
+        # must not append a second, redundant bookkeeping entry.
+        write_head = model._find_write_head()
+        was_training_bw = write_head.training
+        write_head.eval()
+        try:
+            with torch.enable_grad():
+                y_prev = torch.cat(
+                    [init_state_vec.unsqueeze(1), y[:, :-1, :]], dim=1
+                )
+                f_out = _batched_step_fn(
+                    per_sample_step,
+                    y_prev.reshape(B * T, D),
+                    x_seq_leaf.reshape(B * T, X),
+                    step_sample_batch_size=ctx.step_sample_batch_size,
+                ).reshape(B, T, D)
+
+                grad_targets = [x_seq_leaf] + params + (
+                    [init_state_vec] if need_init_grad else []
+                )
+                grads = torch.autograd.grad(
+                    f_out, grad_targets, grad_outputs=mu, allow_unused=True
+                )
+        finally:
+            write_head.train(was_training_bw)
+
+        grad_x_seq = grads[0]
+        grad_params = grads[1 : 1 + len(params)]
+        grad_init_state = grads[1 + len(params)] if need_init_grad else None
+
+        for p, g in zip(params, grad_params):
+            if g is not None:
+                p.grad = g if p.grad is None else p.grad + g
+
+        return None, grad_x_seq, grad_init_state, None, None
 
 
 # ==========================================================================
@@ -554,23 +632,23 @@ class DEERParallelDNC(MambaDNC):
         # unaffected. See module docstring point 4.
         was_training = write_head.training
         write_head.eval()
+        solver_kwargs = dict(
+            max_newton_iters=self.deer_max_newton_iters,
+            tol=self.deer_tol,
+            damping=self.deer_damping,
+            max_jac_diag_abs=self.deer_max_jac_diag_abs,
+            jac_chunk_size=self.deer_jac_chunk_size,  # v3
+            jac_sample_batch_size=self.deer_jac_sample_batch_size,  # v4
+            step_sample_batch_size=self.deer_step_sample_batch_size,  # v5
+        )
         try:
-            y, diagnostics = deer_quasi_newton_solve(
-                per_sample_step,
-                x_seq,
-                init_state_vec,
-                max_newton_iters=self.deer_max_newton_iters,
-                tol=self.deer_tol,
-                damping=self.deer_damping,
-                max_jac_diag_abs=self.deer_max_jac_diag_abs,
-                jac_chunk_size=self.deer_jac_chunk_size,  # v3
-                jac_sample_batch_size=self.deer_jac_sample_batch_size,  # v4
-                step_sample_batch_size=self.deer_step_sample_batch_size,  # v5
+            y = _DEERImplicitSolve.apply(
+                per_sample_step, x_seq, init_state_vec, model, solver_kwargs
             )
         finally:
             write_head.train(was_training)
 
-        self._last_deer_diagnostics = diagnostics
+        diagnostics = self._last_deer_diagnostics
 
         # ---- parallel output reconstruction ----------------------------
         # output/last_read live inside the converged trajectory `y`

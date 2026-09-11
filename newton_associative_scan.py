@@ -130,6 +130,7 @@ __all__ = [
     "pack_state",
     "unpack_state",
     "deer_quasi_newton_solve",
+    "deer_adjoint_scan",
 ]
 
 
@@ -514,6 +515,13 @@ def deer_quasi_newton_solve(
 
     newton_iters = 0
     final_err = float("inf")
+    # No-grad guard for the whole forward solve: gradients are obtained
+    # afterward via implicit differentiation (deer_adjoint_scan below),
+    # not by differentiating through the Newton loop / JVP calls here.
+    # Entered/exited manually (rather than a `with` block) so the loop
+    # body below doesn't need to be re-indented.
+    _no_grad_guard = torch.no_grad()
+    _no_grad_guard.__enter__()
     for it in range(max_newton_iters):
         print(f"[Newton] iter {it+1}/{max_newton_iters}")
         # Predecessor state for every t=1..T: s_0 (fixed) followed by the
@@ -575,4 +583,41 @@ def deer_quasi_newton_solve(
         "converged": final_err < tol,
         "tol": tol,
     }
-    return y, diagnostics
+    _no_grad_guard.__exit__(None, None, None)
+    return y, diag_jac, diagnostics
+
+
+
+def deer_adjoint_scan(diag_jac: torch.Tensor, grad_y: torch.Tensor) -> torch.Tensor:
+    """Reverse-time affine scan computing the adjoint state
+
+        mu_t = grad_y_t + diag_jac_{t+1} * mu_{t+1}     (mu_T := grad_y_T)
+
+    Implements the backward half of Lim et al. 2024 eq. 6-7: gradients
+    through the converged fixed point come from ONE application of the
+    (transposed) linear operator, not from differentiating through the
+    Newton iteration. A diagonal Jacobian is its own transpose, so this
+    adjoint recurrence has the exact same elementwise-affine shape as the
+    forward recurrence -- just walking backward in time with the
+    coefficients shifted by one step -- so it reuses `selective_scan_chunk`
+    unchanged (same O(log T) cost as the forward linear solve).
+
+    Args:
+        diag_jac: (B, T, D) -- diagonal Jacobian at the CONVERGED
+            trajectory (diag_jac[:, t, :] = diag(df/ds_{t-1})).
+        grad_y: (B, T, D) -- dL/dy at the converged trajectory.
+
+    Returns:
+        mu: (B, T, D).
+    """
+    B, T, D = diag_jac.shape
+    zeros_pad = torch.zeros_like(diag_jac[:, :1, :])
+    a_rev = torch.cat([zeros_pad, torch.flip(diag_jac[:, 1:, :], dims=[1])], dim=1)
+    b_rev = torch.flip(grad_y, dims=[1])
+    nu = selective_scan_chunk(
+        dA=a_rev,
+        dBx=b_rev,
+        h0=torch.zeros(B, D, device=diag_jac.device, dtype=diag_jac.dtype),
+        time_dim=1,
+    )
+    return torch.flip(nu, dims=[1])

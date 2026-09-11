@@ -12,8 +12,5 @@ print(f"torch={torch_ver}  torch_mm={torch_mm}  cuda={cuda_ver}  cuda_tag={cuda_
 
 index_url = f"https://wheels.astral.sh/simple/{cuda_tag}/"
 
-# mamba-ssm: pull from Astral's GPU index, ADDING it alongside PyPI
-# (--extra-index-url, not --index-url) so torch/einops/etc still resolve
-# normally and only mamba-ssm itself comes from the matched-wheel index.
 pip install "mamba-ssm==2.3.2.post1+cu.{cuda_ver}.torch.{torch_mm}" \
     --extra-index-url {index_url}

@@ -218,6 +218,7 @@ from newton_associative_scan import (
     _batched_step_fn,
 )
 from stochastic_write_head_v2 import StochasticWriteHead
+from analytic_diag_jac import build_analytic_diag_fn
 
 __all__ = [
     "DEERParallelDNC",
@@ -441,6 +442,7 @@ class DEERParallelDNC(MambaDNC):
         deer_jac_chunk_size: int = 1,  # v3/v4 -- see class docstring
         deer_jac_sample_batch_size: int = 1,  # v4 -- see class docstring
         deer_step_sample_batch_size: Optional[int] = None,  # v5 -- see class docstring
+        deer_use_analytic_diag: bool = False,  # Alternate Phase 3, Step 2, Option 3
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -488,6 +490,7 @@ class DEERParallelDNC(MambaDNC):
         self.deer_jac_chunk_size = deer_jac_chunk_size  # v3
         self.deer_jac_sample_batch_size = deer_jac_sample_batch_size  # v4
         self.deer_step_sample_batch_size = deer_step_sample_batch_size  # v5
+        self.deer_use_analytic_diag = deer_use_analytic_diag  # Option 3
         # Populated after every use_deer=True forward call: the
         # `newton_iters`/`final_max_abs_delta`/`converged`/`tol` dict
         # deer_quasi_newton_solve returns, for the training script to log.
@@ -564,6 +567,11 @@ class DEERParallelDNC(MambaDNC):
         raw_input_dim = self.input_size
 
         model = self  # avoid shadowing inside the closure below
+        analytic_diag_fn = (
+            build_analytic_diag_fn(model, spec, raw_input_dim, _inject_fixed_noise)
+            if self.deer_use_analytic_diag
+            else None
+        )
 
         def per_sample_step(state_vec, x_vec_aug):
             x_vec = x_vec_aug[:raw_input_dim]
@@ -637,7 +645,8 @@ class DEERParallelDNC(MambaDNC):
             tol=self.deer_tol,
             damping=self.deer_damping,
             max_jac_diag_abs=self.deer_max_jac_diag_abs,
-            jac_chunk_size=self.deer_jac_chunk_size,  # v3
+            analytic_diag_fn=analytic_diag_fn,  # Option 3 -- None unless deer_use_analytic_diag
+            jac_chunk_size=self.deer_jac_chunk_size,  # v3 -- ignored when analytic_diag_fn is set
             jac_sample_batch_size=self.deer_jac_sample_batch_size,  # v4
             step_sample_batch_size=self.deer_step_sample_batch_size,  # v5
         )

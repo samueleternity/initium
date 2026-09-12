@@ -432,6 +432,7 @@ def deer_quasi_newton_solve(
     damping: float = 0.0,
     max_jac_diag_abs: Optional[float] = None,
     y_init_guess: Optional[torch.Tensor] = None,
+    analytic_diag_fn: Optional[Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = None,
     jac_chunk_size: int = 1,
     jac_sample_batch_size: int = 1,
     step_sample_batch_size: Optional[int] = None,
@@ -523,7 +524,6 @@ def deer_quasi_newton_solve(
     _no_grad_guard = torch.no_grad()
     _no_grad_guard.__enter__()
     for it in range(max_newton_iters):
-        print(f"[Newton] iter {it+1}/{max_newton_iters}")
         # Predecessor state for every t=1..T: s_0 (fixed) followed by the
         # current guess's own s_1..s_{T-1} (i.e. shift-by-one along time).
         y_prev = torch.cat([init_state_vec.unsqueeze(1), y[:, :-1, :]], dim=1)  # (B, T, D)
@@ -538,7 +538,13 @@ def deer_quasi_newton_solve(
             step_sample_batch_size=step_sample_batch_size,
         ).reshape(B, T, D)
 
-        if jac_chunk_size <= 0:
+        if analytic_diag_fn is not None:
+            # Closed-form diagonal (analytic_diag_jac.py) -- ONE extra
+            # _layer_forward call per sample per round, same cost as f_out
+            # itself, instead of D serial/vmapped jvp calls. Takes priority
+            # over jac_chunk_size, which becomes moot in this branch.
+            _diag_fn = analytic_diag_fn
+        elif jac_chunk_size <= 0:
             def _diag_fn(s: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
                 jac = jacrev(lambda ss: per_sample_step(ss, x))(s)
                 return torch.diagonal(jac)

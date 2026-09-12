@@ -142,6 +142,10 @@ class MambaChunkControllerCell(MambaControllerCell):
     `forward_chunk()` are both available and, per this file's module
     docstring, provably agree).
     """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.mamba.in_proj.weight.is_cuda:
+            self.forward_chunk = torch.compile(self.forward_chunk, dynamic=False)
 
     def forward_chunk(
         self,

@@ -1507,8 +1507,10 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
             deer_tol=deer_tol,  # v9
             deer_damping=deer_damping,  # v9
             deer_max_jac_diag_abs=deer_max_jac_diag_abs, # v9
-            deer_jac_chunk_size=256,          # was silently defaulting to 1 (~140k serial jvp calls)
-            deer_jac_sample_batch_size=4     # keep at 1 for now -- raise later if you have headroom 
+            deer_use_analytic_diag=True,     # Option 3 -- replaces the O(D^2) jvp-loop diagonal with the closed-form one
+            deer_jac_chunk_size=64,          # unused while deer_use_analytic_diag=True; kept as the fallback value
+            deer_jac_sample_batch_size=2048,
+            deer_step_sample_batch_size=2048 
         ).to(device)
     else:
         # v8 (Alternate Phase 3, Step 2, Option 2): ChunkedParallelDNC in

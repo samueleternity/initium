@@ -122,7 +122,7 @@ from typing import Any, Callable, Optional
 import torch
 from torch.func import jacrev, jvp, vmap
 
-from dnc_parallel_scan import selective_scan_chunk
+from Parallelization_Attempt.dnc_parallel_scan import selective_scan_chunk
 
 __all__ = [
     "LeafSpec",

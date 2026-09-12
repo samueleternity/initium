@@ -120,12 +120,12 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from mamba_controller import (  # noqa: F401 -- MambaControllerBlock re-exported for callers that only need the sequential path
+from model.mamba_controller import (  # noqa: F401 -- MambaControllerBlock re-exported for callers that only need the sequential path
     MambaControllerBlock,
     MambaControllerCell,
     _require_mamba_ssm,
 )
-from dnc_parallel_scan import selective_scan_chunk
+from Parallelization_Attempt.dnc_parallel_scan import selective_scan_chunk
 
 
 # ==========================================================================

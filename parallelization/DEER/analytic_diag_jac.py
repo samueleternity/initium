@@ -133,7 +133,7 @@ from typing import Any, Callable, Optional
 
 import torch
 
-from newton_associative_scan import pack_state, unpack_state
+from DEER.newton_associative_scan import pack_state, unpack_state
 
 __all__ = ["build_analytic_diag_fn"]
 

@@ -574,11 +574,7 @@ class MambaDNC(DNC):
                     independent_linears=self.independent_linears,
                 )
             )
-            setattr(self, "rnn_layer_memory_shared", self.memories[0])
-
-        if self.device is not None and self.device.type == "cuda":
-            for _m in self.memories:
-                _m.forward = torch.compile(_m.forward, dynamic=False)      
+            setattr(self, "rnn_layer_memory_shared", self.memories[0]) 
     
         # final output layer -- copied verbatim from dnc.DNC.__init__
         self.output = nn.Linear(self.nn_output_size, self.input_size)

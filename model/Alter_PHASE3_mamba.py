@@ -368,6 +368,7 @@ from stochastic_write_head_v2 import (
     install_stochastic_write_heads, pop_total_kl,
     update_all_prior_snapshots, get_prior_state, load_prior_state,  # v5 (Phase 2)
 )
+from dynamic_memory_resize import resize_memory
 
 # ==========================================
 # 1. CONFIGURATION
@@ -432,6 +433,19 @@ TRAVERSAL_CURRICULUM = [
     ((10, 40), (2, 6), (1, 10)),
     ((10, 40), (2, 6), (1, 20)),
 ]
+
+# Static Option 2: per-lesson memory size N, indexed the same as
+# TRAVERSAL_CURRICULUM (kept as a separate parallel list rather than
+# widening the curriculum tuples, so every existing
+# `nodes_range, out_degree_range, path_len_range = self.table[self.lesson]`
+# unpack in this file keeps working unmodified).
+LESSON_NR_CELLS = [
+    128, 128, 128, 128,      # lessons 1-4  (<=10 nodes)
+    160, 160, 160, 160,      # lessons 5-8  (<=20 nodes)
+    192, 192, 192, 192,      # lessons 9-12 (<=30 nodes)
+    256, 256,                # lessons 13-14 (<=40 nodes, path_length up to 20)
+]
+assert len(LESSON_NR_CELLS) == len(TRAVERSAL_CURRICULUM)
 
 ADVANCE_THRESHOLD = 0.85       # 85% modal accuracy
 OLD_LESSON_MIX_RATE = 0.10     # 10% of exemplars drawn from earlier lessons
@@ -565,7 +579,7 @@ def save_checkpoint(path, rnn, output_proj, stochastic_heads, optimizer,
     os.makedirs(os.path.dirname(path), exist_ok=True)
     model_config = {
         "input_size": INPUT_DIM, "hidden_size": MODEL_HIDDEN_SIZE,
-        "nr_cells": MODEL_NR_CELLS, "cell_size": MODEL_CELL_SIZE,
+        "nr_cells": rnn.memories[0].nr_cells, "cell_size": MODEL_CELL_SIZE, 
         "read_heads": MODEL_READ_HEADS,
         "controller_type": controller_type,  # v7
     }
@@ -870,6 +884,10 @@ class TraversalCurriculum:
 
         if triple_acc / 100.0 >= ADVANCE_THRESHOLD and self.lesson < len(self.table) - 1:
             self.lesson += 1
+            new_n = LESSON_NR_CELLS[self.lesson]
+            if new_n != LESSON_NR_CELLS[self.lesson - 1]:
+                resize_memory(model, new_n, device=device)
+                print(f">>> Memory resized to nr_cells={new_n} for lesson {self.lesson + 1}")
             print(f">>> Curriculum advanced to lesson {self.lesson + 1}/{len(self.table)}")
             # Log addition #4: record the exact step of every lesson advance,
             # so future switch-in points (e.g. "post lesson-2 breakthrough")
@@ -1279,10 +1297,29 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
     # on the first post-switch update.
     if resuming:
         ckpt = load_checkpoint_for_resume(resume_from, device)
-        if ckpt["run_id"] != run_id or ckpt["beta_target"] != beta_target:
-            print(f"WARNING: resuming {ckpt['run_id']} (beta={ckpt['beta_target']}) "
-                  f"into a run configured as {run_id} (beta={beta_target}). "
-                  f"Proceeding, but double-check this is the checkpoint you meant.")
+        # Static Option 2 resume fix: rnn was just constructed above at
+        # LESSON_NR_CELLS[0] (curriculum.lesson doesn't exist yet at that
+        # point in run()). If this checkpoint is mid-schedule, the live
+        # model's Memory is still the wrong size -- maybe_advance() only
+        # resizes on a LIVE lesson transition, which never replays for
+        # lessons already passed before this resume. Must happen BEFORE
+        # rnn.load_state_dict() below, so load_state_dict fills the
+        # resized module's parameters with the checkpoint's trained values
+        # directly, instead of transplanting fresh-init weights that then
+        # get immediately overwritten anyway.
+        # Prefer the checkpoint's own recorded nr_cells (self-describing,
+        # Edit A above) over recomputing from the current LESSON_NR_CELLS
+        # list, in case the schedule was edited since this checkpoint was
+        # produced.
+        ckpt_nr_cells = ckpt.get("model_config", {}).get("nr_cells")
+        if ckpt_nr_cells is None:
+            ckpt_nr_cells = LESSON_NR_CELLS[ckpt["curriculum_lesson"]]
+            print(f"[{run_id}] WARNING: checkpoint predates per-lesson "
+                  f"nr_cells recording (static Option 2) -- inferring "
+                  f"nr_cells={ckpt_nr_cells} from LESSON_NR_CELLS"
+                  f"[{ckpt['curriculum_lesson']}] instead of a recorded value.")
+        resize_memory(rnn, ckpt_nr_cells, device=device)
+            
         rnn.load_state_dict(ckpt["rnn_state_dict"])
         output_proj.load_state_dict(ckpt["output_proj_state_dict"])
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])

@@ -934,7 +934,16 @@ def decode_prediction(output_step):
 
 def evaluate_traversal(model, device, num_episodes=100, verbose_n=3,
                        num_nodes=None, nodes_range=None, k_range=None, path_length_range=None,
-                       fixed_graph=None, hop_breakdown=False, rng=None):
+                       fixed_graph=None, hop_breakdown=False, rng=None,
+                       ablate_memory=False):
+    """
+    ablate_memory: functional-usage check (LB-9/Concept 6, rsDNC's bimodal-
+        convergence finding). Passes pass_through_memory=False into the
+        model's own forward() -- an existing dnc.DNC kwarg, unmodified here
+        -- which skips memory read AND write for every timestep of this
+        eval call, substituting zero read-vectors. Default False, so every
+        existing call site (training, ID eval, OOD eval) is unaffected.
+    """
     """
     num_nodes: fixed graph size for every eval episode (old behavior).
     nodes_range: (lo, hi) tuple -- if given (and num_nodes is None), num_nodes
@@ -977,7 +986,8 @@ def evaluate_traversal(model, device, num_episodes=100, verbose_n=3,
             input_seq = input_seq.unsqueeze(0).to(device)
 
             hidden = (None, None, None)
-            output, _ = model(input_seq, hidden, reset_experience=True)
+            output, _ = model(input_seq, hidden, reset_experience=True,
+                               pass_through_memory=not ablate_memory)
             output = output.transpose(0, 1).contiguous().squeeze(0)  # (T, 92)
             output = output_proj_current(output)  # (T, 90) -- see run(); module set per-run
 
@@ -1101,6 +1111,11 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
             "grad_norm", "amp_scale", "elapsed_sec",  # log addition #2, #3, #5
             "snapshot_step",  # v5 (Phase 2): net-new, appended at the end --
             # everything above is the untouched Phase 1 schema, in the same
+            # order.
+            "gpu_mem_peak_mb", "param_count",  # Option 3 (Concept 24/LB-17):
+            # net-new, appended at the very end, same convention as
+            # snapshot_step above.
+            # everything above is the untouched Phase 1 schema, in the same
             # order. Which frozen (mu_g, Sigma_g) snapshot this window's
             # kl_* columns were computed against; 0 if the prior has never
             # been snapshotted yet (still N(0,I), i.e. Phase-1-equivalent).
@@ -1118,6 +1133,23 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
         ood_log_writer.writerow([
             "step", "lesson", "id_triple_acc", "id_perfect_frac",
             "ood_triple_acc", "ood_perfect_frac", "ood_offset_triple", "ood_offset_perfect",
+        ])
+
+    # Functional-usage check (LB-9/Concept 6): same-cadence, same-distribution
+    # companion to the ID/OOD log above, but with the model's own memory
+    # path switched off (see evaluate_traversal's ablate_memory kwarg). A
+    # standing per-run check, not a one-off sanity pass, per the roadmap's
+    # explicit requirement -- catches rsDNC's silent bypass-path collapse
+    # (still trains, still runs, loss curves look fine) that a KL- or
+    # loss-only view can't see.
+    mem_check_path = os.path.join(LOG_DIR, f"run_{run_id}_memory_dependency.csv")
+    mem_check_file = open(mem_check_path, "a" if resuming else "w", newline="")
+    mem_check_writer = csv.writer(mem_check_file)
+    if not resuming:
+        mem_check_writer.writerow([
+            "step", "lesson", "id_triple_acc", "id_perfect_frac",
+            "ablated_triple_acc", "ablated_perfect_frac",
+            "memory_dependency_triple", "memory_dependency_perfect",
         ])
 
     # Log addition #4: explicit lesson-advance event log (step at which each
@@ -1236,6 +1268,13 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
         list(rnn.parameters()) + list(output_proj.parameters()),
         lr=LR
     )
+    # Option 3 (Concept 24/LB-17): multi-axis efficiency accounting.
+    # param_count is fixed for the life of this run -- static Option 2's
+    # nr_cells resize never changes it (every Memory sublayer is sized by
+    # cell_size/read_heads/input_size, never nr_cells, per the Option-2
+    # analysis) -- so this is a one-time computation, not per-step.
+    param_count = sum(p.numel() for p in rnn.parameters()) + \
+                  sum(p.numel() for p in output_proj.parameters())
     amp_enabled = USE_AMP and device.type == 'cuda'
     # v3 fix: init_scale explicit instead of the 65536 default -- see header
     # note / AMP_INIT_SCALE comment in CONFIGURATION.
@@ -1398,6 +1437,10 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
     # (potentially still reflecting the old buggy drifted value).
     running_task_loss, running_kl_loss, running_div, running_grad_norm = 0.0, 0.0, 0, 0.0
     t0 = time.time()
+
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats(device)
+
     # Log addition #5: cumulative wall-clock for this run(). Starts fresh on
     # a resumed leg too (i.e. measures THIS process's elapsed time, not
     # elapsed time since the original run began across all resumed legs --
@@ -1466,13 +1509,16 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
             avg_kl = running_kl_loss / LOG_EVERY
             avg_div = running_div / LOG_EVERY
             avg_grad_norm = running_grad_norm / LOG_EVERY
+            gpu_mem_peak_mb = (torch.cuda.max_memory_allocated(device) / 1e6
+                                           if torch.cuda.is_available() else 0.0)
             print(f"[{run_id}] Step {step}/{TOTAL_STEPS} | Lesson {curriculum.lesson + 1}/{len(curriculum.table)} "
                   f"| L_task {avg_task:.4f} | L_KL {avg_kl:.4f} | beta {beta_eff:.4f} "
                   f"| diversity {avg_div:.2f} | {LOG_EVERY / elapsed:.2f} steps/s "
                   f"| KL[mean {kl_diag['kl_mean']:.4f} max {kl_diag['kl_max']:.4f}] | LR {current_lr:.6f} "
                   f"| grad_norm {avg_grad_norm:.4f} | amp_scale {amp_scale:.1f}"
                   f"| clamp_frac {kl_diag['clamp_frac']:.4f}"
-                  f"| snapshot_step {kl_diag['snapshot_step']}")  # v6: net-new, appended at the end --
+                  f"| snapshot_step {kl_diag['snapshot_step']}"
+                  f"| gpu_mem_peak_mb {gpu_mem_peak_mb:.1f} | params {param_count}")  # v6: net-new, appended at the end --
                   # everything before this token is the untouched Phase 1
                   # console line, in the same order, so any existing
                   # parsing/scraping of this line by column position still
@@ -1482,8 +1528,11 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
                 avg_task, avg_kl, avg_task + beta_eff * avg_kl, avg_div,
                 kl_diag["kl_mean"], kl_diag["kl_max"], kl_diag["kl_min"], kl_diag["kl_std"], 
                 kl_diag["clamp_frac"], current_lr, avg_grad_norm, amp_scale, total_elapsed,
-                kl_diag["snapshot_step"],  # v5 (Phase 2): net-new, appended at the end -- see header schema note
+                kl_diag["snapshot_step"],
+                gpu_mem_peak_mb, param_count,
             ])
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats(device)  # so next window's peak isn't cumulative
             log_file.flush()
             running_task_loss, running_kl_loss, running_div, running_grad_norm = 0.0, 0.0, 0, 0.0
 
@@ -1516,6 +1565,7 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
             prior_log_file.flush()
 
         if step % EVAL_EVERY == 0:
+            pre_advance_lesson = curriculum.lesson  # capture before maybe_advance can bump it
             _, id_triple_acc, id_perfect_frac = curriculum.maybe_advance(rnn, device, step=step)
 
             # Log addition #1: periodic OOD (London Underground) eval, using
@@ -1544,6 +1594,26 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
             print(f"[{run_id}] Step {step} periodic OOD check: "
                   f"ID {id_triple_acc:.2f}% | OOD {ood_triple_acc:.2f}% | "
                   f"offset {id_triple_acc - ood_triple_acc:.2f}")
+            
+            # Functional-usage check: same lesson distribution the ID eval
+            # above just used (pre_advance_lesson, not curriculum.lesson --
+            # this call may have just advanced it).
+            nodes_range, out_degree_range, path_len_range = curriculum.table[pre_advance_lesson]
+            ablated_triple_acc, ablated_perfect_frac = evaluate_traversal(
+                rnn, device, num_episodes=EVAL_BATCH_SIZE, verbose_n=0,
+                nodes_range=nodes_range, k_range=out_degree_range, path_length_range=path_len_range,
+                ablate_memory=True,
+            )
+            mem_check_writer.writerow([
+                step, pre_advance_lesson + 1, id_triple_acc, id_perfect_frac,
+                ablated_triple_acc, ablated_perfect_frac,
+                id_triple_acc - ablated_triple_acc, id_perfect_frac - ablated_perfect_frac,
+            ])
+            mem_check_file.flush()
+            print(f"[{run_id}] Step {step} memory-dependency check: "
+                  f"ID (memory on) {id_triple_acc:.2f}% | ablated (memory off) "
+                  f"{ablated_triple_acc:.2f}% | dependency {id_triple_acc - ablated_triple_acc:.2f}")
+        
 
         if step % CHECKPOINT_EVERY == 0 or step == TOTAL_STEPS:
             ckpt_path = os.path.join(CHECKPOINT_DIR, f"{run_id}_step{step}.pt")

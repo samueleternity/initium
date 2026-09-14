@@ -1,4 +1,6 @@
 """
+file: link_matrix_ablation.py
+
 Static Option 1: ablate or sparsify the DNC's temporal link matrix at fixed
 N=256, per Session 009's synthesis finding that temporal-linkage addressing
 is near-unused in QA-style (single-hop, content-addressed) tasks. Graph

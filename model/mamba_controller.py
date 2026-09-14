@@ -1,5 +1,5 @@
 """
-mamba_controller.py -- v1 (new file)
+mamba_controller.py -- v1 
 
 Alternate Phase 3, Step 1 (see Experiment-Roadmap.md, "Alternative Phase 3 -
 fits better to the programs architecture"): wire a Mamba-1 (selective SSM)
@@ -286,39 +286,43 @@ class MambaControllerCell(nn.Module):
         x_conv = m.act(x_conv).to(dtype=dtype)
 
         # ---- input-dependent selection parameters (Delta, B, C) ---------
-        x_db = m.x_proj(x_conv)  # (B, dt_rank + 2*d_state)
-        dt, B, C = torch.split(x_db, [self.dt_rank, self.d_state, self.d_state], dim=-1)
-        dt = F.linear(dt, m.dt_proj.weight)  # bias added below, inside softplus
-        dt = F.softplus(dt + m.dt_proj.bias.to(dtype=dt.dtype))  # (B, d_inner)
-        # ---- selective-scan single step, out-of-place --------------------
-        # FIX (grad_norm nan, independent of beta -- see chat log): under
-        # torch.amp.autocast, einsum is an autocast-to-fp16 op, so A's
-        # .float() cast above was silently undone here, and m.A_log has no
-        # upper bound -- torch.exp(m.A_log.float()) can overflow to +inf
-        # while softplus(dt) can underflow to exactly 0.0 in fp16 range,
-        # producing 0.0 * -inf == nan that poisons ssm_state on every step,
-        # for every beta, since this path has no dependency on beta_eff.
-        # Force the whole recurrence to real fp32 regardless of the outer
-        # autocast context (matching how mamba_ssm's own CUDA kernel always
-        # accumulates the scan in fp32 even with fp16 activations), and
-        # clamp A_log so A can never reach -inf in the first place.
+        # FIX (chronic grad_norm nan in Mamba only, never in LSTM runs):
+        # x_proj/dt_proj/softplus/out_proj are plain nn.Linear calls, so
+        # under ambient autocast they still run (and can overflow) in fp16
+        # even though the scan below was already forced to fp32. Because
+        # ssm_state/conv_state persist across an entire episode (up to
+        # ~250+ timesteps, reset only at episode start), a single fp16
+        # overflow anywhere in this chain poisons every later step of that
+        # episode -- unlike the LSTM, whose gated hidden state is bounded
+        # by construction every step. Fix: run x_proj/dt_proj/softplus and
+        # the scan in real fp32, clamp dt's upper bound (its own dynamics
+        # only ever need ~0.001-0.1) and A_log's lower bound (a very
+        # negative A_log drives A -> 0, turning the SSM into an undamped
+        # accumulator), and hard-clamp the recurrent state and y before
+        # they're allowed to re-enter out_proj's autocast fp16 matmul.
         with torch.autocast(device_type=hidden_states.device.type, enabled=False):
-            dt32 = dt.float().clamp(min=1e-6)
+            x_conv32 = x_conv.float()
+            x_db = m.x_proj(x_conv32)  # (B, dt_rank + 2*d_state), real fp32
+            dt, B, C = torch.split(x_db, [self.dt_rank, self.d_state, self.d_state], dim=-1)
+            dt = F.linear(dt, m.dt_proj.weight.float())  # bias added below, inside softplus
+            dt = F.softplus(dt + m.dt_proj.bias.float())  # (B, d_inner), real fp32
+            dt32 = dt.clamp(min=1e-6, max=100.0)  # upper bound: normal dt is 0.001-0.1
             B32 = B.float()
             C32 = C.float()
-            x_conv32 = x_conv.float()
-            A_log_c = m.A_log.float().clamp(max=20.0)  # exp(20) already far above any dt*A this model needs
+            A_log_c = m.A_log.float().clamp(min=-20.0, max=20.0)  # lower bound stops A -> 0 (undamped accumulator)
             A32 = -torch.exp(A_log_c)  # (d_inner, d_state)
             dA = torch.exp(torch.einsum("bd,dn->bdn", dt32, A32))
             dB = torch.einsum("bd,bn->bdn", dt32, B32)
             new_ssm_state32 = ssm_state.float() * dA + x_conv32.unsqueeze(-1) * dB  # (B, d_inner, d_state)
+            new_ssm_state32 = new_ssm_state32.clamp(min=-1e4, max=1e4)  # hard stop on undamped growth
             y32 = torch.einsum("bdn,bn->bd", new_ssm_state32, C32)
             y32 = y32 + m.D.float() * x_conv32
             y32 = y32 * m.act(z).float()  # gated output
+            y32 = y32.clamp(min=-1e4, max=1e4)  # stay well inside fp16 range before out_proj re-enters autocast
         new_ssm_state = new_ssm_state32.to(dtype)
         y = y32.to(dtype)
 
-        out = m.out_proj(y)  # (B, d_model)
+        out = m.out_proj(y)  # (B, d_model) -- back under ambient autocast, safe now that y is bounded
         return out, new_conv_state, new_ssm_state
 
 

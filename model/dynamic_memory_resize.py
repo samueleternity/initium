@@ -1,4 +1,6 @@
 """
+file: dynamic_memory_resize.py
+
 Static Option 2: rebuild a dnc.DNC's Memory submodule at a new nr_cells,
 transplanting every N-independent learned sublayer so no trained weight is
 lost. Safe because Memory's per-episode state (memory/link_matrix/

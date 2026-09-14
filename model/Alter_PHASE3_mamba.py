@@ -1,4 +1,6 @@
 """
+file: Alter_PHASE3_mamba.py
+
 Phase 1 -- add the complexity term, keeping everything else fixed.
 
 This is the original graph-traversal training script (Graves 2016-style

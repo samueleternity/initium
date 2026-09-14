@@ -388,11 +388,6 @@ AMP_INIT_SCALE = 128.0             # v3 fix: GradScaler previously defaulted to 
                                     # to a stable ~0.1 (see header note) before training worked at
                                     # all -- start near where it actually stabilized instead.
 
-# v3: model capacity -- see header note for what changed and why.
-# Was hidden_size, nr_cells, cell_size, read_heads = 256, 256, 128, 4.
-# Promoted to module-level constants (previously a local tuple in run(),
-# and separately duplicated as a hardcoded dict literal in save_checkpoint())
-# so both places read the same numbers and can't desync.
 MODEL_HIDDEN_SIZE = 512
 MODEL_NR_CELLS = 256               # left unchanged -- see header note (O(N^2) link matrix)
 MODEL_CELL_SIZE = 192
@@ -480,14 +475,9 @@ device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
 
 # ---- Phase 1 additions ----------------------------------------------------
-BETAS_TO_SWEEP = [0.0, 0.001]         # beta=0 anchored to Run 0 instead -- see header note
+BETAS_TO_SWEEP = [0.0]         # beta=0 anchored to Run 0 instead -- see header note
 KL_ANNEAL_STEPS = 8000                    # ramp beta 0 -> target over this many steps
-FREE_BITS = 1                          # per-dimension KL floor (nats); 0.0 disables
-# v3 review (not a change): cell_size 128->192 makes the raw, summed-over-
-# dims L_KL ~1.5x larger for the same per-dim KL, but this floor is already
-# applied per-dimension in pop_kl() (stochastic_write_head.py), so it scales
-# automatically with cell_size -- left as 0.02. Verify kl_mean/dim and
-# clamp_frac at this run's first checkpoints rather than assume unchanged.
+FREE_BITS = 0.1                          # per-dimension KL floor (nats); 0.0 disables
 LOG_DIR = "./phase1_logs"
 OOD_EVAL_EPISODES = 200
 OOD_PATH_LENGTH_RANGE = (3, 5)
@@ -1539,9 +1529,12 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
             avg_kl = running_kl_loss / LOG_EVERY
             avg_div = running_div / LOG_EVERY
             avg_grad_norm = running_grad_norm / LOG_EVERY
+            kl_contrib = beta_eff * avg_kl  # actual beta*L_KL added to total loss, vs. avg_kl (pre-beta, raw clamped sum)
             gpu_mem_peak_mb = (torch.cuda.max_memory_allocated(device) / 1e6
                                            if torch.cuda.is_available() else 0.0)
-            print(f"[{run_id}] Step {step}/{total_steps} | Lesson {curriculum.lesson + 1}/{len(curriculum.table)} "                  f"| L_task {avg_task:.4f} | L_KL {avg_kl:.4f} | beta {beta_eff:.4f} "
+            print(f"[{run_id}] Step {step}/{total_steps} | Lesson {curriculum.lesson + 1}/{len(curriculum.table)} "                  
+                  f"| L_task {avg_task:.4f} | L_KL {avg_kl:.4f} | beta {beta_eff:.4f} "
+                  f"| KL_contrib {kl_contrib:.4f} "
                   f"| diversity {avg_div:.2f} | {LOG_EVERY / elapsed:.2f} steps/s "
                   f"| KL[mean {kl_diag['kl_mean']:.4f} max {kl_diag['kl_max']:.4f}] | LR {current_lr:.6f} "
                   f"| grad_norm {avg_grad_norm:.4f} | amp_scale {amp_scale:.1f}"
@@ -1555,7 +1548,7 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
                   # works; this is purely an appended trailing field.
             log_writer.writerow([
                 step, curriculum.lesson + 1, beta_eff,
-                avg_task, avg_kl, avg_task + beta_eff * avg_kl, avg_div,
+                avg_task, avg_kl, kl_contrib, avg_task + kl_contrib, avg_div,
                 kl_diag["kl_mean"], kl_diag["kl_max"], kl_diag["kl_min"], kl_diag["kl_std"], 
                 kl_diag["clamp_frac"], current_lr, avg_grad_norm, amp_scale, total_elapsed,
                 kl_diag["snapshot_step"],

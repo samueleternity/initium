@@ -482,7 +482,7 @@ print(f"Using device: {device}")
 # ---- Phase 1 additions ----------------------------------------------------
 BETAS_TO_SWEEP = [0.0, 0.001]         # beta=0 anchored to Run 0 instead -- see header note
 KL_ANNEAL_STEPS = 8000                    # ramp beta 0 -> target over this many steps
-FREE_BITS = 0.02                          # per-dimension KL floor (nats); 0.0 disables
+FREE_BITS = 1                          # per-dimension KL floor (nats); 0.0 disables
 # v3 review (not a change): cell_size 128->192 makes the raw, summed-over-
 # dims L_KL ~1.5x larger for the same per-dim KL, but this floor is already
 # applied per-dimension in pop_kl() (stochastic_write_head.py), so it scales
@@ -1517,6 +1517,7 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
                   f"| KL[mean {kl_diag['kl_mean']:.4f} max {kl_diag['kl_max']:.4f}] | LR {current_lr:.6f} "
                   f"| grad_norm {avg_grad_norm:.4f} | amp_scale {amp_scale:.1f}"
                   f"| clamp_frac {kl_diag['clamp_frac']:.4f}"
+                  f"| floor_frac {kl_diag['floor_frac']:.4f}"
                   f"| snapshot_step {kl_diag['snapshot_step']}"
                   f"| gpu_mem_peak_mb {gpu_mem_peak_mb:.1f} | params {param_count}")  # v6: net-new, appended at the end --
                   # everything before this token is the untouched Phase 1

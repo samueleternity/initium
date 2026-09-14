@@ -254,11 +254,15 @@ class StochasticWriteHead(nn.Module):
             "kl_std": kl_stack.std().item(),
             "clamp_frac": torch.cat([t.flatten() for t in self._clamp_terms]).mean().item()
                         if self._clamp_terms else 0.0,
+            "floor_frac": (kl_stack <= free_bits).float().mean().item() if free_bits > 0 else 0.0,
             "snapshot_step": self.last_snapshot_step,  # v2: audit tag, see module docstring point 6
         }
 
         if free_bits > 0:
+            floor_frac = (kl_stack <= free_bits).float().mean().item()  # diagnostic, computed pre-clamp
             kl_stack = torch.clamp(kl_stack, min=free_bits)
+        else:
+            floor_frac = 0.0
 
         loss = kl_stack.sum(dim=-1).mean()  # sum over dims (per timestep), mean over (T*B)
 

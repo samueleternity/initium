@@ -290,15 +290,33 @@ class MambaControllerCell(nn.Module):
         dt, B, C = torch.split(x_db, [self.dt_rank, self.d_state, self.d_state], dim=-1)
         dt = F.linear(dt, m.dt_proj.weight)  # bias added below, inside softplus
         dt = F.softplus(dt + m.dt_proj.bias.to(dtype=dt.dtype))  # (B, d_inner)
-        A = -torch.exp(m.A_log.float())  # (d_inner, d_state)
-
         # ---- selective-scan single step, out-of-place --------------------
-        dA = torch.exp(torch.einsum("bd,dn->bdn", dt, A))
-        dB = torch.einsum("bd,bn->bdn", dt, B)
-        new_ssm_state = ssm_state * dA + x_conv.unsqueeze(-1) * dB  # (B, d_inner, d_state)
-        y = torch.einsum("bdn,bn->bd", new_ssm_state.to(dtype), C)
-        y = y + m.D.to(dtype) * x_conv
-        y = y * m.act(z)  # gated output
+        # FIX (grad_norm nan, independent of beta -- see chat log): under
+        # torch.amp.autocast, einsum is an autocast-to-fp16 op, so A's
+        # .float() cast above was silently undone here, and m.A_log has no
+        # upper bound -- torch.exp(m.A_log.float()) can overflow to +inf
+        # while softplus(dt) can underflow to exactly 0.0 in fp16 range,
+        # producing 0.0 * -inf == nan that poisons ssm_state on every step,
+        # for every beta, since this path has no dependency on beta_eff.
+        # Force the whole recurrence to real fp32 regardless of the outer
+        # autocast context (matching how mamba_ssm's own CUDA kernel always
+        # accumulates the scan in fp32 even with fp16 activations), and
+        # clamp A_log so A can never reach -inf in the first place.
+        with torch.autocast(device_type=hidden_states.device.type, enabled=False):
+            dt32 = dt.float().clamp(min=1e-6)
+            B32 = B.float()
+            C32 = C.float()
+            x_conv32 = x_conv.float()
+            A_log_c = m.A_log.float().clamp(max=20.0)  # exp(20) already far above any dt*A this model needs
+            A32 = -torch.exp(A_log_c)  # (d_inner, d_state)
+            dA = torch.exp(torch.einsum("bd,dn->bdn", dt32, A32))
+            dB = torch.einsum("bd,bn->bdn", dt32, B32)
+            new_ssm_state32 = ssm_state.float() * dA + x_conv32.unsqueeze(-1) * dB  # (B, d_inner, d_state)
+            y32 = torch.einsum("bdn,bn->bd", new_ssm_state32, C32)
+            y32 = y32 + m.D.float() * x_conv32
+            y32 = y32 * m.act(z).float()  # gated output
+        new_ssm_state = new_ssm_state32.to(dtype)
+        y = y32.to(dtype)
 
         out = m.out_proj(y)  # (B, d_model)
         return out, new_conv_state, new_ssm_state

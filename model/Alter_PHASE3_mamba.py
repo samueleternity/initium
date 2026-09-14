@@ -369,6 +369,7 @@ from stochastic_write_head_v2 import (
     update_all_prior_snapshots, get_prior_state, load_prior_state,  # v5 (Phase 2)
 )
 from dynamic_memory_resize import resize_memory
+from link_matrix_ablation import patch_link_matrix
 
 # ==========================================
 # 1. CONFIGURATION
@@ -446,6 +447,19 @@ ADVANCE_THRESHOLD = 0.85       # 85% modal accuracy
 OLD_LESSON_MIX_RATE = 0.10     # 10% of exemplars drawn from earlier lessons
 EVAL_BATCH_SIZE = 100          # episodes per lesson-completion check
 
+
+# Static Option 1 (link-matrix ablation/sparsification at fixed N). Defaults
+# are baseline/no-op so nothing changes for existing lstm/mamba KL-sweep
+# runs unless the new CLI flags below are explicitly passed.
+LINK_MATRIX_MODE = "dense"          # "dense" | "ablated" | "sparse_topk"
+LINK_MATRIX_TOPK = None             # required (int) only for "sparse_topk"
+ISOLATE_LINK_ABLATION = False       # True: hold nr_cells fixed at MODEL_NR_CELLS
+                                     # for the whole run (overrides LESSON_NR_CELLS
+                                     # to a constant list), so this run measures
+                                     # ONLY the link-matrix change -- never combine
+                                     # with Option 2's curriculum-indexed resize in
+                                     # the same run, per Concept 16/SP-10 isolation.
+
 LONDON_UNDERGROUND_EDGES_RAW = [
     ("OxfordCircus", "TottenhamCtRd", "Central"),
     ("TottenhamCtRd", "OxfordCircus", "Central"),
@@ -521,7 +535,8 @@ CHECKPOINT_EVERY = 2000     # periodic safety checkpoint, in addition to end-of-
 
 def save_checkpoint(path, rnn, output_proj, stochastic_heads, optimizer,
                      curriculum, step, beta_target, run_id, scaler, ood_rng,
-                     controller_type=CONTROLLER_TYPE):  # v7: see model_config note below
+                     controller_type=CONTROLLER_TYPE,  # v7: see model_config note below
+                     link_matrix_mode=LINK_MATRIX_MODE, link_matrix_topk=LINK_MATRIX_TOPK):  # Static Option 1
     """Save everything needed to resume training or re-run eval later:
       - model + output-projection + optimizer state
       - LR is NOT saved separately -- it's now a pure function of `step`
@@ -584,6 +599,7 @@ def save_checkpoint(path, rnn, output_proj, stochastic_heads, optimizer,
         "nr_cells": rnn.memories[0].nr_cells, "cell_size": MODEL_CELL_SIZE, 
         "read_heads": MODEL_READ_HEADS,
         "controller_type": controller_type,  # v7
+        "link_matrix_mode": link_matrix_mode, "link_matrix_topk": link_matrix_topk,  # Static Option 1
     }
     if controller_type == "mamba":  # v7
         model_config.update({
@@ -883,6 +899,11 @@ class TraversalCurriculum:
                 for hops, (acc, pf, n) in hop_breakdown.items()
             )
             print(f"    [lesson {self.lesson + 1} eval by hop count] {breakdown_str}")
+            hop_writer = getattr(self, "hop_log_writer", None)
+            if hop_writer is not None:
+                for hops, (acc, pf, n) in sorted(hop_breakdown.items()):
+                    hop_writer.writerow([step, self.lesson + 1, "id", hops, acc, pf, n])
+                self.hop_log_file.flush()
 
         if triple_acc / 100.0 >= ADVANCE_THRESHOLD and self.lesson < len(self.table) - 1:
             self.lesson += 1
@@ -1091,7 +1112,10 @@ output_proj_current = None
 def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = None,
         controller: str = CONTROLLER_TYPE,  # v7 (Alternate Phase 3, Step 1)
         beta_mode: str = BETA_MODE,  # dynamic-beta toggle: "static" or "dynamic"
-        total_steps: int = TOTAL_STEPS):  # see --total-steps.
+        total_steps: int = TOTAL_STEPS,  # see --total-steps.
+        link_matrix_mode: str = LINK_MATRIX_MODE,  # Static Option 1
+        link_matrix_topk: int = LINK_MATRIX_TOPK,  # Static Option 1
+        isolate_link_ablation: bool = ISOLATE_LINK_ABLATION):  # Static Option 1
         # Deliberately does NOT touch LR_DECAY_STEPS -- that's a separate
         # module-level constant, fixed at import time from the *original*
         # TOTAL_STEPS, and lr_at_step()/set_lr() below read it directly by
@@ -1172,6 +1196,25 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
     if not resuming:
         lesson_log_writer.writerow(["step", "new_lesson", "of_total_lessons"])
 
+    # Static Option 1 watch-item: per-hop-count accuracy, logged as its own
+    # trajectory instead of console-only. The link-matrix ablation/sparsify
+    # finding this option validates (Session 009 synthesis) was established
+    # on QA-style tasks, where each answer is effectively a 1-hop lookup and
+    # content-based addressing dominates. Graph traversal chains multiple
+    # hops per episode -- exactly where temporal/sequential-link addressing
+    # could matter more than it does for QA. So the thing to watch isn't
+    # whether aggregate triple_acc holds after ablating/sparsifying the link
+    # matrix, it's whether accuracy holds *evenly across hop counts* or
+    # collapses specifically at higher hops. hop_breakdown already computes
+    # this at every advance-check; this file just persists it.
+    hop_log_path = os.path.join(LOG_DIR, f"run_{run_id}_hop_breakdown.csv")
+    hop_log_file = open(hop_log_path, "a" if resuming else "w", newline="")
+    hop_log_writer = csv.writer(hop_log_file)
+    if not resuming:
+        hop_log_writer.writerow([
+            "step", "lesson", "eval_type", "hop_count", "triple_acc", "perfect_frac", "n_episodes",
+        ])
+
     # v5 (Phase 2): periodic "prior snapshot updated" log -- net-new file,
     # written every PRIOR_SNAPSHOT_EVERY steps by update_all_prior_snapshots()
     # below. This is the direct evidence for the Q48 periodic-snapshot
@@ -1193,6 +1236,8 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
     curriculum = TraversalCurriculum()
     curriculum.advance_log_writer = lesson_log_writer  # log addition #4, read by maybe_advance
     curriculum.advance_log_file = lesson_log_file       # flushed after each write
+    curriculum.hop_log_writer = hop_log_writer   # Static Option 1 watch-item
+    curriculum.hop_log_file = hop_log_file
 
     # v5 (Phase 2): dedicated RNG stream for OOD (London Underground) walk
     # sampling, decoupled from the global `random` stream that curriculum ID
@@ -1220,6 +1265,13 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
     print(f"[{run_id}] Model config: hidden={hidden_size} nr_cells={nr_cells} "
           f"cell_size={cell_size} read_heads={read_heads} | beta={beta_target} "
           f"| controller={controller}")  # v7: controller tag added to this line
+    
+    global LESSON_NR_CELLS
+    if isolate_link_ablation:
+        LESSON_NR_CELLS = [MODEL_NR_CELLS] * len(TRAVERSAL_CURRICULUM)
+        print(f"[{run_id}] isolate_link_ablation=True - nr_cells held fixed "
+              f"at {MODEL_NR_CELLS} for the whole run (Option 2's resize "
+              f"mechanism will never fire this run).")
 
     # v7 (Alternate Phase 3, Step 1): model construction now goes through
     # MambaDNC instead of the plain DNC import. For controller='lstm' (the
@@ -1259,6 +1311,13 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
         # dnc.memory.Memory identically regardless of rnn_type.
         **mamba_kwargs,
     ).to(device)
+
+    
+    if link_matrix_mode != "dense":
+        patch_link_matrix(rnn, mode=link_matrix_mode, topk=link_matrix_topk)
+        topk_note = f" topk={link_matrix_topk}" if link_matrix_mode == "sparse_topk" else ""
+        print(f"[{run_id}] link_matrix_mode={link_matrix_mode}{topk_note} -- "
+              f"Static Option 1 applied to rnn.memories.")
 
     output_proj = nn.Linear(INPUT_DIM, TRIPLE_DIM).to(device)
     output_proj_current = output_proj
@@ -1638,11 +1697,12 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
             # fixed graph) from the global `random` stream curriculum ID
             # sampling uses. See v5 header note.
             edges, node_labels, adjacency = build_london_underground_eval()
-            ood_triple_acc, ood_perfect_frac = evaluate_traversal(
+            ood_triple_acc, ood_perfect_frac, ood_hop_breakdown = evaluate_traversal(
                 rnn, device, num_episodes=OOD_EVAL_EPISODES_PERIODIC, verbose_n=0,
                 fixed_graph=(edges, node_labels, adjacency, len(node_labels)),
                 path_length_range=OOD_PATH_LENGTH_RANGE,
                 rng=ood_rng,
+                hop_breakdown=True,
             )
             ood_log_writer.writerow([
                 step, curriculum.lesson + 1,
@@ -1654,6 +1714,9 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
             print(f"[{run_id}] Step {step} periodic OOD check: "
                   f"ID {id_triple_acc:.2f}% | OOD {ood_triple_acc:.2f}% | "
                   f"offset {id_triple_acc - ood_triple_acc:.2f}")
+            for hops, (acc, pf, n) in sorted(ood_hop_breakdown.items()):
+                hop_log_writer.writerow([step, curriculum.lesson + 1, "ood", hops, acc, pf, n])
+            hop_log_file.flush()
             
             # Functional-usage check: same lesson distribution the ID eval
             # above just used (pre_advance_lesson, not curriculum.lesson --
@@ -1680,7 +1743,8 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
             save_checkpoint(ckpt_path, rnn, output_proj, stochastic_heads,
                              optimizer, curriculum, step,
                              beta_target, run_id, scaler, ood_rng,  # v6: + ood_rng
-                             controller_type=controller)  # v7
+                             controller_type=controller,  # v7
+                             link_matrix_mode=link_matrix_mode, link_matrix_topk=link_matrix_topk)  # Static Option 1
             # Also keep a stable "latest" pointer so eval/resume don't need
             # to know the exact final step number in advance. Plain file
             # copy -- NOT a torch.load()+torch.save() round-trip. The
@@ -1700,11 +1764,12 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
     # OOD sampling (periodic and final) is decoupled from the ID/curriculum
     # stream consistently.
     edges, node_labels, adjacency = build_london_underground_eval()
-    ood_triple_acc, ood_perfect_frac = evaluate_traversal(
+    ood_triple_acc, ood_perfect_frac, ood_hop_breakdown = evaluate_traversal(
         rnn, device, num_episodes=OOD_EVAL_EPISODES, verbose_n=10,
         fixed_graph=(edges, node_labels, adjacency, len(node_labels)),
         path_length_range=OOD_PATH_LENGTH_RANGE,
         rng=ood_rng,
+        hop_breakdown=True,
     )
 
     ood_offset_triple = id_triple_acc - ood_triple_acc
@@ -1721,6 +1786,10 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
         ood_offset_triple, ood_offset_perfect,
     ])
     ood_log_file.flush()
+
+    for hops, (acc, pf, n) in sorted(ood_hop_breakdown.items()):
+        hop_log_writer.writerow([step, curriculum.lesson + 1, "ood", hops, acc, pf, n])
+    hop_log_file.flush()
 
     summary = {
         "run_id": run_id,
@@ -1793,11 +1862,31 @@ if __name__ == "__main__":
                               f"{TOTAL_STEPS}-step sweep). Defaults to the module constant "
                               f"TOTAL_STEPS ({TOTAL_STEPS}) if omitted. Does NOT change "
                               "LR_DECAY_STEPS -- a pilot run still anneals on the full schedule.")
+    parser.add_argument("--link-matrix-mode", type=str, default=LINK_MATRIX_MODE,
+                         choices=["dense", "ablated", "sparse_topk"],
+                         help="Static Option 1: link-matrix ablation/sparsification at "
+                              "fixed N. 'dense' (default): unchanged Memory behavior. "
+                              "'ablated': link matrix never updated (temporal addressing "
+                              "contributes nothing). 'sparse_topk': link matrix updated "
+                              "as normal, then each row keeps only its --link-matrix-topk "
+                              "largest-magnitude entries.")
+    parser.add_argument("--link-matrix-topk", type=int, default=LINK_MATRIX_TOPK,
+                         help="Required when --link-matrix-mode=sparse_topk: how many "
+                              "entries each link-matrix row keeps per step.")
+    parser.add_argument("--isolate-link-ablation", action="store_true",
+                         help="Hold nr_cells fixed at MODEL_NR_CELLS for the whole run "
+                              "(overrides LESSON_NR_CELLS to a constant list), so Option "
+                              "2's curriculum-indexed resize never fires. Use this for "
+                              "the isolated Option-1 run the roadmap's ordering requires "
+                              "-- do not combine with Option 2 in the same run.")
     args = parser.parse_args()
 
     if args.resume is not None and args.beta is None:
         raise SystemExit("--resume requires the beta positional arg too, e.g.:\n"
                           f"  python3 {sys.argv[0]} 0.02 --resume phase1_checkpoints/beta_0p02_latest.pt")
+    
+    if args.link_matrix_mode == "sparse_topk" and args.link_matrix_topk is None:
+        raise SystemExit("--link-matrix-mode=sparse_topk requires --link-matrix-topk")
 
     if args.beta is not None:
         betas_to_run = [args.beta]
@@ -1824,12 +1913,18 @@ if __name__ == "__main__":
             run_id = f"{run_id}_mambactrl"
         if args.beta_mode == "dynamic":  # keep dynamic-beta runs from colliding with static sweep files
             run_id = f"{run_id}_dynbeta"
+        if args.link_matrix_mode != "dense":  # Static Option 1: keep these runs from colliding with dense-baseline sweep files
+            tag = args.link_matrix_mode if args.link_matrix_mode != "sparse_topk" else f"sparsetopk{args.link_matrix_topk}"
+            run_id = f"{run_id}_link{tag}"
         if args.run_id_suffix:
             run_id = f"{run_id}_{args.run_id_suffix}"
         summary = run(beta_target=beta, run_id=run_id, seed=args.seed,
                        resume_from=args.resume, controller=args.controller,  # v7
                        beta_mode=args.beta_mode,
-                       total_steps=(args.total_steps if args.total_steps is not None else TOTAL_STEPS))
+                       total_steps=(args.total_steps if args.total_steps is not None else TOTAL_STEPS),
+                       link_matrix_mode=args.link_matrix_mode,
+                       link_matrix_topk=args.link_matrix_topk,
+                       isolate_link_ablation=args.isolate_link_ablation)
         all_summaries.append(summary)
 
     print("\n===== Sweep summary (this process) =====")

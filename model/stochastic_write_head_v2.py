@@ -240,7 +240,8 @@ class StochasticWriteHead(nn.Module):
             zero = torch.zeros((), device=self.mu_transform.weight.device)
             return zero, {
                 "kl_mean": 0.0, "kl_max": 0.0, "kl_min": 0.0, "kl_std": 0.0,
-                "clamp_frac": 0.0, "snapshot_step": self.last_snapshot_step,
+                "clamp_frac": 0.0, "floor_frac": 0.0,
+                "snapshot_step": self.last_snapshot_step,
             }
 
         kl_stack = torch.cat(
@@ -411,7 +412,7 @@ def pop_total_kl(heads: list[StochasticWriteHead], free_bits: float = 0.0):
     head's snapshot is).
     """
     total = None
-    merged = {"kl_mean": [], "kl_max": [], "kl_min": [], "kl_std": [], "clamp_frac": []}
+    merged = {"kl_mean": [], "kl_max": [], "kl_min": [], "kl_std": [], "clamp_frac": [], "floor_frac": []}
     snapshot_steps = []
     for h in heads:
         loss, diag = h.pop_kl(free_bits=free_bits)

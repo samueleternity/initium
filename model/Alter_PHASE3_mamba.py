@@ -360,7 +360,7 @@ from dnc import DNC  # noqa: F401 -- kept for anyone importing DNC from this
                       # module elsewhere; model construction below now goes
                       # through MambaDNC (v7), which defers to this same
                       # dnc.DNC implementation for rnn_type='lstm'.
-from ALTERNATE_PHASE_3_step_1.mamba_controller import MambaDNC  # v7 (Alternate Phase 3, Step 1): see
+from mamba_controller import MambaDNC  # v7 (Alternate Phase 3, Step 1): see
                                         # mamba_controller.py for the actual
                                         # Mamba-1 controller wiring.
 
@@ -1100,7 +1100,14 @@ output_proj_current = None
 # ==========================================
 def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = None,
         controller: str = CONTROLLER_TYPE,  # v7 (Alternate Phase 3, Step 1)
-        beta_mode: str = BETA_MODE):  # dynamic-beta toggle: "static" or "dynamic"
+        beta_mode: str = BETA_MODE,  # dynamic-beta toggle: "static" or "dynamic"
+        total_steps: int = TOTAL_STEPS):  # see --total-steps.
+        # Deliberately does NOT touch LR_DECAY_STEPS -- that's a separate
+        # module-level constant, fixed at import time from the *original*
+        # TOTAL_STEPS, and lr_at_step()/set_lr() below read it directly by
+        # name, not through this parameter. A pilot run still anneals LR on
+        # the full 120000-step schedule and simply stops early partway
+        # through it, exactly as the --total-steps help text promises.
     global output_proj_current
 
     torch.manual_seed(seed)
@@ -1435,10 +1442,10 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
                   f"the next {KL_ANNEAL_STEPS} steps.")
         print(f"[{run_id}] Resumed from {resume_from} at step {step} "
               f"(lesson {curriculum.lesson + 1}/{len(curriculum.table)}); "
-              f"continuing to TOTAL_STEPS={TOTAL_STEPS}")
-        if step >= TOTAL_STEPS:
-            print(f"[{run_id}] Checkpoint step {step} already >= TOTAL_STEPS "
-                  f"{TOTAL_STEPS} -- nothing to do. Raise TOTAL_STEPS if you "
+              f"continuing to total_steps={total_steps}")
+        if step >= total_steps:
+            print(f"[{run_id}] Checkpoint step {step} already >= total_steps "
+                  f"{total_steps} -- nothing to do. Raise --total-steps if you "
                   f"want to extend further.")
 
     print(f"\n=== [{run_id}] Training (beta_target={beta_target}, beta_mode={beta_mode}) "
@@ -1468,7 +1475,7 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
     # legs already have their own timestamped log rows if that's needed).
     t_run_start = time.time()
 
-    while step < TOTAL_STEPS:
+    while step < total_steps:
         input_seq, target_digits, answer_mask = sample_batch(curriculum, BATCH_SIZE)
 
         input_seq = input_seq.to(device, non_blocking=True)
@@ -1534,8 +1541,7 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
             avg_grad_norm = running_grad_norm / LOG_EVERY
             gpu_mem_peak_mb = (torch.cuda.max_memory_allocated(device) / 1e6
                                            if torch.cuda.is_available() else 0.0)
-            print(f"[{run_id}] Step {step}/{TOTAL_STEPS} | Lesson {curriculum.lesson + 1}/{len(curriculum.table)} "
-                  f"| L_task {avg_task:.4f} | L_KL {avg_kl:.4f} | beta {beta_eff:.4f} "
+            print(f"[{run_id}] Step {step}/{total_steps} | Lesson {curriculum.lesson + 1}/{len(curriculum.table)} "                  f"| L_task {avg_task:.4f} | L_KL {avg_kl:.4f} | beta {beta_eff:.4f} "
                   f"| diversity {avg_div:.2f} | {LOG_EVERY / elapsed:.2f} steps/s "
                   f"| KL[mean {kl_diag['kl_mean']:.4f} max {kl_diag['kl_max']:.4f}] | LR {current_lr:.6f} "
                   f"| grad_norm {avg_grad_norm:.4f} | amp_scale {amp_scale:.1f}"
@@ -1676,7 +1682,7 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
                   f"{ablated_triple_acc:.2f}% | dependency {id_triple_acc - ablated_triple_acc:.2f}")
         
 
-        if step % CHECKPOINT_EVERY == 0 or step == TOTAL_STEPS:
+        if step % CHECKPOINT_EVERY == 0 or step == total_steps:
             ckpt_path = os.path.join(CHECKPOINT_DIR, f"{run_id}_step{step}.pt")
             save_checkpoint(ckpt_path, rnn, output_proj, stochastic_heads,
                              optimizer, curriculum, step,
@@ -1787,6 +1793,13 @@ if __name__ == "__main__":
                               "starts at the given positional beta and is then adjusted "
                               "every EVAL_EVERY steps by a task-accuracy-constrained "
                               "controller, bounded to [BETA_CTRL_MIN, BETA_CTRL_MAX].")
+    parser.add_argument("--total-steps", type=int, default=None,
+                         help="Override the training loop's stopping point for a "
+                              "cheap pilot run (e.g. the seed-0/seed-2, short-budget staging pass "
+                              "suggested before committing to the full 4-seed x 3-config x "
+                              f"{TOTAL_STEPS}-step sweep). Defaults to the module constant "
+                              f"TOTAL_STEPS ({TOTAL_STEPS}) if omitted. Does NOT change "
+                              "LR_DECAY_STEPS -- a pilot run still anneals on the full schedule.")
     args = parser.parse_args()
 
     if args.resume is not None and args.beta is None:
@@ -1822,7 +1835,8 @@ if __name__ == "__main__":
             run_id = f"{run_id}_{args.run_id_suffix}"
         summary = run(beta_target=beta, run_id=run_id, seed=args.seed,
                        resume_from=args.resume, controller=args.controller,  # v7
-                       beta_mode=args.beta_mode)
+                       beta_mode=args.beta_mode,
+                       total_steps=(args.total_steps if args.total_steps is not None else TOTAL_STEPS))
         all_summaries.append(summary)
 
     print("\n===== Sweep summary (this process) =====")

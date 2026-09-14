@@ -492,6 +492,18 @@ LOG_DIR = "./phase1_logs"
 OOD_EVAL_EPISODES = 200
 OOD_PATH_LENGTH_RANGE = (3, 5)
 
+
+# Dynamic beta (GECO-style dual ascent), task-accuracy constrained --
+# alternative to a fixed BETAS_TO_SWEEP entry. beta_target is reused as
+# the controller's live value: it still gets checkpointed/resumed/logged
+# via the existing beta_target plumbing with no extra state needed.
+BETA_MODE = "static"          # "static" (current sweep behavior, unchanged) or "dynamic"
+BETA_CTRL_ACC_TARGET = ADVANCE_THRESHOLD  # task-accuracy floor the controller protects (0-1 frac)
+BETA_CTRL_LR = 2e-5           # rate-limit: max step per EVAL_EVERY cycle at constraint==1.0
+BETA_CTRL_MIN = 0.0
+BETA_CTRL_MAX = 2e-4          # hard ceiling -- 1e-3 is known to collapse, stay well clear
+BETA_CTRL_EMA_DECAY = 0.9     # smooths the constraint signal across eval cycles
+
 # ---- Phase 2 additions (v5) ------------------------------------------
 # Learned-prior snapshot cadence and numerical floor/ceiling -- see
 # stochastic_write_head.py v2 (update_prior_snapshot) for what these
@@ -1087,7 +1099,8 @@ output_proj_current = None
 #     Only new lines vs. Phase 0 are marked "# Phase 1".
 # ==========================================
 def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = None,
-        controller: str = CONTROLLER_TYPE):  # v7 (Alternate Phase 3, Step 1)
+        controller: str = CONTROLLER_TYPE,  # v7 (Alternate Phase 3, Step 1)
+        beta_mode: str = BETA_MODE):  # dynamic-beta toggle: "static" or "dynamic"
     global output_proj_current
 
     torch.manual_seed(seed)
@@ -1428,7 +1441,7 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
                   f"{TOTAL_STEPS} -- nothing to do. Raise TOTAL_STEPS if you "
                   f"want to extend further.")
 
-    print(f"\n=== [{run_id}] Training (beta_target={beta_target}) "
+    print(f"\n=== [{run_id}] Training (beta_target={beta_target}, beta_mode={beta_mode}) "
           f"{'[resumed]' if resuming else ''} ===")
     rnn.train()
     set_lr(step)  # Phase 1 FIX: ensure correct clamped LR from the very first
@@ -1436,6 +1449,14 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
     # whatever LR was saved inside optimizer_state_dict at checkpoint time
     # (potentially still reflecting the old buggy drifted value).
     running_task_loss, running_kl_loss, running_div, running_grad_norm = 0.0, 0.0, 0, 0.0
+
+    # Dynamic-beta controller state (no-op / unused when beta_mode == "static").
+    # Initialized post-resume so a resumed dynamic run starts its health check
+    # from the just-restored scaler scale rather than a fresh-process default.
+    beta_constraint_ema = 0.0
+    scale_at_last_eval = scaler.get_scale()
+    grad_was_finite_since_eval = True
+
     t0 = time.time()
 
     if torch.cuda.is_available():
@@ -1486,6 +1507,8 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
         # against, useful for telling a genuine instability apart from the
         # expected one-off "shock" when sampling noise is switched on.
         grad_norm = torch.nn.utils.clip_grad_norm_(rnn.parameters(), max_norm=10.0)
+        if not math.isfinite(float(grad_norm)):
+            grad_was_finite_since_eval = False
         scaler.step(optimizer)
         scaler.update()
         # Log addition #3: AMP loss-scale value. A collapsing/repeatedly
@@ -1568,6 +1591,43 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
         if step % EVAL_EVERY == 0:
             pre_advance_lesson = curriculum.lesson  # capture before maybe_advance can bump it
             _, id_triple_acc, id_perfect_frac = curriculum.maybe_advance(rnn, device, step=step)
+            if beta_mode == "dynamic":
+                # Hard safety ceiling -- enforced every eval cycle unconditionally,
+                # independent of the health gate below. Without this, starting
+                # beta_target above [BETA_CTRL_MIN, BETA_CTRL_MAX] (e.g. testing
+                # 0.001) could ride out the whole KL_ANNEAL_STEPS window unclamped
+                # if early-training grad instability keeps failing the health
+                # check on every eval cycle -- i.e. behave identically to static
+                # mode at the known-collapse value, silently. This is a clamp,
+                # not a rate-limited step: it can move beta_target more than
+                # BETA_CTRL_LR in one cycle, on purpose.
+                if not (BETA_CTRL_MIN <= beta_target <= BETA_CTRL_MAX):
+                    clamped = float(np.clip(beta_target, BETA_CTRL_MIN, BETA_CTRL_MAX))
+                    print(f"[{run_id}] Step {step} beta_target {beta_target:.6f} outside "
+                          f"[{BETA_CTRL_MIN}, {BETA_CTRL_MAX}] -- hard-clamping to {clamped:.6f} "
+                          f"(unconditional, ignores health gate below)")
+                    beta_target = clamped
+
+                scale_backed_off = scaler.get_scale() < scale_at_last_eval
+                healthy = grad_was_finite_since_eval and not scale_backed_off
+                if healthy:
+                    acc_frac = id_triple_acc / 100.0
+                    raw_constraint = acc_frac - BETA_CTRL_ACC_TARGET
+                    beta_constraint_ema = (BETA_CTRL_EMA_DECAY * beta_constraint_ema
+                                            + (1 - BETA_CTRL_EMA_DECAY) * raw_constraint)
+                    beta_target = float(np.clip(
+                        beta_target + BETA_CTRL_LR * beta_constraint_ema,
+                        BETA_CTRL_MIN, BETA_CTRL_MAX,
+                    ))
+                    print(f"[{run_id}] Step {step} dynamic-beta update | "
+                          f"acc {acc_frac:.4f} target {BETA_CTRL_ACC_TARGET:.4f} | "
+                          f"constraint_ema {beta_constraint_ema:.4f} | beta -> {beta_target:.6f}")
+                else:
+                    print(f"[{run_id}] Step {step} dynamic-beta update SKIPPED "
+                          f"(grad_finite={grad_was_finite_since_eval}, "
+                          f"scale_backoff={scale_backed_off}) | beta stays {beta_target:.6f}")
+                scale_at_last_eval = scaler.get_scale()
+                grad_was_finite_since_eval = True
 
             # Log addition #1: periodic OOD (London Underground) eval, using
             # the RNG-safe build_london_underground_eval() (see fix above --
@@ -1720,6 +1780,13 @@ if __name__ == "__main__":
                               "'lstm' (default) reproduces Phase 2 exactly. "
                               "'mamba' swaps in the Mamba-1 controller from "
                               "mamba_controller.py; requires the mamba-ssm package.")
+    parser.add_argument("--beta-mode", type=str, default=BETA_MODE,
+                         choices=["static", "dynamic"],
+                         help="'static' (default): beta_target is fixed for the run, "
+                              "current sweep behavior, unchanged. 'dynamic': beta_target "
+                              "starts at the given positional beta and is then adjusted "
+                              "every EVAL_EVERY steps by a task-accuracy-constrained "
+                              "controller, bounded to [BETA_CTRL_MIN, BETA_CTRL_MAX].")
     args = parser.parse_args()
 
     if args.resume is not None and args.beta is None:
@@ -1749,10 +1816,13 @@ if __name__ == "__main__":
         run_id = f"beta_{beta}_seed{args.seed}_learnedprior".replace(".", "p")
         if args.controller == "mamba":  # v7: keep lstm/mamba runs from colliding in phase1_logs/
             run_id = f"{run_id}_mambactrl"
+        if args.beta_mode == "dynamic":  # keep dynamic-beta runs from colliding with static sweep files
+            run_id = f"{run_id}_dynbeta"
         if args.run_id_suffix:
             run_id = f"{run_id}_{args.run_id_suffix}"
         summary = run(beta_target=beta, run_id=run_id, seed=args.seed,
-                       resume_from=args.resume, controller=args.controller)  # v7
+                       resume_from=args.resume, controller=args.controller,  # v7
+                       beta_mode=args.beta_mode)
         all_summaries.append(summary)
 
     print("\n===== Sweep summary (this process) =====")

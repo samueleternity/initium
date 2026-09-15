@@ -260,12 +260,14 @@ class StochasticWriteHead(nn.Module):
         }
 
         if free_bits > 0:
-            floor_frac = (kl_stack <= free_bits).float().mean().item()  # diagnostic, computed pre-clamp
-            kl_stack = torch.clamp(kl_stack, min=free_bits)
+            floor_frac = (kl_stack <= free_bits).float().mean().item()  # diagnostic, unchanged: per-dim rate
+            per_step_kl = kl_stack.sum(dim=-1)                # (T*B,) — sum over dims, pre-clamp
+            free_bits_total = free_bits * kl_stack.shape[-1]  # scale per-dim threshold to the summed budget
+            per_step_kl = torch.clamp(per_step_kl, min=free_bits_total)
+            loss = per_step_kl.mean()
         else:
             floor_frac = 0.0
-
-        loss = kl_stack.sum(dim=-1).mean()  # sum over dims (per timestep), mean over (T*B)
+            loss = kl_stack.sum(dim=-1).mean()
 
         self._kl_terms = []
         self._clamp_terms = []

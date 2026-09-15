@@ -493,7 +493,7 @@ print(f"Using device: {device}")
 # ---- Phase 1 additions ----------------------------------------------------
 BETAS_TO_SWEEP = [0.0]         # beta=0 anchored to Run 0 instead -- see header note
 KL_ANNEAL_STEPS = 8000                    # ramp beta 0 -> target over this many steps
-FREE_BITS = 0.1                          # per-dimension KL floor (nats); 0.0 disables
+FREE_BITS = 0.02                          # per-dimension KL floor (nats); 0.0 disables
 LOG_DIR = "./phase1_logs"
 OOD_EVAL_EPISODES = 200
 OOD_PATH_LENGTH_RANGE = (3, 5)
@@ -1651,6 +1651,11 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
         if step % EVAL_EVERY == 0:
             pre_advance_lesson = curriculum.lesson  # capture before maybe_advance can bump it
             _, id_triple_acc, id_perfect_frac = curriculum.maybe_advance(rnn, device, step=step)
+            if curriculum.lesson != pre_advance_lesson:
+                anneal_start_step = step
+                print(f"[{run_id}] Step {step} lesson advance {pre_advance_lesson + 1}->"
+                      f"{curriculum.lesson + 1}: KL anneal restarted from step "
+                      f"{anneal_start_step}, ramping over the next {KL_ANNEAL_STEPS} steps.")
             if beta_mode == "dynamic":
                 # Hard safety ceiling -- enforced every eval cycle unconditionally,
                 # independent of the health gate below. Without this, starting

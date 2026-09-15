@@ -315,6 +315,8 @@ class MambaControllerCell(nn.Module):
             dB = torch.einsum("bd,bn->bdn", dt32, B32)
             new_ssm_state32 = ssm_state.float() * dA + x_conv32.unsqueeze(-1) * dB  # (B, d_inner, d_state)
             new_ssm_state32 = new_ssm_state32.clamp(min=-1e4, max=1e4)  # hard stop on undamped growth
+            if new_ssm_state32.abs().max() > 9999.0:
+                print(f"[clamp-hit] ssm_state clamped, pre-clamp max would have exceeded bound") #If you see [clamp-hit] printed and NaNs still occur afterward in the same run, that proves the overflow is happening in the backward pass, not the forward activations — i.e., gradients blowing up through the dA = exp(dt·A) term over the ~250-step unroll even though forward values are now bounded. clamp() zeroes the gradient outside its range, so that specific tensor can't be the source once clamped; the remaining unclamped path (particularly dt32 and A32 before the einsum) is the next suspect, since gradients through exp() compounded across hundreds of BPTT steps can still explode independent of forward-value magnitude.
             y32 = torch.einsum("bdn,bn->bd", new_ssm_state32, C32)
             y32 = y32 + m.D.float() * x_conv32
             y32 = y32 * m.act(z).float()  # gated output

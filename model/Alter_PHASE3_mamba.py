@@ -372,6 +372,7 @@ from stochastic_write_head_v2 import (
 )
 from dynamic_memory_resize import resize_memory
 from link_matrix_ablation import patch_link_matrix
+from dynamic_n_controller import DynamicNController  # Dynamic-N (usage-triggered, macro-scale)
 
 # ==========================================
 # 1. CONFIGURATION
@@ -462,6 +463,34 @@ ISOLATE_LINK_ABLATION = False       # True: hold nr_cells fixed at MODEL_NR_CELL
                                      # with Option 2's curriculum-indexed resize in
                                      # the same run, per Concept 16/SP-10 isolation.
 
+# Dynamic-N, macro-scale (usage-triggered nr_cells growth, between episodes).
+# See Strategy_for_phase_3_step_2_options_1-2.md ("Whether Option 1 can be
+# made dynamic the same way" -> case (a), macro-scale) and
+# dynamic_n_controller.py for the actual trigger logic. Mutually exclusive
+# with LESSON_NR_CELLS-driven resize, same isolation discipline as
+# ISOLATE_LINK_ABLATION above (Concept 16/SP-10): DYNAMIC_N_MODE=True
+# overrides LESSON_NR_CELLS to a constant list (held at DYNAMIC_N_FLOOR) so
+# TraversalCurriculum.maybe_advance()'s curriculum-indexed resize never
+# fires this run -- all resizing instead goes through DynamicNController.
+DYNAMIC_N_MODE = False               # True: usage-triggered resize instead of LESSON_NR_CELLS
+DYNAMIC_N_FLOOR = 128                 # starting nr_cells when DYNAMIC_N_MODE=True (matches
+                                       # static Option 2's lesson-1 floor -- the whole point of
+                                       # "don't over-provision N" is to start small)
+DYNAMIC_N_CEILING = 512               # hard ceiling: Strategy doc flags the sparse-link-matrix
+                                       # approximation as only validated to N=512, and this also
+                                       # bounds worst-case O(N^2) link-matrix cost
+DYNAMIC_N_GROWTH_FACTOR = 2.0         # multiplicative step per growth event (128->256->512)
+DYNAMIC_N_USAGE_HIGH = 0.90           # a memory cell counts as "saturated" above this usage value
+DYNAMIC_N_TRIGGER_FRAC = 0.75         # growth trigger: EMA fraction of saturated cells exceeding this
+DYNAMIC_N_EMA_DECAY = 0.98            # smoothing for the per-episode saturation-fraction EMA --
+                                       # this is the "sustained, not a single-step spike" window
+                                       # signal the strategy doc's trigger-design point calls for
+DYNAMIC_N_COOLDOWN_STEPS = 2000       # steps to wait after a growth event before allowing another,
+                                       # so the model's addressing policy gets time to re-settle
+                                       # before the next resize (strategy doc point 3: a naive
+                                       # implementation could introduce a smaller version of the
+                                       # ANOM-142 threshold-collapse cliff at each growth event)
+
 LONDON_UNDERGROUND_EDGES_RAW = [
     ("OxfordCircus", "TottenhamCtRd", "Central"),
     ("TottenhamCtRd", "OxfordCircus", "Central"),
@@ -538,7 +567,8 @@ CHECKPOINT_EVERY = 2000     # periodic safety checkpoint, in addition to end-of-
 def save_checkpoint(path, rnn, output_proj, stochastic_heads, optimizer,
                      curriculum, step, beta_target, run_id, scaler, ood_rng,
                      controller_type=CONTROLLER_TYPE,  # v7: see model_config note below
-                     link_matrix_mode=LINK_MATRIX_MODE, link_matrix_topk=LINK_MATRIX_TOPK):  # Static Option 1
+                     link_matrix_mode=LINK_MATRIX_MODE, link_matrix_topk=LINK_MATRIX_TOPK,  # Static Option 1
+                     dynamic_n_mode=DYNAMIC_N_MODE, dynamic_n_state=None):  # Dynamic-N (macro-scale)
     """Save everything needed to resume training or re-run eval later:
       - model + output-projection + optimizer state
       - LR is NOT saved separately -- it's now a pure function of `step`
@@ -594,6 +624,19 @@ def save_checkpoint(path, rnn, output_proj, stochastic_heads, optimizer,
         `mamba_layer_0...` keys (see mamba_controller.py's MambaDNC), and
         without this field a reader has no way to know which model class to
         reconstruct before attempting `load_state_dict`.
+      - Dynamic-N (macro-scale): `model_config["dynamic_n_mode"]`, same
+        self-describing-checkpoint rationale as controller_type/
+        link_matrix_mode above -- records WHICH mechanism was responsible
+        for whatever nr_cells this checkpoint's rnn.memories[0].nr_cells
+        already self-describes (curriculum lookup vs. usage-triggered
+        growth), even though the resulting nr_cells value itself doesn't
+        care which mechanism produced it. Also `dynamic_n_state` (top-level
+        key, not inside model_config, same convention as prior_state /
+        scaler_state_dict): DynamicNController's usage-EMA, cooldown
+        counter, and full growth_history -- this is run *state*, not model
+        architecture, so it lives alongside prior_state/ood_rng_state
+        rather than inside model_config. None when this run isn't in
+        dynamic_n_mode.
     """
     os.makedirs(os.path.dirname(path), exist_ok=True)
     model_config = {
@@ -602,6 +645,7 @@ def save_checkpoint(path, rnn, output_proj, stochastic_heads, optimizer,
         "read_heads": MODEL_READ_HEADS,
         "controller_type": controller_type,  # v7
         "link_matrix_mode": link_matrix_mode, "link_matrix_topk": link_matrix_topk,  # Static Option 1
+        "dynamic_n_mode": dynamic_n_mode,  # Dynamic-N (macro-scale)
     }
     if controller_type == "mamba":  # v7
         model_config.update({
@@ -621,6 +665,7 @@ def save_checkpoint(path, rnn, output_proj, stochastic_heads, optimizer,
         "curriculum_lesson": curriculum.lesson,
         "prior_state": get_prior_state(stochastic_heads),  # v5 (Phase 2)
         "ood_rng_state": ood_rng.getstate(),  # v6
+        "dynamic_n_state": dynamic_n_state,  # Dynamic-N (macro-scale); None if not dynamic_n_mode
         "rng_state": {
             "python": random.getstate(),
             "numpy": np.random.get_state(),
@@ -1117,7 +1162,12 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
         total_steps: int = TOTAL_STEPS,  # see --total-steps.
         link_matrix_mode: str = LINK_MATRIX_MODE,  # Static Option 1
         link_matrix_topk: int = LINK_MATRIX_TOPK,  # Static Option 1
-        isolate_link_ablation: bool = ISOLATE_LINK_ABLATION):  # Static Option 1
+        isolate_link_ablation: bool = ISOLATE_LINK_ABLATION,  # Static Option 1
+        dynamic_n_mode: bool = DYNAMIC_N_MODE,  # Dynamic-N (macro-scale)
+        dynamic_n_floor: int = DYNAMIC_N_FLOOR,
+        dynamic_n_ceiling: int = DYNAMIC_N_CEILING,
+        dynamic_n_trigger_frac: float = DYNAMIC_N_TRIGGER_FRAC,
+        dynamic_n_cooldown_steps: int = DYNAMIC_N_COOLDOWN_STEPS):
         # Deliberately does NOT touch LR_DECAY_STEPS -- that's a separate
         # module-level constant, fixed at import time from the *original*
         # TOTAL_STEPS, and lr_at_step()/set_lr() below read it directly by
@@ -1260,8 +1310,13 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
     # No longer pinned to Run 0 Run B's config; now reads the top-level
     # MODEL_* constants (CONFIGURATION section) so save_checkpoint()'s
     # recorded model_config can't desync from what's actually built here.
+    # Dynamic-N starts small (dynamic_n_floor) rather than at MODEL_NR_CELLS
+    # -- growing from a small starting N under a usage trigger is the whole
+    # point ("don't over-provision N"); starting at the static ceiling would
+    # leave DynamicNController nothing to ever grow into.
+    starting_nr_cells = dynamic_n_floor if dynamic_n_mode else MODEL_NR_CELLS
     hidden_size, nr_cells, cell_size, read_heads = (
-        MODEL_HIDDEN_SIZE, MODEL_NR_CELLS, MODEL_CELL_SIZE, MODEL_READ_HEADS
+        MODEL_HIDDEN_SIZE, starting_nr_cells, MODEL_CELL_SIZE, MODEL_READ_HEADS
     )
 
     print(f"[{run_id}] Model config: hidden={hidden_size} nr_cells={nr_cells} "
@@ -1274,6 +1329,26 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
         print(f"[{run_id}] isolate_link_ablation=True - nr_cells held fixed "
               f"at {MODEL_NR_CELLS} for the whole run (Option 2's resize "
               f"mechanism will never fire this run).")
+    if dynamic_n_mode:
+        # Same isolation mechanism as isolate_link_ablation above (Concept
+        # 16/SP-10): hold the curriculum-indexed lookup constant so
+        # TraversalCurriculum.maybe_advance()'s own resize_memory() call
+        # never fires -- DynamicNController is the only thing allowed to
+        # resize nr_cells this run.
+        LESSON_NR_CELLS = [dynamic_n_floor] * len(TRAVERSAL_CURRICULUM)
+        print(f"[{run_id}] dynamic_n_mode=True - nr_cells starts at "
+              f"{dynamic_n_floor} and grows via usage-triggered "
+              f"DynamicNController (ceiling={dynamic_n_ceiling}, "
+              f"trigger_frac={dynamic_n_trigger_frac}, "
+              f"cooldown_steps={dynamic_n_cooldown_steps}); Option 2's "
+              f"curriculum-indexed resize mechanism will never fire this run.")
+        if isolate_link_ablation:
+            print(f"[{run_id}] NOTE: isolate_link_ablation AND dynamic_n_mode "
+                  f"are both set -- these are two independent overrides of "
+                  f"LESSON_NR_CELLS (dynamic_n_mode's wins, since it's "
+                  f"checked second). Combining an isolated-Option-1 run "
+                  f"with Dynamic-N growth is unusual; make sure that's "
+                  f"actually what you meant to measure per Concept 16/SP-10.")
 
     # v7 (Alternate Phase 3, Step 1): model construction now goes through
     # MambaDNC instead of the plain DNC import. For controller='lstm' (the
@@ -1350,6 +1425,30 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
     # v3 fix: init_scale explicit instead of the 65536 default -- see header
     # note / AMP_INIT_SCALE comment in CONFIGURATION.
     scaler = torch.amp.GradScaler('cuda', enabled=amp_enabled, init_scale=AMP_INIT_SCALE)
+
+    # Dynamic-N (macro-scale): None unless dynamic_n_mode -- every call site
+    # below guards on `dynamic_n_ctrl is not None` so this is a true no-op
+    # (not just a disabled-but-present object) when the flag is off.
+    dynamic_n_ctrl = (
+        DynamicNController(
+            floor=dynamic_n_floor,
+            ceiling=dynamic_n_ceiling,
+            growth_factor=DYNAMIC_N_GROWTH_FACTOR,
+            trigger_frac=dynamic_n_trigger_frac,
+            ema_decay=DYNAMIC_N_EMA_DECAY,
+            cooldown_steps=dynamic_n_cooldown_steps,
+        )
+        if dynamic_n_mode else None
+    )
+    dynamic_n_log_writer = None
+    if dynamic_n_ctrl is not None:
+        # Own CSV, same one-file-per-mechanism convention as
+        # run_{run_id}_lesson_advances.csv / _prior_snapshots.csv above.
+        dynamic_n_log_path = os.path.join(LOG_DIR, f"run_{run_id}_dynamic_n_growth.csv")
+        dynamic_n_log_file = open(dynamic_n_log_path, "a" if resuming else "w", newline="")
+        dynamic_n_log_writer = csv.writer(dynamic_n_log_file)
+        if not resuming:
+            dynamic_n_log_writer.writerow(["step", "lesson", "old_nr_cells", "new_nr_cells", "usage_ema"])
 
     # --- LR schedule -----------------------------------------------------
     # FIX (see chat log / Q21-Experiment-Log Section 5): CosineAnnealingLR's
@@ -1452,6 +1551,23 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
         # already reflect the buggy drifted state) is simply ignored rather
         # than needing migration.
         curriculum.lesson = ckpt["curriculum_lesson"]
+        # Dynamic-N (macro-scale): restore the usage-EMA/cooldown/growth
+        # history, so a resumed run doesn't silently reset the trigger's
+        # sustained-saturation window back to 0 (which would just delay the
+        # next growth event by however long the EMA takes to re-climb --
+        # not incorrect, but not reproducible either) and so growth_history
+        # stays complete across resumed legs. `.get(...)` so a checkpoint
+        # saved before dynamic_n_mode existed, or a checkpoint from a
+        # non-dynamic-N run, still loads -- the controller (if this run
+        # even has one) just starts fresh, same as a brand-new run would.
+        if dynamic_n_ctrl is not None:
+            if ckpt.get("dynamic_n_state") is not None:
+                dynamic_n_ctrl.load_state_dict(ckpt["dynamic_n_state"])
+            else:
+                print(f"[{run_id}] WARNING: checkpoint has no dynamic_n_state "
+                      f"(pre-dates Dynamic-N, or was saved by a non-dynamic-N "
+                      f"run) -- usage EMA/cooldown/growth_history starting "
+                      f"fresh instead of resuming the prior leg's.")
         # v5 (Phase 2): restore (mu_g, Sigma_g, last_snapshot_step) for every
         # installed stochastic write head. Without this, resuming would
         # silently continue training/evaluating against whatever prior
@@ -1581,6 +1697,55 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
         running_grad_norm += float(grad_norm)
         step += 1
         current_lr = set_lr(step)  # Phase 1 FIX: clamped manual LR, replaces scheduler.step()
+
+        # Dynamic-N (usage-triggered), macro-scale: record this just-finished
+        # episode's memory-usage saturation and, if the trigger has been
+        # sustained past cooldown, resize nr_cells before the NEXT episode's
+        # forward pass. Placed here -- after scaler.step()/scaler.update()
+        # above, using `hidden` from the forward pass that just completed --
+        # so a resize never touches a live autograd graph: this episode's
+        # backward pass and optimizer step are both already done, and the
+        # very next `hidden = (None, None, None)` at the top of the loop
+        # means nothing carries the old size forward anyway (same "no
+        # cross-episode memory content to preserve" fact static Option 2
+        # relies on -- see dynamic_memory_resize.py's module docstring).
+        # This record()/should_grow() split (see dynamic_n_controller.py) is
+        # deliberately timing-agnostic -- it's what lets a future mid-episode
+        # (micro-scale) variant reuse the same decision core fed from a
+        # per-timestep usage reading instead, without redesigning the
+        # EMA/cooldown logic.
+        if dynamic_n_ctrl is not None:
+            with torch.no_grad():
+                # mem_hidden's shape differs by controller: MambaDNC's
+                # _init_hidden returns mhx as a bare dict for rnn_type!=
+                # 'mamba' (deferring to stock dnc.DNC._init_hidden, share_
+                # memory_between_layers=True case), but wraps it in a
+                # single-entry list for rnn_type=='mamba' (see
+                # mamba_controller.py's _init_hidden memory-state branch,
+                # which is otherwise byte-identical to upstream). Both cases
+                # are layer 0 of a single shared Memory in this project, so
+                # this just picks the right unwrap for whichever controller
+                # is active rather than hardcoding one shape.
+                mem_hidden = hidden[1]
+                mhx = mem_hidden[0] if isinstance(mem_hidden, list) else mem_hidden
+                usage = mhx["usage_vector"].float()
+                frac_saturated = (usage > DYNAMIC_N_USAGE_HIGH).float().mean().item()
+            dynamic_n_ctrl.record(frac_saturated)
+            current_nr_cells = rnn.memories[0].nr_cells
+            new_n = dynamic_n_ctrl.should_grow(current_nr_cells)
+            if new_n is not None:
+                ema_at_trigger = dynamic_n_ctrl.ema  # captured before mark_grown() resets it to 0.0
+                resize_memory(rnn, new_n, device=device, optimizer=optimizer)
+                dynamic_n_ctrl.mark_grown(step, current_nr_cells, new_n)
+                print(f"[{run_id}] Step {step} Dynamic-N growth: nr_cells "
+                      f"{current_nr_cells} -> {new_n} (usage-saturation EMA "
+                      f"{ema_at_trigger:.3f} had reached the "
+                      f"{dynamic_n_ctrl.trigger_frac:.2f} trigger, sustained "
+                      f"past cooldown)")
+                dynamic_n_log_writer.writerow([
+                    step, curriculum.lesson + 1, current_nr_cells, new_n, ema_at_trigger,
+                ])
+                dynamic_n_log_file.flush()
 
         if step % LOG_EVERY == 0:
             elapsed = time.time() - t0
@@ -1751,7 +1916,9 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
                              optimizer, curriculum, step,
                              beta_target, run_id, scaler, ood_rng,  # v6: + ood_rng
                              controller_type=controller,  # v7
-                             link_matrix_mode=link_matrix_mode, link_matrix_topk=link_matrix_topk)  # Static Option 1
+                             link_matrix_mode=link_matrix_mode, link_matrix_topk=link_matrix_topk,  # Static Option 1
+                             dynamic_n_mode=dynamic_n_mode,  # Dynamic-N (macro-scale)
+                             dynamic_n_state=(dynamic_n_ctrl.state_dict() if dynamic_n_ctrl is not None else None))
             # Also keep a stable "latest" pointer so eval/resume don't need
             # to know the exact final step number in advance. Plain file
             # copy -- NOT a torch.load()+torch.save() round-trip. The
@@ -1818,6 +1985,8 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
     ood_log_file.close()
     lesson_log_file.close()
     prior_log_file.close()  # v5 (Phase 2)
+    if dynamic_n_ctrl is not None:
+        dynamic_n_log_file.close()
 
     return summary
 
@@ -1886,6 +2055,26 @@ if __name__ == "__main__":
                               "2's curriculum-indexed resize never fires. Use this for "
                               "the isolated Option-1 run the roadmap's ordering requires "
                               "-- do not combine with Option 2 in the same run.")
+    parser.add_argument("--dynamic-n-mode", action="store_true",
+                         help="Dynamic-N, macro-scale: usage-triggered nr_cells growth "
+                              "between episodes, instead of LESSON_NR_CELLS's "
+                              "curriculum-indexed lookup (which this disables, same "
+                              "isolation as --isolate-link-ablation). Model starts at "
+                              "--dynamic-n-floor and grows toward --dynamic-n-ceiling "
+                              "whenever memory-usage saturation stays above "
+                              "--dynamic-n-trigger-frac past the post-growth cooldown.")
+    parser.add_argument("--dynamic-n-floor", type=int, default=DYNAMIC_N_FLOOR,
+                         help="Starting (and minimum) nr_cells under --dynamic-n-mode.")
+    parser.add_argument("--dynamic-n-ceiling", type=int, default=DYNAMIC_N_CEILING,
+                         help="Hard ceiling nr_cells will never grow past under "
+                              "--dynamic-n-mode (Strategy doc: sparse-link-matrix "
+                              "approximation only validated to N=512).")
+    parser.add_argument("--dynamic-n-trigger-frac", type=float, default=DYNAMIC_N_TRIGGER_FRAC,
+                         help="Growth fires when the EMA fraction of memory cells with "
+                              "usage above DYNAMIC_N_USAGE_HIGH exceeds this, past cooldown.")
+    parser.add_argument("--dynamic-n-cooldown-steps", type=int, default=DYNAMIC_N_COOLDOWN_STEPS,
+                         help="Steps to wait after a growth event before another can fire, "
+                              "so the model's addressing policy gets time to re-settle.")
     args = parser.parse_args()
 
     if args.resume is not None and args.beta is None:
@@ -1923,6 +2112,8 @@ if __name__ == "__main__":
         if args.link_matrix_mode != "dense":  # Static Option 1: keep these runs from colliding with dense-baseline sweep files
             tag = args.link_matrix_mode if args.link_matrix_mode != "sparse_topk" else f"sparsetopk{args.link_matrix_topk}"
             run_id = f"{run_id}_link{tag}"
+        if args.dynamic_n_mode:  # Dynamic-N: keep these runs from colliding with static-Option-2 sweep files
+            run_id = f"{run_id}_dynN"
         if args.run_id_suffix:
             run_id = f"{run_id}_{args.run_id_suffix}"
         summary = run(beta_target=beta, run_id=run_id, seed=args.seed,
@@ -1931,7 +2122,12 @@ if __name__ == "__main__":
                        total_steps=(args.total_steps if args.total_steps is not None else TOTAL_STEPS),
                        link_matrix_mode=args.link_matrix_mode,
                        link_matrix_topk=args.link_matrix_topk,
-                       isolate_link_ablation=args.isolate_link_ablation)
+                       isolate_link_ablation=args.isolate_link_ablation,
+                       dynamic_n_mode=args.dynamic_n_mode,
+                       dynamic_n_floor=args.dynamic_n_floor,
+                       dynamic_n_ceiling=args.dynamic_n_ceiling,
+                       dynamic_n_trigger_frac=args.dynamic_n_trigger_frac,
+                       dynamic_n_cooldown_steps=args.dynamic_n_cooldown_steps)
         all_summaries.append(summary)
 
     print("\n===== Sweep summary (this process) =====")

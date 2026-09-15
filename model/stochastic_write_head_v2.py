@@ -240,7 +240,8 @@ class StochasticWriteHead(nn.Module):
             zero = torch.zeros((), device=self.mu_transform.weight.device)
             return zero, {
                 "kl_mean": 0.0, "kl_max": 0.0, "kl_min": 0.0, "kl_std": 0.0,
-                "clamp_frac": 0.0, "snapshot_step": self.last_snapshot_step,
+                "clamp_frac": 0.0, "floor_frac": 0.0,
+                "snapshot_step": self.last_snapshot_step,
             }
 
         kl_stack = torch.cat(
@@ -254,13 +255,19 @@ class StochasticWriteHead(nn.Module):
             "kl_std": kl_stack.std().item(),
             "clamp_frac": torch.cat([t.flatten() for t in self._clamp_terms]).mean().item()
                         if self._clamp_terms else 0.0,
+            "floor_frac": (kl_stack <= free_bits).float().mean().item() if free_bits > 0 else 0.0,
             "snapshot_step": self.last_snapshot_step,  # v2: audit tag, see module docstring point 6
         }
 
         if free_bits > 0:
-            kl_stack = torch.clamp(kl_stack, min=free_bits)
-
-        loss = kl_stack.sum(dim=-1).mean()  # sum over dims (per timestep), mean over (T*B)
+            floor_frac = (kl_stack <= free_bits).float().mean().item()  # diagnostic, unchanged: per-dim rate
+            per_step_kl = kl_stack.sum(dim=-1)                # (T*B,) — sum over dims, pre-clamp
+            free_bits_total = free_bits * kl_stack.shape[-1]  # scale per-dim threshold to the summed budget
+            per_step_kl = torch.clamp(per_step_kl, min=free_bits_total)
+            loss = per_step_kl.mean()
+        else:
+            floor_frac = 0.0
+            loss = kl_stack.sum(dim=-1).mean()
 
         self._kl_terms = []
         self._clamp_terms = []
@@ -407,7 +414,7 @@ def pop_total_kl(heads: list[StochasticWriteHead], free_bits: float = 0.0):
     head's snapshot is).
     """
     total = None
-    merged = {"kl_mean": [], "kl_max": [], "kl_min": [], "kl_std": [], "clamp_frac": []}
+    merged = {"kl_mean": [], "kl_max": [], "kl_min": [], "kl_std": [], "clamp_frac": [], "floor_frac": []}
     snapshot_steps = []
     for h in heads:
         loss, diag = h.pop_kl(free_bits=free_bits)

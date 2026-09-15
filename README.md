@@ -1,1 +1,1 @@
-The workable model can be trained in the "model" folder.
+The workable model that can be trained is in the "model" folder.

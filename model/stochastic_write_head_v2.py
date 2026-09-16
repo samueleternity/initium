@@ -175,6 +175,22 @@ class StochasticWriteHead(nn.Module):
         mu = self.mu_transform(x)
         logvar = self.logvar_transform(x)
 
+        # [NaN-TRACE] Bisects "this head's input was already corrupted"
+        # from "this head's own Linear layers are where it starts" --
+        # can't tell these apart from outside the module. Silent unless
+        # something's actually wrong.
+        if self.training and self.sample:
+            x_ok = torch.isfinite(x).all()
+            mu_ok = torch.isfinite(mu).all()
+            logvar_ok = torch.isfinite(logvar).all()
+            if not (x_ok and mu_ok and logvar_ok):
+                print(f"[NaN-TRACE] StochasticWriteHead.forward: "
+                      f"x_finite={bool(x_ok)} mu_finite={bool(mu_ok)} "
+                      f"logvar_finite={bool(logvar_ok)} | "
+                      f"x.abs().max()={x.abs().max().item() if x_ok else float('nan')} "
+                      f"mu.abs().max()={mu.abs().max().item() if mu_ok else float('nan')} "
+                      f"logvar.abs().max()={logvar.abs().max().item() if logvar_ok else float('nan')}")
+
         if self.sample:
             # Clamp for numerical stability (matters under AMP/fp16 autocast).
             logvar_c = torch.clamp(logvar, min=-10.0, max=10.0)

@@ -564,6 +564,18 @@ CHECKPOINT_DIR = "./phase1_checkpoints"
 CHECKPOINT_EVERY = 2000     # periodic safety checkpoint, in addition to end-of-run
 
 
+def _first_nonfinite_report(tensor, name, step):
+    """Silent when finite; prints once when not. Exists to bisect WHICH
+    pipeline stage a NaN/Inf first appears at, since the LOG_EVERY-averaged
+    training log only shows the aggregate, not the originating stage."""
+    ok = torch.isfinite(tensor).all()
+    if not ok:
+        bad_frac = (~torch.isfinite(tensor)).float().mean().item()
+        print(f"[NaN-TRACE] step {step}: non-finite in '{name}' "
+              f"({bad_frac*100:.2f}% of elements)")
+    return ok
+
+
 def save_checkpoint(path, rnn, output_proj, stochastic_heads, optimizer,
                      curriculum, step, beta_target, run_id, scaler, ood_rng,
                      controller_type=CONTROLLER_TYPE,  # v7: see model_config note below
@@ -897,7 +909,7 @@ class TraversalCurriculum:
             ep = build_traversal_episode(num_nodes, out_degree_range, path_len_range)
         return ep
 
-    def maybe_advance(self, model, device, step=None):
+    def maybe_advance(self, model, device, step=None, optimizer=None):
         """Returns (lesson, id_triple_acc, id_perfect_frac). The two accuracy
         values are returned (not just used internally for the advance
         decision) so callers -- specifically the log addition #1 periodic
@@ -956,7 +968,13 @@ class TraversalCurriculum:
             self.lesson += 1
             new_n = LESSON_NR_CELLS[self.lesson]
             if new_n != LESSON_NR_CELLS[self.lesson - 1]:
-                resize_memory(model, new_n, device=device)
+                # optimizer=optimizer: without it, this live mid-run resize
+                # silently orphans every rebuilt Memory sublayer from Adam's
+                # param_groups for the rest of the run -- see
+                # dynamic_memory_resize.py's "optimizer resync" docstring
+                # section. Defaults to None (no resync) if a caller doesn't
+                # pass one, so this stays backward-compatible.
+                resize_memory(model, new_n, device=device, optimizer=optimizer)
                 print(f">>> Memory resized to nr_cells={new_n} for lesson {self.lesson + 1}")
             print(f">>> Curriculum advanced to lesson {self.lesson + 1}/{len(self.table)}")
             # Log addition #4: record the exact step of every lesson advance,
@@ -1648,11 +1666,13 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
         input_seq = input_seq.to(device, non_blocking=True)
         target_digits = target_digits.to(device, non_blocking=True)
         answer_mask = answer_mask.to(device, non_blocking=True)
+        _first_nonfinite_report(input_seq, "input_seq", step)
         hidden = (None, None, None)
         optimizer.zero_grad(set_to_none=True)
 
         with torch.amp.autocast('cuda', enabled=amp_enabled):
             output, hidden = rnn(input_seq, hidden, reset_experience=True)
+            _first_nonfinite_report(output, "rnn_output", step)
             output = output.transpose(0, 1).contiguous()  # (B, T, 92)
             output = output_proj(output)  # (B, T, 90)
             task_loss = digit_loss(output, target_digits, answer_mask)
@@ -1669,7 +1689,9 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
         # snapshot is currently frozen in the stochastic_heads' buffers
         # (see stochastic_write_head.py v2). kl_diag now also carries
         # `snapshot_step`, logged below.
+        _first_nonfinite_report(task_loss, "task_loss", step)
         kl_loss, kl_diag = pop_total_kl(stochastic_heads, free_bits=FREE_BITS)  # Phase 1
+        _first_nonfinite_report(kl_loss, "kl_loss", step)
         beta_eff = beta_target * min(1.0, (step - anneal_start_step) / max(1, KL_ANNEAL_STEPS))  # Phase 1: linear KL annealing 0 -> beta_target, measured from anneal_start_step
         loss = task_loss + beta_eff * kl_loss  # Phase 1: L = L_task + beta * L_KL
 
@@ -1683,8 +1705,20 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
         grad_norm = torch.nn.utils.clip_grad_norm_(rnn.parameters(), max_norm=10.0)
         if not math.isfinite(float(grad_norm)):
             grad_was_finite_since_eval = False
-        scaler.step(optimizer)
-        scaler.update()
+            # clip_grad_norm_ computes clip_coef = max_norm/(total_norm+eps)
+            # and multiplies EVERY gradient by it. A NaN total_norm therefore
+            # NaNs out every gradient in the model, including ones that were
+            # finite. GradScaler's found_inf was recorded during unscale_,
+            # BEFORE this clip, so it can be clean while the post-clip grads
+            # are all NaN -- scaler.step() then applies them and the weights
+            # are permanently poisoned, which is exactly the one-way collapse
+            # at step 23700. Zero the grads and skip the step instead: this
+            # costs one wasted batch and is fully recoverable.
+            optimizer.zero_grad(set_to_none=True)
+            scaler.update()
+        else:
+            scaler.step(optimizer)
+            scaler.update()
         # Log addition #3: AMP loss-scale value. A collapsing/repeatedly
         # halved scale is the standard AMP symptom of inf/NaN gradients --
         # the exp()/logvar path in the stochastic write head is the most
@@ -1815,7 +1849,7 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
 
         if step % EVAL_EVERY == 0:
             pre_advance_lesson = curriculum.lesson  # capture before maybe_advance can bump it
-            _, id_triple_acc, id_perfect_frac = curriculum.maybe_advance(rnn, device, step=step)
+            _, id_triple_acc, id_perfect_frac = curriculum.maybe_advance(rnn, device, step=step, optimizer=optimizer)            
             if curriculum.lesson != pre_advance_lesson:
                 anneal_start_step = step
                 print(f"[{run_id}] Step {step} lesson advance {pre_advance_lesson + 1}->"
@@ -1930,7 +1964,7 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
             shutil.copyfile(ckpt_path, latest_path)
 
     print(f"\n[{run_id}] Training complete. Final evaluation on training-distribution lesson:")
-    _, id_triple_acc, id_perfect_frac = curriculum.maybe_advance(rnn, device, step=step)
+    _, id_triple_acc, id_perfect_frac = curriculum.maybe_advance(rnn, device, step=step, optimizer=optimizer)
 
     print(f"\n[{run_id}] Generalization test: London Underground (held out, never trained on):")
     # v5 (Phase 2): rng=ood_rng -- same dedicated-stream fix as the periodic

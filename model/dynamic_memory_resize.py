@@ -96,6 +96,7 @@ def resize_memory(model, new_nr_cells: int, device=None, layer: int = 0, optimiz
         cell_size=old_memory.cell_size,
         read_heads=old_memory.read_heads,
         independent_linears=True,
+        device=device,                                    # VERIFY kwarg name -- see note below
     ).to(device)
 
     # Transplant every N-independent learned sublayer except
@@ -125,6 +126,25 @@ def resize_memory(model, new_nr_cells: int, device=None, layer: int = 0, optimiz
             new_memory.link_matrix_topk = old_memory.link_matrix_topk
 
     model.memories[layer] = new_memory
+    # model.memories is a plain python list, not an nn.ModuleList -- the
+    # line above rebinds the list slot but never touches whatever attribute
+    # PyTorch's own submodule registry (_modules) actually points at
+    # (rnn_layer_memory_shared, or rnn_layer_memory_<layer> when memories
+    # aren't shared -- set once via setattr() at model construction, see
+    # mamba_controller.py / dnc.DNC.__init__). Without this, that attribute
+    # stays pointed at old_memory forever -- the same object whose
+    # write_vector_transform was just swapped to nn.Identity() above as a
+    # transplant placeholder -- so rnn.state_dict()/rnn.parameters()/
+    # rnn.load_state_dict() silently keep walking a stale, Identity-headed
+    # module while forward() (which reads self.memories[layer] directly)
+    # correctly uses new_memory. Found via a resume-time crash: dynamic-N's
+    # floor-start construction forces a resize on resume that a static-only
+    # workflow never used to trigger, which is what surfaced this -- but
+    # the same corruption happens on any LIVE resize, including every
+    # static-Option-2 lesson advance that ever fired.
+    for attr_name, submodule in list(model._modules.items()):
+        if submodule is old_memory:
+            setattr(model, attr_name, new_memory)
 
     if optimizer is not None:
         _resync_optimizer_after_resize(optimizer, old_named_params, new_memory)

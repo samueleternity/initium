@@ -1,0 +1,1 @@
+MoE was implemented as a future-proof feature, when any of the models needs to be trained with 30B+ parameters, they will help out a lot. With smaller amount of parameters they are essentially redudant or even harmful(because of the overhead) - use them when you want to train a model with 30B+ parameters.

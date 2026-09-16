@@ -208,7 +208,7 @@ from typing import Optional
 
 import torch
 
-from model.mamba_controller import MambaDNC
+from model.controller.mamba_controller import MambaDNC
 from DEER.newton_associative_scan import (
     make_state_spec,
     pack_state,

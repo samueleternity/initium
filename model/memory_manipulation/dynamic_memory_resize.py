@@ -47,7 +47,7 @@ already-running static-Option-2 experiments).
 """
 import torch.nn as nn
 from dnc.memory import Memory
-from link_matrix_ablation import AblatableSparseLinkMemory
+from memory_manipulation.link_matrix_ablation import AblatableSparseLinkMemory
 
 
 def _resync_optimizer_after_resize(optimizer, old_named_params: dict, new_memory) -> None:

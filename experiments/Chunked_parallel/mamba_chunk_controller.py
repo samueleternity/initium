@@ -120,7 +120,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from model.mamba_controller import (  # noqa: F401 -- MambaControllerBlock re-exported for callers that only need the sequential path
+from model.controller.mamba_controller import (  # noqa: F401 -- MambaControllerBlock re-exported for callers that only need the sequential path
     MambaControllerBlock,
     MambaControllerCell,
     _require_mamba_ssm,

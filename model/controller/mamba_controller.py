@@ -166,6 +166,8 @@ from dnc import DNC
 from dnc.memory import Memory
 from dnc.util import cuda
 
+from MoE.moe_layer import MoEBlock 
+
 try:
     from mamba_ssm.modules.mamba_simple import Mamba
 except ImportError as _mamba_import_error:  # pragma: no cover - environment-dependent
@@ -385,6 +387,11 @@ class MambaControllerWrapper(nn.Module):
         in_dim: int,
         d_model: int,
         num_blocks: int = 2,
+        moe_enabled: bool = False,
+        moe_num_experts: int = 8,
+        moe_expert_dim: int | None = None,
+        moe_capacity_factor: float = 1.5,
+        moe_load_balance_alpha: float = 0.01,
         d_state: int = 16,
         d_conv: int = 4,
         expand: int = 2,
@@ -411,6 +418,29 @@ class MambaControllerWrapper(nn.Module):
                 for i in range(num_blocks)
             ]
         )
+        self.moe_enabled = moe_enabled
+        self.moe_blocks: nn.ModuleList | None = None
+        if moe_enabled:
+            # External interleaving only (Dead-End #43): one MoEBlock per
+            # MambaControllerBlock, applied AFTER that block's own output.
+            # Every block gets its own MoE sublayer (matches MoE-Mamba's own
+            # architecture, Figure 2: Mamba+MoE repeated N times) rather than
+            # every-other-layer -- their own Table 3 shows both converge to
+            # the same final perplexity for their best (16-expert) config,
+            # so defaulting to every layer costs nothing and is simpler.
+            self.moe_blocks = nn.ModuleList(
+                [
+                    MoEBlock(
+                        d_model,
+                        num_experts=moe_num_experts,
+                        expert_dim=moe_expert_dim,
+                        capacity_factor=moe_capacity_factor,
+                        load_balance_alpha=moe_load_balance_alpha,
+                        device=device, dtype=dtype,
+                    )
+                    for _ in range(num_blocks)
+                ]
+            )
 
     def init_state(self, batch_size: int, device: torch.device | None = None, dtype: torch.dtype | None = None):
         if device is None or dtype is None:
@@ -435,8 +465,10 @@ class MambaControllerWrapper(nn.Module):
             hx = self.init_state(x.size(0), device=x.device, dtype=x.dtype)
 
         new_hx = []
-        for block, state in zip(self.blocks, hx):
+        for i, (block, state) in enumerate(zip(self.blocks, hx)):
             x, new_state = block.step(x, state)
+            if self.moe_enabled:
+                x = self.moe_blocks[i](x)
             new_hx.append(new_state)
 
         return x.unsqueeze(1), new_hx
@@ -484,10 +516,29 @@ class MambaDNC(DNC):
         mamba_d_state: int = 16,
         mamba_d_conv: int = 4,
         mamba_expand: int = 2,
+        moe_enabled: bool = False,
+        moe_num_experts: int = 8,
+        moe_expert_dim: int | None = None,
+        moe_capacity_factor: float = 1.5,
+        moe_load_balance_alpha: float = 0.01,
     ):
         if rnn_type.lower() != "mamba":
             # Not our concern -- defer completely to the stock DNC. This is
             # what makes MambaDNC a true drop-in superset rather than a fork.
+            if moe_enabled:
+                raise NotImplementedError(
+                    "MambaDNC: moe_enabled=True is only wired for "
+                    "rnn_type='mamba' so far (Alternative Phase 3, Step 2, "
+                    "Option 4). moe_layer.py's SwitchMoE/MoEBlock are "
+                    "controller-agnostic by design -- see its module "
+                    "docstring -- so wiring this into the LSTM path (or a "
+                    "future Transformer controller) only requires "
+                    "instantiating MoEBlock alongside that controller's own "
+                    "per-layer blocks, not a redesign of the MoE mechanism "
+                    "itself. Not done here because the LSTM path is the "
+                    "validated baseline this run compares against and "
+                    "should stay byte-identical."
+                )
             super().__init__(
                 input_size=input_size,
                 hidden_size=hidden_size,
@@ -542,6 +593,14 @@ class MambaDNC(DNC):
         self.mamba_d_conv = mamba_d_conv
         self.mamba_expand = mamba_expand
 
+        # Option 4 (MoE) bookkeeping -- stored for checkpoint metadata,
+        # same convention as the mamba_d_state/d_conv/expand fields above.
+        self.moe_enabled = moe_enabled
+        self.moe_num_experts = moe_num_experts
+        self.moe_expert_dim = moe_expert_dim
+        self.moe_capacity_factor = moe_capacity_factor
+        self.moe_load_balance_alpha = moe_load_balance_alpha
+
         self.w = self.cell_size
         self.r = self.read_heads
         self.read_vectors_size = self.read_heads * self.cell_size
@@ -561,6 +620,11 @@ class MambaDNC(DNC):
                 d_state=mamba_d_state,
                 d_conv=mamba_d_conv,
                 expand=mamba_expand,
+                moe_enabled=moe_enabled,
+                moe_num_experts=moe_num_experts,
+                moe_expert_dim=moe_expert_dim,
+                moe_capacity_factor=moe_capacity_factor,
+                moe_load_balance_alpha=moe_load_balance_alpha,
                 device=device,
             )
             self.rnns.append(controller)
@@ -597,6 +661,16 @@ class MambaDNC(DNC):
                 )
             )
             setattr(self, "rnn_layer_memory_shared", self.memories[0])
+
+        # Option 4 (MoE): flat list of every installed MoEBlock across all
+        # layers, for the training script's pop_total_moe_aux_loss() call --
+        # same "give the caller one flat list" convention
+        # install_stochastic_write_heads() already uses for stochastic
+        # write heads in stochastic_write_head_v2.py.
+        self.moe_layers = []
+        if self.moe_enabled:
+            for layer_controller in self.rnns:
+                self.moe_layers.extend(list(layer_controller.moe_blocks))
 
         # final output layer -- copied verbatim from dnc.DNC.__init__
         self.output = nn.Linear(self.nn_output_size, self.input_size)

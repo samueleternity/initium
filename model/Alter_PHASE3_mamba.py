@@ -362,17 +362,30 @@ from dnc import DNC  # noqa: F401 -- kept for anyone importing DNC from this
                       # module elsewhere; model construction below now goes
                       # through MambaDNC (v7), which defers to this same
                       # dnc.DNC implementation for rnn_type='lstm'.
-from mamba_controller import MambaDNC  # v7 (Alternate Phase 3, Step 1): see
+from controller.mamba_controller import MambaDNC  # v7 (Alternate Phase 3, Step 1): see
                                         # mamba_controller.py for the actual
                                         # Mamba-1 controller wiring.
+
+from MoE.moe_layer import pop_total_moe_aux_loss  # v8 (Alternate Phase 3, Step 2,
+                                               # Option 4): see moe_layer.py
+                                               # for the reusable external-MoE
+                                               # mechanism wired into
+                                               # mamba_controller.py.
+
+
+from controller.split_graph_dnc import SplitGraphDNC  # v9 (Alternate Phase 3, Step 2,
+                                               # Option 5): split-compute-graph
+                                               # controller -- disabled unless
+                                               # explicitly enabled, see
+                                               # SPLIT_GRAPH_ENABLED below.
 
 from stochastic_write_head_v2 import (
     install_stochastic_write_heads, pop_total_kl,
     update_all_prior_snapshots, get_prior_state, load_prior_state,  # v5 (Phase 2)
 )
-from dynamic_memory_resize import resize_memory
-from link_matrix_ablation import patch_link_matrix
-from dynamic_n_controller import DynamicNController  # Dynamic-N (usage-triggered, macro-scale)
+from memory_manipulation.dynamic_memory_resize import resize_memory
+from memory_manipulation.link_matrix_ablation import patch_link_matrix
+from memory_manipulation.dynamic_n_controller import DynamicNController  # Dynamic-N (usage-triggered, macro-scale)
 
 # ==========================================
 # 1. CONFIGURATION
@@ -406,6 +419,31 @@ CONTROLLER_TYPE = "lstm"
 MAMBA_D_STATE = 16
 MAMBA_D_CONV = 4
 MAMBA_EXPAND = 2
+
+# v8 (Alternate Phase 3, Step 2, Option 4): MoE-in-controller toggle and
+# hyperparameters -- only meaningful when CONTROLLER_TYPE=="mamba" (see
+# mamba_controller.py's MambaDNC: moe_enabled=True raises for any other
+# rnn_type today). num_experts=8 (>=4 required by SwitchMoE, per
+# Dead-End #45); expert_dim=None -> SwitchMoE's own default of
+# 3*hidden_size (MoE-Mamba's "3:3" active-parameter ratio);
+# load_balance_alpha=0.01 (Switch Transformers' own tuned value).
+MOE_ENABLED = False
+MOE_NUM_EXPERTS = 8
+MOE_EXPERT_DIM = None
+MOE_CAPACITY_FACTOR = 1.5
+MOE_LOAD_BALANCE_ALPHA = 0.01
+
+# v9 (Alternate Phase 3, Step 2, Option 5): split-compute-graph controller.
+# DISABLED BY DEFAULT -- the roadmap flags this as an untested,
+# isolated-ablation-required mechanism with no corpus-established failure
+# mode yet ("can have dangerous behaviour"). Must be explicitly turned on
+# via --split-graph; every existing invocation of this script is completely
+# unaffected unless that flag is passed.
+SPLIT_GRAPH_ENABLED = False
+SPLIT_GRAPH_MAMBA_VARIANT = "mamba1"   # "mamba1" | "mamba2"
+SPLIT_GRAPH_NUM_BLOCKS = 2             # mirrors num_hidden_layers's role
+SPLIT_GRAPH_MAMBA_HEADDIM = 64         # mamba2-only
+SPLIT_GRAPH_COMBINE_READS = True       # False = built-in ablation, see split_graph_dnc.py
 
 LABEL_RANGE = 1000
 LABEL_DIGITS = 3             # each label is a 3-digit number, 0-999
@@ -580,7 +618,12 @@ def save_checkpoint(path, rnn, output_proj, stochastic_heads, optimizer,
                      curriculum, step, beta_target, run_id, scaler, ood_rng,
                      controller_type=CONTROLLER_TYPE,  # v7: see model_config note below
                      link_matrix_mode=LINK_MATRIX_MODE, link_matrix_topk=LINK_MATRIX_TOPK,  # Static Option 1
-                     dynamic_n_mode=DYNAMIC_N_MODE, dynamic_n_state=None):  # Dynamic-N (macro-scale)
+                     dynamic_n_mode=DYNAMIC_N_MODE, dynamic_n_state=None,  # Dynamic-N (macro-scale)
+                     moe_enabled=MOE_ENABLED, moe_num_experts=MOE_NUM_EXPERTS,
+                     moe_expert_dim=MOE_EXPERT_DIM, moe_capacity_factor=MOE_CAPACITY_FACTOR,
+                     moe_load_balance_alpha=MOE_LOAD_BALANCE_ALPHA,  # v8 (Option 4)
+                     split_graph_enabled=SPLIT_GRAPH_ENABLED,  # v9 (Option 5)
+                     split_graph_variant=SPLIT_GRAPH_MAMBA_VARIANT):
     """Save everything needed to resume training or re-run eval later:
       - model + output-projection + optimizer state
       - LR is NOT saved separately -- it's now a pure function of `step`
@@ -658,6 +701,11 @@ def save_checkpoint(path, rnn, output_proj, stochastic_heads, optimizer,
         "controller_type": controller_type,  # v7
         "link_matrix_mode": link_matrix_mode, "link_matrix_topk": link_matrix_topk,  # Static Option 1
         "dynamic_n_mode": dynamic_n_mode,  # Dynamic-N (macro-scale)
+        "moe_enabled": moe_enabled, "moe_num_experts": moe_num_experts,  # v8 (Option 4)
+        "moe_expert_dim": moe_expert_dim, "moe_capacity_factor": moe_capacity_factor,
+        "moe_load_balance_alpha": moe_load_balance_alpha,
+        "split_graph_enabled": split_graph_enabled,  # v9 (Option 5)
+        "split_graph_variant": split_graph_variant,
     }
     if controller_type == "mamba":  # v7
         model_config.update({
@@ -1185,7 +1233,17 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
         dynamic_n_floor: int = DYNAMIC_N_FLOOR,
         dynamic_n_ceiling: int = DYNAMIC_N_CEILING,
         dynamic_n_trigger_frac: float = DYNAMIC_N_TRIGGER_FRAC,
-        dynamic_n_cooldown_steps: int = DYNAMIC_N_COOLDOWN_STEPS):
+        dynamic_n_cooldown_steps: int = DYNAMIC_N_COOLDOWN_STEPS,
+        moe_enabled: bool = MOE_ENABLED,  # Option 4
+        moe_num_experts: int = MOE_NUM_EXPERTS,
+        moe_expert_dim: int = MOE_EXPERT_DIM,
+        moe_capacity_factor: float = MOE_CAPACITY_FACTOR,
+        moe_load_balance_alpha: float = MOE_LOAD_BALANCE_ALPHA,
+        split_graph_enabled: bool = SPLIT_GRAPH_ENABLED,  # Option 5
+        split_graph_variant: str = SPLIT_GRAPH_MAMBA_VARIANT,
+        split_graph_num_blocks: int = SPLIT_GRAPH_NUM_BLOCKS,
+        split_graph_headdim: int = SPLIT_GRAPH_MAMBA_HEADDIM,
+        split_graph_combine_reads: bool = SPLIT_GRAPH_COMBINE_READS):
         # Deliberately does NOT touch LR_DECAY_STEPS -- that's a separate
         # module-level constant, fixed at import time from the *original*
         # TOTAL_STEPS, and lr_at_step()/set_lr() below read it directly by
@@ -1212,17 +1270,13 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
             "step", "lesson", "beta_effective",
             "task_loss", "kl_loss", "total_loss", "digit_diversity",
             "kl_mean", "kl_max", "kl_min", "kl_std", "lr",
-            "grad_norm", "amp_scale", "elapsed_sec",  # log addition #2, #3, #5
-            "snapshot_step",  # v5 (Phase 2): net-new, appended at the end --
-            # everything above is the untouched Phase 1 schema, in the same
-            # order.
+            "grad_norm", "amp_scale", "elapsed_sec",
+            "snapshot_step",
             "gpu_mem_peak_mb", "param_count",  # Option 3 (Concept 24/LB-17):
+            "moe_aux_loss", "moe_cv_importance", "moe_cv_load", "moe_max_load_frac",  # v8 (Option 4):
             # net-new, appended at the very end, same convention as
-            # snapshot_step above.
-            # everything above is the untouched Phase 1 schema, in the same
-            # order. Which frozen (mu_g, Sigma_g) snapshot this window's
-            # kl_* columns were computed against; 0 if the prior has never
-            # been snapshotted yet (still N(0,I), i.e. Phase-1-equivalent).
+            # gpu_mem_peak_mb/param_count above. 0 for every column when
+            # moe_enabled=False.
         ])
 
     # Log addition #1: periodic OOD (London Underground) eval, logged as its
@@ -1339,7 +1393,8 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
 
     print(f"[{run_id}] Model config: hidden={hidden_size} nr_cells={nr_cells} "
           f"cell_size={cell_size} read_heads={read_heads} | beta={beta_target} "
-          f"| controller={controller}")  # v7: controller tag added to this line
+          f"| controller={controller}"
+          f"| moe={'on(' + str(moe_num_experts) + 'e)' if moe_enabled else 'off'}") 
     
     global LESSON_NR_CELLS
     if isolate_link_ablation:
@@ -1383,29 +1438,63 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
             mamba_d_state=MAMBA_D_STATE,
             mamba_d_conv=MAMBA_D_CONV,
             mamba_expand=MAMBA_EXPAND,
+            moe_enabled=moe_enabled,
+            moe_num_experts=moe_num_experts,
+            moe_expert_dim=moe_expert_dim,
+            moe_capacity_factor=moe_capacity_factor,
+            moe_load_balance_alpha=moe_load_balance_alpha,
         )
 
-    rnn = MambaDNC(
-        input_size=INPUT_DIM,
-        hidden_size=hidden_size,
-        rnn_type=controller,  # v7: 'lstm' (default) or 'mamba'
-        num_layers=1,
-        nr_cells=nr_cells,
-        cell_size=cell_size,
-        read_heads=read_heads,
-        batch_first=True,
-        device=device,
-        independent_linears=True,  # Phase 1: required so Memory exposes a
-        # standalone write_vector_transform Linear for
-        # install_stochastic_write_heads to swap out. Doesn't change the
-        # addressing math -- just which code path builds the (functionally
-        # equivalent) per-head transforms. See header note + Section 5 of
-        # Q21-Experiment-Log.md for why this makes Run 0 an anchor-by-
-        # equivalence rather than a bit-identical beta=0 substitute.
-        # v7: unaffected by the controller swap -- MambaDNC builds
-        # dnc.memory.Memory identically regardless of rnn_type.
-        **mamba_kwargs,
-    ).to(device)
+    if split_graph_enabled:
+        # v9 (Option 5): --controller / rnn_type is not used in this mode
+        # -- the backbone choice is split_graph_variant instead.
+        if moe_enabled:
+            print(f"[{run_id}] WARNING: split_graph_enabled=True AND moe_enabled=True "
+                  f"-- these are two independent optimizations (Options 4 and 5) that "
+                  f"Concept 16/SP-10 says must be isolated before combining. The combination will be considered in distant future "
+                  f"SplitGraphDNC does not wire MoE into its backbone (see "
+                  f"split_graph_dnc.py) -- moe_enabled will be silently ignored this run.")
+        print(f"[{run_id}] Option 5 (split compute graph) ENABLED | "
+              f"mamba_variant={split_graph_variant} | num_blocks={split_graph_num_blocks} | "
+              f"combine_reads={split_graph_combine_reads}")
+        rnn = SplitGraphDNC(
+            input_size=INPUT_DIM,
+            hidden_size=hidden_size,
+            nr_cells=nr_cells,
+            cell_size=cell_size,
+            read_heads=read_heads,
+            num_backbone_blocks=split_graph_num_blocks,
+            mamba_variant=split_graph_variant,
+            mamba_d_state=MAMBA_D_STATE,
+            mamba_d_conv=MAMBA_D_CONV,
+            mamba_expand=MAMBA_EXPAND,
+            mamba_headdim=split_graph_headdim,
+            combine_reads=split_graph_combine_reads,
+            independent_linears=True,
+            device=device,
+        ).to(device)
+    else:
+        rnn = MambaDNC(
+            input_size=INPUT_DIM,
+            hidden_size=hidden_size,
+            rnn_type=controller,  # v7: 'lstm' (default) or 'mamba'
+            num_layers=1,
+            nr_cells=nr_cells,
+            cell_size=cell_size,
+            read_heads=read_heads,
+            batch_first=True,
+            device=device,
+            independent_linears=True,  # Phase 1: required so Memory exposes a
+            # standalone write_vector_transform Linear for
+            # install_stochastic_write_heads to swap out. Doesn't change the
+            # addressing math -- just which code path builds the (functionally
+            # equivalent) per-head transforms. See header note + Section 5 of
+            # Q21-Experiment-Log.md for why this makes Run 0 an anchor-by-
+            # equivalence rather than a bit-identical beta=0 substitute.
+            # v7: unaffected by the controller swap -- MambaDNC builds
+            # dnc.memory.Memory identically regardless of rnn_type.
+            **mamba_kwargs,
+        ).to(device)
 
     
     if link_matrix_mode != "dense":
@@ -1692,9 +1781,14 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
         _first_nonfinite_report(task_loss, "task_loss", step)
         kl_loss, kl_diag = pop_total_kl(stochastic_heads, free_bits=FREE_BITS)  # Phase 1
         _first_nonfinite_report(kl_loss, "kl_loss", step)
+        moe_aux_loss, moe_diag = (
+            pop_total_moe_aux_loss(rnn.moe_layers) if moe_enabled else
+            (torch.zeros((), device=device), {})
+        )  # v8 (Option 4): Switch-style load-balancing loss, already scaled
+           # by moe_load_balance_alpha inside SwitchMoE.pop_aux_loss() -- no
+           # extra weighting applied here, unlike beta_eff*kl_loss below.
         beta_eff = beta_target * min(1.0, (step - anneal_start_step) / max(1, KL_ANNEAL_STEPS))  # Phase 1: linear KL annealing 0 -> beta_target, measured from anneal_start_step
-        loss = task_loss + beta_eff * kl_loss  # Phase 1: L = L_task + beta * L_KL
-
+        loss = task_loss + beta_eff * kl_loss + moe_aux_loss  # Phase 1 + Option 4: L = L_task + beta*L_KL + L_moe_aux
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
         # Log addition #2: capture the pre-clip gradient norm instead of
@@ -1801,11 +1895,9 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
                   f"| clamp_frac {kl_diag['clamp_frac']:.4f}"
                   f"| floor_frac {kl_diag['floor_frac']:.4f}"
                   f"| snapshot_step {kl_diag['snapshot_step']}"
-                  f"| gpu_mem_peak_mb {gpu_mem_peak_mb:.1f} | params {param_count}")  # v6: net-new, appended at the end --
-                  # everything before this token is the untouched Phase 1
-                  # console line, in the same order, so any existing
-                  # parsing/scraping of this line by column position still
-                  # works; this is purely an appended trailing field.
+                  f"| gpu_mem_peak_mb {gpu_mem_peak_mb:.1f} | params {param_count}"
+                  f"| moe_aux {float(moe_aux_loss):.4f} | moe_cv_load {moe_diag.get('moe_cv_load', 0.0):.4f} "
+                  f"| moe_max_load_frac {moe_diag.get('moe_max_load_frac', 0.0):.4f}")                 
             log_writer.writerow([
                 step, curriculum.lesson + 1, beta_eff,
                 avg_task, avg_kl, kl_contrib, avg_task + kl_contrib, avg_div,
@@ -1813,6 +1905,8 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
                 kl_diag["clamp_frac"], current_lr, avg_grad_norm, amp_scale, total_elapsed,
                 kl_diag["snapshot_step"],
                 gpu_mem_peak_mb, param_count,
+                float(moe_aux_loss), moe_diag.get("moe_cv_importance", 0.0),
+                moe_diag.get("moe_cv_load", 0.0), moe_diag.get("moe_max_load_frac", 0.0),
             ])
             if torch.cuda.is_available():
                 torch.cuda.reset_peak_memory_stats(device)  # so next window's peak isn't cumulative
@@ -1952,7 +2046,12 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
                              controller_type=controller,  # v7
                              link_matrix_mode=link_matrix_mode, link_matrix_topk=link_matrix_topk,  # Static Option 1
                              dynamic_n_mode=dynamic_n_mode,  # Dynamic-N (macro-scale)
-                             dynamic_n_state=(dynamic_n_ctrl.state_dict() if dynamic_n_ctrl is not None else None))
+                             dynamic_n_state=(dynamic_n_ctrl.state_dict() if dynamic_n_ctrl is not None else None),
+                             moe_enabled=moe_enabled, moe_num_experts=moe_num_experts,  # v8 (Option 4)
+                             moe_expert_dim=moe_expert_dim, moe_capacity_factor=moe_capacity_factor,
+                             moe_load_balance_alpha=moe_load_balance_alpha,
+                             split_graph_enabled=split_graph_enabled,  # v9 (Option 5)
+                             split_graph_variant=split_graph_variant)            
             # Also keep a stable "latest" pointer so eval/resume don't need
             # to know the exact final step number in advance. Plain file
             # copy -- NOT a torch.load()+torch.save() round-trip. The
@@ -2109,6 +2208,38 @@ if __name__ == "__main__":
     parser.add_argument("--dynamic-n-cooldown-steps", type=int, default=DYNAMIC_N_COOLDOWN_STEPS,
                          help="Steps to wait after a growth event before another can fire, "
                               "so the model's addressing policy gets time to re-settle.")
+    parser.add_argument("--moe", action="store_true",
+                         help="Alternative Phase 3, Step 2, Option 4: interleave external "
+                              "SwitchMoE blocks between Mamba controller blocks (mamba_controller.py "
+                              "/ moe_layer.py). Only wired for --controller=mamba.")
+    parser.add_argument("--moe-num-experts", type=int, default=MOE_NUM_EXPERTS,
+                         help="Number of experts per MoE block (>=4 enforced by SwitchMoE; "
+                              "roadmap recommends 8+, per Dead-End #45).")
+    parser.add_argument("--moe-expert-dim", type=int, default=MOE_EXPERT_DIM,
+                         help="Hidden dim of each expert FFN. Defaults to 3x the controller's "
+                              "hidden_size (MoE-Mamba's own '3:3' active-parameter ratio) if omitted.")
+    parser.add_argument("--moe-capacity-factor", type=float, default=MOE_CAPACITY_FACTOR,
+                         help="Switch-style expert capacity buffer above an even token split.")
+    parser.add_argument("--moe-load-balance-alpha", type=float, default=MOE_LOAD_BALANCE_ALPHA,
+                         help="Weight on the Switch-style auxiliary load-balancing loss.")
+    parser.add_argument("--split-graph", action="store_true",
+                         help="Alternate Phase 3, Step 2, Option 5: enable the "
+                              "split-compute-graph controller (parallel Mamba backbone + "
+                              "sequential memory addressing). DISABLED unless this flag is "
+                              "passed -- roadmap flags this as untested/isolated-ablation-"
+                              "required. Overrides --controller entirely when set.")
+    parser.add_argument("--split-graph-variant", type=str, default=SPLIT_GRAPH_MAMBA_VARIANT,
+                         choices=["mamba1", "mamba2"],
+                         help="Backbone variant for --split-graph. 'mamba2' requires "
+                              "mamba_ssm.modules.mamba2.Mamba2 to be importable.")
+    parser.add_argument("--split-graph-num-blocks", type=int, default=SPLIT_GRAPH_NUM_BLOCKS,
+                         help="Number of stacked backbone blocks for --split-graph.")
+    parser.add_argument("--split-graph-headdim", type=int, default=SPLIT_GRAPH_MAMBA_HEADDIM,
+                         help="Mamba2 headdim (mamba2 variant only).")
+    parser.add_argument("--split-graph-no-combine", action="store_true",
+                         help="Built-in ablation for the roadmap's required 'read now, "
+                              "decide next hop' verification: disables the read-vector "
+                              "combiner entirely, so addressing never sees any read vector.")
     args = parser.parse_args()
 
     if args.resume is not None and args.beta is None:
@@ -2148,6 +2279,10 @@ if __name__ == "__main__":
             run_id = f"{run_id}_link{tag}"
         if args.dynamic_n_mode:  # Dynamic-N: keep these runs from colliding with static-Option-2 sweep files
             run_id = f"{run_id}_dynN"
+        if args.moe:  # Option 4: keep MoE runs from colliding with dense-controller sweep files
+            run_id = f"{run_id}_moe{args.moe_num_experts}e"
+        if args.split_graph:  # Option 5: keep split-graph runs from colliding with entangled-controller sweep files
+            run_id = f"{run_id}_splitgraph_{args.split_graph_variant}"
         if args.run_id_suffix:
             run_id = f"{run_id}_{args.run_id_suffix}"
         summary = run(beta_target=beta, run_id=run_id, seed=args.seed,
@@ -2161,7 +2296,17 @@ if __name__ == "__main__":
                        dynamic_n_floor=args.dynamic_n_floor,
                        dynamic_n_ceiling=args.dynamic_n_ceiling,
                        dynamic_n_trigger_frac=args.dynamic_n_trigger_frac,
-                       dynamic_n_cooldown_steps=args.dynamic_n_cooldown_steps)
+                       dynamic_n_cooldown_steps=args.dynamic_n_cooldown_steps,
+                       moe_enabled=args.moe,
+                       moe_num_experts=args.moe_num_experts,
+                       moe_expert_dim=args.moe_expert_dim,
+                       moe_capacity_factor=args.moe_capacity_factor,
+                       moe_load_balance_alpha=args.moe_load_balance_alpha,
+                       split_graph_enabled=args.split_graph,
+                       split_graph_variant=args.split_graph_variant,
+                       split_graph_num_blocks=args.split_graph_num_blocks,
+                       split_graph_headdim=args.split_graph_headdim,
+                       split_graph_combine_reads=not args.split_graph_no_combine)
         all_summaries.append(summary)
 
     print("\n===== Sweep summary (this process) =====")

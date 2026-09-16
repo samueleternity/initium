@@ -559,7 +559,8 @@ print(f"Using device: {device}")
 
 # ---- Phase 1 additions ----------------------------------------------------
 BETAS_TO_SWEEP = [0.0]         # beta=0 anchored to Run 0 instead -- see header note
-KL_ANNEAL_STEPS = 8000                    # ramp beta 0 -> target over this many steps
+KL_ANNEAL_STEPS = 8000 # ramp beta 0 -> target over this many steps
+LESSON_KL_DIP_STEPS = 100                            
 FREE_BITS = 0.02                          # per-dimension KL floor (nats); 0.0 disables
 LOG_DIR = "./phase1_logs"
 OOD_EVAL_EPISODES = 200
@@ -1611,6 +1612,8 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
     # ramp restarts at 0 from the switch point instead of reading the
     # already-large absolute step and jumping straight to full beta_target
     # on the first post-switch update.
+    lesson_dip_start_step = -10**9   # idle at run start (so the dip ramp is already at 1.0 immediately);
+                                  # reset to `step` on every lesson advance instead
     if resuming:
         ckpt = load_checkpoint_for_resume(resume_from, device)
         # Static Option 2 resume fix: rnn was just constructed above at
@@ -1787,7 +1790,9 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
         )  # v8 (Option 4): Switch-style load-balancing loss, already scaled
            # by moe_load_balance_alpha inside SwitchMoE.pop_aux_loss() -- no
            # extra weighting applied here, unlike beta_eff*kl_loss below.
-        beta_eff = beta_target * min(1.0, (step - anneal_start_step) / max(1, KL_ANNEAL_STEPS))  # Phase 1: linear KL annealing 0 -> beta_target, measured from anneal_start_step
+        global_ramp = min(1.0, (step - anneal_start_step) / max(1, KL_ANNEAL_STEPS))
+        lesson_dip_ramp = min(1.0, (step - lesson_dip_start_step) / max(1, LESSON_KL_DIP_STEPS))
+        beta_eff = beta_target * global_ramp * lesson_dip_ramp 
         loss = task_loss + beta_eff * kl_loss + moe_aux_loss  # Phase 1 + Option 4: L = L_task + beta*L_KL + L_moe_aux
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -1944,11 +1949,12 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
         if step % EVAL_EVERY == 0:
             pre_advance_lesson = curriculum.lesson  # capture before maybe_advance can bump it
             _, id_triple_acc, id_perfect_frac = curriculum.maybe_advance(rnn, device, step=step, optimizer=optimizer)            
+
             if curriculum.lesson != pre_advance_lesson:
-                anneal_start_step = step
+                lesson_dip_start_step = step
                 print(f"[{run_id}] Step {step} lesson advance {pre_advance_lesson + 1}->"
-                      f"{curriculum.lesson + 1}: KL anneal restarted from step "
-                      f"{anneal_start_step}, ramping over the next {KL_ANNEAL_STEPS} steps.")
+                    f"{curriculum.lesson + 1}: KL briefly dipping and ramping back up "
+                    f"over the next {LESSON_KL_DIP_STEPS} steps (global anneal unaffected).")
             if beta_mode == "dynamic":
                 # Hard safety ceiling -- enforced every eval cycle unconditionally,
                 # independent of the health gate below. Without this, starting

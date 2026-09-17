@@ -269,7 +269,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from model.mamba_controller import MambaDNC
+from model.controller.mamba_controller import MambaDNC
 from Chunked_parallel.mamba_chunk_controller import MambaChunkControllerWrapper
 
 

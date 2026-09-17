@@ -534,7 +534,7 @@ from dnc import DNC  # noqa: F401 -- kept for anyone importing DNC from this
                       # module elsewhere; model construction below now goes
                       # through MambaDNC (v7), which defers to this same
                       # dnc.DNC implementation for rnn_type='lstm'.
-from model.mamba_controller import MambaDNC  # noqa: F401 -- v7 (Alternate Phase 3,
+from model.controller.mamba_controller import MambaDNC  # noqa: F401 -- v7 (Alternate Phase 3,
                                         # Step 1): kept for the docstrings/
                                         # comments above and below that refer
                                         # to it by name; actual model

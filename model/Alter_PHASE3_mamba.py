@@ -362,7 +362,7 @@ from dnc import DNC  # noqa: F401 -- kept for anyone importing DNC from this
                       # module elsewhere; model construction below now goes
                       # through MambaDNC (v7), which defers to this same
                       # dnc.DNC implementation for rnn_type='lstm'.
-from controller.mamba_controller import MambaDNC  # v7 (Alternate Phase 3, Step 1): see
+from mamba_controller.mamba_controller import MambaDNC  # v7 (Alternate Phase 3, Step 1): see
                                         # mamba_controller.py for the actual
                                         # Mamba-1 controller wiring.
 
@@ -373,7 +373,7 @@ from MoE.moe_layer import pop_total_moe_aux_loss  # v8 (Alternate Phase 3, Step 
                                                # mamba_controller.py.
 
 
-from controller.split_graph_dnc import SplitGraphDNC  # v9 (Alternate Phase 3, Step 2,
+from mamba_controller.split_graph_dnc import SplitGraphDNC  # v9 (Alternate Phase 3, Step 2,
                                                # Option 5): split-compute-graph
                                                # controller -- disabled unless
                                                # explicitly enabled, see
@@ -420,6 +420,29 @@ MAMBA_D_STATE = 16
 MAMBA_D_CONV = 4
 MAMBA_EXPAND = 2
 
+# v10: Mamba-2 hyperparameters -- only meaningful when CONTROLLER_TYPE==
+# "mamba2" (mamba_controller/mamba2_controller.py's standalone, per-timestep
+# interleaved Mamba-2 DNC controller -- NOT the same thing as
+# SPLIT_GRAPH_MAMBA_VARIANT="mamba2" below, which drives mamba_ssm's Mamba2
+# over the whole sequence at once with no memory dependency; see
+# mamba2_controller.py's module docstring for the distinction). Defaults are
+# Mamba-2's own paper defaults (Dao & Gu 2024, Section 7.2: head_dim in
+# {64,128}); ngroups=1 matches every other Mamba-2 use in this project.
+MAMBA2_D_STATE = 64
+MAMBA2_D_CONV = 4
+MAMBA2_EXPAND = 2
+MAMBA2_HEADDIM = 64
+MAMBA2_NGROUPS = 1
+
+
+# v12: Mamba-3 (SISO) hyperparameters -- used by --controller mamba3 and
+# --split-graph-variant mamba3. d_state=64 matches the Mamba-2 setting here (paper: Mamba-3 @64 ~ Mamba-2 @128).
+# If the interleaved run OOMs, drop MAMBA3_D_STATE to 32 first (state is (B, H, headdim, d_state) fp32 per step).
+MAMBA3_D_STATE = 64
+MAMBA3_EXPAND = 2
+MAMBA3_HEADDIM = 64
+MAMBA3_ROPE_FRACTION = 0.5
+
 # v8 (Alternate Phase 3, Step 2, Option 4): MoE-in-controller toggle and
 # hyperparameters -- only meaningful when CONTROLLER_TYPE=="mamba" (see
 # mamba_controller.py's MambaDNC: moe_enabled=True raises for any other
@@ -444,6 +467,14 @@ SPLIT_GRAPH_MAMBA_VARIANT = "mamba1"   # "mamba1" | "mamba2"
 SPLIT_GRAPH_NUM_BLOCKS = 2             # mirrors num_hidden_layers's role
 SPLIT_GRAPH_MAMBA_HEADDIM = 64         # mamba2-only
 SPLIT_GRAPH_COMBINE_READS = True       # False = built-in ablation, see split_graph_dnc.py
+# v11: sequential-combiner mechanism. "linear" (default) reproduces the
+# existing, already-validated split-graph behavior exactly -- no existing
+# invocation of this script is affected unless --split-graph-combiner-mode
+# is passed explicitly. "controller" swaps in a real interleaved cell for
+# the addressing step; see split_graph_dnc.py's v11 docstring additions.
+SPLIT_GRAPH_COMBINER_MODE = "linear"
+SPLIT_GRAPH_COMBINER_VARIANT = "mamba1"   # "mamba1" | "mamba2" -- mamba1 is the recommended/expected choice
+SPLIT_GRAPH_COMBINER_NUM_BLOCKS = 1
 
 LABEL_RANGE = 1000
 LABEL_DIGITS = 3             # each label is a 3-digit number, 0-999
@@ -714,6 +745,22 @@ def save_checkpoint(path, rnn, output_proj, stochastic_heads, optimizer,
             "mamba_d_conv": MAMBA_D_CONV,
             "mamba_expand": MAMBA_EXPAND,
         })
+    elif controller_type == "mamba2":  
+        model_config.update({
+            "mamba2_d_state": MAMBA2_D_STATE,
+            "mamba2_d_conv": MAMBA2_D_CONV,
+            "mamba2_expand": MAMBA2_EXPAND,
+            "mamba2_headdim": MAMBA2_HEADDIM,
+            "mamba2_ngroups": MAMBA2_NGROUPS,
+        })
+    elif controller_type == "mamba3":
+        model_config.update({
+            "mamba3_d_state": MAMBA3_D_STATE,
+            "mamba3_expand": MAMBA3_EXPAND,
+            "mamba3_headdim": MAMBA3_HEADDIM,
+            "mamba3_rope_fraction": MAMBA3_ROPE_FRACTION,
+        })
+
     torch.save({
         "step": step,
         "run_id": run_id,
@@ -1227,6 +1274,7 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
         controller: str = CONTROLLER_TYPE,  # v7 (Alternate Phase 3, Step 1)
         beta_mode: str = BETA_MODE,  # dynamic-beta toggle: "static" or "dynamic"
         total_steps: int = TOTAL_STEPS,  # see --total-steps.
+        checkpoint_every: int = CHECKPOINT_EVERY,  # see --checkpoint-every.
         link_matrix_mode: str = LINK_MATRIX_MODE,  # Static Option 1
         link_matrix_topk: int = LINK_MATRIX_TOPK,  # Static Option 1
         isolate_link_ablation: bool = ISOLATE_LINK_ABLATION,  # Static Option 1
@@ -1244,7 +1292,10 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
         split_graph_variant: str = SPLIT_GRAPH_MAMBA_VARIANT,
         split_graph_num_blocks: int = SPLIT_GRAPH_NUM_BLOCKS,
         split_graph_headdim: int = SPLIT_GRAPH_MAMBA_HEADDIM,
-        split_graph_combine_reads: bool = SPLIT_GRAPH_COMBINE_READS):
+        split_graph_combine_reads: bool = SPLIT_GRAPH_COMBINE_READS,
+        split_graph_combiner_mode: str = SPLIT_GRAPH_COMBINER_MODE,
+        split_graph_combiner_variant: str = SPLIT_GRAPH_COMBINER_VARIANT,
+        split_graph_combiner_num_blocks: int = SPLIT_GRAPH_COMBINER_NUM_BLOCKS):
         # Deliberately does NOT touch LR_DECAY_STEPS -- that's a separate
         # module-level constant, fixed at import time from the *original*
         # TOTAL_STEPS, and lr_at_step()/set_lr() below read it directly by
@@ -1445,6 +1496,32 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
             moe_capacity_factor=moe_capacity_factor,
             moe_load_balance_alpha=moe_load_balance_alpha,
         )
+    elif controller == "mamba2":  
+        mamba_kwargs = dict(
+            mamba2_d_state=MAMBA2_D_STATE,
+            mamba2_d_conv=MAMBA2_D_CONV,
+            mamba2_expand=MAMBA2_EXPAND,
+            mamba2_headdim=MAMBA2_HEADDIM,
+            mamba2_ngroups=MAMBA2_NGROUPS,
+            moe_enabled=moe_enabled,
+            moe_num_experts=moe_num_experts,
+            moe_expert_dim=moe_expert_dim,
+            moe_capacity_factor=moe_capacity_factor,
+            moe_load_balance_alpha=moe_load_balance_alpha,
+        )
+
+    if controller == "mamba3":
+        mamba_kwargs = dict(
+            mamba3_d_state=MAMBA3_D_STATE,
+            mamba3_expand=MAMBA3_EXPAND,
+            mamba3_headdim=MAMBA3_HEADDIM,
+            mamba3_rope_fraction=MAMBA3_ROPE_FRACTION,
+            moe_enabled=moe_enabled,
+            moe_num_experts=moe_num_experts,
+            moe_expert_dim=moe_expert_dim,
+            moe_capacity_factor=moe_capacity_factor,
+            moe_load_balance_alpha=moe_load_balance_alpha,
+        )
 
     if split_graph_enabled:
         # v9 (Option 5): --controller / rnn_type is not used in this mode
@@ -1458,6 +1535,15 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
         print(f"[{run_id}] Option 5 (split compute graph) ENABLED | "
               f"mamba_variant={split_graph_variant} | num_blocks={split_graph_num_blocks} | "
               f"combine_reads={split_graph_combine_reads}")
+        # v10: variant-matched hyperparameter defaults instead of always
+        # reusing the Mamba-1 constants here -- harmless previously (any
+        # d_state/headdim is accepted), but not what the SSD paper's own
+        # Mamba-2 defaults are.
+        _sg_d_state, _sg_d_conv, _sg_expand = (
+            (MAMBA3_D_STATE, MAMBA_D_CONV, MAMBA3_EXPAND) if split_graph_variant == "mamba3" else
+            (MAMBA2_D_STATE, MAMBA2_D_CONV, MAMBA2_EXPAND) if split_graph_variant == "mamba2"
+            else (MAMBA_D_STATE, MAMBA_D_CONV, MAMBA_EXPAND)
+        )
         rnn = SplitGraphDNC(
             input_size=INPUT_DIM,
             hidden_size=hidden_size,
@@ -1466,11 +1552,14 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
             read_heads=read_heads,
             num_backbone_blocks=split_graph_num_blocks,
             mamba_variant=split_graph_variant,
-            mamba_d_state=MAMBA_D_STATE,
-            mamba_d_conv=MAMBA_D_CONV,
-            mamba_expand=MAMBA_EXPAND,
+            mamba_d_state=_sg_d_state,
+            mamba_d_conv=_sg_d_conv,
+            mamba_expand=_sg_expand,
             mamba_headdim=split_graph_headdim,
             combine_reads=split_graph_combine_reads,
+            combiner_mode=split_graph_combiner_mode,
+            combiner_variant=split_graph_combiner_variant,
+            combiner_num_blocks=split_graph_combiner_num_blocks,
             independent_linears=True,
             device=device,
         ).to(device)
@@ -1637,7 +1726,7 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
                   f"nr_cells recording (static Option 2) -- inferring "
                   f"nr_cells={ckpt_nr_cells} from LESSON_NR_CELLS"
                   f"[{ckpt['curriculum_lesson']}] instead of a recorded value.")
-        resize_memory(rnn, ckpt_nr_cells, device=device)
+        resize_memory(rnn, ckpt_nr_cells, device=device, optimizer=optimizer)
             
         rnn.load_state_dict(ckpt["rnn_state_dict"])
         output_proj.load_state_dict(ckpt["output_proj_state_dict"])
@@ -1864,6 +1953,7 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
                 usage = mhx["usage_vector"].float()
                 frac_saturated = (usage > DYNAMIC_N_USAGE_HIGH).float().mean().item()
             dynamic_n_ctrl.record(frac_saturated)
+            last_frac_saturated = frac_saturated   
             current_nr_cells = rnn.memories[0].nr_cells
             new_n = dynamic_n_ctrl.should_grow(current_nr_cells)
             if new_n is not None:
@@ -1891,6 +1981,10 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
             kl_contrib = beta_eff * avg_kl  # actual beta*L_KL added to total loss, vs. avg_kl (pre-beta, raw clamped sum)
             gpu_mem_peak_mb = (torch.cuda.max_memory_allocated(device) / 1e6
                                            if torch.cuda.is_available() else 0.0)
+            dyn_n_str = ""
+            if dynamic_n_ctrl is not None:
+                dyn_n_str = (f"| dynN[nr_cells {rnn.memories[0].nr_cells} frac_sat {last_frac_saturated:.3f} "
+                            f"ema {dynamic_n_ctrl.ema:.3f} cooldown {dynamic_n_ctrl.cooldown_remaining}] ")
             print(f"[{run_id}] Step {step}/{total_steps} | Lesson {curriculum.lesson + 1}/{len(curriculum.table)} "                  
                   f"| L_task {avg_task:.4f} | L_KL {avg_kl:.4f} | beta {beta_eff:.4f} "
                   f"| KL_contrib {kl_contrib:.4f} "
@@ -1902,7 +1996,8 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
                   f"| snapshot_step {kl_diag['snapshot_step']}"
                   f"| gpu_mem_peak_mb {gpu_mem_peak_mb:.1f} | params {param_count}"
                   f"| moe_aux {float(moe_aux_loss):.4f} | moe_cv_load {moe_diag.get('moe_cv_load', 0.0):.4f} "
-                  f"| moe_max_load_frac {moe_diag.get('moe_max_load_frac', 0.0):.4f}")                 
+                  f"| moe_max_load_frac {moe_diag.get('moe_max_load_frac', 0.0):.4f}"
+                  f"| {dyn_n_str}")                 
             log_writer.writerow([
                 step, curriculum.lesson + 1, beta_eff,
                 avg_task, avg_kl, kl_contrib, avg_task + kl_contrib, avg_div,
@@ -2044,7 +2139,7 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
                   f"{ablated_triple_acc:.2f}% | dependency {id_triple_acc - ablated_triple_acc:.2f}")
         
 
-        if step % CHECKPOINT_EVERY == 0 or step == total_steps:
+        if step % checkpoint_every == 0 or step == total_steps:
             ckpt_path = os.path.join(CHECKPOINT_DIR, f"{run_id}_step{step}.pt")
             save_checkpoint(ckpt_path, rnn, output_proj, stochastic_heads,
                              optimizer, curriculum, step,
@@ -2158,11 +2253,16 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=SEED,
                      help="random seed for torch/random/numpy (default: SEED module constant)")
     parser.add_argument("--controller", type=str, default=CONTROLLER_TYPE,
-                         choices=["lstm", "mamba"],
-                         help="v7 (Alternate Phase 3, Step 1): DNC controller type. "
-                              "'lstm' (default) reproduces Phase 2 exactly. "
-                              "'mamba' swaps in the Mamba-1 controller from "
-                              "mamba_controller.py; requires the mamba-ssm package.")
+                         choices=["lstm", "mamba", "mamba2", "mamba3"],
+                         help="DNC controller type. 'lstm' (default) "
+                              "reproduces Phase 2 exactly. 'mamba' swaps in the "
+                              "Mamba-1 controller from mamba_controller.py. "
+                              "'mamba2' swaps in the standalone, "
+                              "per-timestep Mamba-2 controller from "
+                              "mamba_controller/mamba2_controller.py - distinct "
+                              "from --split-graph-variant=mamba2, which is a "
+                              "parallel whole-sequence backbone, not an "
+                              "interleaved controller. Both require mamba-ssm.")
     parser.add_argument("--beta-mode", type=str, default=BETA_MODE,
                          choices=["static", "dynamic"],
                          help="'static' (default): beta_target is fixed for the run, "
@@ -2177,6 +2277,11 @@ if __name__ == "__main__":
                               f"{TOTAL_STEPS}-step sweep). Defaults to the module constant "
                               f"TOTAL_STEPS ({TOTAL_STEPS}) if omitted. Does NOT change "
                               "LR_DECAY_STEPS -- a pilot run still anneals on the full schedule.")
+    parser.add_argument("--checkpoint-every", type=int, default=None,
+                         help="Override how often (in steps) a periodic safety checkpoint "
+                              "is saved, in addition to the end-of-run checkpoint. Defaults "
+                              f"to the module constant CHECKPOINT_EVERY ({CHECKPOINT_EVERY}) "
+                              "if omitted.")
     parser.add_argument("--link-matrix-mode", type=str, default=LINK_MATRIX_MODE,
                          choices=["dense", "ablated", "sparse_topk"],
                          help="Static Option 1: link-matrix ablation/sparsification at "
@@ -2235,9 +2340,9 @@ if __name__ == "__main__":
                               "passed -- roadmap flags this as untested/isolated-ablation-"
                               "required. Overrides --controller entirely when set.")
     parser.add_argument("--split-graph-variant", type=str, default=SPLIT_GRAPH_MAMBA_VARIANT,
-                         choices=["mamba1", "mamba2"],
+                         choices=["mamba1", "mamba2", "mamba3"],
                          help="Backbone variant for --split-graph. 'mamba2' requires "
-                              "mamba_ssm.modules.mamba2.Mamba2 to be importable.")
+                              "mamba_ssm.modules.mamba2.Mamba2 to be importable. - same with 'mamba3'")
     parser.add_argument("--split-graph-num-blocks", type=int, default=SPLIT_GRAPH_NUM_BLOCKS,
                          help="Number of stacked backbone blocks for --split-graph.")
     parser.add_argument("--split-graph-headdim", type=int, default=SPLIT_GRAPH_MAMBA_HEADDIM,
@@ -2245,7 +2350,25 @@ if __name__ == "__main__":
     parser.add_argument("--split-graph-no-combine", action="store_true",
                          help="Built-in ablation for the roadmap's required 'read now, "
                               "decide next hop' verification: disables the read-vector "
-                              "combiner entirely, so addressing never sees any read vector.")
+                              "combiner entirely, so addressing never sees any read vector. "
+                              "Only meaningful with --split-graph-combiner-mode=linear.")
+    parser.add_argument("--split-graph-combiner-mode", type=str, default=SPLIT_GRAPH_COMBINER_MODE,
+                         choices=["linear", "controller"],
+                         help="v11: 'linear' (default) is the original, already-efficient "
+                              "stateless combiner. 'controller' drives the sequential "
+                              "addressing step with a real interleaved Mamba controller "
+                              "cell instead (see --split-graph-combiner-variant).")
+    parser.add_argument("--split-graph-combiner-variant", type=str, default=SPLIT_GRAPH_COMBINER_VARIANT,
+                         choices=["mamba1", "mamba2", "mamba3"],
+                         help="v11: which controller drives the sequential combiner when "
+                              "--split-graph-combiner-mode=controller. 'mamba1' is the "
+                              "recommended/efficient choice; 'mamba2' is wired but not "
+                              "expected to be used (known inefficient, same reason plain "
+                              "--controller mamba2 runs aren't pursued).")
+    parser.add_argument("--split-graph-combiner-num-blocks", type=int, default=SPLIT_GRAPH_COMBINER_NUM_BLOCKS,
+                         help="Number of stacked blocks in the controller combiner "
+                              "(--split-graph-combiner-mode=controller only). Kept small "
+                              "by default -- this step is meant to stay cheap.")
     args = parser.parse_args()
 
     if args.resume is not None and args.beta is None:
@@ -2276,8 +2399,12 @@ if __name__ == "__main__":
         # log directory. --run-id-suffix still applies on top of this, for
         # ad-hoc disambiguation beyond the seed/learned-prior tag.
         run_id = f"beta_{beta}_seed{args.seed}_learnedprior".replace(".", "p")
-        if args.controller == "mamba":  # v7: keep lstm/mamba runs from colliding in phase1_logs/
+        if args.controller == "mamba":  
             run_id = f"{run_id}_mambactrl"
+        elif args.controller == "mamba2":  
+            run_id = f"{run_id}_mamba2ctrl"
+        elif args.controller == "mamba3":
+            run_id = f"{run_id}_mamba3ctrl"
         if args.beta_mode == "dynamic":  # keep dynamic-beta runs from colliding with static sweep files
             run_id = f"{run_id}_dynbeta"
         if args.link_matrix_mode != "dense":  # Static Option 1: keep these runs from colliding with dense-baseline sweep files
@@ -2289,12 +2416,15 @@ if __name__ == "__main__":
             run_id = f"{run_id}_moe{args.moe_num_experts}e"
         if args.split_graph:  # Option 5: keep split-graph runs from colliding with entangled-controller sweep files
             run_id = f"{run_id}_splitgraph_{args.split_graph_variant}"
+            if args.split_graph_combiner_mode == "controller":
+                run_id = f"{run_id}_combctrl{args.split_graph_combiner_variant}"
         if args.run_id_suffix:
             run_id = f"{run_id}_{args.run_id_suffix}"
         summary = run(beta_target=beta, run_id=run_id, seed=args.seed,
                        resume_from=args.resume, controller=args.controller,  # v7
                        beta_mode=args.beta_mode,
                        total_steps=(args.total_steps if args.total_steps is not None else TOTAL_STEPS),
+                       checkpoint_every=(args.checkpoint_every if args.checkpoint_every is not None else CHECKPOINT_EVERY),
                        link_matrix_mode=args.link_matrix_mode,
                        link_matrix_topk=args.link_matrix_topk,
                        isolate_link_ablation=args.isolate_link_ablation,
@@ -2312,7 +2442,10 @@ if __name__ == "__main__":
                        split_graph_variant=args.split_graph_variant,
                        split_graph_num_blocks=args.split_graph_num_blocks,
                        split_graph_headdim=args.split_graph_headdim,
-                       split_graph_combine_reads=not args.split_graph_no_combine)
+                       split_graph_combine_reads=not args.split_graph_no_combine,
+                       split_graph_combiner_mode=args.split_graph_combiner_mode,
+                       split_graph_combiner_variant=args.split_graph_combiner_variant,
+                       split_graph_combiner_num_blocks=args.split_graph_combiner_num_blocks)
         all_summaries.append(summary)
 
     print("\n===== Sweep summary (this process) =====")

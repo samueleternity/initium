@@ -187,6 +187,8 @@ def _require_mamba_ssm() -> None:
     if Mamba is None:
         raise ImportError(_MAMBA_IMPORT_ERROR)
 
+from mamba_controller.mamba2_controller import Mamba2ControllerWrapper, _require_mamba2_ssm  # v10 (Mamba-2 standalone controller)
+from mamba_controller.mamba3_controller import Mamba3ControllerWrapper, _require_mamba3_ssm  # v12 (Mamba-3 controller)
 
 # ==========================================================================
 # 1. MambaControllerCell -- one Mamba-1 block, single-timestep, BPTT-safe
@@ -516,19 +518,33 @@ class MambaDNC(DNC):
         mamba_d_state: int = 16,
         mamba_d_conv: int = 4,
         mamba_expand: int = 2,
+        # Mamba-2-specific hyperparameters (rnn_type='mamba2' only -- see
+        # mamba2_controller.py's module docstring for how these differ from
+        # Mamba-1's mamba_d_state/mamba_d_conv/mamba_expand above). Defaults
+        # are Mamba-2's own paper defaults (Dao & Gu 2024, Section 7.2:
+        # head_dim in {64,128}); ngroups=1 matches every other Mamba-2 use in
+        # this project, e.g. mamba_backbone_parallel.py.
+        mamba2_d_state: int = 64,
+        mamba2_d_conv: int = 4,
+        mamba2_expand: int = 2,
+        mamba2_headdim: int = 64,
+        mamba2_ngroups: int = 1,
+        mamba3_d_state: int = 64,
+        mamba3_expand: int = 2,
+        mamba3_headdim: int = 64,
+        mamba3_rope_fraction: float = 0.5,
         moe_enabled: bool = False,
         moe_num_experts: int = 8,
         moe_expert_dim: int | None = None,
         moe_capacity_factor: float = 1.5,
         moe_load_balance_alpha: float = 0.01,
     ):
-        if rnn_type.lower() != "mamba":
-            # Not our concern -- defer completely to the stock DNC. This is
-            # what makes MambaDNC a true drop-in superset rather than a fork.
+        if rnn_type.lower() not in ("mamba", "mamba2", "mamba3"):
             if moe_enabled:
                 raise NotImplementedError(
                     "MambaDNC: moe_enabled=True is only wired for "
-                    "rnn_type='mamba' so far (Alternative Phase 3, Step 2, "
+                    "rnn_type in ('mamba', 'mamba2') so far (Alternative "
+                    "Phase 3, Step 2, "
                     "Option 4). moe_layer.py's SwitchMoE/MoEBlock are "
                     "controller-agnostic by design -- see its module "
                     "docstring -- so wiring this into the LSTM path (or a "
@@ -560,9 +576,14 @@ class MambaDNC(DNC):
             )
             return
 
-        _require_mamba_ssm()
+        if rnn_type.lower() == "mamba2":
+            _require_mamba2_ssm()
+        elif rnn_type.lower() == "mamba3":
+            _require_mamba3_ssm()
+        else:
+            _require_mamba_ssm()
 
-        # ---- rnn_type == "mamba": custom construction --------------------
+        # ---- rnn_type in ("mamba", "mamba2"): custom construction --------
         # Deliberately NOT calling DNC.__init__ (it hardcodes nn.RNN/GRU/LSTM
         # construction inline with no extension point) -- instead, replicate
         # its non-controller-specific bookkeeping verbatim (same attribute
@@ -593,6 +614,19 @@ class MambaDNC(DNC):
         self.mamba_d_conv = mamba_d_conv
         self.mamba_expand = mamba_expand
 
+        # Mamba-2-only bookkeeping (rnn_type='mamba2'), same checkpoint-
+        # metadata rationale as the Mamba-1 fields above.
+        self.mamba2_d_state = mamba2_d_state
+        self.mamba2_d_conv = mamba2_d_conv
+        self.mamba2_expand = mamba2_expand
+        self.mamba2_headdim = mamba2_headdim
+        self.mamba2_ngroups = mamba2_ngroups
+
+        self.mamba3_d_state = mamba3_d_state
+        self.mamba3_expand = mamba3_expand
+        self.mamba3_headdim = mamba3_headdim
+        self.mamba3_rope_fraction = mamba3_rope_fraction
+
         # Option 4 (MoE) bookkeeping -- stored for checkpoint metadata,
         # same convention as the mamba_d_state/d_conv/expand fields above.
         self.moe_enabled = moe_enabled
@@ -613,20 +647,54 @@ class MambaDNC(DNC):
 
         for layer in range(self.num_layers):
             in_dim = self.nn_input_size if layer == 0 else self.nn_output_size
-            controller = MambaControllerWrapper(
-                in_dim=in_dim,
-                d_model=self.output_size,
-                num_blocks=self.num_hidden_layers,
-                d_state=mamba_d_state,
-                d_conv=mamba_d_conv,
-                expand=mamba_expand,
-                moe_enabled=moe_enabled,
-                moe_num_experts=moe_num_experts,
-                moe_expert_dim=moe_expert_dim,
-                moe_capacity_factor=moe_capacity_factor,
-                moe_load_balance_alpha=moe_load_balance_alpha,
-                device=device,
-            )
+            if rnn_type.lower() == "mamba3":
+                controller = Mamba3ControllerWrapper(
+                    in_dim=in_dim,
+                    d_model=self.output_size,
+                    num_blocks=self.num_hidden_layers,
+                    d_state=mamba3_d_state,
+                    expand=mamba3_expand,
+                    headdim=mamba3_headdim,
+                    rope_fraction=mamba3_rope_fraction,
+                    moe_enabled=moe_enabled,
+                    moe_num_experts=moe_num_experts,
+                    moe_expert_dim=moe_expert_dim,
+                    moe_capacity_factor=moe_capacity_factor,
+                    moe_load_balance_alpha=moe_load_balance_alpha,
+                    device=device,
+                )
+            elif rnn_type.lower() == "mamba2":
+                controller = Mamba2ControllerWrapper(
+                    in_dim=in_dim,
+                    d_model=self.output_size,
+                    num_blocks=self.num_hidden_layers,
+                    d_state=mamba2_d_state,
+                    d_conv=mamba2_d_conv,
+                    expand=mamba2_expand,
+                    headdim=mamba2_headdim,
+                    ngroups=mamba2_ngroups,
+                    moe_enabled=moe_enabled,
+                    moe_num_experts=moe_num_experts,
+                    moe_expert_dim=moe_expert_dim,
+                    moe_capacity_factor=moe_capacity_factor,
+                    moe_load_balance_alpha=moe_load_balance_alpha,
+                    device=device,
+                )
+            else:
+                controller = MambaControllerWrapper(
+                    in_dim=in_dim,
+                    d_model=self.output_size,
+                    num_blocks=self.num_hidden_layers,
+                    d_state=mamba_d_state,
+                    d_conv=mamba_d_conv,
+                    expand=mamba_expand,
+                    moe_enabled=moe_enabled,
+                    moe_num_experts=moe_num_experts,
+                    moe_expert_dim=moe_expert_dim,
+                    moe_capacity_factor=moe_capacity_factor,
+                    moe_load_balance_alpha=moe_load_balance_alpha,
+                    device=device,
+                )
             self.rnns.append(controller)
             # setattr so this shows up as a proper submodule for autograd /
             # optimizer.parameters(), same trick dnc.DNC itself uses for its
@@ -680,7 +748,7 @@ class MambaDNC(DNC):
             self.to(self.device)
 
     def _init_hidden(self, hx, batch_size: int, reset_experience: bool):
-        if self.rnn_type.lower() != "mamba":
+        if self.rnn_type.lower() not in ("mamba", "mamba2", "mamba3"):
             return super()._init_hidden(hx, batch_size, reset_experience)
 
         # ---- controller-state branch: Mamba (conv_state, ssm_state) ------

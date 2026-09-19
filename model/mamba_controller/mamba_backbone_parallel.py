@@ -90,13 +90,34 @@ except ImportError as _mamba2_err:  # pragma: no cover - environment-dependent
 else:
     _MAMBA2_IMPORT_ERROR = None
 
+try:
+    from mamba_ssm.modules.mamba3 import Mamba3
+except ImportError as _mamba3_err:  # pragma: no cover - environment-dependent
+    Mamba3 = None
+    _MAMBA3_IMPORT_ERROR = (
+        "mamba_backbone_parallel.py: variant='mamba3' needs mamba-ssm installed from GitHub main "
+        f"(Mamba3 is not in the v2.3.1 wheel). Original import error: {_mamba3_err}"
+    )
+else:
+    _MAMBA3_IMPORT_ERROR = None
+
+import os as _os
+# bf16 (the repo's own precision) when the GPU supports it; otherwise the fp32-under-fp16-autocast trick.
+_MAMBA3_BF16_OK = (
+    torch.cuda.is_available()
+    and torch.cuda.get_device_capability()[0] >= 8
+    and _os.environ.get("MAMBA3_FORCE_FP32", "0") != "1"
+)
+
 
 def _require_variant(variant: str) -> None:
     if variant == "mamba1" and Mamba1 is None:
         raise ImportError(_MAMBA1_IMPORT_ERROR)
     if variant == "mamba2" and Mamba2 is None:
         raise ImportError(_MAMBA2_IMPORT_ERROR)
-    if variant not in ("mamba1", "mamba2"):
+    if variant == "mamba3" and Mamba3 is None:
+        raise ImportError(_MAMBA3_IMPORT_ERROR)
+    if variant not in ("mamba1", "mamba2", "mamba3"):
         raise ValueError(f"mamba_backbone_parallel: unknown variant {variant!r}, "
                           "expected 'mamba1' or 'mamba2'.")
 
@@ -116,7 +137,10 @@ class _ParallelBlock(nn.Module):
         super().__init__()
         _require_variant(variant)
         self.norm = nn.LayerNorm(d_model, device=device, dtype=dtype)
-        if variant == "mamba1":
+        self.variant = variant
+        if variant == "mamba3":
+            self.mixer = Mamba3(d_model=d_model, device=device, dtype=dtype, **mamba_kwargs)
+        elif variant == "mamba1":
             self.mixer = Mamba1(d_model=d_model, device=device, dtype=dtype, **mamba_kwargs)
         else:
             self.mixer = Mamba2(d_model=d_model, device=device, dtype=dtype, **mamba_kwargs)
@@ -127,7 +151,34 @@ class _ParallelBlock(nn.Module):
         # the entire mechanism that makes Option 5 different from
         # mamba_controller.py: one call per block, not one call per DNC
         # timestep.
-        return x + self.mixer(self.norm(x))
+        #
+        # FIX (chronic grad_norm nan under fp16 AMP, Mamba-2 variant only in
+        # practice but applied to both for symmetry): same wrapper trick
+        # already used by mamba_controller.py's MambaControllerCell.step()
+        # and mamba2_controller.py's Mamba2ControllerCell.step() -- force
+        # this call to run in real fp32, outside ambient fp16 autocast,
+        # rather than reimplementing the mixer's internal math by hand the
+        # way those cells do for their own per-timestep step(). Unlike those
+        # cells, self.mixer here is the library's own whole-sequence
+        # forward() (that's the entire point of the parallel backbone), so
+        # we can't insert clamps mid-computation the way step() does --
+        # instead we just deny it fp16 entirely. Mamba-2's SSD algorithm
+        # computes exp() of a cumulative sum of (dt * A) over a whole chunk
+        # (paper Section 6, Listing 1's segsum), which is far more prone to
+        # fp16 underflow/overflow than Mamba-1's fused selective-scan
+        # kernel -- this is the direct cause of the amp_scale-collapse-to-
+        # 0.0 pattern observed in mamba2-backbone split-graph runs that
+        # mamba1-backbone runs didn't show. Costs some speed relative to
+        # running under fp16 (this block no longer benefits from tensor-core
+        # fp16 matmuls), but matches every other Mamba SSM computation path
+        # in this project, all of which already force fp32 for this reason.
+        if self.variant == "mamba3" and _MAMBA3_BF16_OK:
+            with torch.autocast(device_type=x.device.type, dtype=torch.bfloat16, enabled=True):
+                out = self.mixer(self.norm(x.float()).to(torch.bfloat16))
+        else:
+            with torch.autocast(device_type=x.device.type, enabled=False):
+                out = self.mixer(self.norm(x.float()))
+        return x + out.to(x.dtype)
 
 
 class MambaBackboneParallel(nn.Module):
@@ -173,6 +224,9 @@ class MambaBackboneParallel(nn.Module):
         mamba_kwargs = dict(d_state=d_state, d_conv=d_conv, expand=expand)
         if variant == "mamba2":
             mamba_kwargs["headdim"] = headdim
+        if variant == "mamba3":
+            mamba_kwargs["headdim"] = headdim
+            mamba_kwargs["chunk_size"] = 64 if _MAMBA3_BF16_OK else 32  # repo: 64 bf16 / 32 otherwise
 
         self.blocks = nn.ModuleList(
             [_ParallelBlock(d_model, variant, mamba_kwargs, device=device, dtype=dtype)

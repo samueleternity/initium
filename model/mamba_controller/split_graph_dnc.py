@@ -116,6 +116,7 @@ import torch.nn as nn
 from dnc.memory import Memory
 
 from mamba_controller.mamba_backbone_parallel import MambaBackboneParallel
+from LNN_controller.cfc_backbone_parallel import build_parallel_backbone  
 from mamba_controller.mamba_controller import MambaControllerWrapper       
 from mamba_controller.mamba2_controller import Mamba2ControllerWrapper 
 from mamba_controller.mamba3_controller import Mamba3ControllerWrapper
@@ -140,6 +141,7 @@ class SplitGraphDNC(nn.Module):
         mamba_d_state: int = 16,
         mamba_d_conv: int = 4,
         mamba_expand: int = 2,
+        cfc_kwargs: dict | None = None,   # v14: CfC hyperparameters for variants containing "cfc" (None -> defaults)
         mamba_headdim: int = 64,       # mamba2-only
         combine_reads: bool = True,    # built-in ablation switch, see module docstring
         # v11: combiner mechanism for the sequential addressing step. This is
@@ -205,7 +207,7 @@ class SplitGraphDNC(nn.Module):
         self.mamba_expand = mamba_expand
         self.mamba_headdim = mamba_headdim
 
-        self.backbone = MambaBackboneParallel(
+        self.backbone = build_parallel_backbone(
             in_dim=input_size,
             d_model=hidden_size,
             num_blocks=num_backbone_blocks,
@@ -214,6 +216,7 @@ class SplitGraphDNC(nn.Module):
             d_conv=mamba_d_conv,
             expand=mamba_expand,
             headdim=mamba_headdim,
+            cfc_kwargs=cfc_kwargs,
             device=device,
         )
 

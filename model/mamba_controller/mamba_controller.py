@@ -190,6 +190,7 @@ def _require_mamba_ssm() -> None:
 from mamba_controller.mamba2_controller import Mamba2ControllerWrapper, _require_mamba2_ssm  # v10 (Mamba-2 standalone controller)
 from mamba_controller.mamba3_controller import Mamba3ControllerWrapper, _require_mamba3_ssm  # v12 (Mamba-3 controller)
 from LNN_controller.cfc_controller import CfCControllerWrapper, _require_ncps  # v13 (CfC / LNN controller)
+from LNN_controller.hybrid_controller import build_hybrid_controller, is_hybrid_rnn_type  # v14 (Mamba -> CfC chains)
 
 # ==========================================================================
 # 1. MambaControllerCell -- one Mamba-1 block, single-timestep, BPTT-safe
@@ -542,13 +543,15 @@ class MambaDNC(DNC):
         cfc_activation: str = "lecun_tanh",
         cfc_mixed_memory: bool = False,     # True = CfC-mmRNN variant
         cfc_residual: bool = True,
+        hybrid_cfc_num_blocks: int = 1,     # v14: depth of the CfC stage in "<mamba*>+cfc" rnn_types
+                                            # (the Mamba stage's depth is num_hidden_layers)
         moe_enabled: bool = False,
         moe_num_experts: int = 8,
         moe_expert_dim: int | None = None,
         moe_capacity_factor: float = 1.5,
         moe_load_balance_alpha: float = 0.01,
     ):
-        if rnn_type.lower() not in ("mamba", "mamba2", "mamba3", "cfc"):
+        if rnn_type.lower() not in ("mamba", "mamba2", "mamba3", "cfc") and not is_hybrid_rnn_type(rnn_type):
             if moe_enabled:
                 raise NotImplementedError(
                     "MambaDNC: moe_enabled=True is only wired for "
@@ -589,6 +592,12 @@ class MambaDNC(DNC):
             _require_mamba2_ssm()
         elif rnn_type.lower() == "mamba3":
             _require_mamba3_ssm()
+        elif is_hybrid_rnn_type(rnn_type):
+            _require_ncps()
+            if moe_enabled:
+                raise NotImplementedError(
+                    "MambaDNC: moe_enabled=True is not wired for hybrid rnn_types"
+                )
         elif rnn_type.lower() == "cfc":
             _require_ncps()
             if moe_enabled:
@@ -649,6 +658,7 @@ class MambaDNC(DNC):
         self.cfc_activation = cfc_activation
         self.cfc_mixed_memory = cfc_mixed_memory
         self.cfc_residual = cfc_residual
+        self.hybrid_cfc_num_blocks = hybrid_cfc_num_blocks
 
         # Option 4 (MoE) bookkeeping -- stored for checkpoint metadata,
         # same convention as the mamba_d_state/d_conv/expand fields above.
@@ -670,7 +680,32 @@ class MambaDNC(DNC):
 
         for layer in range(self.num_layers):
             in_dim = self.nn_input_size if layer == 0 else self.nn_output_size
-            if rnn_type.lower() == "cfc":
+            if is_hybrid_rnn_type(rnn_type):
+                controller = build_hybrid_controller(
+                    rnn_type.lower(),
+                    in_dim=in_dim,
+                    d_model=self.output_size,
+                    blocks_per_kind={
+                        "mamba": self.num_hidden_layers,
+                        "mamba2": self.num_hidden_layers,
+                        "mamba3": self.num_hidden_layers,
+                        "cfc": hybrid_cfc_num_blocks,
+                    },
+                    kwargs_per_kind={
+                        "mamba": dict(d_state=mamba_d_state, d_conv=mamba_d_conv, expand=mamba_expand),
+                        "mamba2": dict(d_state=mamba2_d_state, d_conv=mamba2_d_conv, expand=mamba2_expand,
+                                       headdim=mamba2_headdim, ngroups=mamba2_ngroups),
+                        "mamba3": dict(d_state=mamba3_d_state, expand=mamba3_expand,
+                                       headdim=mamba3_headdim, rope_fraction=mamba3_rope_fraction),
+                        "cfc": dict(mode=cfc_mode, backbone_units=cfc_backbone_units,
+                                    backbone_layers=cfc_backbone_layers,
+                                    backbone_dropout=cfc_backbone_dropout,
+                                    activation=cfc_activation, mixed_memory=cfc_mixed_memory,
+                                    residual=cfc_residual),
+                    },
+                    device=device,
+                )
+            elif rnn_type.lower() == "cfc":
                 controller = CfCControllerWrapper(
                     in_dim=in_dim,
                     d_model=self.output_size,
@@ -785,7 +820,7 @@ class MambaDNC(DNC):
             self.to(self.device)
 
     def _init_hidden(self, hx, batch_size: int, reset_experience: bool):
-        if self.rnn_type.lower() not in ("mamba", "mamba2", "mamba3", "cfc"):
+        if self.rnn_type.lower() not in ("mamba", "mamba2", "mamba3", "cfc") and not is_hybrid_rnn_type(self.rnn_type):
             return super()._init_hidden(hx, batch_size, reset_experience)
 
         # ---- controller-state branch: Mamba (conv_state, ssm_state) ------

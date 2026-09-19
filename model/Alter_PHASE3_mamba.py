@@ -1953,6 +1953,7 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
                 usage = mhx["usage_vector"].float()
                 frac_saturated = (usage > DYNAMIC_N_USAGE_HIGH).float().mean().item()
             dynamic_n_ctrl.record(frac_saturated)
+            last_frac_saturated = frac_saturated   
             current_nr_cells = rnn.memories[0].nr_cells
             new_n = dynamic_n_ctrl.should_grow(current_nr_cells)
             if new_n is not None:
@@ -1980,6 +1981,10 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
             kl_contrib = beta_eff * avg_kl  # actual beta*L_KL added to total loss, vs. avg_kl (pre-beta, raw clamped sum)
             gpu_mem_peak_mb = (torch.cuda.max_memory_allocated(device) / 1e6
                                            if torch.cuda.is_available() else 0.0)
+            dyn_n_str = ""
+            if dynamic_n_ctrl is not None:
+                dyn_n_str = (f"| dynN[nr_cells {rnn.memories[0].nr_cells} frac_sat {last_frac_saturated:.3f} "
+                            f"ema {dynamic_n_ctrl.ema:.3f} cooldown {dynamic_n_ctrl.cooldown_remaining}] ")
             print(f"[{run_id}] Step {step}/{total_steps} | Lesson {curriculum.lesson + 1}/{len(curriculum.table)} "                  
                   f"| L_task {avg_task:.4f} | L_KL {avg_kl:.4f} | beta {beta_eff:.4f} "
                   f"| KL_contrib {kl_contrib:.4f} "
@@ -1991,7 +1996,8 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
                   f"| snapshot_step {kl_diag['snapshot_step']}"
                   f"| gpu_mem_peak_mb {gpu_mem_peak_mb:.1f} | params {param_count}"
                   f"| moe_aux {float(moe_aux_loss):.4f} | moe_cv_load {moe_diag.get('moe_cv_load', 0.0):.4f} "
-                  f"| moe_max_load_frac {moe_diag.get('moe_max_load_frac', 0.0):.4f}")                 
+                  f"| moe_max_load_frac {moe_diag.get('moe_max_load_frac', 0.0):.4f}"
+                  f"| {dyn_n_str}")                 
             log_writer.writerow([
                 step, curriculum.lesson + 1, beta_eff,
                 avg_task, avg_kl, kl_contrib, avg_task + kl_contrib, avg_div,

@@ -443,6 +443,18 @@ MAMBA3_EXPAND = 2
 MAMBA3_HEADDIM = 64
 MAMBA3_ROPE_FRACTION = 0.5
 
+
+# v13: CfC (LNN, ncps) hyperparameters -- only meaningful when CONTROLLER_TYPE=="cfc".
+# backbone_units: width of CfC's shared backbone MLP (paper's own runs use 64-256; 512 = hidden size here).
+CFC_MODE = "default"          # "default" | "pure" | "no_gate"
+CFC_BACKBONE_UNITS = 512
+CFC_BACKBONE_LAYERS = 1
+CFC_BACKBONE_DROPOUT = 0.0
+CFC_ACTIVATION = "lecun_tanh"
+CFC_MIXED_MEMORY = False      # True = CfC-mmRNN (adds an LSTM cell)
+CFC_RESIDUAL = True
+HYBRID_CFC_NUM_BLOCKS = 1     # v14: CfC stage depth for "<mamba*>+cfc" controllers (Mamba stage depth = num_hidden_layers)
+
 # v8 (Alternate Phase 3, Step 2, Option 4): MoE-in-controller toggle and
 # hyperparameters -- only meaningful when CONTROLLER_TYPE=="mamba" (see
 # mamba_controller.py's MambaDNC: moe_enabled=True raises for any other
@@ -759,6 +771,29 @@ def save_checkpoint(path, rnn, output_proj, stochastic_heads, optimizer,
             "mamba3_expand": MAMBA3_EXPAND,
             "mamba3_headdim": MAMBA3_HEADDIM,
             "mamba3_rope_fraction": MAMBA3_ROPE_FRACTION,
+        })
+    elif controller_type == "cfc":  
+        model_config.update({
+            "cfc_mode": CFC_MODE,
+            "cfc_backbone_units": CFC_BACKBONE_UNITS,
+            "cfc_backbone_layers": CFC_BACKBONE_LAYERS,
+            "cfc_backbone_dropout": CFC_BACKBONE_DROPOUT,
+            "cfc_activation": CFC_ACTIVATION,
+            "cfc_mixed_memory": CFC_MIXED_MEMORY,
+            "cfc_residual": CFC_RESIDUAL,
+        })
+    elif "+" in controller_type:  # v14: hybrid chains, e.g. "mamba+cfc"
+        model_config.update({
+            "mamba_d_state": MAMBA_D_STATE, "mamba_d_conv": MAMBA_D_CONV, "mamba_expand": MAMBA_EXPAND,
+            "mamba2_d_state": MAMBA2_D_STATE, "mamba2_d_conv": MAMBA2_D_CONV,
+            "mamba2_expand": MAMBA2_EXPAND, "mamba2_headdim": MAMBA2_HEADDIM,
+            "mamba2_ngroups": MAMBA2_NGROUPS,
+            "mamba3_d_state": MAMBA3_D_STATE, "mamba3_expand": MAMBA3_EXPAND,
+            "mamba3_headdim": MAMBA3_HEADDIM, "mamba3_rope_fraction": MAMBA3_ROPE_FRACTION,
+            "cfc_mode": CFC_MODE, "cfc_backbone_units": CFC_BACKBONE_UNITS,
+            "cfc_backbone_layers": CFC_BACKBONE_LAYERS, "cfc_backbone_dropout": CFC_BACKBONE_DROPOUT,
+            "cfc_activation": CFC_ACTIVATION, "cfc_mixed_memory": CFC_MIXED_MEMORY,
+            "cfc_residual": CFC_RESIDUAL, "hybrid_cfc_num_blocks": HYBRID_CFC_NUM_BLOCKS,
         })
 
     torch.save({
@@ -1523,6 +1558,32 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
             moe_load_balance_alpha=moe_load_balance_alpha,
         )
 
+    if controller == "cfc":  
+        mamba_kwargs = dict(
+            cfc_mode=CFC_MODE,
+            cfc_backbone_units=CFC_BACKBONE_UNITS,
+            cfc_backbone_layers=CFC_BACKBONE_LAYERS,
+            cfc_backbone_dropout=CFC_BACKBONE_DROPOUT,
+            cfc_activation=CFC_ACTIVATION,
+            cfc_mixed_memory=CFC_MIXED_MEMORY,
+            cfc_residual=CFC_RESIDUAL,
+            moe_enabled=moe_enabled,  # MambaDNC raises if True (not wired for cfc)
+        )
+
+    if "+" in controller:  # v14: hybrid chain, e.g. "mamba+cfc"
+        mamba_kwargs = dict(
+            mamba_d_state=MAMBA_D_STATE, mamba_d_conv=MAMBA_D_CONV, mamba_expand=MAMBA_EXPAND,
+            mamba2_d_state=MAMBA2_D_STATE, mamba2_d_conv=MAMBA2_D_CONV, mamba2_expand=MAMBA2_EXPAND,
+            mamba2_headdim=MAMBA2_HEADDIM, mamba2_ngroups=MAMBA2_NGROUPS,
+            mamba3_d_state=MAMBA3_D_STATE, mamba3_expand=MAMBA3_EXPAND,
+            mamba3_headdim=MAMBA3_HEADDIM, mamba3_rope_fraction=MAMBA3_ROPE_FRACTION,
+            cfc_mode=CFC_MODE, cfc_backbone_units=CFC_BACKBONE_UNITS,
+            cfc_backbone_layers=CFC_BACKBONE_LAYERS, cfc_backbone_dropout=CFC_BACKBONE_DROPOUT,
+            cfc_activation=CFC_ACTIVATION, cfc_mixed_memory=CFC_MIXED_MEMORY,
+            cfc_residual=CFC_RESIDUAL, hybrid_cfc_num_blocks=HYBRID_CFC_NUM_BLOCKS,
+            moe_enabled=moe_enabled,  # MambaDNC raises if True (not wired for hybrids)
+        )
+
     if split_graph_enabled:
         # v9 (Option 5): --controller / rnn_type is not used in this mode
         # -- the backbone choice is split_graph_variant instead.
@@ -1540,8 +1601,8 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
         # d_state/headdim is accepted), but not what the SSD paper's own
         # Mamba-2 defaults are.
         _sg_d_state, _sg_d_conv, _sg_expand = (
-            (MAMBA3_D_STATE, MAMBA_D_CONV, MAMBA3_EXPAND) if split_graph_variant == "mamba3" else
-            (MAMBA2_D_STATE, MAMBA2_D_CONV, MAMBA2_EXPAND) if split_graph_variant == "mamba2"
+            (MAMBA3_D_STATE, MAMBA_D_CONV, MAMBA3_EXPAND) if split_graph_variant.startswith("mamba3") else
+            (MAMBA2_D_STATE, MAMBA2_D_CONV, MAMBA2_EXPAND) if split_graph_variant.startswith("mamba2")
             else (MAMBA_D_STATE, MAMBA_D_CONV, MAMBA_EXPAND)
         )
         rnn = SplitGraphDNC(
@@ -1556,6 +1617,11 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
             mamba_d_conv=_sg_d_conv,
             mamba_expand=_sg_expand,
             mamba_headdim=split_graph_headdim,
+            cfc_kwargs=dict(
+                mode=CFC_MODE, backbone_units=CFC_BACKBONE_UNITS,
+                backbone_layers=CFC_BACKBONE_LAYERS, backbone_dropout=CFC_BACKBONE_DROPOUT,
+                activation=CFC_ACTIVATION, mixed_memory=CFC_MIXED_MEMORY, residual=CFC_RESIDUAL,
+            ),
             combine_reads=split_graph_combine_reads,
             combiner_mode=split_graph_combiner_mode,
             combiner_variant=split_graph_combiner_variant,
@@ -2253,7 +2319,8 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=SEED,
                      help="random seed for torch/random/numpy (default: SEED module constant)")
     parser.add_argument("--controller", type=str, default=CONTROLLER_TYPE,
-                         choices=["lstm", "mamba", "mamba2", "mamba3"],
+                         choices=["lstm", "mamba", "mamba2", "mamba3", "cfc",
+                                  "mamba+cfc", "mamba2+cfc", "mamba3+cfc"],
                          help="DNC controller type. 'lstm' (default) "
                               "reproduces Phase 2 exactly. 'mamba' swaps in the "
                               "Mamba-1 controller from mamba_controller.py. "
@@ -2340,7 +2407,8 @@ if __name__ == "__main__":
                               "passed -- roadmap flags this as untested/isolated-ablation-"
                               "required. Overrides --controller entirely when set.")
     parser.add_argument("--split-graph-variant", type=str, default=SPLIT_GRAPH_MAMBA_VARIANT,
-                         choices=["mamba1", "mamba2", "mamba3"],
+                         choices=["mamba1", "mamba2", "mamba3", "cfc",
+                                  "mamba1+cfc", "mamba2+cfc", "mamba3+cfc"],
                          help="Backbone variant for --split-graph. 'mamba2' requires "
                               "mamba_ssm.modules.mamba2.Mamba2 to be importable. - same with 'mamba3'")
     parser.add_argument("--split-graph-num-blocks", type=int, default=SPLIT_GRAPH_NUM_BLOCKS,
@@ -2359,7 +2427,7 @@ if __name__ == "__main__":
                               "addressing step with a real interleaved Mamba controller "
                               "cell instead (see --split-graph-combiner-variant).")
     parser.add_argument("--split-graph-combiner-variant", type=str, default=SPLIT_GRAPH_COMBINER_VARIANT,
-                         choices=["mamba1", "mamba2", "mamba3"],
+                         choices=["mamba1", "mamba2", "mamba3", "cfc"],
                          help="v11: which controller drives the sequential combiner when "
                               "--split-graph-combiner-mode=controller. 'mamba1' is the "
                               "recommended/efficient choice; 'mamba2' is wired but not "
@@ -2405,6 +2473,10 @@ if __name__ == "__main__":
             run_id = f"{run_id}_mamba2ctrl"
         elif args.controller == "mamba3":
             run_id = f"{run_id}_mamba3ctrl"
+        elif args.controller == "cfc":
+            run_id = f"{run_id}_cfcctrl"
+        elif "+" in args.controller:
+            run_id = f"{run_id}_{args.controller.replace('+', '')}ctrl"
         if args.beta_mode == "dynamic":  # keep dynamic-beta runs from colliding with static sweep files
             run_id = f"{run_id}_dynbeta"
         if args.link_matrix_mode != "dense":  # Static Option 1: keep these runs from colliding with dense-baseline sweep files
@@ -2415,7 +2487,7 @@ if __name__ == "__main__":
         if args.moe:  # Option 4: keep MoE runs from colliding with dense-controller sweep files
             run_id = f"{run_id}_moe{args.moe_num_experts}e"
         if args.split_graph:  # Option 5: keep split-graph runs from colliding with entangled-controller sweep files
-            run_id = f"{run_id}_splitgraph_{args.split_graph_variant}"
+            run_id = f"{run_id}_splitgraph_{args.split_graph_variant.replace('+', '')}"
             if args.split_graph_combiner_mode == "controller":
                 run_id = f"{run_id}_combctrl{args.split_graph_combiner_variant}"
         if args.run_id_suffix:

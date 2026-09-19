@@ -443,6 +443,17 @@ MAMBA3_EXPAND = 2
 MAMBA3_HEADDIM = 64
 MAMBA3_ROPE_FRACTION = 0.5
 
+
+# v13: CfC (LNN, ncps) hyperparameters -- only meaningful when CONTROLLER_TYPE=="cfc".
+# backbone_units: width of CfC's shared backbone MLP (paper's own runs use 64-256; 512 = hidden size here).
+CFC_MODE = "default"          # "default" | "pure" | "no_gate"
+CFC_BACKBONE_UNITS = 512
+CFC_BACKBONE_LAYERS = 1
+CFC_BACKBONE_DROPOUT = 0.0
+CFC_ACTIVATION = "lecun_tanh"
+CFC_MIXED_MEMORY = False      # True = CfC-mmRNN (adds an LSTM cell)
+CFC_RESIDUAL = True
+
 # v8 (Alternate Phase 3, Step 2, Option 4): MoE-in-controller toggle and
 # hyperparameters -- only meaningful when CONTROLLER_TYPE=="mamba" (see
 # mamba_controller.py's MambaDNC: moe_enabled=True raises for any other
@@ -759,6 +770,16 @@ def save_checkpoint(path, rnn, output_proj, stochastic_heads, optimizer,
             "mamba3_expand": MAMBA3_EXPAND,
             "mamba3_headdim": MAMBA3_HEADDIM,
             "mamba3_rope_fraction": MAMBA3_ROPE_FRACTION,
+        })
+    elif controller_type == "cfc":  
+        model_config.update({
+            "cfc_mode": CFC_MODE,
+            "cfc_backbone_units": CFC_BACKBONE_UNITS,
+            "cfc_backbone_layers": CFC_BACKBONE_LAYERS,
+            "cfc_backbone_dropout": CFC_BACKBONE_DROPOUT,
+            "cfc_activation": CFC_ACTIVATION,
+            "cfc_mixed_memory": CFC_MIXED_MEMORY,
+            "cfc_residual": CFC_RESIDUAL,
         })
 
     torch.save({
@@ -1523,6 +1544,18 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
             moe_load_balance_alpha=moe_load_balance_alpha,
         )
 
+    if controller == "cfc":  
+        mamba_kwargs = dict(
+            cfc_mode=CFC_MODE,
+            cfc_backbone_units=CFC_BACKBONE_UNITS,
+            cfc_backbone_layers=CFC_BACKBONE_LAYERS,
+            cfc_backbone_dropout=CFC_BACKBONE_DROPOUT,
+            cfc_activation=CFC_ACTIVATION,
+            cfc_mixed_memory=CFC_MIXED_MEMORY,
+            cfc_residual=CFC_RESIDUAL,
+            moe_enabled=moe_enabled,  # MambaDNC raises if True (not wired for cfc)
+        )
+
     if split_graph_enabled:
         # v9 (Option 5): --controller / rnn_type is not used in this mode
         # -- the backbone choice is split_graph_variant instead.
@@ -2253,7 +2286,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=SEED,
                      help="random seed for torch/random/numpy (default: SEED module constant)")
     parser.add_argument("--controller", type=str, default=CONTROLLER_TYPE,
-                         choices=["lstm", "mamba", "mamba2", "mamba3"],
+                         choices=["lstm", "mamba", "mamba2", "mamba3", "cfc"],
                          help="DNC controller type. 'lstm' (default) "
                               "reproduces Phase 2 exactly. 'mamba' swaps in the "
                               "Mamba-1 controller from mamba_controller.py. "
@@ -2359,7 +2392,7 @@ if __name__ == "__main__":
                               "addressing step with a real interleaved Mamba controller "
                               "cell instead (see --split-graph-combiner-variant).")
     parser.add_argument("--split-graph-combiner-variant", type=str, default=SPLIT_GRAPH_COMBINER_VARIANT,
-                         choices=["mamba1", "mamba2", "mamba3"],
+                         choices=["mamba1", "mamba2", "mamba3", "cfc"],
                          help="v11: which controller drives the sequential combiner when "
                               "--split-graph-combiner-mode=controller. 'mamba1' is the "
                               "recommended/efficient choice; 'mamba2' is wired but not "
@@ -2405,6 +2438,8 @@ if __name__ == "__main__":
             run_id = f"{run_id}_mamba2ctrl"
         elif args.controller == "mamba3":
             run_id = f"{run_id}_mamba3ctrl"
+        elif args.controller == "cfc":
+            run_id = f"{run_id}_cfcctrl"
         if args.beta_mode == "dynamic":  # keep dynamic-beta runs from colliding with static sweep files
             run_id = f"{run_id}_dynbeta"
         if args.link_matrix_mode != "dense":  # Static Option 1: keep these runs from colliding with dense-baseline sweep files

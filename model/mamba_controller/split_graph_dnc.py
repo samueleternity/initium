@@ -118,7 +118,8 @@ from dnc.memory import Memory
 from mamba_controller.mamba_backbone_parallel import MambaBackboneParallel
 from mamba_controller.mamba_controller import MambaControllerWrapper       
 from mamba_controller.mamba2_controller import Mamba2ControllerWrapper 
-from mamba_controller.mamba3_controller import Mamba3ControllerWrapper 
+from mamba_controller.mamba3_controller import Mamba3ControllerWrapper
+from LNN_controller.cfc_controller import CfCControllerWrapper 
 
 
 class SplitGraphDNC(nn.Module):
@@ -277,6 +278,13 @@ class SplitGraphDNC(nn.Module):
                     d_state=_d_state,
                     expand=combiner_expand,
                     headdim=combiner_headdim,
+                    device=device,
+                )
+            elif combiner_variant == "cfc":
+                self.combiner_wrapper = CfCControllerWrapper(
+                    in_dim=combiner_in_dim,
+                    d_model=hidden_size,
+                    num_blocks=combiner_num_blocks,
                     device=device,
                 )
             elif combiner_variant == "mamba1":

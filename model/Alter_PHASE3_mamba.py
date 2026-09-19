@@ -2427,7 +2427,8 @@ if __name__ == "__main__":
                               "addressing step with a real interleaved Mamba controller "
                               "cell instead (see --split-graph-combiner-variant).")
     parser.add_argument("--split-graph-combiner-variant", type=str, default=SPLIT_GRAPH_COMBINER_VARIANT,
-                         choices=["mamba1", "mamba2", "mamba3", "cfc"],
+                         choices=["mamba1", "mamba2", "mamba3", "cfc",
+                                  "mamba+cfc", "mamba2+cfc", "mamba3+cfc"],
                          help="v11: which controller drives the sequential combiner when "
                               "--split-graph-combiner-mode=controller. 'mamba1' is the "
                               "recommended/efficient choice; 'mamba2' is wired but not "
@@ -2489,7 +2490,7 @@ if __name__ == "__main__":
         if args.split_graph:  # Option 5: keep split-graph runs from colliding with entangled-controller sweep files
             run_id = f"{run_id}_splitgraph_{args.split_graph_variant.replace('+', '')}"
             if args.split_graph_combiner_mode == "controller":
-                run_id = f"{run_id}_combctrl{args.split_graph_combiner_variant}"
+                run_id = f"{run_id}_combctrl{args.split_graph_combiner_variant.replace('+', '')}"
         if args.run_id_suffix:
             run_id = f"{run_id}_{args.run_id_suffix}"
         summary = run(beta_target=beta, run_id=run_id, seed=args.seed,

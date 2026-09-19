@@ -116,7 +116,8 @@ import torch.nn as nn
 from dnc.memory import Memory
 
 from mamba_controller.mamba_backbone_parallel import MambaBackboneParallel
-from LNN_controller.cfc_backbone_parallel import build_parallel_backbone  
+from LNN_controller.cfc_backbone_parallel import build_parallel_backbone 
+from LNN_controller.hybrid_controller import build_hybrid_controller, is_hybrid_rnn_type  # v15: hybrid combiner 
 from mamba_controller.mamba_controller import MambaControllerWrapper       
 from mamba_controller.mamba2_controller import Mamba2ControllerWrapper 
 from mamba_controller.mamba3_controller import Mamba3ControllerWrapper
@@ -281,6 +282,21 @@ class SplitGraphDNC(nn.Module):
                     d_state=_d_state,
                     expand=combiner_expand,
                     headdim=combiner_headdim,
+                    device=device,
+                )
+            elif is_hybrid_rnn_type(combiner_variant):  # v15: e.g. "mamba+cfc" (hybrid_controller kind names: mamba, not mamba1)
+                self.combiner_wrapper = build_hybrid_controller(
+                    combiner_variant.lower(),
+                    in_dim=combiner_in_dim,
+                    d_model=hidden_size,
+                    blocks_per_kind={k: combiner_num_blocks for k in ("mamba", "mamba2", "mamba3", "cfc")},
+                    kwargs_per_kind={
+                        "mamba": dict(d_state=16, d_conv=combiner_d_conv, expand=combiner_expand),
+                        "mamba2": dict(d_state=64, d_conv=combiner_d_conv, expand=combiner_expand,
+                                       headdim=combiner_headdim, ngroups=combiner_ngroups),
+                        "mamba3": dict(d_state=64, expand=combiner_expand, headdim=combiner_headdim),
+                        "cfc": dict(cfc_kwargs or {}),
+                    },
                     device=device,
                 )
             elif combiner_variant == "cfc":

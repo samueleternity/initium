@@ -117,7 +117,8 @@ from dnc.memory import Memory
 
 from mamba_controller.mamba_backbone_parallel import MambaBackboneParallel
 from mamba_controller.mamba_controller import MambaControllerWrapper       
-from mamba_controller.mamba2_controller import Mamba2ControllerWrapper  
+from mamba_controller.mamba2_controller import Mamba2ControllerWrapper 
+from mamba_controller.mamba3_controller import Mamba3ControllerWrapper 
 
 
 class SplitGraphDNC(nn.Module):
@@ -253,7 +254,7 @@ class SplitGraphDNC(nn.Module):
                       "combiner_variant='mamba1' is the configuration expected to "
                       "actually be used.")
             _d_state = combiner_d_state if combiner_d_state is not None else (
-                64 if combiner_variant == "mamba2" else 16
+                64 if combiner_variant in ("mamba2", "mamba3") else 16
             )
             combiner_in_dim = hidden_size + self.read_vectors_size
             if combiner_variant == "mamba2":
@@ -266,6 +267,16 @@ class SplitGraphDNC(nn.Module):
                     expand=combiner_expand,
                     headdim=combiner_headdim,
                     ngroups=combiner_ngroups,
+                    device=device,
+                )
+            elif combiner_variant == "mamba3":
+                self.combiner_wrapper = Mamba3ControllerWrapper(
+                    in_dim=combiner_in_dim,
+                    d_model=hidden_size,
+                    num_blocks=combiner_num_blocks,
+                    d_state=_d_state,
+                    expand=combiner_expand,
+                    headdim=combiner_headdim,
                     device=device,
                 )
             elif combiner_variant == "mamba1":

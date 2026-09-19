@@ -188,7 +188,7 @@ def _require_mamba_ssm() -> None:
         raise ImportError(_MAMBA_IMPORT_ERROR)
 
 from mamba_controller.mamba2_controller import Mamba2ControllerWrapper, _require_mamba2_ssm  # v10 (Mamba-2 standalone controller)
-
+from mamba_controller.mamba3_controller import Mamba3ControllerWrapper, _require_mamba3_ssm  # v12 (Mamba-3 controller)
 
 # ==========================================================================
 # 1. MambaControllerCell -- one Mamba-1 block, single-timestep, BPTT-safe
@@ -529,15 +529,17 @@ class MambaDNC(DNC):
         mamba2_expand: int = 2,
         mamba2_headdim: int = 64,
         mamba2_ngroups: int = 1,
+        mamba3_d_state: int = 64,
+        mamba3_expand: int = 2,
+        mamba3_headdim: int = 64,
+        mamba3_rope_fraction: float = 0.5,
         moe_enabled: bool = False,
         moe_num_experts: int = 8,
         moe_expert_dim: int | None = None,
         moe_capacity_factor: float = 1.5,
         moe_load_balance_alpha: float = 0.01,
     ):
-        if rnn_type.lower() not in ("mamba", "mamba2"):
-            # Not our concern -- defer completely to the stock DNC. This is
-            # what makes MambaDNC a true drop-in superset rather than a fork.
+        if rnn_type.lower() not in ("mamba", "mamba2", "mamba3"):
             if moe_enabled:
                 raise NotImplementedError(
                     "MambaDNC: moe_enabled=True is only wired for "
@@ -576,6 +578,8 @@ class MambaDNC(DNC):
 
         if rnn_type.lower() == "mamba2":
             _require_mamba2_ssm()
+        elif rnn_type.lower() == "mamba3":
+            _require_mamba3_ssm()
         else:
             _require_mamba_ssm()
 
@@ -618,6 +622,11 @@ class MambaDNC(DNC):
         self.mamba2_headdim = mamba2_headdim
         self.mamba2_ngroups = mamba2_ngroups
 
+        self.mamba3_d_state = mamba3_d_state
+        self.mamba3_expand = mamba3_expand
+        self.mamba3_headdim = mamba3_headdim
+        self.mamba3_rope_fraction = mamba3_rope_fraction
+
         # Option 4 (MoE) bookkeeping -- stored for checkpoint metadata,
         # same convention as the mamba_d_state/d_conv/expand fields above.
         self.moe_enabled = moe_enabled
@@ -638,7 +647,23 @@ class MambaDNC(DNC):
 
         for layer in range(self.num_layers):
             in_dim = self.nn_input_size if layer == 0 else self.nn_output_size
-            if rnn_type.lower() == "mamba2":
+            if rnn_type.lower() == "mamba3":
+                controller = Mamba3ControllerWrapper(
+                    in_dim=in_dim,
+                    d_model=self.output_size,
+                    num_blocks=self.num_hidden_layers,
+                    d_state=mamba3_d_state,
+                    expand=mamba3_expand,
+                    headdim=mamba3_headdim,
+                    rope_fraction=mamba3_rope_fraction,
+                    moe_enabled=moe_enabled,
+                    moe_num_experts=moe_num_experts,
+                    moe_expert_dim=moe_expert_dim,
+                    moe_capacity_factor=moe_capacity_factor,
+                    moe_load_balance_alpha=moe_load_balance_alpha,
+                    device=device,
+                )
+            elif rnn_type.lower() == "mamba2":
                 controller = Mamba2ControllerWrapper(
                     in_dim=in_dim,
                     d_model=self.output_size,
@@ -723,7 +748,7 @@ class MambaDNC(DNC):
             self.to(self.device)
 
     def _init_hidden(self, hx, batch_size: int, reset_experience: bool):
-        if self.rnn_type.lower() not in ("mamba", "mamba2"):
+        if self.rnn_type.lower() not in ("mamba", "mamba2", "mamba3"):
             return super()._init_hidden(hx, batch_size, reset_experience)
 
         # ---- controller-state branch: Mamba (conv_state, ssm_state) ------

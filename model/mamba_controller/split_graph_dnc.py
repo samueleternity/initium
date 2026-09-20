@@ -366,6 +366,7 @@ class SplitGraphDNC(nn.Module):
         hx=(None, None, None),
         reset_experience: bool = False,
         pass_through_memory: bool = True,
+        combiner_skip_stages=None,
     ):
         """
         input: (B, T, input_size) -- batch-first, the whole padded episode
@@ -441,7 +442,10 @@ class SplitGraphDNC(nn.Module):
 
             if self.combiner_mode == "controller":
                 combiner_in = torch.cat([h_t, read_vec], dim=-1).unsqueeze(1)  # (B, 1, hidden+read)
-                xi_out, combiner_hx = self.combiner_wrapper(combiner_in, combiner_hx)
+                if combiner_skip_stages is not None:
+                    xi_out, combiner_hx = self.combiner_wrapper(combiner_in, combiner_hx, skip_stages=combiner_skip_stages)
+                else:
+                    xi_out, combiner_hx = self.combiner_wrapper(combiner_in, combiner_hx)
                 xi_t = h_t + xi_out.squeeze(1)
             elif self.combine_reads:
                 xi_t = h_t + self.combiner(torch.cat([h_t, read_vec], dim=-1))

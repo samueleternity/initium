@@ -46,5 +46,11 @@ class BaseDataset:
         """Memory-off eval on lesson `lesson_idx` -> (acc_pct, perfect_pct)"""
         raise NotImplementedError
 
+    def evaluate_id_combiner_stage_ablated(self, model, device, curriculum, lesson_idx, skip_stages):
+        """Combiner-stage-off eval on lesson `lesson_idx` -> (acc_pct, perfect_pct).
+        Optional: only implemented by datasets/models with a multi-stage
+        split-graph combiner (see SplitGraphDNC)."""
+        raise NotImplementedError
+
     def write_field_log(self, writer, file, step, lesson, eval_type, field_log):
         raise NotImplementedError

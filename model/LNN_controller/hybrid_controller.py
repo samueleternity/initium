@@ -57,7 +57,7 @@ def build_hybrid_controller(spec, in_dim, d_model, blocks_per_kind, kwargs_per_k
         stages.append(_make_stage(kind, cur, d_model, blocks_per_kind[kind],
                                   kwargs_per_kind.get(kind, {}), device))
         cur = d_model
-    return ChainedControllerWrapper(stages)
+    return ChainedControllerWrapper(stages, stage_kinds=kinds)
 
 
 if __name__ == "__main__":  # smoke test: python -m LNN_controller.hybrid_controller (from project root)

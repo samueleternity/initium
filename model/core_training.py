@@ -375,6 +375,17 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
             "memory_dependency_triple", "memory_dependency_perfect",
         ])
 
+    combiner_stage_log_path = os.path.join(LOG_DIR, f"run_{run_id}_combiner_stage_dependency.csv")
+    combiner_stage_log_file = open(combiner_stage_log_path, "a" if resuming else "w", newline="")
+    combiner_stage_log_writer = csv.writer(combiner_stage_log_file)
+    if not resuming:
+        combiner_stage_log_writer.writerow([
+            "step", "lesson", "stage_index", "stage_kind",
+            "id_triple_acc", "id_perfect_frac",
+            "ablated_triple_acc", "ablated_perfect_frac",
+            "stage_dependency_triple", "stage_dependency_perfect",
+        ])
+
     lesson_log_path = os.path.join(LOG_DIR, f"run_{run_id}_lesson_advances.csv")
     lesson_log_file = open(lesson_log_path, "a" if resuming else "w", newline="")
     lesson_log_writer = csv.writer(lesson_log_file)
@@ -619,7 +630,8 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
             **mamba_kwargs,
         ).to(device)
 
-    
+    combiner_stage_kinds = getattr(getattr(rnn, "combiner_wrapper", None), "stage_kinds", None)  # set only for a hybrid ("<kind>+<kind>") split-graph combiner; None otherwise
+
     if link_matrix_mode != "dense":
         patch_link_matrix(rnn, mode=link_matrix_mode, topk=link_matrix_topk)
         topk_note = f" topk={link_matrix_topk}" if link_matrix_mode == "sparse_topk" else ""
@@ -1142,6 +1154,27 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
             print(f"[{run_id}] Step {step} memory-dependency check: "
                   f"ID (memory on) {id_triple_acc:.2f}% | ablated (memory off) "
                   f"{ablated_triple_acc:.2f}% | dependency {id_triple_acc - ablated_triple_acc:.2f}")
+
+            if combiner_stage_kinds is not None:
+                # Same pattern as the memory-dependency check above, but
+                # ablating one combiner stage (e.g. the CfC block in a
+                # "mamba+cfc" combiner) at a time, so each stage's actual
+                # contribution to accuracy is measured directly instead of
+                # inferred from loss curves / plateau shape.
+                for stage_idx, stage_kind in enumerate(combiner_stage_kinds):
+                    stage_triple_acc, stage_perfect_frac = dataset.evaluate_id_combiner_stage_ablated(
+                        rnn, device, curriculum, pre_advance_lesson, skip_stages={stage_idx})
+                    combiner_stage_log_writer.writerow([
+                        step, pre_advance_lesson + 1, stage_idx, stage_kind,
+                        id_triple_acc, id_perfect_frac,
+                        stage_triple_acc, stage_perfect_frac,
+                        id_triple_acc - stage_triple_acc, id_perfect_frac - stage_perfect_frac,
+                    ])
+                    combiner_stage_log_file.flush()
+                    print(f"[{run_id}] Step {step} combiner-stage-dependency check "
+                          f"[{stage_idx}:{stage_kind}]: ID (full) {id_triple_acc:.2f}% | "
+                          f"ablated ({stage_kind} off) {stage_triple_acc:.2f}% | "
+                          f"dependency {id_triple_acc - stage_triple_acc:.2f}")
         
 
         if step % checkpoint_every == 0 or step == total_steps:
@@ -1206,6 +1239,7 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
     lesson_log_file.close()
     prior_log_file.close()  
     field_log_file.close()  # v16
+    combiner_stage_log_file.close()
     if dynamic_n_ctrl is not None:
         dynamic_n_log_file.close()
 

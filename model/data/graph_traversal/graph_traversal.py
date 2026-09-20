@@ -356,7 +356,7 @@ def decode_prediction(output_step):
 def evaluate_traversal(model, device, num_episodes=100, verbose_n=3,
                        num_nodes=None, nodes_range=None, k_range=None, path_length_range=None,
                        fixed_graph=None, hop_breakdown=False, rng=None,
-                       ablate_memory=False, field_log=None):
+                       ablate_memory=False, field_log=None, model_kwargs=None):
     """
     num_nodes: fixed graph size for every episode. nodes_range: (lo, hi),
         num_nodes resampled per episode (same distribution as training).
@@ -392,7 +392,7 @@ def evaluate_traversal(model, device, num_episodes=100, verbose_n=3,
 
             hidden = (None, None, None)
             output, _ = model(input_seq, hidden, reset_experience=True,
-                               pass_through_memory=not ablate_memory)
+                               pass_through_memory=not ablate_memory, **(model_kwargs or {}))
             output = output.transpose(0, 1).contiguous().squeeze(0)  # (T, 92)
             output = output_proj_current(output)  # (T, 90)
 
@@ -549,6 +549,19 @@ class GraphTraversalDataset(BaseDataset):
             model, device, num_episodes=EVAL_BATCH_SIZE, verbose_n=0,
             nodes_range=nodes_range, k_range=out_degree_range, path_length_range=path_len_range,
             ablate_memory=True,
+        )
+    
+    def evaluate_id_combiner_stage_ablated(self, model, device, curriculum, lesson_idx, skip_stages):
+        """Same lesson-distribution eval as evaluate_id_ablated, but bypasses
+        one stage of a hybrid split-graph combiner (see
+        ChainedControllerWrapper.forward's skip_stages / SplitGraphDNC's
+        combiner_skip_stages) instead of Memory. Only meaningful when
+        model.combiner_wrapper is a ChainedControllerWrapper."""
+        nodes_range, out_degree_range, path_len_range = curriculum.table[lesson_idx]
+        return evaluate_traversal(
+            model, device, num_episodes=EVAL_BATCH_SIZE, verbose_n=0,
+            nodes_range=nodes_range, k_range=out_degree_range, path_length_range=path_len_range,
+            model_kwargs={"combiner_skip_stages": skip_stages},
         )
 
     def write_field_log(self, writer, file, step, lesson, eval_type, field_log):

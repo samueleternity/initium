@@ -558,7 +558,7 @@ from DEER.deer_parallel_dnc import (  # v9 (Alternate Phase 3, Step 2, Option 3)
    # file's v9 header note. Used in place of ChunkedParallelDNC when
    # USE_DEER is True.
 
-from model.stochastic_write_head_v2 import (
+from model.memory_manipulation.stochastic_write_head_v2 import (
     install_stochastic_write_heads, pop_total_kl,
     update_all_prior_snapshots, get_prior_state, load_prior_state,  # v5 (Phase 2)
 )

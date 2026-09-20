@@ -217,7 +217,7 @@ from DEER.newton_associative_scan import (
     deer_adjoint_scan,
     _batched_step_fn,
 )
-from model.stochastic_write_head_v2 import StochasticWriteHead
+from model.memory_manipulation.stochastic_write_head_v2 import StochasticWriteHead
 from DEER.analytic_diag_jac import build_analytic_diag_fn
 
 __all__ = [

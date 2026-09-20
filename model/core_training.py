@@ -22,6 +22,9 @@ Version notes (core-level):
 - v17: dataset split out of this file into data/. Core only talk to the
   dataset through the BaseDataset interface; curriculum's per-lesson memory
   size lives on the curriculum instance (curriculum.lesson_nr_cells).
+- v18: constants moved out: train_config.py (loop/model/KL/prior/checkpoint)
+  and controller_config.py (controllers, MoE, split-graph, link-matrix,
+  Dynamic-N). Pure move, no value changes.
 """
 
 import csv
@@ -40,7 +43,7 @@ from dnc import DNC
 from mamba_controller.mamba_controller import MambaDNC  
 from MoE.moe_layer import pop_total_moe_aux_loss 
 from mamba_controller.split_graph_dnc import SplitGraphDNC  
-from stochastic_write_head_v2 import (
+from memory_manipulation.stochastic_write_head_v2 import (
     install_stochastic_write_heads, pop_total_kl,
     update_all_prior_snapshots, get_prior_state, load_prior_state,  
 )
@@ -49,179 +52,37 @@ from memory_manipulation.link_matrix_ablation import patch_link_matrix
 from memory_manipulation.dynamic_n_controller import DynamicNController  
 from data.dataset_registry import get_dataset
 
-# ==========================================
-# 1. CONFIGURATION
-# ==========================================
-BATCH_SIZE = 16              # bucketed, so padding waste stays low even >1
-TOTAL_STEPS = 120000          
-LOG_EVERY = 100
-EVAL_EVERY = 1000            # curriculum-advance eval cadence; matches the runs that already produced usable data (fixed from 10)
-LR = 3e-4
-LR_MIN = 3e-5
-LR_DECAY_STEPS = TOTAL_STEPS       # cosine anneal from LR to LR_MIN over this many steps
-WARMUP_STEPS = 1000                # v3: linear LR warmup 0 -> LR before the cosine anneal starts
-USE_AMP = True
-SEED = 0
-AMP_INIT_SCALE = 128.0        
-
-MODEL_HIDDEN_SIZE = 512
-MODEL_NR_CELLS = 256               
-MODEL_CELL_SIZE = 192
-MODEL_READ_HEADS = 8
-
-# Dataset selection (see data/dataset_registry.py). Overridable via
-# --dataset-type / --dataset-link.
-DATASET_TYPE = "graph"       # "graph" | "text" | "audio" | "video" (only graph-traversal implemented)
-DATASET_LINK = None          # None / "graph-traversal" -> built-in synthetic graph curriculum
-
-
-CONTROLLER_TYPE = "lstm"
-
-# Mamba-1 hyperparameters - only meaningful when CONTROLLER_TYPE=="mamba".
-# Defaults are Mamba-1's own paper defaults (Gu & Dao 2024, Section 3.4).
-MAMBA_D_STATE = 16
-MAMBA_D_CONV = 4
-MAMBA_EXPAND = 2
-
-# v10: Mamba-2 hyperparameters - only meaningful when CONTROLLER_TYPE==
-# "mamba2" (mamba_controller/mamba2_controller.py's standalone, per-timestep
-# interleaved Mamba-2 DNC controller -- NOT the same thing as
-# SPLIT_GRAPH_MAMBA_VARIANT="mamba2" below, which drives mamba_ssm's Mamba2
-# over the whole sequence at once with no memory dependency; see
-# mamba2_controller.py's module docstring for the distinction). Defaults are
-# Mamba-2's own paper defaults (Dao & Gu 2024, Section 7.2: head_dim in
-# {64,128}); ngroups=1 matches every other Mamba-2 use in this project.
-MAMBA2_D_STATE = 64
-MAMBA2_D_CONV = 4
-MAMBA2_EXPAND = 2
-MAMBA2_HEADDIM = 64
-MAMBA2_NGROUPS = 1
-
-
-# v12: Mamba-3 (SISO) hyperparameters -- used by --controller mamba3 and
-# --split-graph-variant mamba3. d_state=64 matches the Mamba-2 setting here (paper: Mamba-3 @64 ~ Mamba-2 @128).
-# If the interleaved run OOMs, drop MAMBA3_D_STATE to 32 first (state is (B, H, headdim, d_state) fp32 per step).
-MAMBA3_D_STATE = 64
-MAMBA3_EXPAND = 2
-MAMBA3_HEADDIM = 64
-MAMBA3_ROPE_FRACTION = 0.5
-
-
-# v13: CfC (LNN, ncps) hyperparameters -- only meaningful when CONTROLLER_TYPE=="cfc".
-# backbone_units: width of CfC's shared backbone MLP (paper's own runs use 64-256; 512 = hidden size here).
-CFC_MODE = "default"          # "default" | "pure" | "no_gate"
-CFC_BACKBONE_UNITS = 512
-CFC_BACKBONE_LAYERS = 1
-CFC_BACKBONE_DROPOUT = 0.0
-CFC_ACTIVATION = "lecun_tanh"
-CFC_MIXED_MEMORY = False      # True = CfC-mmRNN (adds an LSTM cell)
-CFC_RESIDUAL = True
-HYBRID_CFC_NUM_BLOCKS = 1     # v14: CfC stage depth for "<mamba*>+cfc" controllers (Mamba stage depth = num_hidden_layers)
-
-# v8 (Alternate Phase 3, Step 2, Option 4): MoE-in-controller toggle and
-# hyperparameters -- only meaningful when CONTROLLER_TYPE=="mamba" (see
-# mamba_controller.py's MambaDNC: moe_enabled=True raises for any other
-# rnn_type today). num_experts=8 (>=4 required by SwitchMoE, per
-# Dead-End #45); expert_dim=None -> SwitchMoE's own default of
-# 3*hidden_size (MoE-Mamba's "3:3" active-parameter ratio);
-# load_balance_alpha=0.01 (Switch Transformers' own tuned value).
-MOE_ENABLED = False
-MOE_NUM_EXPERTS = 8
-MOE_EXPERT_DIM = None
-MOE_CAPACITY_FACTOR = 1.5
-MOE_LOAD_BALANCE_ALPHA = 0.01
-
-# v9 (Alternate Phase 3, Step 2, Option 5): split-compute-graph controller.
-# DISABLED BY DEFAULT -- the roadmap flags this as an untested,
-# isolated-ablation-required mechanism with no corpus-established failure
-# mode yet ("can have dangerous behaviour"). Must be explicitly turned on
-# via --split-graph; every existing invocation of this script is completely
-# unaffected unless that flag is passed.
-SPLIT_GRAPH_ENABLED = False
-SPLIT_GRAPH_MAMBA_VARIANT = "mamba1"   # "mamba1" | "mamba2"
-SPLIT_GRAPH_NUM_BLOCKS = 2             # mirrors num_hidden_layers's role
-SPLIT_GRAPH_MAMBA_HEADDIM = 64         # mamba2-only
-SPLIT_GRAPH_COMBINE_READS = True       # False = built-in ablation, see split_graph_dnc.py
-
-# v11: sequential-combiner mechanism. "linear" (default) reproduces the
-# existing, already-validated split-graph behavior exactly -- no existing
-# invocation of this script is affected unless --split-graph-combiner-mode
-# is passed explicitly. "controller" swaps in a real interleaved cell for
-# the addressing step; see split_graph_dnc.py's v11 docstring additions.
-SPLIT_GRAPH_COMBINER_MODE = "linear"
-SPLIT_GRAPH_COMBINER_VARIANT = "mamba1"   # "mamba1" | "mamba2" -- mamba1 is the recommended/expected choice
-SPLIT_GRAPH_COMBINER_NUM_BLOCKS = 1
-
-# Static Option 1 (link-matrix ablation/sparsification at fixed N). Defaults
-# are baseline/no-op so nothing changes for existing lstm/mamba KL-sweep
-# runs unless the new CLI flags below are explicitly passed.
-LINK_MATRIX_MODE = "dense"          # "dense" | "ablated" | "sparse_topk"
-LINK_MATRIX_TOPK = None             # required (int) only for "sparse_topk"
-ISOLATE_LINK_ABLATION = False       # True: hold nr_cells fixed at MODEL_NR_CELLS
-                                     # for the whole run (overrides LESSON_NR_CELLS
-                                     # to a constant list), so this run measures
-                                     # ONLY the link-matrix change -- never combine
-                                     # with Option 2's curriculum-indexed resize in
-                                     # the same run, per Concept 16/SP-10 isolation.
-
-# Dynamic-N, macro-scale (usage-triggered nr_cells growth, between episodes).
-# See Strategy_for_phase_3_step_2_options_1-2.md ("Whether Option 1 can be
-# made dynamic the same way" -> case (a), macro-scale) and
-# dynamic_n_controller.py for the actual trigger logic. Mutually exclusive
-# with LESSON_NR_CELLS-driven resize, same isolation discipline as
-# ISOLATE_LINK_ABLATION above (Concept 16/SP-10): DYNAMIC_N_MODE=True
-# overrides LESSON_NR_CELLS to a constant list (held at DYNAMIC_N_FLOOR) so
-# TraversalCurriculum.maybe_advance()'s curriculum-indexed resize never
-# fires this run -- all resizing instead goes through DynamicNController.
-DYNAMIC_N_MODE = False               # True: usage-triggered resize instead of LESSON_NR_CELLS
-DYNAMIC_N_FLOOR = 128                 # starting nr_cells when DYNAMIC_N_MODE=True (matches
-                                       # static Option 2's lesson-1 floor -- the whole point of
-                                       # "don't over-provision N" is to start small)
-DYNAMIC_N_CEILING = 512               # hard ceiling: Strategy doc flags the sparse-link-matrix
-                                       # approximation as only validated to N=512, and this also
-                                       # bounds worst-case O(N^2) link-matrix cost
-DYNAMIC_N_GROWTH_FACTOR = 2.0         # multiplicative step per growth event (128->256->512)
-DYNAMIC_N_USAGE_HIGH = 0.90           # a memory cell counts as "saturated" above this usage value
-DYNAMIC_N_TRIGGER_FRAC = 0.75         # growth trigger: EMA fraction of saturated cells exceeding this
-DYNAMIC_N_EMA_DECAY = 0.98            # smoothing for the per-episode saturation-fraction EMA --
-                                       # this is the "sustained, not a single-step spike" window
-                                       # signal the strategy doc's trigger-design point calls for
-DYNAMIC_N_COOLDOWN_STEPS = 2000       # steps to wait after a growth event before allowing another,
-                                       # so the model's addressing policy gets time to re-settle
-                                       # before the next resize (strategy doc point 3: a naive
-                                       # implementation could introduce a smaller version of the
-                                       # ANOM-142 threshold-collapse cliff at each growth event)
+from config.train_config import (
+    BATCH_SIZE, TOTAL_STEPS, LOG_EVERY, EVAL_EVERY, LR, LR_MIN, LR_DECAY_STEPS,
+    WARMUP_STEPS, USE_AMP, SEED, AMP_INIT_SCALE,
+    MODEL_HIDDEN_SIZE, MODEL_NR_CELLS, MODEL_CELL_SIZE, MODEL_READ_HEADS,
+    DATASET_TYPE, DATASET_LINK,
+    BETAS_TO_SWEEP, KL_ANNEAL_STEPS, LESSON_KL_DIP_STEPS, FREE_BITS, LOG_DIR,
+    OOD_EVAL_EPISODES, OOD_EVAL_EPISODES_PERIODIC,
+    BETA_MODE, BETA_CTRL_ACC_TARGET, BETA_CTRL_LR, BETA_CTRL_MIN, BETA_CTRL_MAX,
+    BETA_CTRL_EMA_DECAY,
+    PRIOR_SNAPSHOT_EVERY, PRIOR_MIN_LOGVAR, PRIOR_MAX_LOGVAR,
+    CHECKPOINT_DIR, CHECKPOINT_EVERY,
+)
+from config.controller_config import (
+    CONTROLLER_TYPE,
+    MAMBA_D_STATE, MAMBA_D_CONV, MAMBA_EXPAND,
+    MAMBA2_D_STATE, MAMBA2_D_CONV, MAMBA2_EXPAND, MAMBA2_HEADDIM, MAMBA2_NGROUPS,
+    MAMBA3_D_STATE, MAMBA3_EXPAND, MAMBA3_HEADDIM, MAMBA3_ROPE_FRACTION,
+    CFC_MODE, CFC_BACKBONE_UNITS, CFC_BACKBONE_LAYERS, CFC_BACKBONE_DROPOUT,
+    CFC_ACTIVATION, CFC_MIXED_MEMORY, CFC_RESIDUAL, HYBRID_CFC_NUM_BLOCKS,
+    MOE_ENABLED, MOE_NUM_EXPERTS, MOE_EXPERT_DIM, MOE_CAPACITY_FACTOR, MOE_LOAD_BALANCE_ALPHA,
+    SPLIT_GRAPH_ENABLED, SPLIT_GRAPH_MAMBA_VARIANT, SPLIT_GRAPH_NUM_BLOCKS,
+    SPLIT_GRAPH_MAMBA_HEADDIM, SPLIT_GRAPH_COMBINE_READS, SPLIT_GRAPH_COMBINER_MODE,
+    SPLIT_GRAPH_COMBINER_VARIANT, SPLIT_GRAPH_COMBINER_NUM_BLOCKS,
+    LINK_MATRIX_MODE, LINK_MATRIX_TOPK, ISOLATE_LINK_ABLATION,
+    DYNAMIC_N_MODE, DYNAMIC_N_FLOOR, DYNAMIC_N_CEILING, DYNAMIC_N_GROWTH_FACTOR,
+    DYNAMIC_N_USAGE_HIGH, DYNAMIC_N_TRIGGER_FRAC, DYNAMIC_N_EMA_DECAY,
+    DYNAMIC_N_COOLDOWN_STEPS,
+)
 
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
-
-# ---- Phase 1 additions ----------------------------------------------------
-BETAS_TO_SWEEP = [0.0]         # beta=0 anchored to Run 0 instead -- see header note
-KL_ANNEAL_STEPS = 8000 # ramp beta 0 -> target over this many steps
-LESSON_KL_DIP_STEPS = 100                            
-FREE_BITS = 0.02                          # per-dimension KL floor (nats); 0.0 disables
-LOG_DIR = "./phase1_logs"
-OOD_EVAL_EPISODES = 200
-
-# Dynamic beta (GECO-style dual ascent), task-accuracy constrained --
-# alternative to a fixed BETAS_TO_SWEEP entry. beta_target is reused as
-# the controller's live value: it still gets checkpointed/resumed/logged
-# via the existing beta_target plumbing with no extra state needed.
-BETA_MODE = "static"          # "static" (current sweep behavior, unchanged) or "dynamic"
-BETA_CTRL_ACC_TARGET = None  # task-accuracy floor the controller protects (0-1 frac)
-BETA_CTRL_LR = 2e-5           # rate-limit: max step per EVAL_EVERY cycle at constraint==1.0
-BETA_CTRL_MIN = 0.0
-BETA_CTRL_MAX = 2e-4          # hard ceiling -- 1e-3 is known to collapse, stay well clear
-BETA_CTRL_EMA_DECAY = 0.9     # smooths the constraint signal across eval cycles
-
-PRIOR_SNAPSHOT_EVERY = 2000
-PRIOR_MIN_LOGVAR = -6.0   # floor on log(Sigma_g) - prevents a silent Sigma_g -> 0 collapse
-PRIOR_MAX_LOGVAR = 6.0    # ceiling - symmetric guard against the fit blowing up
-OOD_EVAL_EPISODES_PERIODIC = 50   
-
-CHECKPOINT_DIR = "./phase1_checkpoints"
-CHECKPOINT_EVERY = 2000     
-
 
 def _first_nonfinite_report(tensor, name, step):
     """Silent when finite; prints once when not. Exists to bisect WHICH

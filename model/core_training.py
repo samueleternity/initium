@@ -98,14 +98,14 @@ def _first_nonfinite_report(tensor, name, step):
 
 def save_checkpoint(path, rnn, output_proj, stochastic_heads, optimizer,
                      curriculum, step, beta_target, run_id, scaler, ood_rng,
-                     controller_type=CONTROLLER_TYPE,  # v7: see model_config note below
+                     controller_type=CONTROLLER_TYPE,  
                      link_matrix_mode=LINK_MATRIX_MODE, link_matrix_topk=LINK_MATRIX_TOPK,  # Static Option 1
                      dynamic_n_mode=DYNAMIC_N_MODE, dynamic_n_state=None,  # Dynamic-N (macro-scale)
                      moe_enabled=MOE_ENABLED, moe_num_experts=MOE_NUM_EXPERTS,
                      moe_expert_dim=MOE_EXPERT_DIM, moe_capacity_factor=MOE_CAPACITY_FACTOR,
-                     moe_load_balance_alpha=MOE_LOAD_BALANCE_ALPHA,  # v8 (Option 4)
-                     split_graph_enabled=SPLIT_GRAPH_ENABLED,  # v9 (Option 5)
-                     split_graph_variant=SPLIT_GRAPH_MAMBA_VARIANT):
+                     moe_load_balance_alpha=MOE_LOAD_BALANCE_ALPHA,  
+                     split_graph_enabled=SPLIT_GRAPH_ENABLED,  
+                     split_graph_variant=SPLIT_GRAPH_MAMBA_VARIANT, extra_model_config=None):
     """Save everything needed to resume training or re-run eval later:
       - model + output-projection + optimizer state
       - LR is NOT saved separately -- it's now a pure function of `step`
@@ -233,6 +233,9 @@ def save_checkpoint(path, rnn, output_proj, stochastic_heads, optimizer,
             "cfc_activation": CFC_ACTIVATION, "cfc_mixed_memory": CFC_MIXED_MEMORY,
             "cfc_residual": CFC_RESIDUAL, "hybrid_cfc_num_blocks": HYBRID_CFC_NUM_BLOCKS,
         })
+
+    if extra_model_config:  # v19: dataset type / dims / split-graph details, read by inference/
+        model_config.update(extra_model_config)
 
     torch.save({
         "step": step,
@@ -631,6 +634,30 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
         ).to(device)
 
     combiner_stage_kinds = getattr(getattr(rnn, "combiner_wrapper", None), "stage_kinds", None)  # set only for a hybrid ("<kind>+<kind>") split-graph combiner; None otherwise
+    # v19: self-describing metadata for inference/ (capabilities + exact rebuild)
+    extra_model_config = {
+        "dataset_type": dataset_type,
+        "dataset_name": dataset.name,
+        "supported_dataset_types": [dataset_type],   # use ["*"] for a future multi-modal model
+        "input_dim": INPUT_DIM,
+        "output_dim": TRIPLE_DIM,
+        "num_hidden_layers": getattr(rnn, "num_hidden_layers", None),
+        "split_graph_num_blocks": split_graph_num_blocks,
+        "split_graph_headdim": split_graph_headdim,
+        "split_graph_combine_reads": split_graph_combine_reads,
+        "split_graph_combiner_mode": split_graph_combiner_mode,
+        "split_graph_combiner_variant": split_graph_combiner_variant,
+        "split_graph_combiner_num_blocks": split_graph_combiner_num_blocks,
+        "split_graph_mamba_hparams": (
+            dict(d_state=_sg_d_state, d_conv=_sg_d_conv, expand=_sg_expand)
+            if split_graph_enabled else None),
+        "split_graph_cfc_kwargs": (
+            dict(mode=CFC_MODE, backbone_units=CFC_BACKBONE_UNITS,
+                 backbone_layers=CFC_BACKBONE_LAYERS, backbone_dropout=CFC_BACKBONE_DROPOUT,
+                 activation=CFC_ACTIVATION, mixed_memory=CFC_MIXED_MEMORY,
+                 residual=CFC_RESIDUAL)
+            if split_graph_enabled else None),
+    }
 
     if link_matrix_mode != "dense":
         patch_link_matrix(rnn, mode=link_matrix_mode, topk=link_matrix_topk)
@@ -1190,7 +1217,8 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
                              moe_expert_dim=moe_expert_dim, moe_capacity_factor=moe_capacity_factor,
                              moe_load_balance_alpha=moe_load_balance_alpha,
                              split_graph_enabled=split_graph_enabled,  
-                             split_graph_variant=split_graph_variant)            
+                             split_graph_variant=split_graph_variant,
+                             extra_model_config=extra_model_config)            
             latest_path = os.path.join(CHECKPOINT_DIR, f"{run_id}_latest.pt")
             shutil.copyfile(ckpt_path, latest_path)
 
@@ -1383,12 +1411,16 @@ if __name__ == "__main__":
                               "cell instead (see --split-graph-combiner-variant).")
     parser.add_argument("--split-graph-combiner-variant", type=str, default=SPLIT_GRAPH_COMBINER_VARIANT,
                          choices=["mamba1", "mamba2", "mamba3", "cfc",
-                                  "mamba+cfc", "mamba2+cfc", "mamba3+cfc"],
+                                  "mamba+cfc", "mamba2+cfc", "mamba3+cfc",
+                                  "cfc+cfc", "mamba+mamba", "mamba2+mamba2", "mamba3+mamba3"],
                          help="v11: which controller drives the sequential combiner when "
                               "--split-graph-combiner-mode=controller. 'mamba1' is the "
                               "recommended/efficient choice; 'mamba2' is wired but not "
                               "expected to be used (known inefficient, same reason plain "
-                              "--controller mamba2 runs aren't pursued).")
+                              "--controller mamba2 runs aren't pursued). Same-kind stacks "
+                              "(e.g. 'cfc+cfc') isolate depth from cross-kind mixing -- "
+                              "hybrid_controller.py's STAGE_KINDS already supports "
+                              "duplicated kinds, this just widens the CLI's accepted list.")
     parser.add_argument("--split-graph-combiner-num-blocks", type=int, default=SPLIT_GRAPH_COMBINER_NUM_BLOCKS,
                          help="Number of stacked blocks in the controller combiner "
                               "(--split-graph-combiner-mode=controller only). Kept small "

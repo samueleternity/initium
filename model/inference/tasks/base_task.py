@@ -1,0 +1,49 @@
+"""
+file: inference/tasks/base_task.py
+
+Interface the inference engine talks to (counterpart of data/base_dataset.py).
+Any new type (text, audio, video, ...) implements BaseInferenceTask and
+registers itself in task_registry.py; the engine never imports anything
+task-specific.
+
+Contract:
+    dataset_type : canonical type string matched against the checkpoint's
+                   supported_dataset_types (e.g. "graph")
+    input_dim    : model input width the task produces (DNC input_size)
+    output_dim   : output_proj width the task's scoring expects
+    build_episodes(n, rng) -> list[Episode]
+    score_episode(output, episode, verbose) -> EpisodeScore
+        `output` is the post-output_proj (T, output_dim) CPU tensor.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import List
+
+import torch
+
+from inference.metrics import EpisodeScore
+
+
+@dataclass
+class Episode:
+    input_seq: torch.Tensor          # (T, input_dim)
+    target: torch.Tensor             # task-defined, aligned with input_seq's time axis
+    mask: torch.Tensor               # (T,) 1 where a step is scored
+    meta: dict = field(default_factory=dict)
+
+
+class BaseInferenceTask:
+    name: str = "base"
+    dataset_type: str = "base"
+    input_dim: int = None
+    output_dim: int = None
+
+    def build_episodes(self, n: int, rng) -> List[Episode]:
+        raise NotImplementedError
+
+    def score_episode(self, output: torch.Tensor, episode: Episode, verbose: bool = False) -> EpisodeScore:
+        raise NotImplementedError
+
+    def describe(self) -> str:
+        return self.name

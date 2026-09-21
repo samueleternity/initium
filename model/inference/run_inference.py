@@ -3,14 +3,18 @@ file: inference/run_inference.py
 
 CLI entrypoint (counterpart of core_training.py's __main__). Flow:
   load checkpoint -> detect capabilities -> REFUSE if requested dataset type /
-  dims are unsupported -> build task -> rebuild model + load weights -> run ->
-  summarize/log.
+  dims are unsupported -> build task -> rebuild model + load weights ->
+  (optional) set up caches -> run -> summarize/log.
 
 Examples (from the project root):
   python -m inference.run_inference CKPT.pt
   python -m inference.run_inference CKPT.pt --inspect
   python -m inference.run_inference CKPT.pt --no-reset-experience --loop 50 --window 10 --compare-fresh
   python -m inference.run_inference CKPT.pt --dataset-link my_graph.csv --path-length 3 8
+  # caching (see inference/cache/):
+  python -m inference.run_inference CKPT.pt --shared-context --cache prefix
+  python -m inference.run_inference CKPT.pt --shared-context --num-contexts 3 --cache prefix,result --cache-dir ./inference_cache
+  python -m inference.run_inference CKPT.pt --no-reset-experience --loop 50 --cache result --cache-dir ./inference_cache
 """
 import os
 import sys
@@ -30,6 +34,11 @@ from inference.inference_config import (
     INFERENCE_LOG_DIR, DEFAULT_DATASET_TYPE, DEFAULT_DATASET_LINK, DEFAULT_NUM_EPISODES,
     DEFAULT_WINDOW, DEFAULT_SEED, DEFAULT_VERBOSE_N, PROGRESS_EVERY,
 )
+from inference.cache.cache_config import (
+    DEFAULT_CACHE, DEFAULT_CACHE_RAM_MB, DEFAULT_CACHE_DISK_MB, DEFAULT_VERIFY_HITS,
+)
+from inference.cache.cache_registry import parse_cache_spec, setup_caches
+from inference.cache.cached_engine import CachedInferenceEngine
 from inference.checkpoint_io import load_checkpoint, describe_checkpoint
 from inference.capabilities import (
     detect_capabilities, require_type_supported, require_dims_match, IncompatibleModelError,
@@ -65,6 +74,11 @@ def parse_args(argv=None):
                    help="persistent mode: also replay the SAME episodes with reset each episode and report the delta.")
     p.add_argument("--path-length", type=int, nargs=2, metavar=("MIN", "MAX"), default=None,
                    help="graph task: walk length range (default: the training-time OOD range).")
+    p.add_argument("--shared-context", action="store_true",
+                   help="graph task: every episode = ONE fixed edge listing (static prefix) + a fresh "
+                        "random query. Required for the prefix cache to have anything to reuse.")
+    p.add_argument("--num-contexts", type=int, default=1,
+                   help="with --shared-context: number of distinct fixed edge listings, used round-robin.")
     p.add_argument("--seed", type=int, default=DEFAULT_SEED)
     p.add_argument("--device", type=str, default=None, help="default: cuda:0 if available, else cpu")
     p.add_argument("--deterministic-write", action="store_true",
@@ -81,6 +95,25 @@ def parse_args(argv=None):
                         '\'{"split_graph_num_blocks": 3}\' (for legacy checkpoints).')
     p.add_argument("--inspect", action="store_true",
                    help="print the checkpoint's config + capabilities and exit.")
+
+    g = p.add_argument_group("caching (inference/cache/)")
+    g.add_argument("--cache", type=str, default=DEFAULT_CACHE,
+                   help="off | prefix | result | prefix,result | all. 'prefix' = snapshot the model state "
+                        "after a static prefix and resume queries from it (needs --shared-context and "
+                        "reset-experience). 'result' = memoize whole-episode outputs (deterministic models).")
+    g.add_argument("--no-cache", action="store_true", help="force caching off (overrides --cache).")
+    g.add_argument("--cache-dir", type=str, default=None,
+                   help="enable the disk tier here, so caches survive across CLI invocations "
+                        "(one sub-folder per model fingerprint).")
+    g.add_argument("--cache-ram-mb", type=float, default=DEFAULT_CACHE_RAM_MB, help="RAM tier size cap.")
+    g.add_argument("--cache-disk-mb", type=float, default=DEFAULT_CACHE_DISK_MB, help="disk tier size cap.")
+    g.add_argument("--cache-verify", type=int, default=DEFAULT_VERIFY_HITS,
+                   help="recompute the first N cache hits without the cache and compare "
+                        "(0 = off). On mismatch the cache is disabled for the rest of the run.")
+    g.add_argument("--cache-clear", action="store_true", help="wipe this model's disk cache before running.")
+    g.add_argument("--cache-allow-stochastic", action="store_true",
+                   help="allow caching even if the model samples its write vectors (results are then "
+                        "one random draw reused; verification is skipped).")
     args = p.parse_args(argv)
 
     if args.loop is not None and args.reset_experience:
@@ -93,6 +126,12 @@ def parse_args(argv=None):
         v = getattr(args, name)
         if v is not None and v < 1:
             p.error(f"--{name.replace('_', '-')} must be >= 1")
+    if args.num_contexts > 1 and not args.shared_context:
+        p.error("--num-contexts requires --shared-context")
+    try:
+        parse_cache_spec(args.cache)
+    except ValueError as e:
+        p.error(str(e))
     if args.model_config_override is not None:
         try:
             args.model_config_override = json.loads(args.model_config_override)
@@ -117,7 +156,8 @@ def main(argv=None) -> int:
     # ---- compatibility gates (cheap, BEFORE building anything) --------------
     try:
         canon = require_type_supported(caps, args.dataset_type, args.checkpoint)
-        task = get_task(canon, args.dataset_link, path_length_range=args.path_length)
+        task = get_task(canon, args.dataset_link, path_length_range=args.path_length,
+                        shared_context=args.shared_context, num_contexts=args.num_contexts)
         require_dims_match(caps, task, args.checkpoint)
     except (IncompatibleModelError, NotImplementedError, ValueError, FileNotFoundError) as e:
         raise SystemExit(f"[inference] ABORT: {e}")
@@ -136,7 +176,34 @@ def main(argv=None) -> int:
 
     rng = random.Random(args.seed)
     episodes = task.build_episodes(n, rng)          # materialized -> identical episodes for --compare-fresh
-    engine = InferenceEngine(loaded.rnn, loaded.output_proj, task, device, ablate_memory=args.ablate_memory)
+
+    # ---- caches ---------------------------------------------------------------
+    caches, cache_notes, cache_fp = [], [], None
+    if not args.no_cache:
+        caches, cache_notes, cache_fp = setup_caches(
+            args.cache, ckpt=ckpt, device=device, sampled_writes=loaded.sampled_writes,
+            deterministic_write=args.deterministic_write, ablate_memory=args.ablate_memory,
+            cache_dir=args.cache_dir, ram_mb=args.cache_ram_mb, disk_mb=args.cache_disk_mb,
+            clear=args.cache_clear, allow_stochastic=args.cache_allow_stochastic)
+    for note in cache_notes:
+        print(f"[inference] cache: {note}")
+    if caches:
+        print(f"[inference] cache: {', '.join(c.name for c in caches)} | model fingerprint "
+              f"{cache_fp[:12]} | RAM {args.cache_ram_mb:.0f} MB"
+              + (f" | disk {args.cache_dir}" if args.cache_dir else ""))
+        if any(c.wants_boundaries for c in caches) and not any(ep.cache_boundaries for ep in episodes):
+            cache_notes.append("prefix cache is on but no episode declares a static prefix "
+                               "(use --shared-context); it will not hit.")
+            print(f"[inference] cache: {cache_notes[-1]}")
+
+    if caches:
+        engine = CachedInferenceEngine(
+            loaded.rnn, loaded.output_proj, task, device, caches,
+            ablate_memory=args.ablate_memory,
+            verify_hits=(0 if loaded.sampled_writes else args.cache_verify))
+    else:
+        engine = InferenceEngine(loaded.rnn, loaded.output_proj, task, device,
+                                 ablate_memory=args.ablate_memory)
 
     t0 = time.time()
     print(f"[inference] running {n} episodes | reset_experience={reset}")
@@ -144,15 +211,31 @@ def main(argv=None) -> int:
                          progress_every=PROGRESS_EVERY)
     scores = [r.score for r in results]
 
+    tags = [args.run_id_suffix,
+            ("cache-" + "+".join(c.name for c in caches)) if caches else None,
+            "sharedctx" if args.shared_context else None]
+    suffix = "_".join(t for t in tags if t) or None
+
     summary = {
-        "run_id": rl.make_run_id(args.checkpoint, task.name, reset, n, args.run_id_suffix),
+        "run_id": rl.make_run_id(args.checkpoint, task.name, reset, n, suffix),
         "checkpoint": args.checkpoint, "checkpoint_step": loaded.step, "controller": caps.controller_type,
         "supported_types": caps.supported_types, "capabilities_source": caps.source,
         "dataset_type": canon, "dataset_link": args.dataset_link, "task": task.describe(),
         "mode": "fresh" if reset else "persistent", "reset_experience": reset,
         "seed": args.seed, "sampled_writes": loaded.sampled_writes, "ablate_memory": args.ablate_memory,
         "result": aggregate(scores),
+        "mean_episode_ms": sum(r.elapsed_ms for r in results) / max(len(results), 1),
     }
+    if caches:
+        summary["cache"] = {
+            "requested": args.cache, "active": [c.name for c in caches],
+            "model_fingerprint": cache_fp, "disk_dir": args.cache_dir,
+            "report": engine.cache_report(reset=True), "verify": dict(engine.verify),
+            "store": caches[0].store.info(), "notes": cache_notes + engine.notes,
+        }
+    elif cache_notes:
+        summary["cache"] = {"requested": args.cache, "active": [], "notes": cache_notes,
+                            "report": {}, "disk_dir": None}
     if not reset:
         summary["windows"] = windowed(scores, args.window)
         summary["adaptation"] = adaptation_trend(scores, args.window)
@@ -162,6 +245,9 @@ def main(argv=None) -> int:
             summary["fresh_baseline"] = aggregate([r.score for r in fresh])
             summary["persistent_minus_fresh_item_acc"] = (
                 summary["result"]["item_acc"] - summary["fresh_baseline"]["item_acc"])
+            if caches:
+                summary["cache"]["baseline_report"] = engine.cache_report(reset=True)
+                summary["cache"]["notes"] = cache_notes + engine.notes
     summary["elapsed_sec"] = time.time() - t0
 
     if not args.no_log:

@@ -33,7 +33,7 @@ class EpisodeResult:
     score: EpisodeScore
     elapsed_ms: float
     reset_experience: bool
-
+    cache_event: str = ""            # "", "miss", "hit:result", "hit:prefix@22", ...
 
 def aggregate(scores: List[EpisodeScore]) -> dict:
     n_eps = len(scores)

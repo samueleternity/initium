@@ -31,6 +31,10 @@ class Episode:
     target: torch.Tensor             # task-defined, aligned with input_seq's time axis
     mask: torch.Tensor               # (T,) 1 where a step is scored
     meta: dict = field(default_factory=dict)
+    # Step indices where the model state may be snapshotted/reused (sorted). Everything
+    # before a boundary is a static prefix identical across episodes; no scored step
+    # (mask==1) may lie before a boundary. Empty -> nothing cacheable by the prefix cache.
+    cache_boundaries: List[int] = field(default_factory=list)
 
 
 class BaseInferenceTask:

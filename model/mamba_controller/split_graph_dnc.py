@@ -367,6 +367,7 @@ class SplitGraphDNC(nn.Module):
         reset_experience: bool = False,
         pass_through_memory: bool = True,
         combiner_skip_stages=None,
+        start_step: int = 0,   # v20: resume the sequential loop mid-sequence (inference caching)
     ):
         """
         input: (B, T, input_size) -- batch-first, the whole padded episode
@@ -391,6 +392,14 @@ class SplitGraphDNC(nn.Module):
         """
         chx, mhx, last_read = hx
         B, T, _ = input.shape
+        if start_step:
+            # Backbone still runs over the FULL input (cheap, parallel, stateless across
+            # calls); only the sequential memory loop is skipped for t < start_step.
+            # hx must then carry the state as of step `start_step`.
+            if not (0 < start_step < T):
+                raise ValueError(f"start_step={start_step} must be in (0, T={T})")
+            if mhx is None:
+                raise ValueError("start_step>0 requires a resumed hx=(chx, mhx, last_read)")
         device = input.device
 
         # ---- (a) PARALLEL BACKBONE ------------------------------------
@@ -437,7 +446,7 @@ class SplitGraphDNC(nn.Module):
             )
 
         outputs = []
-        for t in range(T):
+        for t in range(start_step, T):
             h_t = H[:, t, :]  # (B, hidden_size)
 
             if self.combiner_mode == "controller":

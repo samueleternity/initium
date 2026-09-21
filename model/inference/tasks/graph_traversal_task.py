@@ -24,9 +24,12 @@ import os
 import random
 from typing import List, Tuple
 
+import torch
+
 from data.graph_traversal.graph_traversal import (
     INPUT_DIM, TRIPLE_DIM, LABEL_RANGE, OOD_PATH_LENGTH_RANGE,
     build_london_underground_eval, build_traversal_episode_from_graph, decode_prediction,
+    encode_triple, triple_to_digit_targets,
 )
 from inference.metrics import EpisodeScore
 from inference.tasks.base_task import BaseInferenceTask, Episode
@@ -113,7 +116,8 @@ class GraphTraversalTask(BaseInferenceTask):
     input_dim = INPUT_DIM
     output_dim = TRIPLE_DIM
 
-    def __init__(self, dataset_link=None, path_length_range=None):
+    def __init__(self, dataset_link=None, path_length_range=None,
+                 shared_context=False, num_contexts=1):
         if path_length_range is not None:
             lo, hi = path_length_range
             if lo < 1 or hi < lo:
@@ -121,6 +125,12 @@ class GraphTraversalTask(BaseInferenceTask):
             self.path_length_range = (int(lo), int(hi))
         else:
             self.path_length_range = tuple(OOD_PATH_LENGTH_RANGE)
+
+        if int(num_contexts) < 1:
+            raise ValueError("num_contexts must be >= 1")
+        if int(num_contexts) > 1 and not shared_context:
+            raise ValueError("num_contexts > 1 requires shared_context=True")
+        self.shared_context, self.num_contexts = bool(shared_context), int(num_contexts)
 
         if dataset_link in BUILTIN_LINKS:
             self.edges, self.node_labels, self.adjacency = build_london_underground_eval()
@@ -136,11 +146,14 @@ class GraphTraversalTask(BaseInferenceTask):
             raise ValueError("test graph has no outgoing edges; cannot build traversal episodes")
 
     def describe(self) -> str:
+        shared = f" | shared context x{self.num_contexts}" if self.shared_context else ""
         return (f"{self.name} | {self.source_desc} | {len(self.node_labels)} nodes, "
-                f"{len(self.edges)} edges | walk length {self.path_length_range}")
+                f"{len(self.edges)} edges | walk length {self.path_length_range}{shared}")
 
     def build_episodes(self, n: int, rng) -> List[Episode]:
         episodes, attempts = [], 0
+        if self.shared_context:
+            return self._build_shared_context_episodes(n, rng)
         while len(episodes) < n:
             attempts += 1
             if attempts > 100 * n + 1000:
@@ -153,6 +166,64 @@ class GraphTraversalTask(BaseInferenceTask):
             input_seq, target_digits, answer_mask = ep
             episodes.append(Episode(input_seq, target_digits, answer_mask,
                                     meta={"walk_length": int(answer_mask.sum().item())}))
+        return episodes
+
+        # ---- shared-context episodes (static prefix -> cacheable) ----------------
+    def _make_context(self, rng) -> torch.Tensor:
+        """One fixed, shuffled edge listing: the static prefix shared by many queries."""
+        shuffled = list(self.edges)
+        rng.shuffle(shuffled)
+        return torch.stack([encode_triple(s, e, d, 1.0 if i == 0 else 0.0, 0.0)
+                            for i, (s, e, d) in enumerate(shuffled)])
+
+    def _build_query(self, rng):
+        """Walk + answer steps only (mirrors the second half of
+        build_traversal_episode_from_graph). -> (inputs, target_digits, mask) or None."""
+        path_length = rng.randint(*self.path_length_range)
+        cur = rng.randrange(len(self.node_labels))
+        walk = []
+        for _ in range(path_length):
+            if not self.adjacency[cur]:
+                break
+            dst_idx, edge_label = rng.choice(self.adjacency[cur])
+            walk.append((cur, edge_label, dst_idx))
+            cur = dst_idx
+        if not walk:
+            return None
+        steps, targets, mask = [], [], []
+        for i, (src_idx, edge_label, _dst) in enumerate(walk):
+            src = self.node_labels[src_idx] if i == 0 else None
+            steps.append(encode_triple(src, edge_label, None, 1.0 if i == 0 else 0.0, 0.0))
+            targets.append([0] * 9)
+            mask.append(0)
+        for i, (src_idx, edge_label, dst_idx) in enumerate(walk):
+            steps.append(encode_triple(None, None, None, 1.0 if i == 0 else 0.0, 1.0))
+            targets.append(triple_to_digit_targets(
+                self.node_labels[src_idx], edge_label, self.node_labels[dst_idx]))
+            mask.append(1)
+        return (torch.stack(steps), torch.tensor(targets, dtype=torch.long),
+                torch.tensor(mask, dtype=torch.float32))
+
+    def _build_shared_context_episodes(self, n: int, rng) -> List[Episode]:
+        contexts = [self._make_context(rng) for _ in range(self.num_contexts)]
+        episodes, attempts = [], 0
+        while len(episodes) < n:
+            attempts += 1
+            if attempts > 100 * n + 1000:
+                raise RuntimeError("could not build enough episodes from this graph")
+            q = self._build_query(rng)
+            if q is None:
+                continue
+            k = len(episodes) % self.num_contexts
+            ctx_seq, (q_in, q_tgt, q_mask) = contexts[k], q
+            P = ctx_seq.shape[0]
+            episodes.append(Episode(
+                torch.cat([ctx_seq, q_in]),
+                torch.cat([torch.zeros(P, 9, dtype=torch.long), q_tgt]),
+                torch.cat([torch.zeros(P), q_mask]),
+                meta={"walk_length": int(q_mask.sum().item()), "context_id": k},
+                cache_boundaries=[P],
+            ))
         return episodes
 
     def score_episode(self, output, episode: Episode, verbose: bool = False) -> EpisodeScore:

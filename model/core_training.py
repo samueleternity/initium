@@ -84,6 +84,16 @@ from config.controller_config import (
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
 
+def _arch_desc(controller, sg_enabled, sg_variant, sg_blocks,
+               sg_comb_mode, sg_comb_variant, sg_comb_blocks, sg_combine_reads):
+    if not sg_enabled:
+        return f"controller={controller}"
+    if sg_comb_mode == "controller":
+        comb = f"controller:{sg_comb_variant}x{sg_comb_blocks}"
+    else:
+        comb = "linear" if sg_combine_reads else "none(no-combine)"
+    return f"split-graph[backbone={sg_variant}x{sg_blocks} | combiner={comb}]"
+
 def _first_nonfinite_report(tensor, name, step):
     """Silent when finite; prints once when not. Exists to bisect WHICH
     pipeline stage a NaN/Inf first appears at, since the LOG_EVERY-averaged
@@ -472,8 +482,11 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
 
     print(f"[{run_id}] Model config: hidden={hidden_size} nr_cells={nr_cells} "
           f"cell_size={cell_size} read_heads={read_heads} | beta={beta_target} "
-          f"| controller={controller}"
-          f"| moe={'on(' + str(moe_num_experts) + 'e)' if moe_enabled else 'off'}") 
+          f"| " + _arch_desc(controller, split_graph_enabled, split_graph_variant,
+                             split_graph_num_blocks, split_graph_combiner_mode,
+                             split_graph_combiner_variant, split_graph_combiner_num_blocks,
+                             split_graph_combine_reads)
+          + (f" | moe={moe_num_experts}e" if moe_enabled else ""))
     
 
     if isolate_link_ablation:
@@ -574,9 +587,7 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
                   f"Concept 16/SP-10 says must be isolated before combining. The combination will be considered in distant future "
                   f"SplitGraphDNC does not wire MoE into its backbone (see "
                   f"split_graph_dnc.py) -- moe_enabled will be silently ignored this run.")
-        print(f"[{run_id}] Option 5 (split compute graph) ENABLED | "
-              f"mamba_variant={split_graph_variant} | num_blocks={split_graph_num_blocks} | "
-              f"combine_reads={split_graph_combine_reads}")
+            
         # v10: variant-matched hyperparameter defaults instead of always
         # reusing the Mamba-1 constants here -- harmless previously (any
         # d_state/headdim is accepted), but not what the SSD paper's own
@@ -691,6 +702,8 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
     param_count = sum(p.numel() for p in rnn.parameters()) + \
                   sum(p.numel() for p in output_proj.parameters())
     amp_enabled = USE_AMP and device.type == 'cuda'
+    kl_on = stochastic_heads[0].sample   # False when beta==0 -> no KL/prior terms in console
+    print(f"[{run_id}] params {param_count} | kl_terms={'on' if kl_on else 'off'} | amp={'on' if amp_enabled else 'off'}")
     scaler = torch.amp.GradScaler('cuda', enabled=amp_enabled, init_scale=AMP_INIT_SCALE)
 
     # Dynamic-N (macro-scale): None unless dynamic_n_mode -- every call site
@@ -1043,19 +1056,27 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
             if dynamic_n_ctrl is not None:
                 dyn_n_str = (f"| dynN[nr_cells {rnn.memories[0].nr_cells} frac_sat {last_frac_saturated:.3f} "
                             f"ema {dynamic_n_ctrl.ema:.3f} cooldown {dynamic_n_ctrl.cooldown_remaining}] ")
-            print(f"[{run_id}] Step {step}/{total_steps} | Lesson {curriculum.lesson + 1}/{len(curriculum.table)} "                  
-                  f"| L_task {avg_task:.4f} | L_KL {avg_kl:.4f} | beta {beta_eff:.4f} "
-                  f"| KL_contrib {kl_contrib:.4f} "
-                  f"| diversity {avg_div:.2f} | {LOG_EVERY / elapsed:.2f} steps/s "
-                  f"| KL[mean {kl_diag['kl_mean']:.4f} max {kl_diag['kl_max']:.4f}] | LR {current_lr:.6f} "
-                  f"| grad_norm {avg_grad_norm:.4f} | amp_scale {amp_scale:.1f}"
-                  f"| clamp_frac {kl_diag['clamp_frac']:.4f}"
-                  f"| floor_frac {kl_diag['floor_frac']:.4f}"
-                  f"| snapshot_step {kl_diag['snapshot_step']}"
-                  f"| gpu_mem_peak_mb {gpu_mem_peak_mb:.1f} | params {param_count}"
-                  f"| moe_aux {float(moe_aux_loss):.4f} | moe_cv_load {moe_diag.get('moe_cv_load', 0.0):.4f} "
-                  f"| moe_max_load_frac {moe_diag.get('moe_max_load_frac', 0.0):.4f}"
-                  f"| {dyn_n_str}")                 
+                
+            parts = [f"[{run_id}] Step {step}/{total_steps} | Lesson {curriculum.lesson + 1}/{len(curriculum.table)}",
+                     f"L_task {avg_task:.4f}"]
+            if kl_on:
+                parts += [f"L_KL {avg_kl:.4f}", f"beta {beta_eff:.4f}", f"KL_contrib {kl_contrib:.4f}",
+                          f"KL[mean {kl_diag['kl_mean']:.4f} max {kl_diag['kl_max']:.4f}]",
+                          f"clamp_frac {kl_diag['clamp_frac']:.4f}", f"floor_frac {kl_diag['floor_frac']:.4f}",
+                          f"snapshot_step {kl_diag['snapshot_step']}"]
+            parts += [f"diversity {avg_div:.2f}", f"{LOG_EVERY / elapsed:.2f} steps/s",
+                      f"LR {current_lr:.6f}", f"grad_norm {avg_grad_norm:.4f}"]
+            if amp_enabled:
+                parts.append(f"amp_scale {amp_scale:.1f}")
+            parts.append(f"gpu_mem_peak_mb {gpu_mem_peak_mb:.1f}")
+            if moe_enabled:
+                parts += [f"moe_aux {float(moe_aux_loss):.4f}",
+                          f"moe_cv_load {moe_diag.get('moe_cv_load', 0.0):.4f}",
+                          f"moe_max_load_frac {moe_diag.get('moe_max_load_frac', 0.0):.4f}"]
+            if dyn_n_str:
+                parts.append(dyn_n_str.strip(" |"))
+            print(" | ".join(parts))  
+
             log_writer.writerow([
                 step, curriculum.lesson + 1, beta_eff,
                 avg_task, avg_kl, kl_contrib, avg_task + kl_contrib, avg_div,
@@ -1071,7 +1092,7 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
             log_file.flush()
             running_task_loss, running_kl_loss, running_div, running_grad_norm = 0.0, 0.0, 0, 0.0
 
-        if step % PRIOR_SNAPSHOT_EVERY == 0:
+        if kl_on and step % PRIOR_SNAPSHOT_EVERY == 0:
             # v5 (Phase 2): refit (mu_g, Sigma_g) from the writes
             # accumulated since the last snapshot, freeze the result into
             # every stochastic write head's buffers, and log a summary.
@@ -1105,9 +1126,10 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
 
             if curriculum.lesson != pre_advance_lesson:
                 lesson_dip_start_step = step
-                print(f"[{run_id}] Step {step} lesson advance {pre_advance_lesson + 1}->"
-                    f"{curriculum.lesson + 1}: KL briefly dipping and ramping back up "
-                    f"over the next {LESSON_KL_DIP_STEPS} steps (global anneal unaffected).")
+                if kl_on:
+                    print(f"[{run_id}] Step {step} lesson advance {pre_advance_lesson + 1}->"
+                          f"{curriculum.lesson + 1}: KL briefly dipping and ramping back up "
+                          f"over the next {LESSON_KL_DIP_STEPS} steps (global anneal unaffected).")
             if beta_mode == "dynamic":
                 # Hard safety ceiling -- enforced every eval cycle unconditionally,
                 # independent of the health gate below. Without this, starting
@@ -1411,7 +1433,7 @@ if __name__ == "__main__":
                               "cell instead (see --split-graph-combiner-variant).")
     parser.add_argument("--split-graph-combiner-variant", type=str, default=SPLIT_GRAPH_COMBINER_VARIANT,
                          choices=["mamba1", "mamba2", "mamba3", "cfc",
-                                  "mamba+cfc", "mamba2+cfc", "mamba3+cfc",
+                                  "mamba+cfc", "mamba2+cfc", "mamba3+cfc", "cfc+mamba",
                                   "cfc+cfc", "mamba+mamba", "mamba2+mamba2", "mamba3+mamba3"],
                          help="v11: which controller drives the sequential combiner when "
                               "--split-graph-combiner-mode=controller. 'mamba1' is the "

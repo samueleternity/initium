@@ -439,7 +439,7 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
     if not resuming:
         prior_log_writer.writerow([
             "step", "snapshot_step", "mu_g_norm",
-            "sigma_g_mean", "sigma_g_min", "sigma_g_max", "trace_sigma_g", "n_samples",
+            "sigma_g_mean", "sigma_g_min", "sigma_g_max", "trace_sigma_g", "n_samples", "raw_var_mean", "raw_var_max", "raw_hi_frac",
         ])
 
     curriculum = dataset.make_curriculum()
@@ -865,7 +865,7 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
             load_prior_state(stochastic_heads, ckpt["prior_state"])
         else:
             print(f"[{run_id}] WARNING: checkpoint predates the learned-prior "
-                  f"snapshot (v5/Phase 2) -- prior starting fresh at N(0,I) "
+                  f"snapshot (v5/Phase 2) - prior starting fresh at N(0,I) "
                   f"instead of resuming a prior snapshot.")
         # v6: restore the dedicated OOD-sampling RNG's state, so a resumed
         # run's OOD walk sequence continues from exactly where the
@@ -1112,11 +1112,12 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
                   f"diag(Sigma_g) mean/min/max {snap_diag['sigma_g_mean']:.4f}/"
                   f"{snap_diag['sigma_g_min']:.4f}/{snap_diag['sigma_g_max']:.4f} | "
                   f"trace(Sigma_g) {snap_diag['trace_sigma_g']:.4f} | "
-                  f"n_samples {snap_diag['n_samples']}")
+                  f"n_samples {snap_diag['n_samples']} " 
+                  f" | raw_var mean/max {snap_diag['raw_var_mean']:.3f}/{snap_diag['raw_var_max']:.3f} hi_frac {snap_diag['raw_hi_frac']:.2f}")
             prior_log_writer.writerow([
                 step, snap_diag["snapshot_step"], snap_diag["mu_g_norm"],
                 snap_diag["sigma_g_mean"], snap_diag["sigma_g_min"], snap_diag["sigma_g_max"],
-                snap_diag["trace_sigma_g"], snap_diag["n_samples"],
+                snap_diag["trace_sigma_g"], snap_diag["n_samples"], snap_diag["raw_var_mean"], snap_diag["raw_var_max"], snap_diag["raw_hi_frac"],
             ])
             prior_log_file.flush()
 

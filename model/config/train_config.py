@@ -55,7 +55,7 @@ BETA_CTRL_EMA_DECAY = 0.9     # smooths the constraint signal across eval cycles
 # See stochastic_write_head_v2.py (update_prior_snapshot) for what these gate.
 PRIOR_SNAPSHOT_EVERY = 2000
 PRIOR_MIN_LOGVAR = -6.0       # floor on log(Sigma_g), prevents silent collapse
-PRIOR_MAX_LOGVAR = 6.0        # symmetric ceiling
+PRIOR_MAX_LOGVAR = 0.0        # symmetric ceiling
 
 # ---- Checkpointing ----------------------------------------------------------
 CHECKPOINT_DIR = "./phase1_checkpoints"

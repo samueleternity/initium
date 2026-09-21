@@ -151,7 +151,7 @@ class StochasticWriteHead(nn.Module):
         # q(v_t) starts equal to the prior p0 = N(0,I) -- standard VAE-style
         # init that avoids an immediate large KL spike / early instability.
         nn.init.zeros_(self.logvar_transform.weight)
-        nn.init.zeros_(self.logvar_transform.bias)
+        nn.init.constant_(self.logvar_transform.bias, -4.0)  # sigma ~0.135 at init
 
         self.sample = sample
         self._kl_terms: list[torch.Tensor] = []  # per-call (BATCH, cell_size) KL, fp32

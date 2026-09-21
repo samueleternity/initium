@@ -228,9 +228,11 @@ class GraphTraversalTask(BaseInferenceTask):
 
     def score_episode(self, output, episode: Episode, verbose: bool = False) -> EpisodeScore:
         answer_idx = (episode.mask == 1).nonzero(as_tuple=True)[0]
-        f = {"src": [0, 0], "edge": [0, 0], "dst": [0, 0]}
+        f = {"src": [0, 0], "edge": [0, 0], "dst": [0, 0],
+             "dst|src+edge": [0, 0], "src|prev_dst_ok": [0, 0]}
+        prev_dst_ok = None
         n_correct = 0
-        for idx in answer_idx:
+        for hop, idx in enumerate(answer_idx, start=1):
             pred = decode_prediction(output[idx])
             td = episode.target[idx].tolist()
             tgt = (int("".join(map(str, td[0:3]))),
@@ -241,6 +243,16 @@ class GraphTraversalTask(BaseInferenceTask):
             for name, p, t in zip(("src", "edge", "dst"), pred, tgt):
                 f[name][0] += int(p == t)
                 f[name][1] += 1
+            if pred[0] == tgt[0] and pred[1] == tgt[1]:      # lookup check
+                f["dst|src+edge"][1] += 1
+                f["dst|src+edge"][0] += int(pred[2] == tgt[2])
+            if prev_dst_ok:                                   # chain check
+                f["src|prev_dst_ok"][1] += 1
+                f["src|prev_dst_ok"][0] += int(pred[0] == tgt[0])
+            prev_dst_ok = pred[2] == tgt[2]
+            hp = f.setdefault(f"hop{hop}", [0, 0])            # triple acc per hop position
+            hp[0] += int(ok)
+            hp[1] += 1
             if verbose:
                 print(f"  Pred: {pred} | Target: {tgt} | Correct: {ok}")
         n = len(answer_idx)

@@ -319,6 +319,11 @@ class SplitGraphDNC(nn.Module):
             else:
                 raise ValueError(f"SplitGraphDNC: unknown combiner_variant {combiner_variant!r}, "
                                   "expected 'mamba1' or 'mamba2'.")
+            
+            _ad = self.combiner_wrapper.in_adapter  # read-vector columns start at 0, like the zero-init linear combiner
+            if isinstance(_ad, nn.Linear):
+                with torch.no_grad():
+                    _ad.weight[:, hidden_size:].zero_()
 
         self.memories = []
         self.memories.append(

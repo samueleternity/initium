@@ -122,30 +122,67 @@ class BPETokenizer:
         return tokens
 
 
-def _text_token_stream_hf(text: str, vocab_size: int) -> List[int]:
-    """Rust-backed BPE (Sennrich et al. 2016) via the `tokenizers` package --
-    same byte-level scheme as BPETokenizer above, orders of magnitude faster
-    to train (no O(corpus_len) list rebuild per merge). Trained fresh on
-    `text` every call, exactly like BPETokenizer.train() -- no pretrained
-    weights, no network access, so this stays a drop-in, offline-safe swap."""
+_TEXT_STREAM_CHUNK_CHARS = 1_000_000   # read/encode in ~1M-char chunks -- the corpus is
+                                        # never materialized whole as one Python str
+
+
+def _iter_text_chunks(path: str, chunk_chars: int = _TEXT_STREAM_CHUNK_CHARS):
+    """Yield the file's text in fixed-size chunks so callers never hold more
+    than `chunk_chars` characters at once (the fix for f.read() loading a
+    multi-GB corpus into one Python str)."""
+    with open(path, encoding="utf-8", errors="ignore") as f:
+        while True:
+            chunk = f.read(chunk_chars)
+            if not chunk:
+                return
+            yield chunk
+
+
+def _text_token_stream_hf(path: str, vocab_size: int):
+    """Rust-backed BPE (Sennrich et al. 2016) via the `tokenizers` package.
+    Trains directly from the file on disk (tokenizers' own file-based
+    train() reads it itself, rather than requiring the corpus in memory
+    first) and encodes the corpus in fixed-size chunks -- neither step
+    materializes the whole file as one Python str or one Python list of
+    boxed ints, which is what made the full 2GB TinyStories corpus OOM
+    before. Returns a numpy int64 array, not a Python list, for the same
+    memory reason on the output side.
+    """
     tok = _HFTokenizer(_HFBPEModel(unk_token=None))
     tok.pre_tokenizer = _HFByteLevel(add_prefix_space=False)
     trainer = _HFBpeTrainer(vocab_size=vocab_size, min_frequency=2, show_progress=False)
-    tok.train_from_iterator([text[:_BPE_TRAIN_CHARS_CAP]], trainer=trainer)
-    ids = tok.encode(text).ids
-    # ByteLevel BPE ids can exceed vocab_size-derived range in edge cases;
-    # keep the same hard contract every caller (build_kv_pool_from_tokens
-    # etc.) already relies on.
-    return [i % vocab_size for i in ids]
+    tok.train([path], trainer=trainer)  # streams the file itself; no full-corpus string needed
+
+    chunks = [np.asarray(tok.encode(chunk_text).ids, dtype=np.int64)
+              for chunk_text in _iter_text_chunks(path)]
+    ids = np.concatenate(chunks) if chunks else np.empty(0, dtype=np.int64)
+
+    # ByteLevel BPE's vocabulary is capped at vocab_size by the trainer
+    # (alphabet + merges), so ids should already be in [0, vocab_size) --
+    # verify instead of silently folding out-of-range ids with modulo,
+    # which can collide two genuinely distinct tokens into the same id.
+    bad = (ids < 0) | (ids >= vocab_size)
+    if bad.any():
+        raise ValueError(
+            f"_text_token_stream_hf: {int(bad.sum())} token id(s) fell outside "
+            f"[0, {vocab_size}) -- tokenizer vocab is misconfigured; fix the "
+            "trainer's vocab_size instead of folding ids with modulo."
+        )
+    return ids
 
 
 def text_token_stream(path: str, vocab_size: int = LABEL_RANGE) -> List[int]:
+    if _HF_TOKENIZERS_AVAILABLE:
+        with open(path, encoding="utf-8", errors="ignore") as f:
+            if not f.read(1):
+                raise ValueError(f"{path}: empty text file")
+        return _text_token_stream_hf(path, vocab_size)
+    # Fallback pure-python tokenizer only: still needs the full text in
+    # memory (BPETokenizer.train() itself caps at _BPE_TRAIN_CHARS_CAP).
     with open(path, encoding="utf-8", errors="ignore") as f:
         text = f.read()
     if not text.strip():
         raise ValueError(f"{path}: empty text file")
-    if _HF_TOKENIZERS_AVAILABLE:
-        return _text_token_stream_hf(text, vocab_size)
     tok = BPETokenizer(vocab_size=vocab_size).train(text)
     return tok.encode(text)
 
@@ -186,7 +223,7 @@ def audio_token_stream(path: str, label_range: int = LABEL_RANGE,
 # ==========================================================================
 # video: frames -> quantized downsampled-frame token stream
 # ==========================================================================
-def _load_frames(path: str):
+def _iter_video_frames(path: str):
     try:
         import cv2
     except ImportError as e:
@@ -195,15 +232,17 @@ def _load_frames(path: str):
             f"Original import error: {e}"
         )
     cap = cv2.VideoCapture(path)
-    frames = []
-    ok, frame = cap.read()
-    while ok:
-        frames.append(frame)
+    try:
+        n = 0
         ok, frame = cap.read()
-    cap.release()
-    if not frames:
-        raise ValueError(f"{path}: no frames read (unsupported codec / bad path?)")
-    return frames, cv2
+        while ok:
+            yield frame, cv2
+            n += 1
+            ok, frame = cap.read()
+        if n == 0:
+            raise ValueError(f"{path}: no frames read (unsupported codec / bad path?)")
+    finally:
+        cap.release()
 
 def video_token_stream(path: str, label_range: int = LABEL_RANGE, grid: int = 8) -> List[int]:
     """Each frame is downsampled to a `grid`x`grid` grayscale thumbnail and
@@ -212,17 +251,16 @@ def video_token_stream(path: str, label_range: int = LABEL_RANGE, grid: int = 8)
     dominant-frequency-bin codebook. Adequate to build a real, non-synthetic
     fact stream out of an actual video file without a full CV pipeline.
 
-    The per-frame resize still goes through OpenCV one frame at a time
-    (cv2 has no batched resize), but the intensity->token quantization --
-    previously a Python float divide/round/clamp per frame -- is now one
-    vectorized numpy pass over every frame's mean at once."""
-    frames, cv2 = _load_frames(path)
-    small_stack = np.empty((len(frames), grid, grid), dtype=np.float32)
-    for i, frame in enumerate(frames):
+    Frames are consumed and discarded one at a time (never collected into a
+    full-length list first) -- a long/high-resolution source would otherwise
+    hold every original full-size frame in RAM before any processing."""
+    means = []
+    for frame, cv2 in _iter_video_frames(path):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        small_stack[i] = cv2.resize(gray, (grid, grid), interpolation=cv2.INTER_AREA)
-    means = small_stack.reshape(len(frames), -1).mean(axis=1)  # (n_frames,), 0..255
-    scaled = np.clip((means / 255.0 * (label_range - 1)).round().astype(np.int64),
+        small = cv2.resize(gray, (grid, grid), interpolation=cv2.INTER_AREA)
+        means.append(float(small.mean()))
+    means_arr = np.asarray(means, dtype=np.float32)
+    scaled = np.clip((means_arr / 255.0 * (label_range - 1)).round().astype(np.int64),
                      0, label_range - 1)
     return scaled.tolist()
 
@@ -245,7 +283,7 @@ def build_kv_pool_from_tokens(token_ids: List[int], label_range: int = LABEL_RAN
     NOTE: ties (two values equally common for the same key) may resolve
     differently than Counter.most_common's insertion-order tie-break --
     harmless here, this only seeds a coarse synthetic/real fact pool."""
-    ids = np.asarray([t % label_range for t in token_ids], dtype=np.int64)
+    ids = np.asarray(token_ids, dtype=np.int64) % label_range
     if ids.size < 2:
         raise ValueError("real-data source produced 0 distinct facts "
                          "(need at least 4) -- source is too short/uniform to train on.")

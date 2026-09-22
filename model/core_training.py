@@ -329,14 +329,15 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
         split_graph_combiner_variant: str = SPLIT_GRAPH_COMBINER_VARIANT,
         split_graph_combiner_num_blocks: int = SPLIT_GRAPH_COMBINER_NUM_BLOCKS,
         dataset_type: str = DATASET_TYPE,  
-        dataset_link: str = DATASET_LINK):
+        dataset_link: str = DATASET_LINK,
+        test_dataset_link: str = None):
         # Deliberately does NOT touch LR_DECAY_STEPS - that's a separate
         # module-level constant, fixed at import time from the *original*
         # TOTAL_STEPS, and lr_at_step()/set_lr() below read it directly by
         # name, not through this parameter. A pilot run still anneals LR on
         # the full 120000-step schedule and simply stops early partway
         # through it, exactly as the --total-steps help text promises.
-    dataset = get_dataset(dataset_type, dataset_link)
+    dataset = get_dataset(dataset_type, dataset_link, test_dataset_link=test_dataset_link)
     INPUT_DIM, TRIPLE_DIM = dataset.input_dim, dataset.output_dim
     beta_ctrl_acc_target = (BETA_CTRL_ACC_TARGET if BETA_CTRL_ACC_TARGET is not None
                             else dataset.advance_threshold)
@@ -1478,8 +1479,18 @@ if __name__ == "__main__":
                          help="Dataset plugged into the core loop (data/dataset_registry.py). "
                               "Only 'graph' (graph-traversal) is implemented so far.")
     parser.add_argument("--dataset-link", type=str, default=DATASET_LINK,
-                         help="Dataset location. Omit or 'graph-traversal' for the built-in "
-                              "synthetic graph-traversal curriculum + London Underground OOD test.")
+                         help="Real training-data source for --dataset-type: a graph edge file "
+                              "(graph), a text file (text), an audio file (audio, needs torchaudio), "
+                              "or a video file (video, needs opencv-python). Omit (or 'graph-traversal' "
+                              "for graph) to keep the built-in synthetic data for that type.")
+    parser.add_argument("--test-dataset-link", type=str, default=None,
+                         help="Path to a real held-out TEST source (a second text/audio/video file, "
+                              "or a graph edge file), used instead of the default synthetic/seeded "
+                              "held-out split -- the modality's analogue of the graph dataset's "
+                              "London Underground test graph. Omit to keep default behavior: for "
+                              "graph, the built-in London Underground; for text/audio/video, a "
+                              "disjoint-key held-out slice of --dataset-link (or the fully synthetic "
+                              "seeded table if --dataset-link is also omitted).")
     args = parser.parse_args()
 
     if args.resume is not None and args.beta is None:
@@ -1556,7 +1567,8 @@ if __name__ == "__main__":
                        split_graph_combiner_variant=args.split_graph_combiner_variant,
                        split_graph_combiner_num_blocks=args.split_graph_combiner_num_blocks,
                        dataset_type=args.dataset_type,
-                       dataset_link=args.dataset_link)
+                       dataset_link=args.dataset_link,
+                       test_dataset_link=args.test_dataset_link)
         all_summaries.append(summary)
 
     print("\n===== Sweep summary (this process) =====")

@@ -29,6 +29,11 @@ _MODALITY_CLASSES = {"text": TextChainDataset, "audio": AudioChainDataset, "vide
 
 
 class MultimodalDataset(BaseDataset):
+    # NOTE: real-data dataset_link/test_dataset_link (see data/common/real_data.py)
+    # are not wired for multimodal yet -- each sub-dataset here is always built
+    # synthetic-only (dataset_link is reserved for the '+'-joined modality list).
+    # Wiring real per-modality sources through is a natural follow-up once the
+    # per-modality real-data pipelines above are validated individually.
     def __init__(self, modalities):
         modalities = [m.strip().lower() for m in modalities if m.strip()]
         if len(modalities) < 2:

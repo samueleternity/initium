@@ -1,25 +1,30 @@
 """
 file: data/audio/audio_dataset.py
 
-Audio modality dataset: AudioChainDataset(KVChainDataset). "Facts" are
-frequency-bin(key)->amplitude-bin(value) tone-event associations; "queries"
-are a sequence of tone identities the model must recognize and accumulate a
-running (mod-1000) signal-energy checksum over.
+Audio modality dataset: AudioChainDataset(KVChainDataset). Default (no
+dataset_link): synthetic frequency-bin(key)->amplitude-bin(value)
+tone-event facts, drawn fresh each episode (unchanged behavior). With
+dataset_link (a path to a real audio file, needs torchaudio): each STFT
+frame is quantized to a dominant-frequency-bin id (data/common/real_data.py
+audio_token_stream) and turned into a real fact pool, split into a
+disjoint TRAIN/TEST pool the same way text_dataset.py does -- the audio
+analogue of the graph dataset's held-out London Underground graph.
+test_dataset_link (a second audio file) can be given to use a genuinely
+different recording as the test set instead of a held-out slice of the
+same one.
 
-Depth axis: number of tone-events (utterance-duration analogue).
-Fields: value (per-event recognition, ~frame/phoneme accuracy), cumsum
-(chained running-energy state).
-OOD axis: a fixed held-out "speaker profile" (a different fixed seed's
-frequency-to-amplitude table) -- the audio analogue of an unseen speaker.
+Depth axis: number of tone-events (utterance-duration analogue). Fields:
+value (per-event recognition), cumsum (chained running-energy state).
 Robustness axis: additive noise -- softly blends the clean value one-hot
-with a second random one-hot, weighted by severity, instead of a hard digit
-flip (a better analogue of acoustic noise than token corruption).
+with a second random one-hot, weighted by severity, instead of a hard
+digit flip.
 """
 import random
 
 import torch
 
 from data.common.chain_task import KVChainDataset
+from data.common.real_data import audio_token_stream, build_kv_pool_from_tokens, split_train_test_facts
 
 AUDIO_CURRICULUM = [
     (3, 2), (3, 3), (5, 3), (5, 4), (8, 4), (8, 5),
@@ -32,11 +37,24 @@ assert len(AUDIO_CURRICULUM) == len(AUDIO_LESSON_NR_CELLS)
 class AudioChainDataset(KVChainDataset):
     name = "audio-chain"
 
-    def __init__(self):
+    def __init__(self, dataset_link: str = None, test_dataset_link: str = None):
         self._table = AUDIO_CURRICULUM
         self._lesson_nr_cells = AUDIO_LESSON_NR_CELLS
+        self._fact_pool = None
+        self._test_fact_pool = None
+        if dataset_link is not None:
+            pool = build_kv_pool_from_tokens(audio_token_stream(dataset_link), self.label_range)
+            if test_dataset_link is not None:
+                self._fact_pool = pool
+                self._test_fact_pool = build_kv_pool_from_tokens(
+                    audio_token_stream(test_dataset_link), self.label_range)
+            else:
+                self._fact_pool, self._test_fact_pool = split_train_test_facts(pool)
+            print(f"[audio-chain] {len(self._fact_pool)} train facts from {dataset_link} | "
+                  f"{len(self._test_fact_pool)} test facts"
+                  + (f" from {test_dataset_link}" if test_dataset_link else " (held-out split)"))
 
-    def build_ood_facts(self, n_facts: int = 20):
+    def _synthetic_ood_facts(self, n_facts: int = 20):
         rng = random.Random(9001)  # different seed -> different "speaker profile"
         keys = rng.sample(range(self.label_range), n_facts)
         vals = [rng.randrange(self.label_range) for _ in range(n_facts)]

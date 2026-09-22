@@ -1,7 +1,7 @@
 """
 file: data/common/chain_task.py
 
-Generic "K facts, then M chained queries" recall+aggregation task - shared
+Generic "K facts, then M chained queries" recall+aggregation task -- shared
 scaffolding for the text / audio / video dataset modules. Mirrors
 data/graph_traversal/graph_traversal.py's overall shape (digit-encoded
 fields, curriculum, evaluate_*, depth breakdown, OOD eval against a fixed
@@ -12,7 +12,16 @@ What stays per-modality (the "treat each modality individually" seam, NOT
 shared): the semantic meaning of a "fact"/"query" (see each of
 data/text/text_dataset.py, data/audio/audio_dataset.py,
 data/video/video_dataset.py), the OOD generalization axis
-(build_ood_facts), and the robustness perturbation (perturb_fact).
+(_synthetic_ood_facts), and the robustness perturbation (perturb_fact).
+
+Real-data hook (v2): `_fact_pool` / `_test_fact_pool` (None by default --
+unchanged synthetic behavior). A subclass whose __init__ was given a real
+dataset_link/test_dataset_link (see data/common/real_data.py) sets these to
+a real (key,value) fact pool built from that source; build_episode() then
+samples FROM that pool instead of drawing fresh random labels, and
+build_ood_facts() uses the disjoint real test pool instead of the seeded
+synthetic table -- the modality analogue of "train on synthetic graphs,
+test on the held-out London Underground graph."
 
 Task shape: present `num_facts` (key, value) pairs (digit-coded labels in
 [0, label_range)), shuffled, first item phase-tagged (mirrors graph's own
@@ -79,8 +88,10 @@ class ChainCurriculum:
 class KVChainDataset(BaseDataset):
     """Parameterized by a few modality-specific hooks (see below). Concrete
     text/audio/video dataset classes only override `name`, the curriculum
-    table/lesson_nr_cells, `build_ood_facts()`, and optionally
-    `perturb_fact()`."""
+    table/lesson_nr_cells, `_synthetic_ood_facts()`, and optionally
+    `perturb_fact()` -- plus, when a real dataset_link is given, they set
+    `_fact_pool`/`_test_fact_pool` in their own __init__ (see module
+    docstring's "Real-data hook")."""
 
     advance_threshold = 0.85
     label_range = 1000
@@ -91,12 +102,30 @@ class KVChainDataset(BaseDataset):
     old_lesson_mix_rate = 0.10
     ood_query_range = (3, 8)
 
+    # Real-data hook (v2): None -> unchanged synthetic behavior everywhere
+    # below. Set by a subclass's __init__ when a real dataset_link/
+    # test_dataset_link was given.
+    _fact_pool = None
+    _test_fact_pool = None
+
     # ---- modality-specific hooks -------------------------------------------
     def build_ood_facts(self, n_facts: int = 20):
-        """Fixed (seeded) held-out fact table -- the analogue of graph's
+        """Fixed held-out fact table -- the analogue of graph's
         build_london_underground_eval(): unseen at training time,
-        reproducible across runs. Override per modality for a more
-        domain-meaningful OOD story."""
+        reproducible across runs. Uses the real, disjoint-key test pool
+        when one was loaded (see module docstring); otherwise falls back to
+        each subclass's own seeded synthetic table via
+        _synthetic_ood_facts()."""
+        if self._test_fact_pool is not None:
+            rng = random.Random(999)
+            pool = self._test_fact_pool
+            return rng.sample(pool, min(n_facts, len(pool)))
+        return self._synthetic_ood_facts(n_facts)
+
+    def _synthetic_ood_facts(self, n_facts: int = 20):
+        """Default synthetic seeded held-out table. Override per modality
+        for a more domain-meaningful OOD story (see each of
+        data/text/text_dataset.py etc.)."""
         rng = random.Random(1234)
         keys = rng.sample(range(self.label_range), n_facts)
         vals = [rng.randrange(self.label_range) for _ in range(n_facts)]
@@ -138,12 +167,19 @@ class KVChainDataset(BaseDataset):
     def build_episode(self, num_facts_range, num_queries_range, rng=None, perturb=None):
         rng = rng if rng is not None else random
         num_facts = rng.randint(*num_facts_range)
-        keys = rng.sample(range(self.label_range), num_facts)
-        vals = [rng.randrange(self.label_range) for _ in range(num_facts)]
-        facts = list(zip(keys, vals))
+        if self._fact_pool is not None:
+            # Real-data hook: sample real (key,value) facts from the loaded
+            # pool instead of drawing fresh random labels every episode.
+            num_facts = min(num_facts, len(self._fact_pool))
+            facts = rng.sample(self._fact_pool, num_facts)
+        else:
+            keys = rng.sample(range(self.label_range), num_facts)
+            vals = [rng.randrange(self.label_range) for _ in range(num_facts)]
+            facts = list(zip(keys, vals))
         rng.shuffle(facts)
         num_queries = rng.randint(*num_queries_range)
-        query_keys = [rng.choice(keys) for _ in range(num_queries)]
+        fact_keys = [k for k, _ in facts]
+        query_keys = [rng.choice(fact_keys) for _ in range(num_queries)]
 
         NF = self.codec.num_digits
         inputs, target_digits, answer_mask = [], [], []

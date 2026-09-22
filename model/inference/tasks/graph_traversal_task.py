@@ -18,16 +18,11 @@ build_traversal_episode_from_graph(), so encoding is byte-identical to training.
 """
 from __future__ import annotations
 
-import csv
-import json
-import os
-import random
-from typing import List, Tuple
-
 import torch
 
+from data.common.graph_io import load_raw_edges, build_graph_from_raw_edges
 from data.graph_traversal.graph_traversal import (
-    INPUT_DIM, TRIPLE_DIM, LABEL_RANGE, OOD_PATH_LENGTH_RANGE,
+    INPUT_DIM, TRIPLE_DIM, OOD_PATH_LENGTH_RANGE,
     build_london_underground_eval, build_traversal_episode_from_graph, decode_prediction,
     encode_triple, triple_to_digit_targets,
 )
@@ -35,79 +30,6 @@ from inference.metrics import EpisodeScore
 from inference.tasks.base_task import BaseInferenceTask, Episode
 
 BUILTIN_LINKS = (None, "", "graph-traversal", "london", "london-underground")
-_HEADER_FIRST_FIELDS = {"src", "source", "from"}
-
-
-def _is_label(x: str) -> bool:
-    try:
-        return 0 <= int(x) < LABEL_RANGE
-    except (TypeError, ValueError):
-        return False
-
-
-def load_raw_edges(path: str) -> List[Tuple[str, str, str]]:
-    ext = os.path.splitext(path)[1].lower()
-    rows = []
-    if ext == ".json":
-        with open(path) as f:
-            data = json.load(f)
-        if isinstance(data, dict):
-            data = data.get("edges", data.get("raw_edges"))
-        if not isinstance(data, list):
-            raise ValueError(f"{path}: JSON must be a list of edges or {{'edges': [...]}}")
-        rows = data
-    else:
-        with open(path, newline="") as f:
-            for row in csv.reader(f, delimiter="\t" if ext == ".tsv" else ","):
-                if not row or row[0].strip().startswith("#"):
-                    continue
-                rows.append(row)
-
-    edges = []
-    for i, row in enumerate(rows):
-        if isinstance(row, dict):
-            row = [row.get("src"), row.get("dst"), row.get("line")]
-        if len(row) != 3 or any(x is None for x in row):
-            raise ValueError(f"{path}: row {i} is not 'src,dst,line': {row!r}")
-        row = [str(x).strip() for x in row]
-        if i == 0 and row[0].lower() in _HEADER_FIRST_FIELDS:
-            continue
-        edges.append(tuple(row))
-    if not edges:
-        raise ValueError(f"{path}: no edges found")
-    return edges
-
-
-def build_graph_from_raw_edges(raw_edges, label_seed: int = 1234):
-    """-> (edges [(src_label, edge_label, dst_label)], node_labels, adjacency)."""
-    if all(_is_label(x) for e in raw_edges for x in e):
-        raw_edges = [tuple(str(int(x)) for x in e) for e in raw_edges]
-        numeric = True
-    else:
-        numeric = False
-
-    stations = sorted({s for s, _, _ in raw_edges} | {d for _, d, _ in raw_edges})
-    lines = sorted({l for _, _, l in raw_edges})
-
-    if numeric:
-        station_to_label = {s: int(s) for s in stations}
-        line_to_label = {l: int(l) for l in lines}
-    else:
-        need = len(stations) + len(lines)
-        if need > LABEL_RANGE:
-            raise ValueError(f"graph has {need} distinct stations+lines; max is {LABEL_RANGE}")
-        rng = random.Random(label_seed)
-        all_labels = rng.sample(range(LABEL_RANGE), need)
-        station_to_label = dict(zip(stations, all_labels[:len(stations)]))
-        line_to_label = dict(zip(lines, all_labels[len(stations):]))
-
-    edges = [(station_to_label[s], line_to_label[l], station_to_label[d]) for s, d, l in raw_edges]
-    station_idx = {s: i for i, s in enumerate(stations)}
-    adjacency = {i: [] for i in range(len(stations))}
-    for s, d, l in raw_edges:
-        adjacency[station_idx[s]].append((station_idx[d], line_to_label[l]))
-    node_labels = [station_to_label[s] for s in stations]
-    return edges, node_labels, adjacency
 
 
 class GraphTraversalTask(BaseInferenceTask):

@@ -24,11 +24,12 @@ class TextChainTask(BaseInferenceTask):
     dataset_type = "text"
 
     def __init__(self, dataset_link=None, path_length_range=None, **kwargs):
-        if dataset_link not in BUILTIN_LINKS:
-            raise NotImplementedError(
-                f"text task: custom --dataset-link {dataset_link!r} not supported yet; "
-                "omit it for the built-in synthetic KV-chain task.")
-        self._ds = TextChainDataset()
+        # Inference always tests a trained model, so --dataset-link here plays the
+        # role of test_dataset_link on the training-side dataset class: a real
+        # text file used as the held-out fact source, instead of the synthetic
+        # seeded table. Omit (or pass one of BUILTIN_LINKS) for that default.
+        link = None if dataset_link in BUILTIN_LINKS else dataset_link
+        self._ds = TextChainDataset(test_dataset_link=link)
         self.input_dim, self.output_dim = self._ds.input_dim, self._ds.output_dim
         self.query_range = tuple(path_length_range) if path_length_range else self._ds.ood_query_range
         self.facts = self._ds.build_ood_facts()

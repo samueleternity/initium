@@ -223,7 +223,7 @@ class MultimodalDataset(BaseDataset):
 
     def evaluate_chain(self, model, device, num_episodes, num_facts_range=None, num_queries_range=None,
                         rng=None, ablate_memory=False, step_breakdown=False, skip_modalities=None,
-                        verbose_n=0, use_test_pool=False):
+                        verbose_n=0, use_test_pool=False, skip_stages=None):
         model.eval()
         total = correct = perfect_episodes = tested = 0
         by_depth = {}
@@ -235,7 +235,8 @@ class MultimodalDataset(BaseDataset):
                     use_test_pool=use_test_pool)
                 input_seq = input_seq.unsqueeze(0).to(device)
                 output, _ = model(input_seq, (None, None, None), reset_experience=True,
-                                   pass_through_memory=not ablate_memory)
+                                   pass_through_memory=not ablate_memory,
+                                   **({"combiner_skip_stages": skip_stages} if skip_stages else {}))
                 output = self._output_proj(output.transpose(0, 1).contiguous().squeeze(0))
                 answer_idx = (answer_mask == 1).nonzero(as_tuple=True)[0]
                 ep_total = ep_correct = 0
@@ -273,6 +274,15 @@ class MultimodalDataset(BaseDataset):
         nf, nq = curriculum.table[lesson_idx]
         return self.evaluate_chain(model, device, self.eval_batch_size,
                                     num_facts_range=nf, num_queries_range=nq, ablate_memory=True)
+    
+    def evaluate_id_combiner_stage_ablated(self, model, device, curriculum, lesson_idx, skip_stages):
+        """Combiner-stage-off eval on lesson `lesson_idx` -> (acc_pct, perfect_pct).
+        Mirrors data/common/chain_task.py's KVChainDataset implementation --
+        only meaningful when model.combiner_wrapper is a ChainedControllerWrapper
+        (e.g. --split-graph-combiner-variant mamba+cfc)."""
+        nf, nq = curriculum.table[lesson_idx]
+        return self.evaluate_chain(model, device, self.eval_batch_size,
+                                    num_facts_range=nf, num_queries_range=nq, skip_stages=skip_stages)
 
     def evaluate_modality_ablated(self, model, device, curriculum, lesson_idx, modality: str):
         """Delta_<modality> = full_acc - ablated_acc, per the research doc's

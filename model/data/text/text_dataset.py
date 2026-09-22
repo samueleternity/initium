@@ -21,7 +21,7 @@ analogue). Fields: value (lookup), cumsum (chained state).
 import random
 
 from data.common.chain_task import KVChainDataset
-from data.common.real_data import text_token_stream, build_kv_pool_from_tokens, split_train_test_facts
+from data.common.real_data import build_text_kv_pool, split_train_test_facts
 
 TEXT_CURRICULUM = [
     (3, 2), (3, 3), (5, 3), (5, 4), (8, 4), (8, 5),
@@ -40,11 +40,10 @@ class TextChainDataset(KVChainDataset):
         self._fact_pool = None
         self._test_fact_pool = None
         if dataset_link is not None:
-            pool = build_kv_pool_from_tokens(text_token_stream(dataset_link), self.label_range)
+            pool = build_text_kv_pool(dataset_link, self.label_range)
             if test_dataset_link is not None:
                 self._fact_pool = pool
-                self._test_fact_pool = build_kv_pool_from_tokens(
-                    text_token_stream(test_dataset_link), self.label_range)
+                self._test_fact_pool = build_text_kv_pool(test_dataset_link, self.label_range)
             else:
                 self._fact_pool, self._test_fact_pool = split_train_test_facts(pool)
             print(f"[text-chain] {len(self._fact_pool)} train facts from {dataset_link} | "

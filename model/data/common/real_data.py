@@ -34,6 +34,10 @@ implementation, a real mel-spectrogram front end, or a real video encoder
 later only means replacing the token-stream function; build_kv_pool_from_tokens
 / split_train_test_facts and everything downstream (chain_task.py,
 training, evaluation) stays the same.
+
+Note for later:
+Audio computes torch.stft over the whole waveform in one call — a real streaming fix there needs a windowed-STFT 
+rewrite, which is out of scope here; flagging it rather than pretending to fix it.
 """
 from __future__ import annotations
 
@@ -171,6 +175,30 @@ def _text_token_stream_hf(path: str, vocab_size: int):
     return ids
 
 
+def _text_token_stream_hf_chunks(path: str, vocab_size: int):
+    """Same train step as _text_token_stream_hf, but YIELDS each encoded
+    chunk instead of concatenating every chunk into one corpus-length array
+    -- this is the actual fix for the 2GB-corpus OOM (see module docstring):
+    the old function's np.concatenate materialized the whole token stream
+    before build_kv_pool_from_tokens ever ran, on top of THAT function's own
+    3-4x blowup (now also fixed, see build_kv_pool_from_tokens)."""
+    tok = _HFTokenizer(_HFBPEModel(unk_token=None))
+    tok.pre_tokenizer = _HFByteLevel(add_prefix_space=False)
+    trainer = _HFBpeTrainer(vocab_size=vocab_size, min_frequency=2, show_progress=False)
+    tok.train([path], trainer=trainer)  # streams the file itself; no full-corpus string needed
+
+    for chunk_text in _iter_text_chunks(path):
+        ids = np.asarray(tok.encode(chunk_text).ids, dtype=np.int64)
+        bad = (ids < 0) | (ids >= vocab_size)
+        if bad.any():
+            raise ValueError(
+                f"_text_token_stream_hf_chunks: {int(bad.sum())} token id(s) fell outside "
+                f"[0, {vocab_size}) -- tokenizer vocab is misconfigured; fix the "
+                "trainer's vocab_size instead of folding ids with modulo."
+            )
+        yield ids
+
+
 def text_token_stream(path: str, vocab_size: int = LABEL_RANGE) -> List[int]:
     if _HF_TOKENIZERS_AVAILABLE:
         with open(path, encoding="utf-8", errors="ignore") as f:
@@ -186,6 +214,25 @@ def text_token_stream(path: str, vocab_size: int = LABEL_RANGE) -> List[int]:
     tok = BPETokenizer(vocab_size=vocab_size).train(text)
     return tok.encode(text)
 
+def build_text_kv_pool(path: str, label_range: int = LABEL_RANGE) -> List[Tuple[int, int]]:
+    """Streaming replacement for build_kv_pool_from_tokens(text_token_stream(path), ...):
+    trains + encodes the corpus chunk-by-chunk and folds bigram counts
+    directly into the fixed count matrix, so the full token stream is never
+    materialized as one array. Only the `tokenizers`-unavailable fallback
+    still fully materializes the corpus in memory (BPETokenizer.train()
+    itself caps at _BPE_TRAIN_CHARS_CAP; see text_token_stream's own
+    docstring) -- that path is unaffected by, and not the target of, this
+    fix."""
+    if _HF_TOKENIZERS_AVAILABLE:
+        with open(path, encoding="utf-8", errors="ignore") as f:
+            if not f.read(1):
+                raise ValueError(f"{path}: empty text file")
+        matrix = np.zeros(label_range * label_range, dtype=np.int64)
+        prev_last = None
+        for chunk in _text_token_stream_hf_chunks(path, label_range):
+            prev_last = _accumulate_bigram_chunk(matrix, chunk, label_range, prev_last)
+        return _pool_from_bigram_matrix(matrix, label_range)
+    return build_kv_pool_from_tokens(text_token_stream(path, label_range), label_range)
 
 # ==========================================================================
 # audio: waveform -> quantized spectrogram-frame token stream
@@ -264,41 +311,93 @@ def video_token_stream(path: str, label_range: int = LABEL_RANGE, grid: int = 8)
                      0, label_range - 1)
     return scaled.tolist()
 
+def build_video_kv_pool(path: str, label_range: int = LABEL_RANGE, grid: int = 8,
+                        chunk_frames: int = 200_000) -> List[Tuple[int, int]]:
+    """Streaming replacement for build_kv_pool_from_tokens(video_token_stream(path), ...):
+    quantizes and folds frames into the bigram count matrix chunk_frames at
+    a time, instead of building one `means` list for the whole video first."""
+    matrix = np.zeros(label_range * label_range, dtype=np.int64)
+    prev_last = None
+    buf = []
+    def _flush(buf):
+        arr = np.asarray(buf, dtype=np.float32)
+        return np.clip((arr / 255.0 * (label_range - 1)).round(), 0, label_range - 1).astype(np.int64)
+    for frame, cv2 in _iter_video_frames(path):
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        small = cv2.resize(gray, (grid, grid), interpolation=cv2.INTER_AREA)
+        buf.append(float(small.mean()))
+        if len(buf) >= chunk_frames:
+            prev_last = _accumulate_bigram_chunk(matrix, _flush(buf), label_range, prev_last)
+            buf = []
+    if buf:
+        prev_last = _accumulate_bigram_chunk(matrix, _flush(buf), label_range, prev_last)
+    return _pool_from_bigram_matrix(matrix, label_range)
 
 # ==========================================================================
 # shared: token stream -> fact pool -> train/test split
 # ==========================================================================
-def build_kv_pool_from_tokens(token_ids: List[int], label_range: int = LABEL_RANGE) -> List[Tuple[int, int]]:
+def build_kv_pool_from_tokens(token_ids, label_range: int = LABEL_RANGE) -> List[Tuple[int, int]]:
     """Consecutive-pair (bigram) counts -> one (key, most_common_value) fact
-    per distinct key seen. This is what turns an arbitrary token stream
-    into the same 'glossary' shape build_episode()/evaluate_chain() already
-    expect (a KV dictionary, not a raw sequence).
-
-    Vectorized with numpy instead of a Python dict-of-Counter scan: pack
-    each (key, value) bigram into one int64 (key*label_range + value),
-    count distinct pairs with np.unique, then take -- per key -- the
-    highest-count value via a lexsort (key asc, count desc) + first-per-
-    group mask. O(n log n) instead of O(n) with heavy per-element Python
-    dict/Counter overhead, and no allocation of a Counter object per key.
-    NOTE: ties (two values equally common for the same key) may resolve
-    differently than Counter.most_common's insertion-order tie-break --
-    harmless here, this only seeds a coarse synthetic/real fact pool."""
-    ids = np.asarray(token_ids, dtype=np.int64) % label_range
-    if ids.size < 2:
+    per distinct key seen. Accumulates into a FIXED label_range x label_range
+    int64 count matrix (8 MB at label_range=1000, independent of corpus
+    length) instead of the old np.unique/lexsort pipeline, which built 3-4
+    additional corpus-length arrays on top of `token_ids` itself (the modulo
+    copy, the packed-pair array, np.unique's own sort buffer) -- exactly
+    what turned a multi-GB token stream into a 10-20x-larger peak RSS and
+    OOM'd. `token_ids` is consumed in bounded-size slices, not concatenated
+    into another extra array, so even a pre-materialized huge list/array
+    here doesn't multiply memory the way the old pipeline did.
+    IDs are expected to already be valid -- out-of-range ids raise instead
+    of being silently folded in via modulo (a silent fold can collide two
+    genuinely distinct tokens into the same id).
+    NOTE: ties resolve to whichever value the count matrix's argmax picks
+    (lowest value index on a tie) -- harmless, this only seeds a coarse
+    synthetic/real fact pool."""
+    n = len(token_ids)
+    if n < 2:
         raise ValueError("real-data source produced 0 distinct facts "
                          "(need at least 4) -- source is too short/uniform to train on.")
-    keys, vals = ids[:-1], ids[1:]
-    combined = keys * label_range + vals
-    uniq, counts = np.unique(combined, return_counts=True)
-    u_keys, u_vals = uniq // label_range, uniq % label_range
-    order = np.lexsort((-counts, u_keys))          # sort by key, then by count desc within key
-    u_keys, u_vals = u_keys[order], u_vals[order]
-    first_per_key = np.concatenate(([True], u_keys[1:] != u_keys[:-1]))
-    pool = list(zip(u_keys[first_per_key].tolist(), u_vals[first_per_key].tolist()))
-    if len(pool) < 4:
-        raise ValueError(f"real-data source produced only {len(pool)} distinct facts "
+    matrix = np.zeros(label_range * label_range, dtype=np.int64)
+    prev_last = None
+    slice_size = 5_000_000
+    for start in range(0, n, slice_size):
+        chunk = np.asarray(token_ids[start:start + slice_size], dtype=np.int64)
+        prev_last = _accumulate_bigram_chunk(matrix, chunk, label_range, prev_last)
+    return _pool_from_bigram_matrix(matrix, label_range)
+
+
+def _accumulate_bigram_chunk(matrix_flat: np.ndarray, chunk: np.ndarray, label_range: int, prev_last):
+    """Folds one chunk's consecutive-pair counts into `matrix_flat` (a flat,
+    length label_range**2 int64 array) in place, and returns this chunk's
+    last token id so the NEXT chunk's caller can pass it back in as
+    `prev_last` (preserves the cross-chunk-boundary bigram that would
+    otherwise be lost by chunking). `chunk` must already contain only ids
+    in [0, label_range) -- raises rather than silently wrapping out-of-range
+    ids with modulo."""
+    if chunk.size == 0:
+        return prev_last
+    bad = (chunk < 0) | (chunk >= label_range)
+    if bad.any():
+        raise ValueError(f"_accumulate_bigram_chunk: {int(bad.sum())} token id(s) fell "
+                         f"outside [0, {label_range}) -- upstream tokenizer/quantizer is "
+                         "misconfigured; ids must already be valid.")
+    if prev_last is not None:
+        matrix_flat[prev_last * label_range + int(chunk[0])] += 1
+    if chunk.size >= 2:
+        idx = chunk[:-1] * label_range + chunk[1:]
+        matrix_flat += np.bincount(idx, minlength=label_range * label_range)
+    return int(chunk[-1])
+
+
+def _pool_from_bigram_matrix(matrix_flat: np.ndarray, label_range: int) -> List[Tuple[int, int]]:
+    matrix = matrix_flat.reshape(label_range, label_range)
+    row_sums = matrix.sum(axis=1)
+    keys_present = np.nonzero(row_sums)[0]
+    if keys_present.size < 4:
+        raise ValueError(f"real-data source produced only {keys_present.size} distinct facts "
                          "(need at least 4) -- source is too short/uniform to train on.")
-    return pool
+    vals = matrix[keys_present].argmax(axis=1)
+    return list(zip(keys_present.tolist(), vals.tolist()))
 
 
 def split_train_test_facts(pool: List[Tuple[int, int]], test_frac: float = 0.1,

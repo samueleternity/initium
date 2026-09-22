@@ -43,9 +43,14 @@ class BaseInferenceTask:
     input_dim: int = None
     output_dim: int = None
 
-    def build_episodes(self, n: int, rng) -> List[Episode]:
+    def build_episodes(self, n: int, rng, perturbation=None) -> List[Episode]:
+        """perturbation: optional dataset-defined robustness probe (see
+        data/base_dataset.py's evaluate_robustness for the training-side
+        analogue), e.g. {'kind': 'noise', 'severity': 0.1}. None (default)
+        builds ordinary, unperturbed episodes -- purely additive, existing
+        tasks ignore it unless they opt in."""
         raise NotImplementedError
-
+    
     def score_episode(self, output: torch.Tensor, episode: Episode, verbose: bool = False) -> EpisodeScore:
         raise NotImplementedError
 

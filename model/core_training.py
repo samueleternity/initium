@@ -400,6 +400,16 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
         ])
 
     lesson_log_path = os.path.join(LOG_DIR, f"run_{run_id}_lesson_advances.csv")
+    modality_log_path = os.path.join(LOG_DIR, f"run_{run_id}_modality_dependency.csv")
+    modality_log_file = open(modality_log_path, "a" if resuming else "w", newline="")
+    modality_log_writer = csv.writer(modality_log_file)
+    if not resuming:
+        modality_log_writer.writerow([
+            "step", "lesson", "modality",
+            "id_acc", "id_perfect_frac",
+            "ablated_acc", "ablated_perfect_frac",
+            "modality_dependency_acc", "modality_dependency_perfect",
+        ])
     lesson_log_file = open(lesson_log_path, "a" if resuming else "w", newline="")
     lesson_log_writer = csv.writer(lesson_log_file)
     if not resuming:
@@ -1225,6 +1235,20 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
                           f"[{stage_idx}:{stage_kind}]: ID (full) {id_triple_acc:.2f}% | "
                           f"ablated ({stage_kind} off) {stage_triple_acc:.2f}% | "
                           f"dependency {id_triple_acc - stage_triple_acc:.2f}")
+
+            if getattr(dataset, "modalities", None):
+                for modality in dataset.modalities:
+                    m_acc, m_pf = dataset.evaluate_modality_ablated(
+                        rnn, device, curriculum, pre_advance_lesson, modality)
+                    modality_log_writer.writerow([
+                        step, pre_advance_lesson + 1, modality,
+                        id_triple_acc, id_perfect_frac, m_acc, m_pf,
+                        id_triple_acc - m_acc, id_perfect_frac - m_pf,
+                    ])
+                    modality_log_file.flush()
+                    print(f"[{run_id}] Step {step} modality-dependency check "
+                          f"[{modality}]: full {id_triple_acc:.2f}% | ablated ({modality} off) "
+                          f"{m_acc:.2f}% | dependency {id_triple_acc - m_acc:.2f}")
         
 
         if step % checkpoint_every == 0 or step == total_steps:
@@ -1291,6 +1315,7 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
     prior_log_file.close()  
     field_log_file.close()  # v16
     combiner_stage_log_file.close()
+    modality_log_file.close()
     if dynamic_n_ctrl is not None:
         dynamic_n_log_file.close()
 
@@ -1449,7 +1474,7 @@ if __name__ == "__main__":
                               "(--split-graph-combiner-mode=controller only). Kept small "
                               "by default -- this step is meant to stay cheap.")
     parser.add_argument("--dataset-type", type=str, default=DATASET_TYPE,
-                         choices=["graph", "text", "audio", "video"],
+                         choices=["graph", "text", "audio", "video", "multimodal"],
                          help="Dataset plugged into the core loop (data/dataset_registry.py). "
                               "Only 'graph' (graph-traversal) is implemented so far.")
     parser.add_argument("--dataset-link", type=str, default=DATASET_LINK,

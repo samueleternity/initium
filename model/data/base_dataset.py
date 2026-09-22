@@ -52,5 +52,14 @@ class BaseDataset:
         split-graph combiner (see SplitGraphDNC)."""
         raise NotImplementedError
 
+    def evaluate_robustness(self, model, device, curriculum, lesson_idx, perturbation, rng):
+        """Same lesson-distribution eval as evaluate_id_ablated, but sampling
+        PERTURBED episodes (modality-specific corruption) instead of
+        ablating the model itself. -> (acc_pct, perfect_pct). Layer D
+        ("Robustness") of the shared eval skeleton (Task/Generalization/
+        Dependency/Robustness) -- optional per dataset, NotImplementedError
+        by default."""
+        raise NotImplementedError
+
     def write_field_log(self, writer, file, step, lesson, eval_type, field_log):
         raise NotImplementedError

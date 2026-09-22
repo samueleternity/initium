@@ -74,6 +74,11 @@ def parse_args(argv=None):
                    help="persistent mode: also replay the SAME episodes with reset each episode and report the delta.")
     p.add_argument("--path-length", type=int, nargs=2, metavar=("MIN", "MAX"), default=None,
                    help="graph task: walk length range (default: the training-time OOD range).")
+    p.add_argument("--perturbation-severity", type=float, default=None,
+                   help="Robustness probe (Layer D): if set, episodes are built with "
+                        "perturbation={'severity': X} - e.g. text/audio/video token-corruption / "
+                        "additive-noise / frame-dropping severity in [0,1]. Graph task ignores this "
+                        "(no perturbation hook wired for it yet).")
     p.add_argument("--shared-context", action="store_true",
                    help="graph task: every episode = ONE fixed edge listing (static prefix) + a fresh "
                         "random query. Required for the prefix cache to have anything to reuse.")
@@ -175,7 +180,8 @@ def main(argv=None) -> int:
             args.num_episodes if args.num_episodes is not None else DEFAULT_NUM_EPISODES)
 
     rng = random.Random(args.seed)
-    episodes = task.build_episodes(n, rng)          # materialized -> identical episodes for --compare-fresh
+    perturbation = {"severity": args.perturbation_severity} if args.perturbation_severity is not None else None
+    episodes = task.build_episodes(n, rng, perturbation=perturbation)  # materialized -> identical episodes for --compare-fresh
 
     # ---- caches ---------------------------------------------------------------
     caches, cache_notes, cache_fp = [], [], None

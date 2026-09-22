@@ -150,7 +150,9 @@ class GraphTraversalTask(BaseInferenceTask):
         return (f"{self.name} | {self.source_desc} | {len(self.node_labels)} nodes, "
                 f"{len(self.edges)} edges | walk length {self.path_length_range}{shared}")
 
-    def build_episodes(self, n: int, rng) -> List[Episode]:
+    def build_episodes(self, n: int, rng, perturbation=None) -> List[Episode]:
+        # perturbation: not wired for graph yet (see base_task.py) -- accepted
+        # and ignored so the shared BaseInferenceTask interface stays uniform.
         episodes, attempts = [], 0
         if self.shared_context:
             return self._build_shared_context_episodes(n, rng)

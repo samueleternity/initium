@@ -77,9 +77,11 @@ class CfCControllerBlock(nn.Module):
         return (h, torch.zeros_like(h)) if self.mixed_memory else h
 
     def step(self, x, state):
-        out, new_state = self.cfc(self.norm(x).unsqueeze(1), state)  # (B,1,d_model), state
-        out = out.squeeze(1)
-        y = x + out.to(x.dtype) if self.residual else out
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            out, new_state = self.cfc(self.norm(x.float()).unsqueeze(1), 
+                                        _state_to_fp32(state) if state is not None else None)
+        out = out.squeeze(1).clamp(min=-1e4, max=1e4)
+        y = x + out.to(x.dtype) if self.residual else out.to(x.dtype)
         return y, _state_to_fp32(new_state)
 
 

@@ -84,6 +84,9 @@ class ChainCurriculum:
                 self.advance_log_file.flush()
         return self.lesson, combined_acc, perfect_frac
 
+def _as_range(v):
+    """Accept either a fixed int or an (lo, hi) range; normalize to a range."""
+    return tuple(v) if isinstance(v, (tuple, list)) else (v, v)
 
 class KVChainDataset(BaseDataset):
     """Parameterized by a few modality-specific hooks (see below). Concrete
@@ -160,12 +163,14 @@ class KVChainDataset(BaseDataset):
     def _encode_query(self, key, phase_transition):
         return torch.cat([self.codec.encode_label(key), torch.zeros(self.codec.label_dim),
                            torch.tensor([phase_transition, 0.0])])
-
+    
     def _encode_answer(self, phase_transition):
         return torch.cat([torch.zeros(2 * self.codec.label_dim), torch.tensor([phase_transition, 1.0])])
 
     def build_episode(self, num_facts_range, num_queries_range, rng=None, perturb=None):
         rng = rng if rng is not None else random
+        num_facts_range = _as_range(num_facts_range)
+        num_queries_range = _as_range(num_queries_range)
         num_facts = rng.randint(*num_facts_range)
         if self._fact_pool is not None:
             # Real-data hook: sample real (key,value) facts from the loaded
@@ -239,7 +244,7 @@ class KVChainDataset(BaseDataset):
 
     def evaluate_chain(self, model, device, num_episodes, num_facts_range=None, num_queries_range=None,
                         fixed_facts=None, rng=None, ablate_memory=False, step_breakdown=False,
-                        perturb=None, verbose_n=0):
+                        perturb=None, verbose_n=0, skip_stages=None):
         model.eval()
         total = correct_value = correct_cumsum = perfect_episodes = tested = 0
         by_depth = {}
@@ -249,7 +254,7 @@ class KVChainDataset(BaseDataset):
                 if fixed_facts is not None:
                     keys = [k for k, _ in fixed_facts]
                     vals_map = dict(fixed_facts)
-                    nq = _rng.randint(*(num_queries_range or self.ood_query_range))
+                    nq = _rng.randint(*_as_range(num_queries_range or self.ood_query_range))
                     query_keys = [_rng.choice(keys) for _ in range(nq)]
                     facts = list(fixed_facts); _rng.shuffle(facts)
                     NF = self.codec.num_digits
@@ -274,7 +279,8 @@ class KVChainDataset(BaseDataset):
                 input_seq, target_digits, answer_mask, depth = ep
                 input_seq = input_seq.unsqueeze(0).to(device)
                 output, _ = model(input_seq, (None, None, None), reset_experience=True,
-                                   pass_through_memory=not ablate_memory)
+                                   pass_through_memory=not ablate_memory,
+                                   **({"combiner_skip_stages": skip_stages} if skip_stages else {}))
                 output = self._output_proj(output.transpose(0, 1).contiguous().squeeze(0))
 
                 answer_idx = (answer_mask == 1).nonzero(as_tuple=True)[0]
@@ -321,6 +327,11 @@ class KVChainDataset(BaseDataset):
         nf, nq = curriculum.table[lesson_idx]
         return self.evaluate_chain(model, device, self.eval_batch_size,
                                     num_facts_range=nf, num_queries_range=nq, ablate_memory=True)
+    
+    def evaluate_id_combiner_stage_ablated(self, model, device, curriculum, lesson_idx, skip_stages):
+        nf, nq = curriculum.table[lesson_idx]
+        return self.evaluate_chain(model, device, self.eval_batch_size,
+                                    num_facts_range=nf, num_queries_range=nq, skip_stages=skip_stages)
 
     def evaluate_robustness(self, model, device, curriculum, lesson_idx, perturbation, rng):
         nf, nq = curriculum.table[lesson_idx]

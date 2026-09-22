@@ -43,6 +43,18 @@ from typing import List, Tuple
 
 LABEL_RANGE = 1000
 
+
+import numpy as np
+
+try:
+    from tokenizers import Tokenizer as _HFTokenizer
+    from tokenizers.models import BPE as _HFBPEModel
+    from tokenizers.trainers import BpeTrainer as _HFBpeTrainer
+    from tokenizers.pre_tokenizers import ByteLevel as _HFByteLevel
+    _HF_TOKENIZERS_AVAILABLE = True
+except ImportError:
+    _HF_TOKENIZERS_AVAILABLE = False
+
 # BPE trainer is O(corpus_len * merges) in pure python -- fine for a
 # "reasonable synthetic-real" corpus, not meant for GB-scale text. Cap the
 # training sample so a huge file doesn't hang the training script's startup.
@@ -110,11 +122,30 @@ class BPETokenizer:
         return tokens
 
 
+def _text_token_stream_hf(text: str, vocab_size: int) -> List[int]:
+    """Rust-backed BPE (Sennrich et al. 2016) via the `tokenizers` package --
+    same byte-level scheme as BPETokenizer above, orders of magnitude faster
+    to train (no O(corpus_len) list rebuild per merge). Trained fresh on
+    `text` every call, exactly like BPETokenizer.train() -- no pretrained
+    weights, no network access, so this stays a drop-in, offline-safe swap."""
+    tok = _HFTokenizer(_HFBPEModel(unk_token=None))
+    tok.pre_tokenizer = _HFByteLevel(add_prefix_space=False)
+    trainer = _HFBpeTrainer(vocab_size=vocab_size, min_frequency=2, show_progress=False)
+    tok.train_from_iterator([text[:_BPE_TRAIN_CHARS_CAP]], trainer=trainer)
+    ids = tok.encode(text).ids
+    # ByteLevel BPE ids can exceed vocab_size-derived range in edge cases;
+    # keep the same hard contract every caller (build_kv_pool_from_tokens
+    # etc.) already relies on.
+    return [i % vocab_size for i in ids]
+
+
 def text_token_stream(path: str, vocab_size: int = LABEL_RANGE) -> List[int]:
     with open(path, encoding="utf-8", errors="ignore") as f:
         text = f.read()
     if not text.strip():
         raise ValueError(f"{path}: empty text file")
+    if _HF_TOKENIZERS_AVAILABLE:
+        return _text_token_stream_hf(text, vocab_size)
     tok = BPETokenizer(vocab_size=vocab_size).train(text)
     return tok.encode(text)
 
@@ -174,22 +205,26 @@ def _load_frames(path: str):
         raise ValueError(f"{path}: no frames read (unsupported codec / bad path?)")
     return frames, cv2
 
-
 def video_token_stream(path: str, label_range: int = LABEL_RANGE, grid: int = 8) -> List[int]:
     """Each frame is downsampled to a `grid`x`grid` grayscale thumbnail and
     its mean intensity quantized to [0, label_range) -- a coarse "scene
     brightness/shape" codebook, analogous in spirit to audio_token_stream's
     dominant-frequency-bin codebook. Adequate to build a real, non-synthetic
-    fact stream out of an actual video file without a full CV pipeline."""
+    fact stream out of an actual video file without a full CV pipeline.
+
+    The per-frame resize still goes through OpenCV one frame at a time
+    (cv2 has no batched resize), but the intensity->token quantization --
+    previously a Python float divide/round/clamp per frame -- is now one
+    vectorized numpy pass over every frame's mean at once."""
     frames, cv2 = _load_frames(path)
-    ids = []
-    for frame in frames:
+    small_stack = np.empty((len(frames), grid, grid), dtype=np.float32)
+    for i, frame in enumerate(frames):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        small = cv2.resize(gray, (grid, grid), interpolation=cv2.INTER_AREA)
-        mean_intensity = float(small.mean())  # 0..255
-        token_id = int(mean_intensity / 255.0 * (label_range - 1))
-        ids.append(max(0, min(label_range - 1, token_id)))
-    return ids
+        small_stack[i] = cv2.resize(gray, (grid, grid), interpolation=cv2.INTER_AREA)
+    means = small_stack.reshape(len(frames), -1).mean(axis=1)  # (n_frames,), 0..255
+    scaled = np.clip((means / 255.0 * (label_range - 1)).round().astype(np.int64),
+                     0, label_range - 1)
+    return scaled.tolist()
 
 
 # ==========================================================================
@@ -199,12 +234,29 @@ def build_kv_pool_from_tokens(token_ids: List[int], label_range: int = LABEL_RAN
     """Consecutive-pair (bigram) counts -> one (key, most_common_value) fact
     per distinct key seen. This is what turns an arbitrary token stream
     into the same 'glossary' shape build_episode()/evaluate_chain() already
-    expect (a KV dictionary, not a raw sequence)."""
-    token_ids = [t % label_range for t in token_ids]
-    counts: dict = {}
-    for a, b in zip(token_ids, token_ids[1:]):
-        counts.setdefault(a, Counter())[b] += 1
-    pool = [(k, v_counter.most_common(1)[0][0]) for k, v_counter in counts.items()]
+    expect (a KV dictionary, not a raw sequence).
+
+    Vectorized with numpy instead of a Python dict-of-Counter scan: pack
+    each (key, value) bigram into one int64 (key*label_range + value),
+    count distinct pairs with np.unique, then take -- per key -- the
+    highest-count value via a lexsort (key asc, count desc) + first-per-
+    group mask. O(n log n) instead of O(n) with heavy per-element Python
+    dict/Counter overhead, and no allocation of a Counter object per key.
+    NOTE: ties (two values equally common for the same key) may resolve
+    differently than Counter.most_common's insertion-order tie-break --
+    harmless here, this only seeds a coarse synthetic/real fact pool."""
+    ids = np.asarray([t % label_range for t in token_ids], dtype=np.int64)
+    if ids.size < 2:
+        raise ValueError("real-data source produced 0 distinct facts "
+                         "(need at least 4) -- source is too short/uniform to train on.")
+    keys, vals = ids[:-1], ids[1:]
+    combined = keys * label_range + vals
+    uniq, counts = np.unique(combined, return_counts=True)
+    u_keys, u_vals = uniq // label_range, uniq % label_range
+    order = np.lexsort((-counts, u_keys))          # sort by key, then by count desc within key
+    u_keys, u_vals = u_keys[order], u_vals[order]
+    first_per_key = np.concatenate(([True], u_keys[1:] != u_keys[:-1]))
+    pool = list(zip(u_keys[first_per_key].tolist(), u_vals[first_per_key].tolist()))
     if len(pool) < 4:
         raise ValueError(f"real-data source produced only {len(pool)} distinct facts "
                          "(need at least 4) -- source is too short/uniform to train on.")

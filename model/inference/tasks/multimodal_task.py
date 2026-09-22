@@ -20,18 +20,25 @@ class MultimodalTask(BaseInferenceTask):
     dataset_type = "multimodal"
 
     def __init__(self, modalities, path_length_range=None, **kwargs):
-        self._ds = MultimodalDataset(modalities)
+        # Inference always tests a trained model, so each per-modality real
+        # source given via --dataset-link (e.g. "video:clip.mp4+audio:clip.mp4")
+        # is wired in as that modality's test_dataset_link, matching every
+        # other *_task.py's own convention (see e.g. text_task.py).
+        self._ds = MultimodalDataset(modalities, link_role="test_dataset_link")
         self.name = self._ds.name
         self.input_dim, self.output_dim = self._ds.input_dim, self._ds.output_dim
         self.query_range = tuple(path_length_range) if path_length_range else self._ds.primary.ood_query_range
 
     def describe(self) -> str:
-        return f"{self.name} | queries {self.query_range}"
+        real = [m for m, s in zip(self._ds.modalities, self._ds.subs) if s._test_fact_pool is not None]
+        src = f" | real data: {', '.join(real)}" if real else ""
+        return f"{self.name} | queries {self.query_range}{src}"
 
     def build_episodes(self, n: int, rng, perturbation=None) -> List[Episode]:
         episodes = []
         for _ in range(n):
-            inp, tgt, mask, nq = self._ds._build_fused_episode((15, 20), self.query_range, rng=rng)
+            inp, tgt, mask, nq = self._ds._build_fused_episode((15, 20), self.query_range, rng=rng,
+                                                                use_test_pool=True)
             episodes.append(Episode(inp, tgt, mask, meta={"num_queries": nq}))
         return episodes
 

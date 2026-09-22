@@ -24,6 +24,8 @@ import os
 import random
 from typing import List, Tuple
 
+from data.common.real_data import resolve_link_paths
+
 LABEL_RANGE = 1000
 _HEADER_FIRST_FIELDS = {"src", "source", "from"}
 
@@ -35,7 +37,7 @@ def _is_label(x: str) -> bool:
         return False
 
 
-def load_raw_edges(path: str) -> List[Tuple[str, str, str]]:
+def _load_raw_edges_one(path: str) -> List[Tuple[str, str, str]]:
     ext = os.path.splitext(path)[1].lower()
     rows = []
     if ext == ".json":
@@ -66,6 +68,20 @@ def load_raw_edges(path: str) -> List[Tuple[str, str, str]]:
     if not edges:
         raise ValueError(f"{path}: no edges found")
     return edges
+
+
+def load_raw_edges(path) -> List[Tuple[str, str, str]]:
+    """`path` may be a single edge file, or a directory / glob pattern /
+    '+'-joined list of these (see real_data.resolve_link_paths) -- e.g. an
+    entire folder of edge-list files, each contributing its own edges to
+    one combined graph. Rows are concatenated in resolved-path order; the
+    per-file header-row / '#'-comment skip still applies independently to
+    each file (so each file may have its own header)."""
+    paths = resolve_link_paths(path)
+    all_edges: List[Tuple[str, str, str]] = []
+    for p in paths:
+        all_edges.extend(_load_raw_edges_one(p))
+    return all_edges
 
 
 def build_graph_from_raw_edges(raw_edges, label_seed: int = 1234):

@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import torch
 
+import os
+
 from data.common.graph_io import load_raw_edges, build_graph_from_raw_edges
 from data.graph_traversal.graph_traversal import (
     INPUT_DIM, TRIPLE_DIM, OOD_PATH_LENGTH_RANGE,
@@ -58,11 +60,14 @@ class GraphTraversalTask(BaseInferenceTask):
             self.edges, self.node_labels, self.adjacency = build_london_underground_eval()
             self.source_desc = "London Underground (built-in)"
         else:
-            if not os.path.isfile(dataset_link):
-                raise FileNotFoundError(f"graph test file not found: {dataset_link}")
+            # dataset_link may be a single edge file, a directory, a glob
+            # pattern, or a '+'-joined list of these -- load_raw_edges
+            # resolves it (data/common/real_data.py's resolve_link_paths)
+            # and raises its own clear FileNotFoundError if nothing
+            # matches, so no separate isfile guard is needed here.
             self.edges, self.node_labels, self.adjacency = build_graph_from_raw_edges(
                 load_raw_edges(dataset_link))
-            self.source_desc = f"file: {dataset_link}"
+            self.source_desc = f"source: {dataset_link}"
 
         if not any(self.adjacency[i] for i in self.adjacency):
             raise ValueError("test graph has no outgoing edges; cannot build traversal episodes")

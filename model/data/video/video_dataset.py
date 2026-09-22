@@ -53,6 +53,10 @@ class VideoChainDataset(KVChainDataset):
             print(f"[video-chain] {len(self._fact_pool)} train facts from {dataset_link} | "
                   f"{len(self._test_fact_pool)} test facts"
                   + (f" from {test_dataset_link}" if test_dataset_link else " (held-out split)"))
+        elif test_dataset_link is not None:
+            # Inference-only real test pool -- see text_dataset.py's twin fix.
+            self._test_fact_pool = build_video_kv_pool(test_dataset_link, self.label_range)
+            print(f"[video-chain] {len(self._test_fact_pool)} test facts from {test_dataset_link}")
 
     def _synthetic_ood_facts(self, n_facts: int = 20):
         rng = random.Random(31337)  # unseen object/action table

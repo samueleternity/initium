@@ -24,7 +24,7 @@ import random
 import torch
 
 from data.common.chain_task import KVChainDataset
-from data.common.real_data import audio_token_stream, build_kv_pool_from_tokens, split_train_test_facts
+from data.common.real_data import build_audio_kv_pool, split_train_test_facts
 
 AUDIO_CURRICULUM = [
     (3, 2), (3, 3), (5, 3), (5, 4), (8, 4), (8, 5),
@@ -37,22 +37,33 @@ assert len(AUDIO_CURRICULUM) == len(AUDIO_LESSON_NR_CELLS)
 class AudioChainDataset(KVChainDataset):
     name = "audio-chain"
 
-    def __init__(self, dataset_link: str = None, test_dataset_link: str = None):
+    def __init__(self, dataset_link=None, test_dataset_link=None):
+        # dataset_link / test_dataset_link each accept a single file, a
+        # directory (an entire folder of clips), a glob pattern
+        # ("/data/audio_clips/*.wav"), or a '+'-joined list of these -- see
+        # data/common/real_data.py's resolve_link_paths. Each matched file
+        # contributes its own facts (e.g. 5 clips with different
+        # frequency/amplitude profiles) to one combined pool.
         self._table = AUDIO_CURRICULUM
         self._lesson_nr_cells = AUDIO_LESSON_NR_CELLS
         self._fact_pool = None
         self._test_fact_pool = None
         if dataset_link is not None:
-            pool = build_kv_pool_from_tokens(audio_token_stream(dataset_link), self.label_range)
+            pool = build_audio_kv_pool(dataset_link, self.label_range)
             if test_dataset_link is not None:
                 self._fact_pool = pool
-                self._test_fact_pool = build_kv_pool_from_tokens(
-                    audio_token_stream(test_dataset_link), self.label_range)
+                self._test_fact_pool = build_audio_kv_pool(test_dataset_link, self.label_range)
             else:
                 self._fact_pool, self._test_fact_pool = split_train_test_facts(pool)
             print(f"[audio-chain] {len(self._fact_pool)} train facts from {dataset_link} | "
                   f"{len(self._test_fact_pool)} test facts"
                   + (f" from {test_dataset_link}" if test_dataset_link else " (held-out split)"))
+        elif test_dataset_link is not None:
+            # Inference-only: no training pool needed, just a fixed real
+            # test pool -- every inference/tasks/*_task.py passes
+            # --dataset-link through as test_dataset_link.
+            self._test_fact_pool = build_audio_kv_pool(test_dataset_link, self.label_range)
+            print(f"[audio-chain] {len(self._test_fact_pool)} test facts from {test_dataset_link}")
 
     def _synthetic_ood_facts(self, n_facts: int = 20):
         rng = random.Random(9001)  # different seed -> different "speaker profile"

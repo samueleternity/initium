@@ -11,9 +11,21 @@ Delta_<modality>, the Dependency-layer (Layer C) analogue of
 evaluate_id_ablated (memory) / evaluate_id_combiner_stage_ablated
 (component), for modalities.
 
-Only the FIRST listed modality's targets are scored ("primary") -- this
+Only the FIRST listed modality's targets are scored ("primary") - this
 tests whether auxiliary modalities help/are relied upon for the primary
 modality's own recall+chain task, not multi-task multi-output prediction.
+
+Real-data wiring: each modality in the `modalities` list passed to
+__init__ may be a bare name (synthetic, unchanged default) or
+"modality:path" to source that modality's own real fact pool from `path`
+via its existing single-modality real-data pipeline (data/common/
+real_data.py) -- see _parse_modality_specs() below. Repeating the SAME
+path across modalities (e.g. "video:clip.mp4+audio:clip.mp4") draws both
+modalities' real content from one shared file, such as a video that also
+carries an audio track -- the flagship "upload one video, learn its
+picture AND its soundtrack" case. See MultimodalDataset.__init__'s
+`link_role` for how training vs. inference (MultimodalTask) route a
+spec's path to the right underlying *ChainDataset kwarg.
 """
 import random
 
@@ -28,24 +40,61 @@ from data.video.video_dataset import VideoChainDataset
 _MODALITY_CLASSES = {"text": TextChainDataset, "audio": AudioChainDataset, "video": VideoChainDataset}
 
 
+def _parse_modality_specs(modalities):
+    """Each entry of `modalities` is either a bare modality name ("text",
+    "audio", "video") -- synthetic facts, unchanged default -- or
+    "modality:path" to source that modality's OWN real (key,value) fact
+    pool from `path`, via the exact same per-modality real-data pipeline
+    single-modality datasets already use (data/common/real_data.py). The
+    SAME path can be given to more than one modality -- e.g.
+    "video:clip.mp4+audio:clip.mp4" -- to draw both modalities' real
+    content from one shared file, such as a video that also carries an
+    audio track: video_token_stream (opencv) and audio_token_stream
+    (torchaudio) each open the container with their own library and only
+    ever read the stream they care about, so pointing both at the same
+    path is safe and is the intended way to say "learn from this video's
+    picture AND its soundtrack." -> [(name, path_or_None), ...].
+    """
+    parsed = []
+    for spec in modalities:
+        spec = (spec or "").strip()
+        if not spec:
+            continue
+        name, _, path = spec.partition(":")
+        parsed.append((name.strip().lower(), path.strip() or None))
+    return parsed
+
+
 class MultimodalDataset(BaseDataset):
-    # NOTE: real-data dataset_link/test_dataset_link (see data/common/real_data.py)
-    # are not wired for multimodal yet -- each sub-dataset here is always built
-    # synthetic-only (dataset_link is reserved for the '+'-joined modality list).
-    # Wiring real per-modality sources through is a natural follow-up once the
-    # per-modality real-data pipelines above are validated individually.
-    def __init__(self, modalities):
-        modalities = [m.strip().lower() for m in modalities if m.strip()]
-        if len(modalities) < 2:
+    # Real-data wiring: see _parse_modality_specs() above for the
+    # "modality[:path]" spec syntax and MultimodalTask (inference/tasks/
+    # multimodal_task.py) for how --dataset-link reaches here at inference.
+    def __init__(self, modalities, link_role: str = "dataset_link"):
+        """
+        modalities: iterable of modality specs (see _parse_modality_specs).
+        link_role: "dataset_link" (default; training-side) -- a spec's path
+            becomes that modality's OWN training source (auto-split into a
+            disjoint train/test pool by that modality's dataset class,
+            exactly like a standalone *ChainDataset(dataset_link=...)), or
+            "test_dataset_link" (inference-side, see MultimodalTask) -- a
+            spec's path becomes a fixed, already-real TEST pool directly.
+        """
+        if link_role not in ("dataset_link", "test_dataset_link"):
+            raise ValueError("MultimodalDataset: link_role must be 'dataset_link' "
+                              f"or 'test_dataset_link', got {link_role!r}")
+        specs = _parse_modality_specs(modalities)
+        if len(specs) < 2:
             raise ValueError(f"MultimodalDataset needs >=2 modalities, got {modalities!r}")
-        unknown = [m for m in modalities if m not in _MODALITY_CLASSES]
+        names = [n for n, _ in specs]
+        unknown = [n for n in names if n not in _MODALITY_CLASSES]
         if unknown:
             raise ValueError(f"MultimodalDataset: unknown modalities {unknown}, "
                               f"expected a subset of {sorted(_MODALITY_CLASSES)}")
-        self.modalities = modalities
-        self.subs = [_MODALITY_CLASSES[m]() for m in modalities]
+        self.modalities = names
+        self.subs = [_MODALITY_CLASSES[name](**({link_role: path} if path else {}))
+                     for name, path in specs]
         self.primary = self.subs[0]
-        self.name = "multimodal[" + "+".join(modalities) + "]"
+        self.name = "multimodal[" + "+".join(names) + "]"
 
         off = 0
         self._offsets = []
@@ -58,6 +107,34 @@ class MultimodalDataset(BaseDataset):
         self._table = self.primary._table
         self._lesson_nr_cells = self.primary._lesson_nr_cells
 
+    def _facts_pool(self, use_test_pool: bool = False):
+        """Real (key,value) pool to draw a fused episode from, or None for
+        the fully-synthetic draw (unchanged default when no modality was
+        given a real source). use_test_pool selects each sub's held-out
+        `_test_fact_pool` (evaluate_ood) vs its training `_fact_pool`
+        (sample_batch / evaluate_id_ablated / evaluate_modality_ablated) --
+        same train/test convention every single-modality dataset already
+        uses. Values always come from the PRIMARY modality's pool (only the
+        primary is scored -- see class docstring); keys are restricted to
+        ones ALSO present in every OTHER real-sourced modality's pool, so
+        any channel built from real data genuinely has real content for
+        every key an episode can draw (e.g. a video file's frame-derived
+        pool intersected with that SAME file's audio-track-derived pool).
+        Falls back to the unrestricted primary pool if the intersection is
+        empty, rather than raising mid-run."""
+        attr = "_test_fact_pool" if use_test_pool else "_fact_pool"
+        primary_pool = getattr(self.primary, attr)
+        if primary_pool is None:
+            return None
+        other_pools = [p for p in (getattr(s, attr) for s in self.subs[1:]) if p is not None]
+        if not other_pools:
+            return primary_pool
+        shared_keys = set(k for k, _ in primary_pool)
+        for p in other_pools:
+            shared_keys &= set(k for k, _ in p)
+        restricted = [(k, v) for k, v in primary_pool if k in shared_keys]
+        return restricted or primary_pool
+
     def make_curriculum(self):
         return ChainCurriculum(self, self._table, self._lesson_nr_cells)
 
@@ -65,16 +142,23 @@ class MultimodalDataset(BaseDataset):
         self._output_proj = proj
 
     def _build_fused_episode(self, num_facts_range, num_queries_range, rng=None,
-                              skip_modalities=None, perturb=None):
+                              skip_modalities=None, perturb=None, use_test_pool=False):
         rng = rng if rng is not None else random
         skip_modalities = skip_modalities or set()
         codec, label_range = self.primary.codec, self.primary.label_range
         NF = codec.num_digits
 
         num_facts = rng.randint(*num_facts_range)
-        keys = rng.sample(range(label_range), num_facts)
-        vals = [rng.randrange(label_range) for _ in range(num_facts)]
-        facts = list(zip(keys, vals)); rng.shuffle(facts)
+        pool = self._facts_pool(use_test_pool=use_test_pool)
+        if pool is not None:
+            num_facts = min(num_facts, len(pool))
+            facts = rng.sample(pool, num_facts)
+        else:
+            keys = rng.sample(range(label_range), num_facts)
+            vals = [rng.randrange(label_range) for _ in range(num_facts)]
+            facts = list(zip(keys, vals))
+        rng.shuffle(facts)
+        keys = [k for k, _ in facts]
         num_queries = rng.randint(*num_queries_range)
         query_keys = [rng.choice(keys) for _ in range(num_queries)]
 
@@ -119,7 +203,7 @@ class MultimodalDataset(BaseDataset):
 
     def evaluate_chain(self, model, device, num_episodes, num_facts_range=None, num_queries_range=None,
                         rng=None, ablate_memory=False, step_breakdown=False, skip_modalities=None,
-                        verbose_n=0):
+                        verbose_n=0, use_test_pool=False):
         model.eval()
         total = correct = perfect_episodes = tested = 0
         by_depth = {}
@@ -127,7 +211,8 @@ class MultimodalDataset(BaseDataset):
         with torch.no_grad():
             while tested < num_episodes:
                 input_seq, target_digits, answer_mask, depth = self._build_fused_episode(
-                    num_facts_range, num_queries_range, rng=rng, skip_modalities=skip_modalities)
+                    num_facts_range, num_queries_range, rng=rng, skip_modalities=skip_modalities,
+                    use_test_pool=use_test_pool)
                 input_seq = input_seq.unsqueeze(0).to(device)
                 output, _ = model(input_seq, (None, None, None), reset_experience=True,
                                    pass_through_memory=not ablate_memory)
@@ -161,7 +246,8 @@ class MultimodalDataset(BaseDataset):
 
     def evaluate_ood(self, model, device, num_episodes, rng, verbose_n=0, field_log=None):
         return self.evaluate_chain(model, device, num_episodes, num_facts_range=(15, 20),
-                                    num_queries_range=self.primary.ood_query_range, rng=rng, step_breakdown=True)
+                                    num_queries_range=self.primary.ood_query_range, rng=rng,
+                                    step_breakdown=True, use_test_pool=True)
 
     def evaluate_id_ablated(self, model, device, curriculum, lesson_idx):
         nf, nq = curriculum.table[lesson_idx]

@@ -41,11 +41,71 @@ rewrite, which is out of scope here; flagging it rather than pretending to fix i
 """
 from __future__ import annotations
 
+import glob as _glob
+import os
 import random
 from collections import Counter
 from typing import List, Tuple
 
 LABEL_RANGE = 1000
+
+
+def resolve_link_paths(link) -> List[str]:
+    """Expand a dataset link into a sorted, de-duplicated list of one or
+    more file paths. Accepts: a single file path; a directory (every
+    regular file directly inside it is used -- e.g. "/data/audio_clips" to
+    pull in a whole folder); a glob pattern (e.g. "/data/audio_clips/*.wav");
+    or several of these '+'-joined in one string (e.g.
+    "clip_a.wav+clip_b.wav"), or an actual list/tuple of specs.
+
+    Each resolved path is treated as an independent SOURCE by the
+    build_*_kv_pool() functions below: its own token stream/bigram counts
+    are folded into the SAME shared pool, but never stitched across a file
+    boundary the way within-file chunking is (see _accumulate_bigram_chunk)
+    -- two unrelated files (e.g. 5 audio clips with different frequency
+    content) have no real adjacency between them, so treating their
+    boundary as a genuine bigram would inject spurious facts. This is the
+    single place multi-file/"pass a whole folder" support lives; every
+    caller (text/audio/video real-data pools, and data/common/graph_io.py's
+    multi-file edge loading) goes through this function, so no per-modality
+    globbing logic is duplicated.
+
+    Sorted (not glob's arbitrary OS order) so the resulting pool is
+    reproducible across runs/machines for the same directory/pattern.
+    """
+    if isinstance(link, (list, tuple)):
+        specs = list(link)
+    else:
+        specs = str(link).split("+")
+
+    paths: List[str] = []
+    for spec in specs:
+        spec = spec.strip()
+        if not spec:
+            continue
+        if any(ch in spec for ch in "*?["):
+            matches = sorted(p for p in _glob.glob(spec) if os.path.isfile(p))
+            if not matches:
+                raise FileNotFoundError(f"resolve_link_paths: glob {spec!r} matched no files")
+            paths.extend(matches)
+        elif os.path.isdir(spec):
+            matches = sorted(p for p in _glob.glob(os.path.join(spec, "*")) if os.path.isfile(p))
+            if not matches:
+                raise FileNotFoundError(f"resolve_link_paths: directory {spec!r} contains no files")
+            paths.extend(matches)
+        elif os.path.isfile(spec):
+            paths.append(spec)
+        else:
+            raise FileNotFoundError(f"resolve_link_paths: {spec!r} is not a file, directory, or glob match")
+
+    seen, deduped = set(), []
+    for p in paths:
+        if p not in seen:
+            seen.add(p)
+            deduped.append(p)
+    if not deduped:
+        raise FileNotFoundError(f"resolve_link_paths: {link!r} resolved to no files")
+    return deduped
 
 
 import numpy as np
@@ -214,25 +274,33 @@ def text_token_stream(path: str, vocab_size: int = LABEL_RANGE) -> List[int]:
     tok = BPETokenizer(vocab_size=vocab_size).train(text)
     return tok.encode(text)
 
-def build_text_kv_pool(path: str, label_range: int = LABEL_RANGE) -> List[Tuple[int, int]]:
-    """Streaming replacement for build_kv_pool_from_tokens(text_token_stream(path), ...):
-    trains + encodes the corpus chunk-by-chunk and folds bigram counts
-    directly into the fixed count matrix, so the full token stream is never
-    materialized as one array. Only the `tokenizers`-unavailable fallback
-    still fully materializes the corpus in memory (BPETokenizer.train()
-    itself caps at _BPE_TRAIN_CHARS_CAP; see text_token_stream's own
-    docstring) -- that path is unaffected by, and not the target of, this
-    fix."""
-    if _HF_TOKENIZERS_AVAILABLE:
-        with open(path, encoding="utf-8", errors="ignore") as f:
-            if not f.read(1):
-                raise ValueError(f"{path}: empty text file")
-        matrix = np.zeros(label_range * label_range, dtype=np.int64)
-        prev_last = None
-        for chunk in _text_token_stream_hf_chunks(path, label_range):
-            prev_last = _accumulate_bigram_chunk(matrix, chunk, label_range, prev_last)
-        return _pool_from_bigram_matrix(matrix, label_range)
-    return build_kv_pool_from_tokens(text_token_stream(path, label_range), label_range)
+def build_text_kv_pool(path, label_range: int = LABEL_RANGE) -> List[Tuple[int, int]]:
+    """Streaming AND multi-file: `path` may be a single text file, or a
+    directory / glob pattern / '+'-joined list of these (see
+    resolve_link_paths) -- e.g. an entire folder of text files, each
+    contributing its own bigram-derived facts to one shared pool. Each
+    resolved file is trained/encoded independently (the HF path streams +
+    trains its own BPE vocabulary per file rather than assuming unrelated
+    files share one byte-pair vocabulary) and folded into the same fixed
+    count matrix; a chunk's cross-boundary bigram is only ever stitched
+    WITHIN one file (see _accumulate_bigram_chunk), never across files.
+    Only the `tokenizers`-unavailable fallback still fully materializes
+    each file in memory (BPETokenizer.train() itself caps at
+    _BPE_TRAIN_CHARS_CAP; see text_token_stream's own docstring)."""
+    paths = resolve_link_paths(path)
+    matrix = np.zeros(label_range * label_range, dtype=np.int64)
+    for p in paths:
+        if _HF_TOKENIZERS_AVAILABLE:
+            with open(p, encoding="utf-8", errors="ignore") as f:
+                if not f.read(1):
+                    raise ValueError(f"{p}: empty text file")
+            prev_last = None
+            for chunk in _text_token_stream_hf_chunks(p, label_range):
+                prev_last = _accumulate_bigram_chunk(matrix, chunk, label_range, prev_last)
+        else:
+            tokens = np.asarray(text_token_stream(p, label_range), dtype=np.int64)
+            _accumulate_bigram_chunk(matrix, tokens, label_range, None)
+    return _pool_from_bigram_matrix(matrix, label_range)
 
 # ==========================================================================
 # audio: waveform -> quantized spectrogram-frame token stream
@@ -245,7 +313,21 @@ def _load_waveform(path: str):
             "audio real-data loading requires `torchaudio` (`pip install torchaudio`). "
             f"Original import error: {e}"
         )
-    waveform, sample_rate = torchaudio.load(path)
+    try:
+        # Works on a plain audio file OR a video container's audio track --
+        # e.g. the same path used for the "video" modality in a
+        # "video:clip.mp4+audio:clip.mp4" multimodal spec (see
+        # data/multimodal/multimodal_dataset.py) -- as long as torchaudio's
+        # backend can demux it.
+        waveform, sample_rate = torchaudio.load(path)
+    except Exception as e:
+        raise RuntimeError(
+            f"audio real-data loading: torchaudio could not decode an audio stream from "
+            f"'{path}'. If this is a video container (mp4/mkv/...) with an embedded audio "
+            "track, torchaudio needs an ffmpeg-capable backend to demux it -- a system "
+            "ffmpeg install alongside `pip install torchaudio` usually fixes this. "
+            f"Original error: {e}"
+        ) from e
     return waveform.mean(dim=0), sample_rate  # mono
 
 
@@ -265,6 +347,24 @@ def audio_token_stream(path: str, label_range: int = LABEL_RANGE,
     dominant_bin = mag.argmax(dim=0)  # (n_frames,) in [0, freq_bins)
     scaled = (dominant_bin.float() / max(freq_bins - 1, 1) * (label_range - 1)).round().long()
     return scaled.clamp(0, label_range - 1).tolist()
+
+
+def build_audio_kv_pool(path, label_range: int = LABEL_RANGE) -> List[Tuple[int, int]]:
+    """Multi-file counterpart of build_text_kv_pool/build_video_kv_pool for
+    audio: `path` may be a single audio file, or a directory / glob
+    pattern / '+'-joined list of these (see resolve_link_paths) -- e.g. an
+    entire folder of clips with different frequency/amplitude profiles,
+    each contributing its own facts to one shared pool instead of only the
+    first file being read. Each file's dominant-frequency-bin token stream
+    is folded into the same fixed count matrix independently -- no bigram
+    is stitched across a file boundary (two unrelated clips have no real
+    temporal adjacency)."""
+    paths = resolve_link_paths(path)
+    matrix = np.zeros(label_range * label_range, dtype=np.int64)
+    for p in paths:
+        tokens = np.asarray(audio_token_stream(p, label_range), dtype=np.int64)
+        _accumulate_bigram_chunk(matrix, tokens, label_range, None)
+    return _pool_from_bigram_matrix(matrix, label_range)
 
 
 # ==========================================================================
@@ -311,26 +411,32 @@ def video_token_stream(path: str, label_range: int = LABEL_RANGE, grid: int = 8)
                      0, label_range - 1)
     return scaled.tolist()
 
-def build_video_kv_pool(path: str, label_range: int = LABEL_RANGE, grid: int = 8,
+def build_video_kv_pool(path, label_range: int = LABEL_RANGE, grid: int = 8,
                         chunk_frames: int = 200_000) -> List[Tuple[int, int]]:
-    """Streaming replacement for build_kv_pool_from_tokens(video_token_stream(path), ...):
-    quantizes and folds frames into the bigram count matrix chunk_frames at
-    a time, instead of building one `means` list for the whole video first."""
+    """Streaming AND multi-file: `path` may be a single video file, or a
+    directory / glob pattern / '+'-joined list of these (see
+    resolve_link_paths) -- e.g. an entire folder of clips. Quantizes and
+    folds frames into the bigram count matrix chunk_frames at a time (never
+    building one `means` list for a whole video), and resets the
+    within-file stitching state (prev_last) at the start of EACH file, so
+    no bigram is stitched across a file boundary."""
+    paths = resolve_link_paths(path)
     matrix = np.zeros(label_range * label_range, dtype=np.int64)
-    prev_last = None
-    buf = []
     def _flush(buf):
         arr = np.asarray(buf, dtype=np.float32)
         return np.clip((arr / 255.0 * (label_range - 1)).round(), 0, label_range - 1).astype(np.int64)
-    for frame, cv2 in _iter_video_frames(path):
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        small = cv2.resize(gray, (grid, grid), interpolation=cv2.INTER_AREA)
-        buf.append(float(small.mean()))
-        if len(buf) >= chunk_frames:
+    for p in paths:
+        prev_last = None
+        buf = []
+        for frame, cv2 in _iter_video_frames(p):
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            small = cv2.resize(gray, (grid, grid), interpolation=cv2.INTER_AREA)
+            buf.append(float(small.mean()))
+            if len(buf) >= chunk_frames:
+                prev_last = _accumulate_bigram_chunk(matrix, _flush(buf), label_range, prev_last)
+                buf = []
+        if buf:
             prev_last = _accumulate_bigram_chunk(matrix, _flush(buf), label_range, prev_last)
-            buf = []
-    if buf:
-        prev_last = _accumulate_bigram_chunk(matrix, _flush(buf), label_range, prev_last)
     return _pool_from_bigram_matrix(matrix, label_range)
 
 # ==========================================================================

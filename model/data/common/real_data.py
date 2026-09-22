@@ -35,9 +35,16 @@ later only means replacing the token-stream function; build_kv_pool_from_tokens
 / split_train_test_facts and everything downstream (chain_task.py,
 training, evaluation) stays the same.
 
-Note for later:
-Audio computes torch.stft over the whole waveform in one call — a real streaming fix there needs a windowed-STFT 
-rewrite, which is out of scope here; flagging it rather than pretending to fix it.
+Note: audio real-data loading now streams (see _iter_waveform_chunks /
+audio_token_stream_chunks / build_audio_kv_pool below) -- the whole-file
+torch.stft call this used to require was the actual cause of OOMs on
+multi-hour sources (a 2-hour recording's single torch.stft call alone was
+several GB); it is now computed chunk_seconds at a time instead.
+audio_token_stream() (the original whole-file function) is kept as-is for
+small files / direct use, but build_audio_kv_pool() no longer calls it.
+Decoding goes through the `ffmpeg`/`ffprobe` CLI directly rather than
+torchaudio's I/O backend, whose legacy info()/load() API has been removed
+or changed across torchaudio releases -- see _require_ffmpeg()'s docstring.
 """
 from __future__ import annotations
 
@@ -305,30 +312,74 @@ def build_text_kv_pool(path, label_range: int = LABEL_RANGE) -> List[Tuple[int, 
 # ==========================================================================
 # audio: waveform -> quantized spectrogram-frame token stream
 # ==========================================================================
-def _load_waveform(path: str):
-    try:
-        import torchaudio
-    except ImportError as e:
-        raise ImportError(
-            "audio real-data loading requires `torchaudio` (`pip install torchaudio`). "
-            f"Original import error: {e}"
-        )
-    try:
-        # Works on a plain audio file OR a video container's audio track --
-        # e.g. the same path used for the "video" modality in a
-        # "video:clip.mp4+audio:clip.mp4" multimodal spec (see
-        # data/multimodal/multimodal_dataset.py) -- as long as torchaudio's
-        # backend can demux it.
-        waveform, sample_rate = torchaudio.load(path)
-    except Exception as e:
+# Decoded via the `ffmpeg`/`ffprobe` CLI directly, not torchaudio's I/O
+# backend. torchaudio's legacy info()/load() API has been unstable across
+# releases (e.g. `torchaudio.info` was removed outright in some newer
+# versions -- the exact failure that motivated this switch), and
+# `soundfile` (a common fallback) can't demux mp4/AAC video containers at
+# all, which is exactly the "audio track embedded in a video file" case
+# this pipeline needs. ffmpeg handles any container/codec natively, and
+# Colab ships it preinstalled.
+def _require_ffmpeg() -> None:
+    import shutil
+    missing = [exe for exe in ("ffmpeg", "ffprobe") if shutil.which(exe) is None]
+    if missing:
         raise RuntimeError(
-            f"audio real-data loading: torchaudio could not decode an audio stream from "
-            f"'{path}'. If this is a video container (mp4/mkv/...) with an embedded audio "
-            "track, torchaudio needs an ffmpeg-capable backend to demux it -- a system "
-            "ffmpeg install alongside `pip install torchaudio` usually fixes this. "
-            f"Original error: {e}"
-        ) from e
-    return waveform.mean(dim=0), sample_rate  # mono
+            f"audio real-data loading requires the `ffmpeg`/`ffprobe` CLI tools on PATH "
+            f"(missing: {missing}). Google Colab has both preinstalled; elsewhere "
+            "`apt-get install ffmpeg` (Debian/Ubuntu) or `conda install ffmpeg` provides both."
+        )
+
+
+def _ffmpeg_audio_info(path: str) -> int:
+    """-> sample_rate of the first audio stream in `path`, via ffprobe.
+    Works on any container ffmpeg can demux (wav/mp3/flac/... as well as a
+    video file's embedded audio track, e.g. mp4/mkv)."""
+    import json as _json
+    import subprocess
+    _require_ffmpeg()
+    cmd = ["ffprobe", "-v", "error", "-select_streams", "a:0",
+           "-show_entries", "stream=sample_rate", "-of", "json", path]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"ffprobe failed on {path!r}: {e.stderr.strip()}") from e
+    streams = (_json.loads(out.stdout) or {}).get("streams") or []
+    if not streams or not streams[0].get("sample_rate"):
+        raise ValueError(f"{path}: no audio stream found (or missing sample_rate)")
+    return int(streams[0]["sample_rate"])
+
+
+def _ffmpeg_decode_mono_f32(path: str, sample_rate: int):
+    """Starts an ffmpeg subprocess decoding `path` to mono float32 PCM at
+    `sample_rate`, streamed on stdout. `-v error` keeps stderr essentially
+    silent in the normal case, which matters for the streaming caller
+    below: it only drains stderr after stdout is exhausted, and a chatty
+    stderr could otherwise deadlock a long-running decode by filling that
+    pipe's OS buffer. Caller must read stdout to EOF and check the return
+    code (see _load_waveform / _iter_waveform_chunks)."""
+    import subprocess
+    cmd = ["ffmpeg", "-v", "error", "-i", path, "-vn", "-ac", "1",
+           "-ar", str(sample_rate), "-f", "f32le", "-"]
+    return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+def _load_waveform(path: str):
+    """Decodes the WHOLE file to mono float32 PCM via ffmpeg. Used only by
+    audio_token_stream() below, the original whole-file function kept for
+    small files / direct use -- build_audio_kv_pool() uses the streaming
+    _iter_waveform_chunks() instead and never materializes a whole long
+    recording in memory (see that function's docstring)."""
+    import numpy as _np
+    import torch
+    sr = _ffmpeg_audio_info(path)
+    proc = _ffmpeg_decode_mono_f32(path, sr)
+    raw, stderr = proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg failed decoding {path!r}: {stderr.decode(errors='ignore')[-2000:]}")
+    usable = len(raw) - (len(raw) % 4)
+    arr = _np.frombuffer(raw[:usable], dtype=_np.float32).copy()
+    return torch.from_numpy(arr), sr
 
 
 def audio_token_stream(path: str, label_range: int = LABEL_RANGE,
@@ -349,21 +400,109 @@ def audio_token_stream(path: str, label_range: int = LABEL_RANGE,
     return scaled.clamp(0, label_range - 1).tolist()
 
 
-def build_audio_kv_pool(path, label_range: int = LABEL_RANGE) -> List[Tuple[int, int]]:
-    """Multi-file counterpart of build_text_kv_pool/build_video_kv_pool for
-    audio: `path` may be a single audio file, or a directory / glob
-    pattern / '+'-joined list of these (see resolve_link_paths) -- e.g. an
-    entire folder of clips with different frequency/amplitude profiles,
-    each contributing its own facts to one shared pool instead of only the
-    first file being read. Each file's dominant-frequency-bin token stream
-    is folded into the same fixed count matrix independently -- no bigram
-    is stitched across a file boundary (two unrelated clips have no real
-    temporal adjacency)."""
+_AUDIO_CHUNK_SECONDS = 30.0   # ~1.3M samples/chunk at 44.1kHz -> a stft matrix of tens of MB,
+                              # not the multi-GB single-shot matrix a multi-hour file used to need
+
+
+def _iter_waveform_chunks(path: str, chunk_seconds: float = _AUDIO_CHUNK_SECONDS):
+    """Streams mono float32 PCM straight from an ffmpeg subprocess pipe, in
+    chunk_seconds-sized pieces, so a long recording (or a video file's
+    audio track) is never materialized whole in memory -- the actual OOM
+    fix for multi-hour sources (see module docstring). Reads directly off
+    the pipe rather than seeking per-chunk on disk, so this is also a
+    single continuous decode, not one ffmpeg invocation per chunk. Yields
+    (mono_waveform_chunk: torch.Tensor, sample_rate)."""
+    import numpy as _np
+    import torch
+    sr = _ffmpeg_audio_info(path)
+    chunk_frames = max(1, int(chunk_seconds * sr))
+    bytes_per_frame = 4  # f32le, already downmixed to mono by -ac 1
+    chunk_bytes = chunk_frames * bytes_per_frame
+    proc = _ffmpeg_decode_mono_f32(path, sr)
+    try:
+        while True:
+            raw = proc.stdout.read(chunk_bytes)  # BufferedReader.read(n) blocks for n bytes or EOF
+            if not raw:
+                break
+            usable = len(raw) - (len(raw) % bytes_per_frame)
+            if usable <= 0:
+                break
+            arr = _np.frombuffer(raw[:usable], dtype=_np.float32).copy()
+            yield torch.from_numpy(arr), sr
+    finally:
+        proc.stdout.close()
+        stderr = proc.stderr.read()
+        proc.stderr.close()
+        ret = proc.wait()
+        if ret != 0:
+            raise RuntimeError(f"ffmpeg failed decoding {path!r} (exit {ret}): "
+                               f"{stderr.decode(errors='ignore')[-2000:]}")
+
+
+def audio_token_stream_chunks(path: str, label_range: int = LABEL_RANGE,
+                              n_fft: int = 400, hop_length: int = 160,
+                              chunk_seconds: float = _AUDIO_CHUNK_SECONDS):
+    """Streaming replacement for audio_token_stream(): computes the STFT
+    chunk_seconds worth of audio at a time instead of loading the whole
+    waveform and running one torch.stft call over it. A small per-chunk
+    sample overlap (n_fft - hop_length) is carried over between chunks so
+    STFT windows spanning a chunk boundary are still computed, and the
+    handful of frames derived purely from that carried-over overlap are
+    dropped from every chunk after the first, so tokens are not
+    double-counted at chunk boundaries. Uses center=False (unlike the
+    whole-file audio_token_stream's default-centered torch.stft) so chunk
+    boundaries are unambiguous; this shifts frame alignment by at most one
+    window and has no effect on the coarse dominant-frequency-bin codebook
+    this pipeline builds. Yields one int64 numpy array of token ids per
+    chunk (a very short final chunk may yield nothing)."""
+    import torch
+    overlap = max(0, n_fft - hop_length)
+    carry = None
+    first = True
+    for wf, _sr in _iter_waveform_chunks(path, chunk_seconds=chunk_seconds):
+        if carry is not None:
+            wf = torch.cat([carry, wf])
+        if wf.shape[0] < n_fft:
+            carry = wf  # too short to STFT yet -- fold into the next chunk instead
+            continue
+        carry = wf[-overlap:].clone() if overlap > 0 else None
+        spec = torch.stft(wf, n_fft=n_fft, hop_length=hop_length,
+                          window=torch.hann_window(n_fft), center=False, return_complex=True)
+        mag = spec.abs()  # (freq_bins, n_frames)
+        freq_bins = mag.shape[0]
+        dominant_bin = mag.argmax(dim=0)
+        scaled = (dominant_bin.float() / max(freq_bins - 1, 1) * (label_range - 1)).round().long()
+        ids = scaled.clamp(0, label_range - 1)
+        if not first:
+            n_drop = min(overlap // hop_length, ids.shape[0])
+            ids = ids[n_drop:]
+        first = False
+        if ids.numel():
+            yield ids.numpy().astype(np.int64)
+
+
+def build_audio_kv_pool(path, label_range: int = LABEL_RANGE,
+                        n_fft: int = 400, hop_length: int = 160,
+                        chunk_seconds: float = _AUDIO_CHUNK_SECONDS) -> List[Tuple[int, int]]:
+    """Multi-file AND streaming counterpart of build_text_kv_pool/
+    build_video_kv_pool for audio: `path` may be a single audio file, or a
+    directory / glob pattern / '+'-joined list of these (see
+    resolve_link_paths) -- e.g. an entire folder of clips with different
+    frequency/amplitude profiles. Each resolved file's dominant-frequency
+    token stream is computed and folded into the bigram matrix
+    chunk_seconds at a time (see audio_token_stream_chunks) rather than
+    loading the whole file into one torch.stft call -- this is what makes
+    a multi-hour recording (or a long video's audio track) safe to build a
+    pool from without OOMing. No bigram is stitched across a FILE boundary
+    (prev_last resets per file); it IS correctly stitched across a CHUNK
+    boundary within the same file via prev_last."""
     paths = resolve_link_paths(path)
     matrix = np.zeros(label_range * label_range, dtype=np.int64)
     for p in paths:
-        tokens = np.asarray(audio_token_stream(p, label_range), dtype=np.int64)
-        _accumulate_bigram_chunk(matrix, tokens, label_range, None)
+        prev_last = None
+        for chunk in audio_token_stream_chunks(p, label_range, n_fft=n_fft,
+                                               hop_length=hop_length, chunk_seconds=chunk_seconds):
+            prev_last = _accumulate_bigram_chunk(matrix, chunk, label_range, prev_last)
     return _pool_from_bigram_matrix(matrix, label_range)
 
 

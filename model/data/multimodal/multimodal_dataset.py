@@ -142,11 +142,17 @@ class MultimodalDataset(BaseDataset):
         self._output_proj = proj
 
     def _build_fused_episode(self, num_facts_range, num_queries_range, rng=None,
-                              skip_modalities=None, perturb=None, use_test_pool=False):
+                            skip_modalities=None, perturb=None, use_test_pool=False):
         rng = rng if rng is not None else random
         skip_modalities = skip_modalities or set()
         codec, label_range = self.primary.codec, self.primary.label_range
         NF = codec.num_digits
+
+        def _as_range(x):
+            return x if isinstance(x, tuple) else (x, x)
+
+        num_facts_range = _as_range(num_facts_range)
+        num_queries_range = _as_range(num_queries_range)
 
         num_facts = rng.randint(*num_facts_range)
         pool = self._facts_pool(use_test_pool=use_test_pool)
@@ -186,14 +192,28 @@ class MultimodalDataset(BaseDataset):
         return (torch.stack(inputs), torch.tensor(target_digits, dtype=torch.long),
                 torch.tensor(answer_mask, dtype=torch.float32), num_queries)
 
+    def collate(self, batch):
+        max_len = max(len(x[0]) for x in batch)
+        B = len(batch)
+        NF = self.primary.codec.num_digits
+        padded_input = torch.zeros(B, max_len, self.input_dim)          
+        padded_targets = torch.zeros(B, max_len, 2 * NF, dtype=torch.long)
+        padded_mask = torch.zeros(B, max_len)
+        for i, (inp, tgt, mask, _) in enumerate(batch):
+            T = inp.size(0)
+            padded_input[i, :T] = inp
+            padded_targets[i, :T] = tgt
+            padded_mask[i, :T] = mask
+        return padded_input, padded_targets, padded_mask
+
     def sample_batch(self, curriculum, batch_size):
         episodes = []
         for _ in range(batch_size):
             idx = (random.randint(0, curriculum.lesson - 1)
-                   if curriculum.lesson > 0 and random.random() < 0.10 else curriculum.lesson)
+                if curriculum.lesson > 0 and random.random() < 0.10 else curriculum.lesson)
             nf, nq = curriculum.table[idx]
             episodes.append(self._build_fused_episode(nf, nq))
-        return self.primary.collate(episodes)
+        return self.collate(episodes)   # was self.primary.collate(episodes)
 
     def loss(self, output, target, mask):
         return self.primary.loss(output, target, mask)

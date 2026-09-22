@@ -116,9 +116,12 @@ import torch.nn as nn
 from dnc.memory import Memory
 
 from mamba_controller.mamba_backbone_parallel import MambaBackboneParallel
+from LNN_controller.cfc_backbone_parallel import build_parallel_backbone 
+from LNN_controller.hybrid_controller import build_hybrid_controller, is_hybrid_rnn_type  # v15: hybrid combiner 
 from mamba_controller.mamba_controller import MambaControllerWrapper       
 from mamba_controller.mamba2_controller import Mamba2ControllerWrapper 
-from mamba_controller.mamba3_controller import Mamba3ControllerWrapper 
+from mamba_controller.mamba3_controller import Mamba3ControllerWrapper
+from LNN_controller.cfc_controller import CfCControllerWrapper 
 
 
 class SplitGraphDNC(nn.Module):
@@ -139,6 +142,7 @@ class SplitGraphDNC(nn.Module):
         mamba_d_state: int = 16,
         mamba_d_conv: int = 4,
         mamba_expand: int = 2,
+        cfc_kwargs: dict | None = None,   # v14: CfC hyperparameters for variants containing "cfc" (None -> defaults)
         mamba_headdim: int = 64,       # mamba2-only
         combine_reads: bool = True,    # built-in ablation switch, see module docstring
         # v11: combiner mechanism for the sequential addressing step. This is
@@ -204,7 +208,7 @@ class SplitGraphDNC(nn.Module):
         self.mamba_expand = mamba_expand
         self.mamba_headdim = mamba_headdim
 
-        self.backbone = MambaBackboneParallel(
+        self.backbone = build_parallel_backbone(
             in_dim=input_size,
             d_model=hidden_size,
             num_blocks=num_backbone_blocks,
@@ -213,6 +217,7 @@ class SplitGraphDNC(nn.Module):
             d_conv=mamba_d_conv,
             expand=mamba_expand,
             headdim=mamba_headdim,
+            cfc_kwargs=cfc_kwargs,
             device=device,
         )
 
@@ -279,6 +284,28 @@ class SplitGraphDNC(nn.Module):
                     headdim=combiner_headdim,
                     device=device,
                 )
+            elif is_hybrid_rnn_type(combiner_variant):  # v15: e.g. "mamba+cfc" (hybrid_controller kind names: mamba, not mamba1)
+                self.combiner_wrapper = build_hybrid_controller(
+                    combiner_variant.lower(),
+                    in_dim=combiner_in_dim,
+                    d_model=hidden_size,
+                    blocks_per_kind={k: combiner_num_blocks for k in ("mamba", "mamba2", "mamba3", "cfc")},
+                    kwargs_per_kind={
+                        "mamba": dict(d_state=16, d_conv=combiner_d_conv, expand=combiner_expand),
+                        "mamba2": dict(d_state=64, d_conv=combiner_d_conv, expand=combiner_expand,
+                                       headdim=combiner_headdim, ngroups=combiner_ngroups),
+                        "mamba3": dict(d_state=64, expand=combiner_expand, headdim=combiner_headdim),
+                        "cfc": dict(cfc_kwargs or {}),
+                    },
+                    device=device,
+                )
+            elif combiner_variant == "cfc":
+                self.combiner_wrapper = CfCControllerWrapper(
+                    in_dim=combiner_in_dim,
+                    d_model=hidden_size,
+                    num_blocks=combiner_num_blocks,
+                    device=device,
+                )
             elif combiner_variant == "mamba1":
                 self.combiner_wrapper = MambaControllerWrapper(
                     in_dim=combiner_in_dim,
@@ -292,6 +319,11 @@ class SplitGraphDNC(nn.Module):
             else:
                 raise ValueError(f"SplitGraphDNC: unknown combiner_variant {combiner_variant!r}, "
                                   "expected 'mamba1' or 'mamba2'.")
+            
+            _ad = self.combiner_wrapper.in_adapter  # read-vector columns start at 0, like the zero-init linear combiner
+            if isinstance(_ad, nn.Linear):
+                with torch.no_grad():
+                    _ad.weight[:, hidden_size:].zero_()
 
         self.memories = []
         self.memories.append(
@@ -339,6 +371,8 @@ class SplitGraphDNC(nn.Module):
         hx=(None, None, None),
         reset_experience: bool = False,
         pass_through_memory: bool = True,
+        combiner_skip_stages=None,
+        start_step: int = 0,   # v20: resume the sequential loop mid-sequence (inference caching)
     ):
         """
         input: (B, T, input_size) -- batch-first, the whole padded episode
@@ -363,6 +397,14 @@ class SplitGraphDNC(nn.Module):
         """
         chx, mhx, last_read = hx
         B, T, _ = input.shape
+        if start_step:
+            # Backbone still runs over the FULL input (cheap, parallel, stateless across
+            # calls); only the sequential memory loop is skipped for t < start_step.
+            # hx must then carry the state as of step `start_step`.
+            if not (0 < start_step < T):
+                raise ValueError(f"start_step={start_step} must be in (0, T={T})")
+            if mhx is None:
+                raise ValueError("start_step>0 requires a resumed hx=(chx, mhx, last_read)")
         device = input.device
 
         # ---- (a) PARALLEL BACKBONE ------------------------------------
@@ -409,12 +451,15 @@ class SplitGraphDNC(nn.Module):
             )
 
         outputs = []
-        for t in range(T):
+        for t in range(start_step, T):
             h_t = H[:, t, :]  # (B, hidden_size)
 
             if self.combiner_mode == "controller":
                 combiner_in = torch.cat([h_t, read_vec], dim=-1).unsqueeze(1)  # (B, 1, hidden+read)
-                xi_out, combiner_hx = self.combiner_wrapper(combiner_in, combiner_hx)
+                if combiner_skip_stages is not None:
+                    xi_out, combiner_hx = self.combiner_wrapper(combiner_in, combiner_hx, skip_stages=combiner_skip_stages)
+                else:
+                    xi_out, combiner_hx = self.combiner_wrapper(combiner_in, combiner_hx)
                 xi_t = h_t + xi_out.squeeze(1)
             elif self.combine_reads:
                 xi_t = h_t + self.combiner(torch.cat([h_t, read_vec], dim=-1))

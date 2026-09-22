@@ -151,7 +151,7 @@ class StochasticWriteHead(nn.Module):
         # q(v_t) starts equal to the prior p0 = N(0,I) -- standard VAE-style
         # init that avoids an immediate large KL spike / early instability.
         nn.init.zeros_(self.logvar_transform.weight)
-        nn.init.zeros_(self.logvar_transform.bias)
+        nn.init.constant_(self.logvar_transform.bias, -4.0)  # sigma ~0.135 at init
 
         self.sample = sample
         self._kl_terms: list[torch.Tensor] = []  # per-call (BATCH, cell_size) KL, fp32
@@ -330,6 +330,7 @@ class StochasticWriteHead(nn.Module):
         if not self._recent_writes:
             diag = self.snapshot_diagnostics()
             diag["n_samples"] = 0
+            diag["raw_var_mean"] = diag["raw_var_max"] = diag["raw_hi_frac"] = 0.0
             return diag
 
         with torch.no_grad():
@@ -337,6 +338,9 @@ class StochasticWriteHead(nn.Module):
             n_samples = stacked.shape[0]
             new_mu = stacked.mean(dim=0)
             new_var = stacked.var(dim=0, unbiased=False).clamp(min=eps)
+            raw_var_mean = new_var.mean().item()
+            raw_var_max = new_var.max().item()
+            raw_hi_frac = (new_var.log() > max_logvar).float().mean().item()
             new_logvar = new_var.log().clamp(min=min_logvar, max=max_logvar)
             self.prior_mu.copy_(new_mu)
             self.prior_logvar.copy_(new_logvar)
@@ -346,6 +350,9 @@ class StochasticWriteHead(nn.Module):
 
         diag = self.snapshot_diagnostics()
         diag["n_samples"] = n_samples
+        diag["raw_var_mean"] = raw_var_mean
+        diag["raw_var_max"] = raw_var_max
+        diag["raw_hi_frac"] = raw_hi_frac
         return diag
 
     def snapshot_diagnostics(self) -> dict:
@@ -461,7 +468,8 @@ def update_all_prior_snapshots(
     """
     per_head = [h.update_prior_snapshot(step, min_logvar=min_logvar, max_logvar=max_logvar)
                 for h in heads]
-    keys = ["mu_g_norm", "sigma_g_mean", "sigma_g_min", "sigma_g_max", "trace_sigma_g"]
+    keys = ["mu_g_norm", "sigma_g_mean", "sigma_g_min", "sigma_g_max", "trace_sigma_g",
+            "raw_var_mean", "raw_var_max", "raw_hi_frac"]
     merged = {k: sum(d[k] for d in per_head) / len(per_head) for k in keys}
     merged["n_samples"] = sum(d["n_samples"] for d in per_head)
     merged["snapshot_step"] = step

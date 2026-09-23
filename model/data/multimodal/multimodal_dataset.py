@@ -32,7 +32,7 @@ import random
 import torch
 
 from data.base_dataset import BaseDataset
-from data.common.chain_task import ChainCurriculum
+from data.common.chain_task import ChainCurriculum, score_answer_steps
 from data.text.text_dataset import TextChainDataset
 from data.audio.audio_dataset import AudioChainDataset
 from data.video.video_dataset import VideoChainDataset
@@ -225,7 +225,7 @@ class MultimodalDataset(BaseDataset):
                         rng=None, ablate_memory=False, step_breakdown=False, skip_modalities=None,
                         verbose_n=0, use_test_pool=False, skip_stages=None):
         model.eval()
-        total = correct = perfect_episodes = tested = 0
+        total = correct_value = correct_cumsum = perfect_episodes = tested = 0
         by_depth = {}
         codec = self.primary.codec
         with torch.no_grad():
@@ -238,26 +238,18 @@ class MultimodalDataset(BaseDataset):
                                    pass_through_memory=not ablate_memory,
                                    **({"combiner_skip_stages": skip_stages} if skip_stages else {}))
                 output = self._output_proj(output.transpose(0, 1).contiguous().squeeze(0))
-                answer_idx = (answer_mask == 1).nonzero(as_tuple=True)[0]
-                ep_total = ep_correct = 0
-                episode_perfect = True
-                D, nd = codec.label_dim, codec.num_digits
-                for idx in answer_idx:
-                    v_pred = codec.decode_field(output[idx][0:D])
-                    c_pred = codec.decode_field(output[idx][D:2 * D])
-                    td = target_digits[idx].tolist()
-                    v_tgt = int("".join(map(str, td[0:nd]))); c_tgt = int("".join(map(str, td[nd:2 * nd])))
-                    v_ok, c_ok = v_pred == v_tgt, c_pred == c_tgt
-                    correct += int(v_ok) + int(c_ok); total += 1; ep_total += 1
-                    ep_correct += int(v_ok) + int(c_ok)
-                    if not (v_ok and c_ok):
-                        episode_perfect = False
+                ep_total, ep_correct, episode_perfect, ep_cv, ep_cc, ep_n = score_answer_steps(
+                    output, target_digits, answer_mask, codec, verbose=(tested < verbose_n))
+                correct_value += ep_cv; correct_cumsum += ep_cc; total += ep_n
                 perfect_episodes += int(episode_perfect); tested += 1
                 if step_breakdown:
                     acc = by_depth.setdefault(ep_total, [0, 0, 0, 0])
                     acc[0] += 2 * ep_total; acc[1] += ep_correct; acc[2] += 1; acc[3] += int(episode_perfect)
-        combined_acc = 100.0 * correct / max(2 * total, 1)
+        combined_acc = 100.0 * (correct_value + correct_cumsum) / max(2 * total, 1)
         perfect_frac = 100.0 * perfect_episodes / max(tested, 1)
+        print(f"Eval [{self.name}]: value {100.0*correct_value/max(total,1):.2f}% | "
+              f"cumsum {100.0*correct_cumsum/max(total,1):.2f}% | combined {combined_acc:.2f}% | "
+              f"perfect {perfect_frac:.2f}% ({tested} episodes)")
         model.train()
         if step_breakdown:
             breakdown = {d: (100.0 * c / max(t, 1), 100.0 * p / max(e, 1), e)
@@ -268,7 +260,7 @@ class MultimodalDataset(BaseDataset):
     def evaluate_ood(self, model, device, num_episodes, rng, verbose_n=0, field_log=None):
         return self.evaluate_chain(model, device, num_episodes, num_facts_range=(15, 20),
                                     num_queries_range=self.primary.ood_query_range, rng=rng,
-                                    step_breakdown=True, use_test_pool=True)
+                                    step_breakdown=True, use_test_pool=True, verbose_n=verbose_n)
 
     def evaluate_id_ablated(self, model, device, curriculum, lesson_idx):
         nf, nq = curriculum.table[lesson_idx]

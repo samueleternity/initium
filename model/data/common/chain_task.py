@@ -48,6 +48,43 @@ NUM_FIELDS = 2  # [value, cumsum]
 NUM_PHASE_CHANNELS = 2
 
 
+def score_answer_steps(output, target_digits, answer_mask, codec, verbose=False):
+    """Shared per-episode answer scoring: decode each answer step's (value,
+    cumsum) fields, compare to target_digits, optionally print. Used by both
+    KVChainDataset.evaluate_chain (text/audio/video) and
+    MultimodalDataset.evaluate_chain (data/multimodal/multimodal_dataset.py)
+    so the two families can never silently drift in what counts as
+    'correct' or how depth/perfect-episode bookkeeping is derived.
+    -> (ep_total, ep_correct, episode_perfect, correct_value, correct_cumsum, n_steps)
+    ep_total/ep_correct: this episode's step-count / correct-field-count
+        (2 fields per step), for the caller's by_depth breakdown.
+    correct_value/correct_cumsum/n_steps: per-field correct counts and step
+        count, for the caller's running totals (separate value vs cumsum
+        accuracy in the final summary print).
+    """
+    D = codec.label_dim
+    nd = codec.num_digits
+    answer_idx = (answer_mask == 1).nonzero(as_tuple=True)[0]
+    ep_total = ep_correct = 0
+    episode_perfect = True
+    correct_value = correct_cumsum = n_steps = 0
+    for hop_pos, idx in enumerate(answer_idx, start=1):
+        v_pred = codec.decode_field(output[idx][0:D])
+        c_pred = codec.decode_field(output[idx][D:2 * D])
+        td = target_digits[idx].tolist()
+        v_tgt = int("".join(map(str, td[0:nd])))
+        c_tgt = int("".join(map(str, td[nd:2 * nd])))
+        v_ok, c_ok = v_pred == v_tgt, c_pred == c_tgt
+        correct_value += int(v_ok); correct_cumsum += int(c_ok)
+        ep_correct += int(v_ok) + int(c_ok)
+        n_steps += 1; ep_total += 1
+        if not (v_ok and c_ok):
+            episode_perfect = False
+        if verbose:
+            print(f"  step {hop_pos}: value {v_pred}/{v_tgt} ok={v_ok} | cumsum {c_pred}/{c_tgt} ok={c_ok}")
+    return ep_total, ep_correct, episode_perfect, correct_value, correct_cumsum, n_steps
+
+
 class ChainCurriculum:
     def __init__(self, dataset, table, lesson_nr_cells):
         assert len(table) == len(lesson_nr_cells)
@@ -276,30 +313,16 @@ class KVChainDataset(BaseDataset):
                           torch.tensor(answer_mask, dtype=torch.float32), nq)
                 else:
                     ep = self.build_episode(num_facts_range, num_queries_range, rng=_rng, perturb=perturb)
-                input_seq, target_digits, answer_mask, depth = ep
+                input_seq, target_digits, answer_mask = input_seq, target_digits, answer_mask
                 input_seq = input_seq.unsqueeze(0).to(device)
                 output, _ = model(input_seq, (None, None, None), reset_experience=True,
                                    pass_through_memory=not ablate_memory,
                                    **({"combiner_skip_stages": skip_stages} if skip_stages else {}))
                 output = self._output_proj(output.transpose(0, 1).contiguous().squeeze(0))
 
-                answer_idx = (answer_mask == 1).nonzero(as_tuple=True)[0]
-                ep_total = ep_correct = 0
-                episode_perfect = True
-                D = self.codec.num_digits
-                for hop_pos, idx in enumerate(answer_idx, start=1):
-                    v_pred, c_pred = self._decode_answer(output[idx])
-                    td = target_digits[idx].tolist()
-                    v_tgt = int("".join(map(str, td[0:D])))
-                    c_tgt = int("".join(map(str, td[D:2 * D])))
-                    v_ok, c_ok = v_pred == v_tgt, c_pred == c_tgt
-                    correct_value += int(v_ok); correct_cumsum += int(c_ok)
-                    ep_correct += int(v_ok) + int(c_ok)
-                    total += 1; ep_total += 1
-                    if not (v_ok and c_ok):
-                        episode_perfect = False
-                    if tested < verbose_n:
-                        print(f"  step {hop_pos}: value {v_pred}/{v_tgt} ok={v_ok} | cumsum {c_pred}/{c_tgt} ok={c_ok}")
+                ep_total, ep_correct, episode_perfect, ep_cv, ep_cc, ep_n = score_answer_steps(
+                    output, target_digits, answer_mask, self.codec, verbose=(tested < verbose_n))
+                correct_value += ep_cv; correct_cumsum += ep_cc; total += ep_n
                 perfect_episodes += int(episode_perfect)
                 tested += 1
                 if step_breakdown:

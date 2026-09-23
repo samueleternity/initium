@@ -1097,7 +1097,7 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
                 parts.append(f"amp_scale {amp_scale:.1f}")
             parts.append(f"gpu_mem_peak_mb {gpu_mem_peak_mb:.1f}")
             if moe_enabled:
-                parts += [f"moe_aux {float(moe_aux_loss):.4f}",
+                parts += [f"moe_aux {float(moe_aux_loss.detach()):.4f}",
                           f"moe_cv_load {moe_diag.get('moe_cv_load', 0.0):.4f}",
                           f"moe_max_load_frac {moe_diag.get('moe_max_load_frac', 0.0):.4f}"]
             if dyn_n_str:
@@ -1111,7 +1111,7 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
                 kl_diag["clamp_frac"], current_lr, avg_grad_norm, amp_scale, total_elapsed,
                 kl_diag["snapshot_step"],
                 gpu_mem_peak_mb, param_count,
-                float(moe_aux_loss), moe_diag.get("moe_cv_importance", 0.0),
+                float(moe_aux_loss.detach()), moe_diag.get("moe_cv_importance", 0.0),
                 moe_diag.get("moe_cv_load", 0.0), moe_diag.get("moe_max_load_frac", 0.0),
             ])
             if torch.cuda.is_available():
@@ -1438,7 +1438,7 @@ if __name__ == "__main__":
     parser.add_argument("--moe", action="store_true",
                          help="Alternative Phase 3, Step 2, Option 4: interleave external "
                               "SwitchMoE blocks between Mamba controller blocks (mamba_controller.py "
-                              "/ moe_layer.py). Only wired for --controller=mamba.")
+                              "/ moe_layer.py).")
     parser.add_argument("--moe-num-experts", type=int, default=MOE_NUM_EXPERTS,
                          help="Number of experts per MoE block (>=4 enforced by SwitchMoE; "
                               "roadmap recommends 8+, per Dead-End #45).")

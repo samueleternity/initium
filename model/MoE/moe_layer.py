@@ -119,6 +119,7 @@ class SwitchMoE(nn.Module):
         capacity_factor: float = 1.5,
         router_noise_eps: float = 1e-2,
         load_balance_alpha: float = 0.01,
+        top_k: int = 1,
     ):
         super().__init__()
         if num_experts < 4:
@@ -135,6 +136,9 @@ class SwitchMoE(nn.Module):
         self.capacity_factor = capacity_factor
         self.router_noise_eps = router_noise_eps
         self.load_balance_alpha = load_balance_alpha
+        if not (1 <= top_k <= num_experts):
+            raise ValueError(f"SwitchMoE: top_k={top_k} must be in [1, num_experts={num_experts}]")
+        self.top_k = top_k
 
         self.router = nn.Linear(d_model, num_experts, bias=False)
         self.experts = nn.ModuleList([Expert(d_model, expert_dim) for _ in range(num_experts)])
@@ -161,20 +165,28 @@ class SwitchMoE(nn.Module):
             logits32 = logits32 * noise
         probs = torch.softmax(logits32, dim=-1)  # (num_tokens, num_experts)
 
-        top1_prob, top1_idx = probs.max(dim=-1)  # (num_tokens,), (num_tokens,)
+        # Top-K routing (Shazeer et al. 2017 / GShard), generalizing Switch's
+        # own k=1 special case: each token selects its top_k highest-prob
+        # experts, gate weights renormalized to sum to 1 across just those
+        # k slots -- top_k=1 reduces to the original Switch gate exactly.
+        # Every expert is computed ONCE for the WHOLE token batch (dense,
+        # single pair of batched einsums below) regardless of top_k, so the
+        # k selected experts for a given token are genuinely active
+        # SIMULTANEOUSLY (one fused kernel launch covers all E experts x
+        # all T tokens), not run as k sequential passes -- this is what
+        # "multiple experts active at once" means at this project's scale.
+        top_k = self.top_k
+        topk_prob, topk_idx = probs.topk(top_k, dim=-1)              # (T, k) each
+        gate_weights = topk_prob / topk_prob.sum(dim=-1, keepdim=True).clamp(min=1e-9)
 
         if self.training:
-            # Switch/Shazeer-style load-balancing auxiliary loss (Fedus et
-            # al. Eq. 4-6): loss = alpha * N * sum_i f_i * P_i, where f_i is
-            # the fraction of tokens routed (argmax) to expert i and P_i is
-            # the fraction of router probability mass assigned to expert i
-            # across the batch. f is non-differentiable (argmax); P carries
-            # the gradient back into the router. Computed here on only the
-            # tokens THIS forward() call sees -- no scan of anything outside
-            # this one call, matching Phase 1/2's "local to this call" bar.
-            one_hot = F.one_hot(top1_idx, num_classes=self.num_experts).float()
-            f_i = one_hot.mean(dim=0)          # (num_experts,)
-            P_i = probs.mean(dim=0)            # (num_experts,)
+            # Generalized Switch/GShard load-balancing loss: f_i is the
+            # fraction of (token, slot) routing decisions that picked expert
+            # i across all num_tokens*top_k slots (== Switch's own f_i at
+            # top_k=1); P_i is unchanged (mean full router prob mass on i).
+            one_hot_k = F.one_hot(topk_idx, num_classes=self.num_experts).float()  # (T, k, E)
+            f_i = one_hot_k.sum(dim=(0, 1)) / max(num_tokens * top_k, 1)
+            P_i = probs.mean(dim=0)
             aux_loss = self.load_balance_alpha * self.num_experts * (f_i * P_i).sum()
             self._aux_losses.append(aux_loss)
 
@@ -187,73 +199,38 @@ class SwitchMoE(nn.Module):
                     "max_load_frac": f_i.max().item(),
                 }
 
-        # Expert capacity (Switch Eq. 3): buffer above the even split so
-        # token routing doesn't collapse under minor imbalance. Tokens
-        # beyond an expert's capacity are dropped -- they get zero expert
-        # contribution and pass through via whatever residual the CALLER
-        # applies (this module returns only the expert contribution, not
-        # x + expert(x)).
-        capacity = max(1, int((num_tokens / self.num_experts) * self.capacity_factor))
+        # Expert capacity, scaled by top_k (each slot competes for the same
+        # per-expert buffer).
+        capacity = max(1, int((num_tokens * top_k / self.num_experts) * self.capacity_factor))
 
-        """
-        output = torch.zeros_like(flat)
-        for expert_id, expert in enumerate(self.experts):
-            token_mask = top1_idx == expert_id
-            token_indices = token_mask.nonzero(as_tuple=True)[0]
-            if token_indices.numel() == 0:
-                continue
-            if token_indices.numel() > capacity:
-                # Drop overflow tokens (Switch's own documented behavior).
-                token_indices = token_indices[:capacity]
-            expert_out = expert(flat[token_indices])
-            gate = top1_prob[token_indices].unsqueeze(-1).to(expert_out.dtype)
-            output[token_indices] = (expert_out * gate).to(output.dtype)
-
-        return output.reshape(orig_shape)
-        """
-    
-
-        # Vectorized dispatch: at this project's scale (num_tokens ==
-        # batch_size, e.g. 16, called once per DNC timestep), the old
-        # per-expert Python loop launched one tiny (<=capacity-row) matmul
-        # per expert per call -- kernel-launch-overhead-bound, not
-        # compute-bound, at capacity~3. Replacing it with two batched
-        # einsum calls (every expert applied to every token at once)
-        # trades a few extra FLOPs (cheap at this token count) for a
-        # constant number of kernel launches regardless of num_experts.
-        # Capacity-based dropping is preserved exactly -- same
-        # first-N-tokens-in-order-per-expert semantics as the loop
-        # version -- computed via a cumulative count instead of
-        # per-expert slicing.
         w_in = torch.stack([e.w_in.weight for e in self.experts], dim=0)    # (E, expert_dim, d_model)
         b_in = torch.stack([e.w_in.bias for e in self.experts], dim=0)      # (E, expert_dim)
         w_out = torch.stack([e.w_out.weight for e in self.experts], dim=0)  # (E, d_model, expert_dim)
         b_out = torch.stack([e.w_out.bias for e in self.experts], dim=0)    # (E, d_model)
 
+        # Dense pass over EVERY expert for EVERY token -- the single fused
+        # computation that makes the top-k selected experts per token
+        # simultaneous rather than sequential.
         hidden = torch.einsum('td,exd->tex', flat, w_in) + b_in            # (T, E, expert_dim)
         hidden = F.relu(hidden)
         expert_out_all = torch.einsum('tex,edx->ted', hidden, w_out) + b_out  # (T, E, d_model)
 
-        # Every token only ever uses its top-1 expert's output.
-        expert_out = expert_out_all[torch.arange(num_tokens, device=flat.device), top1_idx]  # (T, d_model)
+        gathered = torch.gather(
+            expert_out_all, 1, topk_idx.unsqueeze(-1).expand(-1, -1, d_model)
+        )  # (T, k, d_model)
 
-        # Capacity mask: keep only the first `capacity` tokens (in
-        # original token order) routed to each expert -- identical drop
-        # behavior to the old token_indices[:capacity] slicing.
-        one_hot = F.one_hot(top1_idx, num_classes=self.num_experts)  # (T, E)
-        rank_in_expert = (
-            one_hot.cumsum(dim=0).gather(1, top1_idx.unsqueeze(1)).squeeze(1) - 1
-        )  # (T,) -- this token's position among tokens routed to the same expert
-        keep = rank_in_expert < capacity  # (T,) bool
+        # Capacity mask: keep only the first `capacity` (token,slot) pairs,
+        # in original order, routed to each expert -- same drop semantics
+        # as the prior top-1 implementation, generalized over the
+        # flattened (T*k) slot order.
+        flat_idx = topk_idx.reshape(-1)
+        one_hot_flat = F.one_hot(flat_idx, num_classes=self.num_experts)
+        rank_in_expert = one_hot_flat.cumsum(dim=0).gather(1, flat_idx.unsqueeze(1)).squeeze(1) - 1
+        keep = (rank_in_expert < capacity).reshape(num_tokens, top_k)
 
-        gate = (top1_prob * keep.to(top1_prob.dtype)).unsqueeze(-1).to(expert_out.dtype)
-        output = (expert_out * gate).to(flat.dtype)
+        gate = (gate_weights * keep.to(gate_weights.dtype)).unsqueeze(-1).to(gathered.dtype)
+        output = (gathered * gate).sum(dim=1).to(flat.dtype)  # (T, d_model)
 
-        # One caveat: this computes all 8 experts for all tokens rather than skipping unused ones, 
-        # so if you ever scale num_tokens way up (e.g. via BATCH_SIZE) the FLOPs cost of this dense approach grows 
-        # faster than the old sparse loop's would. At your current scale that's irrelevant; 
-        # if you ever do increase batch size significantly later, worth re-benchmarking which approach 
-        # wins at that point.
         return output.reshape(orig_shape)
 
     def pop_aux_loss(self) -> torch.Tensor:
@@ -298,6 +275,7 @@ class MoEBlock(nn.Module):
         capacity_factor: float = 1.5,
         router_noise_eps: float = 1e-2,
         load_balance_alpha: float = 0.01,
+        top_k: int = 1,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
     ):
@@ -306,7 +284,7 @@ class MoEBlock(nn.Module):
         self.moe = SwitchMoE(
             d_model, num_experts=num_experts, expert_dim=expert_dim,
             capacity_factor=capacity_factor, router_noise_eps=router_noise_eps,
-            load_balance_alpha=load_balance_alpha,
+            load_balance_alpha=load_balance_alpha, top_k=top_k,
         )
         if device is not None and getattr(device, "type", None) == "cuda":
             self.to(device)
@@ -320,6 +298,116 @@ class MoEBlock(nn.Module):
     def last_diagnostics(self) -> dict:
         return self.moe.last_diagnostics()
 
+class SourceEmbedding(nn.Module):
+    """Learned per-source bias added to a token's representation before
+    routing, so a Top-K router can specialize by SOURCE identity (e.g.
+    "parallel backbone output" vs "previous memory read vector" in
+    SplitGraphDNC's controller combiner) in addition to content. One
+    embedding row per declared source; ADDED, not concatenated, so it never
+    changes d_model. Zero-init: routing starts purely content-based and the
+    model has to learn any source specialization, matching this project's
+    "start equal to the simpler baseline" convention (see
+    stochastic_write_head_v2.py's zero-init logvar head)."""
+
+    def __init__(self, num_sources: int, d_model: int, device=None, dtype=None):
+        super().__init__()
+        self.embedding = nn.Embedding(num_sources, d_model, device=device, dtype=dtype)
+        nn.init.zeros_(self.embedding.weight)
+
+    def forward(self, x: torch.Tensor, source_id: int) -> torch.Tensor:
+        idx = torch.full((x.shape[0],), source_id, dtype=torch.long, device=x.device)
+        return x + self.embedding(idx).to(x.dtype)
+
+
+class MultiSourceMoEBlock(nn.Module):
+    """CfC-oriented MoE sublayer: accepts a VARIABLE-length list of
+    per-source token tensors -- each (B, d_model) -- and returns the same
+    number of outputs, one per source, each individually routed and gated
+    through ONE shared bank of Top-K experts (SwitchMoE.forward -- every
+    expert still runs exactly once per call, dense and simultaneous).
+
+    This is what lets a CfC controller/combiner keep its "many inputs in,
+    many outputs out, with per-input specialization" property once MoE
+    sits in front of/inside it: the router sees BOTH a token's content AND
+    a learned source embedding, so it can genuinely learn "route source A's
+    tokens toward experts {2,5}, source B's toward {1,7}" -- a per-source
+    specialization on top of ordinary within-source content routing -- the
+    concrete mechanism behind "an internal router analyzes the type of
+    input and allocates it to specific experts."
+
+    All sources are concatenated into one (sum(B_i), d_model) token batch
+    and pushed through a SINGLE SwitchMoE call, so adding sources costs
+    router/gather overhead only, never extra kernel launches.
+    """
+
+    def __init__(self, d_model: int, num_sources: int, num_experts: int = 8,
+                 expert_dim: int | None = None, top_k: int = 1,
+                 capacity_factor: float = 1.5, router_noise_eps: float = 1e-2,
+                 load_balance_alpha: float = 0.01, device=None, dtype=None):
+        super().__init__()
+        if num_sources < 1:
+            raise ValueError(f"MultiSourceMoEBlock: num_sources must be >= 1, got {num_sources}")
+        self.num_sources = num_sources
+        self.norm = nn.LayerNorm(d_model, device=device, dtype=dtype)
+        self.source_embed = SourceEmbedding(num_sources, d_model, device=device, dtype=dtype)
+        self.moe = SwitchMoE(d_model, num_experts=num_experts, expert_dim=expert_dim, top_k=top_k,
+                             capacity_factor=capacity_factor, router_noise_eps=router_noise_eps,
+                             load_balance_alpha=load_balance_alpha)
+        if device is not None and getattr(device, "type", None) == "cuda":
+            self.to(device)
+
+    def forward(self, sources: list[torch.Tensor]) -> list[torch.Tensor]:
+        if len(sources) != self.num_sources:
+            raise ValueError(f"MultiSourceMoEBlock: expected {self.num_sources} source tensors, "
+                             f"got {len(sources)}")
+        batch_sizes = [s.shape[0] for s in sources]
+        tagged = torch.cat([self.source_embed(self.norm(s), i) for i, s in enumerate(sources)], dim=0)
+        routed = self.moe(tagged)
+        outs, offset = [], 0
+        for i, b in enumerate(batch_sizes):
+            outs.append(sources[i] + routed[offset:offset + b])  # per-source residual
+            offset += b
+        return outs
+
+    def pop_aux_loss(self) -> torch.Tensor:
+        return self.moe.pop_aux_loss()
+
+    def last_diagnostics(self) -> dict:
+        return self.moe.last_diagnostics()
+
+
+class MoERNNWrapper(nn.Module):
+    """Minimal external-MoE add-on for the stock nn.LSTM/GRU/RNN controller
+    path (dnc.DNC's own rnn_type in {'lstm','gru','rnn'}). The plain
+    baseline controller doesn't need per-block/per-source specialization --
+    only a single Top-K MoE sublayer applied to its own per-step output --
+    so this stays deliberately simpler than the Mamba/CfC wrappers'
+    external-per-block interleaving.
+
+    Preserves the exact `module(x.unsqueeze(1), hx) -> (out.unsqueeze(1),
+    new_hx)` calling convention pytorch-dnc's `DNC._layer_forward` expects,
+    so it substitutes for `self.rnns[layer]` with zero changes anywhere
+    else in dnc.DNC's forward path.
+    """
+
+    def __init__(self, rnn: nn.Module, d_model: int, num_experts: int = 8,
+                 expert_dim: int | None = None, top_k: int = 1,
+                 capacity_factor: float = 1.5, load_balance_alpha: float = 0.01,
+                 device=None, dtype=None):
+        super().__init__()
+        self.rnn = rnn
+        self.d_model = d_model
+        self.moe_enabled = True
+        self.moe_blocks = nn.ModuleList([
+            MoEBlock(d_model, num_experts=num_experts, expert_dim=expert_dim, top_k=top_k,
+                    capacity_factor=capacity_factor, load_balance_alpha=load_balance_alpha,
+                    device=device, dtype=dtype)
+        ])
+
+    def forward(self, input: torch.Tensor, hx):
+        out, new_hx = self.rnn(input, hx)
+        out = self.moe_blocks[0](out)
+        return out, new_hx
 
 def pop_total_moe_aux_loss(moe_layers: list) -> tuple:
     """Sum pop_aux_loss() across all installed MoEBlock/SwitchMoE layers and

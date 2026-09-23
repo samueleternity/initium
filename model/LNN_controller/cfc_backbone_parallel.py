@@ -26,6 +26,7 @@ import torch.nn as nn
 
 from LNN_controller.cfc_controller import CfC, _require_ncps
 from mamba_controller.mamba_backbone_parallel import MambaBackboneParallel
+from MoE.moe_layer import MoEBlock
 
 _BACKBONE_KINDS = ("mamba1", "mamba2", "mamba3", "cfc")
 
@@ -62,7 +63,10 @@ class CfCBackboneParallel(nn.Module):
     def __init__(self, in_dim, d_model, num_blocks=2, units=None, mode="default",
                  backbone_units=512, backbone_layers=1, backbone_dropout=0.0,
                  activation="lecun_tanh", mixed_memory=False, residual=True,
-                 force_fp32=True, device=None, dtype=None):
+                 force_fp32=True, moe_enabled: bool = False, moe_num_experts: int = 8,
+                 moe_expert_dim: int | None = None, moe_top_k: int = 1,
+                 moe_capacity_factor: float = 1.5, moe_load_balance_alpha: float = 0.01,
+                 device=None, dtype=None):
         super().__init__()
         self.d_model = d_model
         self.in_adapter: nn.Module = (
@@ -73,34 +77,63 @@ class CfCBackboneParallel(nn.Module):
                               activation, mixed_memory, residual, force_fp32, device=device, dtype=dtype)
             for _ in range(num_blocks)
         ])
+        # External interleave, applied to the WHOLE (B, L, d_model) sequence
+        # after each block (SwitchMoE reshapes any leading dims to a flat
+        # token batch, so this costs nothing extra to support here).
+        self.moe_enabled = moe_enabled
+        self.moe_blocks: nn.ModuleList | None = None
+        if moe_enabled:
+            self.moe_blocks = nn.ModuleList([
+                MoEBlock(d_model, num_experts=moe_num_experts, expert_dim=moe_expert_dim,
+                        top_k=moe_top_k, capacity_factor=moe_capacity_factor,
+                        load_balance_alpha=moe_load_balance_alpha, device=device, dtype=dtype)
+                for _ in range(num_blocks)
+            ])
 
     def forward(self, x):  # (B, L, in_dim) -> (B, L, d_model), called ONCE per training step
         h = self.in_adapter(x)
-        for block in self.blocks:
+        for i, block in enumerate(self.blocks):
             h = block(h)
+            if self.moe_enabled:
+                h = self.moe_blocks[i](h)
         return h
 
 
 def build_parallel_backbone(in_dim, d_model, num_blocks=2, variant="mamba1", d_state=16,
                             d_conv=4, expand=2, headdim=64, cfc_kwargs=None,
+                            moe_enabled: bool = False, moe_num_experts: int = 8,
+                            moe_expert_dim: int | None = None, moe_top_k: int = 1,
+                            moe_capacity_factor: float = 1.5, moe_load_balance_alpha: float = 0.01,
                             device=None, dtype=None):
     kinds = [k.strip().lower() for k in variant.split("+")]
     bad = [k for k in kinds if k not in _BACKBONE_KINDS]
     if bad:
         raise ValueError(f"build_parallel_backbone: unknown variant part(s) {bad} in {variant!r}, "
                          f"expected '+'-joined parts of {_BACKBONE_KINDS}")
+    moe_kw = dict(moe_enabled=moe_enabled, moe_num_experts=moe_num_experts, moe_expert_dim=moe_expert_dim,
+                 moe_top_k=moe_top_k, moe_capacity_factor=moe_capacity_factor,
+                 moe_load_balance_alpha=moe_load_balance_alpha)
     stages, cur = [], in_dim
     for kind in kinds:
         if kind == "cfc":
             stages.append(CfCBackboneParallel(cur, d_model, num_blocks=num_blocks,
-                                              device=device, dtype=dtype, **(cfc_kwargs or {})))
+                                              device=device, dtype=dtype, **moe_kw, **(cfc_kwargs or {})))
         else:
             stages.append(MambaBackboneParallel(
                 in_dim=cur, d_model=d_model, num_blocks=num_blocks, variant=kind,
                 d_state=d_state, d_conv=d_conv, expand=expand, headdim=headdim,
-                device=device, dtype=dtype))
+                device=device, dtype=dtype, **moe_kw))
         cur = d_model
     return stages[0] if len(stages) == 1 else nn.Sequential(*stages)
+
+
+def collect_backbone_moe_layers(backbone: nn.Module) -> list:
+    """Flat list of every installed MoE sublayer on a backbone built by
+    build_parallel_backbone -- a single stage or a '+'-stacked nn.Sequential
+    of stages, each of which self-reports via .moe_enabled/.moe_blocks (same
+    convention every controller wrapper in this project uses)."""
+    stages = list(backbone) if isinstance(backbone, nn.Sequential) else [backbone]
+    return [b for s in stages if getattr(s, "moe_enabled", False) for b in s.moe_blocks]
 
 
 if __name__ == "__main__":  # smoke test: python -m LNN_controller.cfc_backbone_parallel (from project root)

@@ -67,6 +67,8 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from MoE.moe_layer import MoEBlock
+
 try:
     from mamba_ssm.modules.mamba_simple import Mamba as Mamba1
 except ImportError as _mamba1_err:  # pragma: no cover - environment-dependent
@@ -204,6 +206,12 @@ class MambaBackboneParallel(nn.Module):
         d_conv: int = 4,
         expand: int = 2,
         headdim: int = 64,  # mamba2-only
+        moe_enabled: bool = False,
+        moe_num_experts: int = 8,
+        moe_expert_dim: int | None = None,
+        moe_top_k: int = 1,
+        moe_capacity_factor: float = 1.5,
+        moe_load_balance_alpha: float = 0.01,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
     ):
@@ -211,6 +219,8 @@ class MambaBackboneParallel(nn.Module):
         _require_variant(variant)
         self.variant = variant
         self.d_model = d_model
+        self.moe_enabled = moe_enabled
+        self.moe_blocks: nn.ModuleList | None = None
 
         # Same role as MambaControllerWrapper's in_adapter: DNC's raw
         # per-timestep input (input_size) generally differs from
@@ -232,6 +242,13 @@ class MambaBackboneParallel(nn.Module):
             [_ParallelBlock(d_model, variant, mamba_kwargs, device=device, dtype=dtype)
              for _ in range(num_blocks)]
         )
+        if moe_enabled:
+            self.moe_blocks = nn.ModuleList([
+                MoEBlock(d_model, num_experts=moe_num_experts, expert_dim=moe_expert_dim,
+                        top_k=moe_top_k, capacity_factor=moe_capacity_factor,
+                        load_balance_alpha=moe_load_balance_alpha, device=device, dtype=dtype)
+                for _ in range(num_blocks)
+            ])
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, L, in_dim) -> (B, L, d_model). Called EXACTLY ONCE per
@@ -239,6 +256,8 @@ class MambaBackboneParallel(nn.Module):
         # MambaControllerWrapper) -- this single call is the entire
         # "backbone half" of the Option 5 split.
         h = self.in_adapter(x)
-        for block in self.blocks:
+        for i, block in enumerate(self.blocks):
             h = block(h)
+            if self.moe_enabled:
+                h = self.moe_blocks[i](h)
         return h

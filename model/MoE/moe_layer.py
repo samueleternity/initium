@@ -179,25 +179,26 @@ class SwitchMoE(nn.Module):
         topk_prob, topk_idx = probs.topk(top_k, dim=-1)              # (T, k) each
         gate_weights = topk_prob / topk_prob.sum(dim=-1, keepdim=True).clamp(min=1e-9)
 
+        # f_i/P_i are cheap to compute regardless of mode; only the aux LOSS
+        # accumulation (needed for backward()) is training-gated below.
+        # Computing diagnostics unconditionally is what lets inference
+        # (model.eval()) report routing health -- previously last_diagnostics()
+        # stayed empty forever outside training, which made it impossible to
+        # verify MoE routing on real held-out data at inference time.
+        one_hot_k = F.one_hot(topk_idx, num_classes=self.num_experts).float()  # (T, k, E)
+        f_i = one_hot_k.sum(dim=(0, 1)) / max(num_tokens * top_k, 1)
+        P_i = probs.mean(dim=0)
+
         if self.training:
-            # Generalized Switch/GShard load-balancing loss: f_i is the
-            # fraction of (token, slot) routing decisions that picked expert
-            # i across all num_tokens*top_k slots (== Switch's own f_i at
-            # top_k=1); P_i is unchanged (mean full router prob mass on i).
-            one_hot_k = F.one_hot(topk_idx, num_classes=self.num_experts).float()  # (T, k, E)
-            f_i = one_hot_k.sum(dim=(0, 1)) / max(num_tokens * top_k, 1)
-            P_i = probs.mean(dim=0)
             aux_loss = self.load_balance_alpha * self.num_experts * (f_i * P_i).sum()
             self._aux_losses.append(aux_loss)
 
-            with torch.no_grad():
-                cv_importance = (P_i.std() / P_i.mean().clamp(min=1e-8)).item()
-                cv_load = (f_i.std() / f_i.mean().clamp(min=1e-8)).item()
-                self._last_diag = {
-                    "cv_importance": cv_importance,
-                    "cv_load": cv_load,
-                    "max_load_frac": f_i.max().item(),
-                }
+        with torch.no_grad():
+            self._last_diag = {
+                "cv_importance": (P_i.std() / P_i.mean().clamp(min=1e-8)).item(),
+                "cv_load": (f_i.std() / f_i.mean().clamp(min=1e-8)).item(),
+                "max_load_frac": f_i.max().item(),
+            }
 
         # Expert capacity, scaled by top_k (each slot competes for the same
         # per-expert buffer).

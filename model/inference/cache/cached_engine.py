@@ -46,8 +46,9 @@ def model_supports_resume(model) -> bool:
 
 class CachedInferenceEngine(InferenceEngine):
     def __init__(self, model, output_proj, task, device, caches, ablate_memory: bool = False,
+                 combiner_skip_stages: frozenset | None = None,
                  verify_hits: int = DEFAULT_VERIFY_HITS, verify_tol: float = DEFAULT_VERIFY_TOL):
-        super().__init__(model, output_proj, task, device, ablate_memory)
+        super().__init__(model, output_proj, task, device, ablate_memory, combiner_skip_stages)
         self.caches = list(caches)
         self.resumable = model_supports_resume(model)
         self.verify_hits, self.verify_tol = verify_hits, verify_tol
@@ -95,6 +96,8 @@ class CachedInferenceEngine(InferenceEngine):
     def _forward_segment(self, x_full: torch.Tensor, start: int, end: int, hidden,
                          reset_experience: bool):
         kw = dict(reset_experience=reset_experience, pass_through_memory=not self.ablate_memory)
+        if self.combiner_skip_stages:
+            kw["combiner_skip_stages"] = self.combiner_skip_stages
         if hasattr(self.model, "backbone"):              # SplitGraphDNC
             x = x_full[:end].unsqueeze(0).to(self.device)
             if start > 0:

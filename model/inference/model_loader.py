@@ -40,6 +40,7 @@ class LoadedModel:
     run_id: str
     beta_target: float
     sampled_writes: bool
+    combiner_stage_kinds: list | None = None
 
 
 class _Cfg:
@@ -193,8 +194,10 @@ def load_model(ckpt: dict, device: torch.device, deterministic_write: bool = Fal
 
     rnn.eval()
     output_proj.eval()
+    combiner_stage_kinds = list(getattr(getattr(rnn, "combiner_wrapper", None), "stage_kinds", []) or []) or None
     return LoadedModel(
         rnn=rnn, output_proj=output_proj, heads=heads, config=raw,
         step=int(ckpt.get("step", -1)), run_id=str(ckpt.get("run_id", "?")),
         beta_target=beta, sampled_writes=bool(heads and heads[0].sample),
+        combiner_stage_kinds=combiner_stage_kinds,
     )

@@ -90,6 +90,17 @@ def parse_args(argv=None):
                    help="disable write-vector sampling (use mu only), even if the model was trained with beta>0.")
     p.add_argument("--ablate-memory", action="store_true",
                    help="skip memory read+write (functional-usage check).")
+    p.add_argument("--ablate-combiner-stage", type=str, nargs="+", default=None,
+                   help="split-graph checkpoints with a hybrid controller combiner only "
+                        "(--split-graph-combiner-mode controller, variant like 'mamba+cfc'): "
+                        "bypass one or more stages by name (as listed by --inspect, e.g. 'cfc') "
+                        "or 0-based index, to measure that stage's contribution on real held-out "
+                        "episodes. Compare against a run with this flag omitted for the delta.")
+    p.add_argument("--report-moe-stats", action="store_true",
+                   help="after the run, print each installed MoE sublayer's routing "
+                        "diagnostics (CV(load), CV(importance), max load fraction) from its "
+                        "last forward call -- confirms MoE is actually routing/balancing on "
+                        "this data, independent of task accuracy.")
     p.add_argument("--verbose-n", type=int, default=DEFAULT_VERBOSE_N,
                    help="print per-item predictions for the first N episodes.")
     p.add_argument("--log-dir", type=str, default=INFERENCE_LOG_DIR)
@@ -171,6 +182,28 @@ def main(argv=None) -> int:
     torch.manual_seed(args.seed)
     loaded = load_model(ckpt, device, deterministic_write=args.deterministic_write)
     print(f"[inference] model loaded (step {loaded.step}, sampled_writes={loaded.sampled_writes})")
+    if loaded.combiner_stage_kinds:
+        print(f"[inference] combiner stages: {list(enumerate(loaded.combiner_stage_kinds))}")
+
+    combiner_skip_stages = None
+    if args.ablate_combiner_stage:
+        kinds = loaded.combiner_stage_kinds
+        if not kinds:
+            raise SystemExit("[inference] ABORT: --ablate-combiner-stage requires a split-graph "
+                              "checkpoint with --split-graph-combiner-mode controller; this "
+                              "checkpoint has no combiner stages to ablate.")
+        idx = set()
+        for tok in args.ablate_combiner_stage:
+            if tok.isdigit() and 0 <= int(tok) < len(kinds):
+                idx.add(int(tok))
+            elif tok in kinds:
+                idx.add(kinds.index(tok))
+            else:
+                raise SystemExit(f"[inference] ABORT: unknown combiner stage {tok!r}; "
+                                  f"this checkpoint's stages are {list(enumerate(kinds))}")
+        combiner_skip_stages = frozenset(idx)
+        print(f"[inference] ablating combiner stage(s) "
+              f"{[(i, kinds[i]) for i in sorted(combiner_skip_stages)]}")
 
     reset = args.reset_experience
     if reset:
@@ -189,6 +222,7 @@ def main(argv=None) -> int:
         caches, cache_notes, cache_fp = setup_caches(
             args.cache, ckpt=ckpt, device=device, sampled_writes=loaded.sampled_writes,
             deterministic_write=args.deterministic_write, ablate_memory=args.ablate_memory,
+            combiner_skip_stages=combiner_skip_stages,
             cache_dir=args.cache_dir, ram_mb=args.cache_ram_mb, disk_mb=args.cache_disk_mb,
             clear=args.cache_clear, allow_stochastic=args.cache_allow_stochastic)
     for note in cache_notes:
@@ -205,11 +239,12 @@ def main(argv=None) -> int:
     if caches:
         engine = CachedInferenceEngine(
             loaded.rnn, loaded.output_proj, task, device, caches,
-            ablate_memory=args.ablate_memory,
+            ablate_memory=args.ablate_memory, combiner_skip_stages=combiner_skip_stages,
             verify_hits=(0 if loaded.sampled_writes else args.cache_verify))
     else:
         engine = InferenceEngine(loaded.rnn, loaded.output_proj, task, device,
-                                 ablate_memory=args.ablate_memory)
+                                 ablate_memory=args.ablate_memory,
+                                 combiner_skip_stages=combiner_skip_stages)
 
     t0 = time.time()
     print(f"[inference] running {n} episodes | reset_experience={reset}")
@@ -266,6 +301,22 @@ def main(argv=None) -> int:
             rl.write_window_csv(files[1], summary["windows"])
         summary["log_files"] = files
         rl.write_summary_json(files[-1], summary)
+
+    if args.report_moe_stats:
+        moe_layers = getattr(loaded.rnn, "moe_layers", None)
+        if not moe_layers:
+            print("[inference] --report-moe-stats: this checkpoint has no MoE layers installed.")
+        else:
+            print(f"[inference] MoE routing diagnostics ({len(moe_layers)} sublayer(s), "
+                  f"from the LAST forward call only):")
+            for i, layer in enumerate(moe_layers):
+                diag = layer.last_diagnostics()
+                if not diag:
+                    print(f"  [{i}] no diagnostics recorded")
+                    continue
+                print(f"  [{i}] cv_load={diag['cv_load']:.4f} "
+                      f"cv_importance={diag['cv_importance']:.4f} "
+                      f"max_load_frac={diag['max_load_frac']:.4f}")
 
     rl.print_summary(summary)
     return 0

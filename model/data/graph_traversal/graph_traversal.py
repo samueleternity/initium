@@ -32,6 +32,7 @@ import random
 import torch
 
 from data.base_dataset import BaseDataset
+from data.common.graph_io import load_graph
 from memory_manipulation.dynamic_memory_resize import resize_memory
 
 # ==========================================
@@ -273,12 +274,20 @@ def build_traversal_episode(num_nodes, k_range, path_length_range, rng=None):
 # CURRICULUM
 # ==========================================
 class TraversalCurriculum:
-    def __init__(self, table=TRAVERSAL_CURRICULUM):
+    def __init__(self, table=TRAVERSAL_CURRICULUM, custom_graph=None):
         self.table = table
         self.lesson = 0
         # per-instance so core can override per run (isolate_link_ablation /
         # dynamic_n_mode) without mutating module globals
         self.lesson_nr_cells = list(LESSON_NR_CELLS)
+        # custom_graph: (edges, node_labels, adjacency) from a user-supplied
+        # graph file (GraphTraversalDataset's dataset_link), or None for the
+        # default per-episode synthetic generate_graph() behavior. When set,
+        # sample_episode() walks THIS fixed graph instead of generating a
+        # fresh random one -- node count is then whatever the supplied graph
+        # has, not the per-lesson nodes_range; only path_length_range still
+        # scales difficulty across lessons.
+        self.custom_graph = custom_graph
 
     def _sample_lesson_params(self):
         if self.lesson > 0 and random.random() < OLD_LESSON_MIX_RATE:
@@ -289,6 +298,13 @@ class TraversalCurriculum:
 
     def sample_episode(self):
         nodes_range, out_degree_range, path_len_range = self._sample_lesson_params()
+        if self.custom_graph is not None:
+            edges, node_labels, adjacency = self.custom_graph
+            ep = None
+            while ep is None:
+                ep = build_traversal_episode_from_graph(
+                    edges, node_labels, adjacency, len(node_labels), path_len_range)
+            return ep
         ep = None
         while ep is None:
             num_nodes = random.randint(*nodes_range)
@@ -297,13 +313,20 @@ class TraversalCurriculum:
 
     def maybe_advance(self, model, device, step=None, optimizer=None):
         """Returns (lesson, id_triple_acc, id_perfect_frac). Eval samples
-        num_nodes over the lesson's nodes_range (as trained); the gate advances
-        on triple_acc >= ADVANCE_THRESHOLD (see header, v4)."""
+        num_nodes over the lesson's nodes_range (as trained), or walks the
+        fixed custom_graph when one was supplied; the gate advances on
+        triple_acc >= ADVANCE_THRESHOLD (see header, v4)."""
         nodes_range, out_degree_range, path_len_range = self.table[self.lesson]
+        if self.custom_graph is not None:
+            edges, node_labels, adjacency = self.custom_graph
+            graph_kwargs = dict(fixed_graph=(edges, node_labels, adjacency, len(node_labels)),
+                                path_length_range=path_len_range)
+        else:
+            graph_kwargs = dict(nodes_range=nodes_range, k_range=out_degree_range,
+                                path_length_range=path_len_range)
         triple_acc, perfect_frac, hop_breakdown = evaluate_traversal(
             model, device, num_episodes=EVAL_BATCH_SIZE, verbose_n=0, field_log=(field_log := {}),
-            nodes_range=nodes_range, k_range=out_degree_range, path_length_range=path_len_range,
-            hop_breakdown=True,
+            hop_breakdown=True, **graph_kwargs,
         )
         if hop_breakdown:
             breakdown_str = ", ".join(
@@ -520,8 +543,26 @@ class GraphTraversalDataset(BaseDataset):
     output_dim = TRIPLE_DIM
     advance_threshold = ADVANCE_THRESHOLD
 
+    def __init__(self, dataset_link: str = None, test_dataset_link: str = None):
+        # dataset_link: path to a real edge file (see data/common/graph_io.py
+        # for the accepted formats) to TRAIN on, instead of the default
+        # per-episode synthetic generate_graph(). None (default) -> unchanged
+        # synthetic behavior.
+        # test_dataset_link: path to a real edge file to use as the fixed
+        # OOD TEST graph, instead of the built-in London Underground -- the
+        # graph analogue of text/audio/video's test_dataset_link. None
+        # (default) -> the built-in London Underground, unchanged.
+        self._custom_graph = load_graph(dataset_link) if dataset_link is not None else None
+        self._custom_test_graph = load_graph(test_dataset_link) if test_dataset_link is not None else None
+        if dataset_link is not None:
+            print(f"[graph-traversal] training graph loaded from {dataset_link}: "
+                  f"{len(self._custom_graph[1])} nodes, {len(self._custom_graph[0])} edges")
+        if test_dataset_link is not None:
+            print(f"[graph-traversal] test graph loaded from {test_dataset_link}: "
+                  f"{len(self._custom_test_graph[1])} nodes, {len(self._custom_test_graph[0])} edges")
+
     def make_curriculum(self):
-        return TraversalCurriculum()
+        return TraversalCurriculum(custom_graph=self._custom_graph)
 
     def sample_batch(self, curriculum, batch_size):
         return sample_batch(curriculum, batch_size)
@@ -536,33 +577,52 @@ class GraphTraversalDataset(BaseDataset):
         set_output_proj(proj)
 
     def evaluate_ood(self, model, device, num_episodes, rng, verbose_n=0, field_log=None):
-        edges, node_labels, adjacency = build_london_underground_eval()
+        if self._custom_test_graph is not None:
+            edges, node_labels, adjacency = self._custom_test_graph
+        else:
+            edges, node_labels, adjacency = build_london_underground_eval()
         return evaluate_traversal(
             model, device, num_episodes=num_episodes, verbose_n=verbose_n, field_log=field_log,
             fixed_graph=(edges, node_labels, adjacency, len(node_labels)),
             path_length_range=OOD_PATH_LENGTH_RANGE, rng=rng, hop_breakdown=True,
         )
 
-    def evaluate_id_ablated(self, model, device, curriculum, lesson_idx):
+    def _lesson_eval_graph_kwargs(self, curriculum, lesson_idx):
+        """-> kwargs for evaluate_traversal() covering the 'which graph(s)'
+        half of a lesson-distribution eval: nodes_range/k_range (synthetic,
+        default) or a fixed_graph (when dataset_link supplied a custom
+        training graph -- see __init__ above). Either way path_length_range
+        still comes from the lesson table."""
         nodes_range, out_degree_range, path_len_range = curriculum.table[lesson_idx]
+        if self._custom_graph is not None:
+            edges, node_labels, adjacency = self._custom_graph
+            return dict(fixed_graph=(edges, node_labels, adjacency, len(node_labels)),
+                       path_length_range=path_len_range)
+        return dict(nodes_range=nodes_range, k_range=out_degree_range, path_length_range=path_len_range)
+
+    def evaluate_id_ablated(self, model, device, curriculum, lesson_idx):
         return evaluate_traversal(
             model, device, num_episodes=EVAL_BATCH_SIZE, verbose_n=0,
-            nodes_range=nodes_range, k_range=out_degree_range, path_length_range=path_len_range,
-            ablate_memory=True,
+            ablate_memory=True, **self._lesson_eval_graph_kwargs(curriculum, lesson_idx),
         )
-    
+
     def evaluate_id_combiner_stage_ablated(self, model, device, curriculum, lesson_idx, skip_stages):
         """Same lesson-distribution eval as evaluate_id_ablated, but bypasses
         one stage of a hybrid split-graph combiner (see
         ChainedControllerWrapper.forward's skip_stages / SplitGraphDNC's
         combiner_skip_stages) instead of Memory. Only meaningful when
         model.combiner_wrapper is a ChainedControllerWrapper."""
-        nodes_range, out_degree_range, path_len_range = curriculum.table[lesson_idx]
         return evaluate_traversal(
             model, device, num_episodes=EVAL_BATCH_SIZE, verbose_n=0,
-            nodes_range=nodes_range, k_range=out_degree_range, path_length_range=path_len_range,
             model_kwargs={"combiner_skip_stages": skip_stages},
+            **self._lesson_eval_graph_kwargs(curriculum, lesson_idx),
         )
+
+    def field_log_header(self):
+        return ["path_length", "hop_position", "n_triples",
+                "src_acc", "edge_acc", "dst_acc", "triple_acc",
+                "dst_acc_given_src_edge", "n_src_edge_correct",
+                "src_acc_given_prev_dst_correct", "n_prev_dst_correct"]
 
     def write_field_log(self, writer, file, step, lesson, eval_type, field_log):
         write_field_log(writer, file, step, lesson, eval_type, field_log)

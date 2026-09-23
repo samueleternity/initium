@@ -18,7 +18,7 @@ Version notes (core-level):
 - v7+: pluggable controllers via MambaDNC (lstm/mamba/mamba2/mamba3/cfc/
   hybrids), MoE (Option 4), split-graph (Option 5), link-matrix ablation
   (Option 1), static/dynamic N (Option 2), dynamic beta. Each keeps its own
-  CLI flag and run_id tag so runs never collide in phase1_logs/.
+  CLI flag and run_id tag so runs never collide in logs/.
 - v17: dataset split out of this file into data/. Core only talk to the
   dataset through the BaseDataset interface; curriculum's per-lesson memory
   size lives on the curriculum instance (curriculum.lesson_nr_cells).
@@ -329,14 +329,15 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
         split_graph_combiner_variant: str = SPLIT_GRAPH_COMBINER_VARIANT,
         split_graph_combiner_num_blocks: int = SPLIT_GRAPH_COMBINER_NUM_BLOCKS,
         dataset_type: str = DATASET_TYPE,  
-        dataset_link: str = DATASET_LINK):
+        dataset_link: str = DATASET_LINK,
+        test_dataset_link: str = None):
         # Deliberately does NOT touch LR_DECAY_STEPS - that's a separate
         # module-level constant, fixed at import time from the *original*
         # TOTAL_STEPS, and lr_at_step()/set_lr() below read it directly by
         # name, not through this parameter. A pilot run still anneals LR on
         # the full 120000-step schedule and simply stops early partway
         # through it, exactly as the --total-steps help text promises.
-    dataset = get_dataset(dataset_type, dataset_link)
+    dataset = get_dataset(dataset_type, dataset_link, test_dataset_link=test_dataset_link)
     INPUT_DIM, TRIPLE_DIM = dataset.input_dim, dataset.output_dim
     beta_ctrl_acc_target = (BETA_CTRL_ACC_TARGET if BETA_CTRL_ACC_TARGET is not None
                             else dataset.advance_threshold)
@@ -400,6 +401,16 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
         ])
 
     lesson_log_path = os.path.join(LOG_DIR, f"run_{run_id}_lesson_advances.csv")
+    modality_log_path = os.path.join(LOG_DIR, f"run_{run_id}_modality_dependency.csv")
+    modality_log_file = open(modality_log_path, "a" if resuming else "w", newline="")
+    modality_log_writer = csv.writer(modality_log_file)
+    if not resuming:
+        modality_log_writer.writerow([
+            "step", "lesson", "modality",
+            "id_acc", "id_perfect_frac",
+            "ablated_acc", "ablated_perfect_frac",
+            "modality_dependency_acc", "modality_dependency_perfect",
+        ])
     lesson_log_file = open(lesson_log_path, "a" if resuming else "w", newline="")
     lesson_log_writer = csv.writer(lesson_log_file)
     if not resuming:
@@ -452,12 +463,10 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
     field_log_file = open(field_log_path, "a" if resuming else "w", newline="")
     field_log_writer = csv.writer(field_log_file)
     if os.path.getsize(field_log_path) == 0:
-        field_log_writer.writerow([
-            "step", "lesson", "eval_type", "path_length", "hop_position", "n_triples",
-            "src_acc", "edge_acc", "dst_acc", "triple_acc",
-            "dst_acc_given_src_edge", "n_src_edge_correct",
-            "src_acc_given_prev_dst_correct", "n_prev_dst_correct",
-        ])
+        # v20: header is dataset-owned (see BaseDataset.field_log_header) instead of
+        # hardcoded to graph's src/edge/dst schema, since text/audio/video/multimodal
+        # now log their own value/cumsum breakdown into this same file.
+        field_log_writer.writerow(["step", "lesson", "eval_type"] + dataset.field_log_header())
     curriculum.field_log_writer = field_log_writer
     curriculum.field_log_file = field_log_file
 
@@ -1225,6 +1234,20 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
                           f"[{stage_idx}:{stage_kind}]: ID (full) {id_triple_acc:.2f}% | "
                           f"ablated ({stage_kind} off) {stage_triple_acc:.2f}% | "
                           f"dependency {id_triple_acc - stage_triple_acc:.2f}")
+
+            if getattr(dataset, "modalities", None):
+                for modality in dataset.modalities:
+                    m_acc, m_pf = dataset.evaluate_modality_ablated(
+                        rnn, device, curriculum, pre_advance_lesson, modality)
+                    modality_log_writer.writerow([
+                        step, pre_advance_lesson + 1, modality,
+                        id_triple_acc, id_perfect_frac, m_acc, m_pf,
+                        id_triple_acc - m_acc, id_perfect_frac - m_pf,
+                    ])
+                    modality_log_file.flush()
+                    print(f"[{run_id}] Step {step} modality-dependency check "
+                          f"[{modality}]: full {id_triple_acc:.2f}% | ablated ({modality} off) "
+                          f"{m_acc:.2f}% | dependency {id_triple_acc - m_acc:.2f}")
         
 
         if step % checkpoint_every == 0 or step == total_steps:
@@ -1291,6 +1314,7 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
     prior_log_file.close()  
     field_log_file.close()  # v16
     combiner_stage_log_file.close()
+    modality_log_file.close()
     if dynamic_n_ctrl is not None:
         dynamic_n_log_file.close()
 
@@ -1317,8 +1341,8 @@ if __name__ == "__main__":
                               "Training continues from the checkpoint's step up to TOTAL_STEPS.")
     parser.add_argument("--run-id-suffix", type=str, default=None,
                          help="appended to the derived run_id (e.g. 'switch') so this run's checkpoints "
-                              "(phase1_checkpoints/beta_XXX<suffix>_stepN.pt) and log "
-                              "(phase1_logs/run_beta_XXX<suffix>.csv) don't collide with an existing run "
+                              "(checkpoints/beta_XXX<suffix>_stepN.pt) and log "
+                              "(logs/run_beta_XXX<suffix>.csv) don't collide with an existing run "
                               "that used the same beta value -- e.g. resuming a beta=0 checkpoint into a "
                               "beta=0.01 run would otherwise reuse the same run_id/files as a prior plain "
                               "beta=0.01 sweep run.")
@@ -1449,17 +1473,27 @@ if __name__ == "__main__":
                               "(--split-graph-combiner-mode=controller only). Kept small "
                               "by default -- this step is meant to stay cheap.")
     parser.add_argument("--dataset-type", type=str, default=DATASET_TYPE,
-                         choices=["graph", "text", "audio", "video"],
+                         choices=["graph", "text", "audio", "video", "multimodal"],
                          help="Dataset plugged into the core loop (data/dataset_registry.py). "
                               "Only 'graph' (graph-traversal) is implemented so far.")
     parser.add_argument("--dataset-link", type=str, default=DATASET_LINK,
-                         help="Dataset location. Omit or 'graph-traversal' for the built-in "
-                              "synthetic graph-traversal curriculum + London Underground OOD test.")
+                         help="Real training-data source for --dataset-type: a graph edge file "
+                              "(graph), a text file (text), an audio file (audio, needs torchaudio), "
+                              "or a video file (video, needs opencv-python). Omit (or 'graph-traversal' "
+                              "for graph) to keep the built-in synthetic data for that type.")
+    parser.add_argument("--test-dataset-link", type=str, default=None,
+                         help="Path to a real held-out TEST source (a second text/audio/video file, "
+                              "or a graph edge file), used instead of the default synthetic/seeded "
+                              "held-out split -- the modality's analogue of the graph dataset's "
+                              "London Underground test graph. Omit to keep default behavior: for "
+                              "graph, the built-in London Underground; for text/audio/video, a "
+                              "disjoint-key held-out slice of --dataset-link (or the fully synthetic "
+                              "seeded table if --dataset-link is also omitted).")
     args = parser.parse_args()
 
     if args.resume is not None and args.beta is None:
         raise SystemExit("--resume requires the beta positional arg too, e.g.:\n"
-                          f"  python3 {sys.argv[0]} 0.02 --resume phase1_checkpoints/beta_0p02_latest.pt")
+                          f"  python3 {sys.argv[0]} 0.02 --resume checkpoints/beta_0p02_latest.pt")
     
     if args.link_matrix_mode == "sparse_topk" and args.link_matrix_topk is None:
         raise SystemExit("--link-matrix-mode=sparse_topk requires --link-matrix-topk")
@@ -1531,7 +1565,8 @@ if __name__ == "__main__":
                        split_graph_combiner_variant=args.split_graph_combiner_variant,
                        split_graph_combiner_num_blocks=args.split_graph_combiner_num_blocks,
                        dataset_type=args.dataset_type,
-                       dataset_link=args.dataset_link)
+                       dataset_link=args.dataset_link,
+                       test_dataset_link=args.test_dataset_link)
         all_summaries.append(summary)
 
     print("\n===== Sweep summary (this process) =====")

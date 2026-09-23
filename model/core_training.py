@@ -40,6 +40,9 @@ import torch.nn as nn
 
 from dnc import DNC 
 
+from memory_manipulation.nvrtc_compat import patch_prod_jiterator
+patch_prod_jiterator()  # environment workaround -- see module docstring
+
 from mamba_controller.mamba_controller import MambaDNC  
 from MoE.moe_layer import pop_total_moe_aux_loss 
 from mamba_controller.split_graph_dnc import SplitGraphDNC  

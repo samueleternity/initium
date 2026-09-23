@@ -45,6 +45,8 @@ from inference.capabilities import (
 )
 from inference.tasks.task_registry import get_task
 from inference.model_loader import load_model
+from memory_manipulation.nvrtc_compat import patch_prod_jiterator
+patch_prod_jiterator()  # environment workaround -- see that module's docstring
 from inference.engine import InferenceEngine
 from inference.metrics import aggregate, windowed, adaptation_trend
 from inference import run_logging as rl

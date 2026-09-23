@@ -618,5 +618,11 @@ class GraphTraversalDataset(BaseDataset):
             **self._lesson_eval_graph_kwargs(curriculum, lesson_idx),
         )
 
+    def field_log_header(self):
+        return ["path_length", "hop_position", "n_triples",
+                "src_acc", "edge_acc", "dst_acc", "triple_acc",
+                "dst_acc_given_src_edge", "n_src_edge_correct",
+                "src_acc_given_prev_dst_correct", "n_prev_dst_correct"]
+
     def write_field_log(self, writer, file, step, lesson, eval_type, field_log):
         write_field_log(writer, file, step, lesson, eval_type, field_log)

@@ -39,7 +39,7 @@ BETAS_TO_SWEEP = [0.0]
 KL_ANNEAL_STEPS = 8000       # ramp beta 0 -> target over this many steps
 LESSON_KL_DIP_STEPS = 100
 FREE_BITS = 0.02             # per-dimension KL floor (nats); 0.0 disables
-LOG_DIR = "./phase1_logs"
+LOG_DIR = "./logs"
 OOD_EVAL_EPISODES = 200                # terminal OOD eval
 OOD_EVAL_EPISODES_PERIODIC = 50        # lighter periodic OOD read every EVAL_EVERY steps
 
@@ -59,5 +59,5 @@ PRIOR_MIN_LOGVAR = -6.0       # floor on log(Sigma_g), prevents silent collapse
 PRIOR_MAX_LOGVAR = math.log(6)       # symmetric ceiling
 
 # ---- Checkpointing ----------------------------------------------------------
-CHECKPOINT_DIR = "./phase1_checkpoints"
+CHECKPOINT_DIR = "./checkpoints"
 CHECKPOINT_EVERY = 2000       # periodic safety checkpoint, in addition to end-of-run

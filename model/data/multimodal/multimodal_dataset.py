@@ -32,7 +32,9 @@ import random
 import torch
 
 from data.base_dataset import BaseDataset
-from data.common.chain_task import ChainCurriculum, score_answer_steps
+from data.common.chain_task import (
+    ChainCurriculum, score_answer_steps, write_value_cumsum_field_log, value_cumsum_field_log_header,
+)
 from data.text.text_dataset import TextChainDataset
 from data.audio.audio_dataset import AudioChainDataset
 from data.video.video_dataset import VideoChainDataset
@@ -223,7 +225,7 @@ class MultimodalDataset(BaseDataset):
 
     def evaluate_chain(self, model, device, num_episodes, num_facts_range=None, num_queries_range=None,
                         rng=None, ablate_memory=False, step_breakdown=False, skip_modalities=None,
-                        verbose_n=0, use_test_pool=False, skip_stages=None):
+                        verbose_n=0, use_test_pool=False, skip_stages=None, field_log=None):
         model.eval()
         total = correct_value = correct_cumsum = perfect_episodes = tested = 0
         by_depth = {}
@@ -239,7 +241,8 @@ class MultimodalDataset(BaseDataset):
                                    **({"combiner_skip_stages": skip_stages} if skip_stages else {}))
                 output = self._output_proj(output.transpose(0, 1).contiguous().squeeze(0))
                 ep_total, ep_correct, episode_perfect, ep_cv, ep_cc, ep_n = score_answer_steps(
-                    output, target_digits, answer_mask, codec, verbose=(tested < verbose_n))
+                    output, target_digits, answer_mask, codec, verbose=(tested < verbose_n),
+                    field_log=field_log)
                 correct_value += ep_cv; correct_cumsum += ep_cc; total += ep_n
                 perfect_episodes += int(episode_perfect); tested += 1
                 if step_breakdown:
@@ -260,7 +263,8 @@ class MultimodalDataset(BaseDataset):
     def evaluate_ood(self, model, device, num_episodes, rng, verbose_n=0, field_log=None):
         return self.evaluate_chain(model, device, num_episodes, num_facts_range=(15, 20),
                                     num_queries_range=self.primary.ood_query_range, rng=rng,
-                                    step_breakdown=True, use_test_pool=True, verbose_n=verbose_n)
+                                    step_breakdown=True, use_test_pool=True, verbose_n=verbose_n,
+                                    field_log=field_log)
 
     def evaluate_id_ablated(self, model, device, curriculum, lesson_idx):
         nf, nq = curriculum.table[lesson_idx]
@@ -284,5 +288,8 @@ class MultimodalDataset(BaseDataset):
         return self.evaluate_chain(model, device, self.eval_batch_size,
                                     num_facts_range=nf, num_queries_range=nq, skip_modalities={idx})
 
+    def field_log_header(self):
+        return value_cumsum_field_log_header()
+
     def write_field_log(self, writer, file, step, lesson, eval_type, field_log):
-        pass
+        write_value_cumsum_field_log(writer, file, step, lesson, eval_type, field_log)

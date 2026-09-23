@@ -18,7 +18,7 @@ Version notes (core-level):
 - v7+: pluggable controllers via MambaDNC (lstm/mamba/mamba2/mamba3/cfc/
   hybrids), MoE (Option 4), split-graph (Option 5), link-matrix ablation
   (Option 1), static/dynamic N (Option 2), dynamic beta. Each keeps its own
-  CLI flag and run_id tag so runs never collide in phase1_logs/.
+  CLI flag and run_id tag so runs never collide in logs/.
 - v17: dataset split out of this file into data/. Core only talk to the
   dataset through the BaseDataset interface; curriculum's per-lesson memory
   size lives on the curriculum instance (curriculum.lesson_nr_cells).
@@ -463,12 +463,10 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
     field_log_file = open(field_log_path, "a" if resuming else "w", newline="")
     field_log_writer = csv.writer(field_log_file)
     if os.path.getsize(field_log_path) == 0:
-        field_log_writer.writerow([
-            "step", "lesson", "eval_type", "path_length", "hop_position", "n_triples",
-            "src_acc", "edge_acc", "dst_acc", "triple_acc",
-            "dst_acc_given_src_edge", "n_src_edge_correct",
-            "src_acc_given_prev_dst_correct", "n_prev_dst_correct",
-        ])
+        # v20: header is dataset-owned (see BaseDataset.field_log_header) instead of
+        # hardcoded to graph's src/edge/dst schema, since text/audio/video/multimodal
+        # now log their own value/cumsum breakdown into this same file.
+        field_log_writer.writerow(["step", "lesson", "eval_type"] + dataset.field_log_header())
     curriculum.field_log_writer = field_log_writer
     curriculum.field_log_file = field_log_file
 
@@ -1343,8 +1341,8 @@ if __name__ == "__main__":
                               "Training continues from the checkpoint's step up to TOTAL_STEPS.")
     parser.add_argument("--run-id-suffix", type=str, default=None,
                          help="appended to the derived run_id (e.g. 'switch') so this run's checkpoints "
-                              "(phase1_checkpoints/beta_XXX<suffix>_stepN.pt) and log "
-                              "(phase1_logs/run_beta_XXX<suffix>.csv) don't collide with an existing run "
+                              "(checkpoints/beta_XXX<suffix>_stepN.pt) and log "
+                              "(logs/run_beta_XXX<suffix>.csv) don't collide with an existing run "
                               "that used the same beta value -- e.g. resuming a beta=0 checkpoint into a "
                               "beta=0.01 run would otherwise reuse the same run_id/files as a prior plain "
                               "beta=0.01 sweep run.")
@@ -1495,7 +1493,7 @@ if __name__ == "__main__":
 
     if args.resume is not None and args.beta is None:
         raise SystemExit("--resume requires the beta positional arg too, e.g.:\n"
-                          f"  python3 {sys.argv[0]} 0.02 --resume phase1_checkpoints/beta_0p02_latest.pt")
+                          f"  python3 {sys.argv[0]} 0.02 --resume checkpoints/beta_0p02_latest.pt")
     
     if args.link_matrix_mode == "sparse_topk" and args.link_matrix_topk is None:
         raise SystemExit("--link-matrix-mode=sparse_topk requires --link-matrix-topk")

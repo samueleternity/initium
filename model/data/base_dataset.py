@@ -61,5 +61,13 @@ class BaseDataset:
         by default."""
         raise NotImplementedError
 
+    def field_log_header(self):
+        """Column names (after the shared step/lesson/eval_type prefix
+        core_training.py's field_breakdown CSV always writes) for THIS
+        dataset's write_field_log() rows. Each dataset owns its own field
+        schema (graph: src/edge/dst; the KV-chain family: value/cumsum) so
+        core_training.py never hardcodes one dataset's column layout."""
+        raise NotImplementedError
+
     def write_field_log(self, writer, file, step, lesson, eval_type, field_log):
         raise NotImplementedError

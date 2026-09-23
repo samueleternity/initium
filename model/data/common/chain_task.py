@@ -48,23 +48,34 @@ NUM_FIELDS = 2  # [value, cumsum]
 NUM_PHASE_CHANNELS = 2
 
 
-def score_answer_steps(output, target_digits, answer_mask, codec, verbose=False):
+def score_answer_steps(output, target_digits, answer_mask, codec, verbose=False, field_log=None):
     """Shared per-episode answer scoring: decode each answer step's (value,
-    cumsum) fields, compare to target_digits, optionally print. Used by both
+    cumsum) fields, compare to target_digits, optionally print, optionally
+    accumulate a per-(episode_depth, hop_position) breakdown. Used by both
     KVChainDataset.evaluate_chain (text/audio/video) and
     MultimodalDataset.evaluate_chain (data/multimodal/multimodal_dataset.py)
     so the two families can never silently drift in what counts as
-    'correct' or how depth/perfect-episode bookkeeping is derived.
+    'correct', how depth/perfect-episode bookkeeping is derived, or how the
+    field_log is keyed.
     -> (ep_total, ep_correct, episode_perfect, correct_value, correct_cumsum, n_steps)
     ep_total/ep_correct: this episode's step-count / correct-field-count
         (2 fields per step), for the caller's by_depth breakdown.
     correct_value/correct_cumsum/n_steps: per-field correct counts and step
         count, for the caller's running totals (separate value vs cumsum
         accuracy in the final summary print).
+    field_log: optional dict, keyed by (depth, hop_position) -> [n, value_ok,
+        cumsum_ok], filled in place. depth = this episode's total number of
+        answer steps (its 'num_queries' -- the family's hop-count analogue),
+        so this groups hop position WITHIN episodes of the same length,
+        mirroring graph_traversal.py's (path_length, hop_position) keying.
+        Lets a caller ask "does cumsum specifically degrade at later hop
+        positions within an episode (a capacity/forgetting signal), or is it
+        uniformly low across positions (a training-progress signal)?"
     """
     D = codec.label_dim
     nd = codec.num_digits
     answer_idx = (answer_mask == 1).nonzero(as_tuple=True)[0]
+    depth = int(answer_idx.shape[0])
     ep_total = ep_correct = 0
     episode_perfect = True
     correct_value = correct_cumsum = n_steps = 0
@@ -82,7 +93,37 @@ def score_answer_steps(output, target_digits, answer_mask, codec, verbose=False)
             episode_perfect = False
         if verbose:
             print(f"  step {hop_pos}: value {v_pred}/{v_tgt} ok={v_ok} | cumsum {c_pred}/{c_tgt} ok={c_ok}")
+        if field_log is not None:
+            fl = field_log.setdefault((depth, hop_pos), [0, 0, 0])
+            fl[0] += 1
+            fl[1] += int(v_ok)
+            fl[2] += int(c_ok)
     return ep_total, ep_correct, episode_perfect, correct_value, correct_cumsum, n_steps
+
+
+def write_value_cumsum_field_log(writer, file, step, lesson, eval_type, field_log):
+    """Shared field_log writer for the value/cumsum family (KVChainDataset
+    and MultimodalDataset both fill field_log via score_answer_steps above,
+    so they share this same (depth, hop_position) -> [n, value_ok,
+    cumsum_ok] schema and can share how it's dumped/printed)."""
+    for (depth, hop_pos), (n, v_ok, c_ok) in sorted(field_log.items()):
+        writer.writerow([step, lesson, eval_type, depth, hop_pos, n,
+                          v_ok / n * 100, c_ok / n * 100])
+    file.flush()
+    agg = {}
+    for (depth, hop_pos), v in field_log.items():
+        a = agg.setdefault(hop_pos, [0, 0, 0])
+        for i in range(3):
+            a[i] += v[i]
+    parts = []
+    for hop_pos in sorted(agg)[:4]:
+        n, v_ok, c_ok = agg[hop_pos]
+        parts.append(f"hop{hop_pos}: value {v_ok / n * 100:.0f} cumsum {c_ok / n * 100:.0f} (n={n})")
+    print(f"    [field acc {eval_type} step {step}] " + " | ".join(parts))
+
+
+def value_cumsum_field_log_header():
+    return ["depth", "hop_position", "n_steps", "value_acc", "cumsum_acc"]
 
 
 class ChainCurriculum:
@@ -98,6 +139,7 @@ class ChainCurriculum:
         combined_acc, perfect_frac, breakdown = self.dataset.evaluate_chain(
             model, device, num_episodes=self.dataset.eval_batch_size,
             num_facts_range=nf, num_queries_range=nq, step_breakdown=True,
+            field_log=(field_log := {}),
         )
         if breakdown:
             print(f"    [lesson {self.lesson + 1} eval by depth] " + ", ".join(
@@ -107,6 +149,10 @@ class ChainCurriculum:
                 for d, (a, p, n) in sorted(breakdown.items()):
                     hop_writer.writerow([step, self.lesson + 1, "id", d, a, p, n])
                 self.hop_log_file.flush()
+
+        field_writer = getattr(self, "field_log_writer", None)
+        if field_writer is not None and field_log:
+            self.dataset.write_field_log(field_writer, self.field_log_file, step, self.lesson + 1, "id", field_log)
 
         if combined_acc / 100.0 >= self.dataset.advance_threshold and self.lesson < len(self.table) - 1:
             self.lesson += 1
@@ -281,7 +327,7 @@ class KVChainDataset(BaseDataset):
 
     def evaluate_chain(self, model, device, num_episodes, num_facts_range=None, num_queries_range=None,
                         fixed_facts=None, rng=None, ablate_memory=False, step_breakdown=False,
-                        perturb=None, verbose_n=0, skip_stages=None):
+                        perturb=None, verbose_n=0, skip_stages=None, field_log=None):
         model.eval()
         total = correct_value = correct_cumsum = perfect_episodes = tested = 0
         by_depth = {}
@@ -321,7 +367,8 @@ class KVChainDataset(BaseDataset):
                 output = self._output_proj(output.transpose(0, 1).contiguous().squeeze(0))
 
                 ep_total, ep_correct, episode_perfect, ep_cv, ep_cc, ep_n = score_answer_steps(
-                    output, target_digits, answer_mask, self.codec, verbose=(tested < verbose_n))
+                    output, target_digits, answer_mask, self.codec, verbose=(tested < verbose_n),
+                    field_log=field_log)
                 correct_value += ep_cv; correct_cumsum += ep_cc; total += ep_n
                 perfect_episodes += int(episode_perfect)
                 tested += 1
@@ -344,7 +391,7 @@ class KVChainDataset(BaseDataset):
     def evaluate_ood(self, model, device, num_episodes, rng, verbose_n=0, field_log=None):
         return self.evaluate_chain(model, device, num_episodes, fixed_facts=self.build_ood_facts(),
                                     num_queries_range=self.ood_query_range, rng=rng,
-                                    step_breakdown=True, verbose_n=verbose_n)
+                                    step_breakdown=True, verbose_n=verbose_n, field_log=field_log)
 
     def evaluate_id_ablated(self, model, device, curriculum, lesson_idx):
         nf, nq = curriculum.table[lesson_idx]
@@ -362,6 +409,8 @@ class KVChainDataset(BaseDataset):
         return self.evaluate_chain(model, device, self.eval_batch_size,
                                     num_facts_range=nf, num_queries_range=nq, rng=rng, perturb=severity)
 
+    def field_log_header(self):
+        return value_cumsum_field_log_header()
+
     def write_field_log(self, writer, file, step, lesson, eval_type, field_log):
-        pass  # this family reports its own depth breakdown via evaluate_chain's console/return
-              # value instead; present as a no-op so core_training.py's unconditional call is safe.
+        write_value_cumsum_field_log(writer, file, step, lesson, eval_type, field_log)

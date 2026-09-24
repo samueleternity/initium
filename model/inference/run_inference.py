@@ -46,7 +46,7 @@ from inference.capabilities import (
 from inference.tasks.task_registry import get_task
 from inference.model_loader import load_model
 from memory_manipulation.nvrtc_compat import patch_prod_jiterator
-patch_prod_jiterator()  # environment workaround -- see that module's docstring
+patch_prod_jiterator()  # environment workaround - see that module's docstring
 from inference.engine import InferenceEngine
 from inference.metrics import aggregate, windowed, adaptation_trend
 from inference import run_logging as rl
@@ -316,9 +316,16 @@ def main(argv=None) -> int:
                 if not diag:
                     print(f"  [{i}] no diagnostics recorded")
                     continue
-                print(f"  [{i}] cv_load={diag['cv_load']:.4f} "
+                tag = " (multi-source combiner)" if hasattr(layer, "last_source_diagnostics") else ""
+                print(f"  [{i}]{tag} cv_load={diag['cv_load']:.4f} "
                       f"cv_importance={diag['cv_importance']:.4f} "
                       f"max_load_frac={diag['max_load_frac']:.4f}")
+                src_diag = layer.last_source_diagnostics() if hasattr(layer, "last_source_diagnostics") else None
+                if src_diag:
+                    for s_idx, s in enumerate(src_diag):
+                        frac_str = ", ".join(f"e{e}:{f:.2f}" for e, f in enumerate(s["expert_frac"]))
+                        print(f"      source {s_idx}: top_expert={s['top_expert']} "
+                              f"({s['top_expert_frac']:.2f}) | dist [{frac_str}]")
 
     rl.print_summary(summary)
     return 0

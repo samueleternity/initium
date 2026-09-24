@@ -3,7 +3,7 @@ file: memory_manipulation/nvrtc_compat.py
 
 Environment-compatibility shim, NOT a modeling change. Works around a
 CUDA/NVRTC library mismatch observed in this environment ("nvrtc: error:
-failed to open libnvrtc-builtins.so.13.0" -- the installed torch build's
+failed to open libnvrtc-builtins.so.13.0" - the installed torch build's
 CUDA minor version has no matching nvrtc-builtins shared library present,
 a known failure mode after a partial torch/CUDA reinstall or a fresh
 Colab runtime whose nvidia-cuda-nvrtc-cuXX package doesn't match the
@@ -27,36 +27,36 @@ Rather than reimplementing each of dnc.memory's internal methods by hand
 (fragile: depends on exactly matching an undocumented third-party
 formula, and any future call site is invisible until it crashes), this
 module patches `torch.prod` / `torch.cumprod` / `Tensor.prod` /
-`Tensor.cumprod` THEMSELVES. Every call inside dnc/memory.py -- known or
-not yet discovered -- is transparently redirected, with zero changes
+`Tensor.cumprod` THEMSELVES. Every call inside dnc/memory.py - known or
+not yet discovered - is transparently redirected, with zero changes
 needed to the third-party package or to any call site in this project.
 
 Fix mechanism: for a CUDA tensor with an explicit `dim`, replace the
 product/cumulative-product with the equivalent log-space reduction
 exp(sum(log(clamp(x, min=EPS)), dim)) or exp(cumsum(log(clamp(x)), dim)).
 log, sum/cumsum, and exp are ordinary elementwise/reduction ops with
-statically pre-compiled CUDA kernels for every dtype PyTorch ships -- no
-Jiterator involved -- so this sidesteps the missing-nvrtc-builtins
+statically pre-compiled CUDA kernels for every dtype PyTorch ships - no
+Jiterator involved - so this sidesteps the missing-nvrtc-builtins
 failure without requiring a CUDA toolkit reinstall inside the notebook.
 
 Safety net: the log-space substitution is only mathematically valid for
 NON-NEGATIVE inputs (log of a negative number is NaN). Every known call
 site in dnc.memory operates on gates/usages/weights, which are always in
-[0,1] -- but to stay correct even for an unknown future call site (some
+[0,1] - but to stay correct even for an unknown future call site (some
 other library, or an edit to dnc.memory) with genuinely negative values,
 the patched functions check `torch.isnan(result).any()` after the
 log-space computation and, on a hit, recompute via the ORIGINAL op on a
 CPU copy of the input (never re-invoking the broken CUDA op) before
 moving the result back to the original device. This costs a device sync
 + small copy only in that (expected-never, for this project) fallback
-path -- the common case never sees it.
+path - the common case never sees it.
 
-Call patch_prod_jiterator() once, before running any forward pass --
+Call patch_prod_jiterator() once, before running any forward pass -
 idempotent, so importing this from multiple entry points (core_training.py,
 run_inference.py) is safe. If the underlying environment issue is fixed
 instead (matching nvidia-cuda-nvrtc-cuXX package reinstalled), this patch
 is a harmless no-op difference in float rounding at the ~1e-6 level, not
-a correctness regression -- there is no reason to remove it once applied.
+a correctness regression - there is no reason to remove it once applied.
 """
 from __future__ import annotations
 
@@ -130,4 +130,4 @@ def patch_prod_jiterator() -> None:
           "environment's missing/mismatched libnvrtc-builtins. Every "
           "dnc.memory.Memory call site (get_usage_vector, allocation "
           "weighting, and any other prod/cumprod use) is covered "
-          "automatically -- no per-method patching needed.")
+          "automatically - no per-method patching needed.")

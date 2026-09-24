@@ -145,6 +145,7 @@ class SwitchMoE(nn.Module):
 
         self._aux_losses: list[torch.Tensor] = []
         self._last_diag: dict = {}
+        self._last_topk_idx: torch.Tensor | None = None  # (T, k), detached -- for per-source breakdowns
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         orig_shape = x.shape
@@ -199,6 +200,7 @@ class SwitchMoE(nn.Module):
                 "cv_load": (f_i.std() / f_i.mean().clamp(min=1e-8)).item(),
                 "max_load_frac": f_i.max().item(),
             }
+            self._last_topk_idx = topk_idx.detach()
 
         # Expert capacity, scaled by top_k (each slot competes for the same
         # per-expert buffer).
@@ -255,6 +257,15 @@ class SwitchMoE(nn.Module):
         requires the training script's own memory-ablation check for that,
         not a routing-internal metric."""
         return dict(self._last_diag)
+
+    def last_routing(self) -> torch.Tensor | None:
+        """(num_tokens, top_k) expert indices chosen on the most recent
+        forward() call, or None before any call. Callers that know the
+        token-batch's composition (e.g. MultiSourceMoEBlock, which knows
+        which token rows came from which source) slice this to compute
+        per-slice routing breakdowns that this pooled-over-all-tokens
+        class has no notion of on its own."""
+        return self._last_topk_idx
 
 
 class MoEBlock(nn.Module):
@@ -364,6 +375,31 @@ class MultiSourceMoEBlock(nn.Module):
         batch_sizes = [s.shape[0] for s in sources]
         tagged = torch.cat([self.source_embed(self.norm(s), i) for i, s in enumerate(sources)], dim=0)
         routed = self.moe(tagged)
+
+        # Per-source routing breakdown: which experts did THIS source's rows
+        # actually go to, independent of the pooled cv_load/cv_importance
+        # SwitchMoE.last_diagnostics() reports over the whole concatenated
+        # batch. This is the direct evidence for (or against) genuine
+        # per-source specialization -- e.g. "source 0 (backbone output)
+        # concentrates on experts {2,5}, source 1 (read vector) on {1,7}"
+        # -- rather than every source routing near-identically by chance.
+        topk_idx = self.moe.last_routing()  # (sum(batch_sizes), top_k) or None
+        if topk_idx is not None:
+            num_experts = self.moe.num_experts
+            source_diag, offset = [], 0
+            for i, b in enumerate(batch_sizes):
+                idx_slice = topk_idx[offset:offset + b].reshape(-1)
+                counts = torch.bincount(idx_slice, minlength=num_experts).float()
+                frac = (counts / counts.sum().clamp(min=1)).tolist()
+                top_expert = int(counts.argmax().item())
+                source_diag.append({
+                    "expert_frac": frac,
+                    "top_expert": top_expert,
+                    "top_expert_frac": frac[top_expert],
+                })
+                offset += b
+            self._last_source_diag = source_diag
+
         outs, offset = [], 0
         for i, b in enumerate(batch_sizes):
             outs.append(sources[i] + routed[offset:offset + b])  # per-source residual
@@ -375,6 +411,16 @@ class MultiSourceMoEBlock(nn.Module):
 
     def last_diagnostics(self) -> dict:
         return self.moe.last_diagnostics()
+
+    def last_source_diagnostics(self) -> list[dict] | None:
+        """Per-source expert-usage breakdown from the most recent forward()
+        call: one dict per source (same order as the `sources` list passed
+        in), each with `expert_frac` (this source's rows' distribution over
+        experts), `top_expert`, and `top_expert_frac`. None before any call.
+        Comparing this ACROSS sources is the concrete test of whether the
+        router is genuinely specializing by input identity rather than
+        routing every source near-identically."""
+        return getattr(self, "_last_source_diag", None)
 
 
 class MoERNNWrapper(nn.Module):

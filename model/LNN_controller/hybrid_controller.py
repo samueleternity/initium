@@ -17,6 +17,7 @@ New controller kind: add it to STAGE_KINDS and _make_stage() in hybrid_controlle
 New parallel backbone kind: add it to _BACKBONE_KINDS and the loop in build_parallel_backbone().
 
 """
+
 from __future__ import annotations
 
 from LNN_controller.cfc_controller import CfCControllerWrapper
@@ -36,8 +37,9 @@ def is_hybrid_rnn_type(rnn_type: str) -> bool:
 
 def _make_stage(kind, in_dim, d_model, num_blocks, kw, device):
     if kind == "cfc":
-        return CfCControllerWrapper(in_dim=in_dim, d_model=d_model, num_blocks=num_blocks,
-                                    device=device, **kw)
+        return CfCControllerWrapper(
+            in_dim=in_dim, d_model=d_model, num_blocks=num_blocks, device=device, **kw
+        )
     if kind == "mamba":
         from mamba_controller.mamba_controller import MambaControllerWrapper as W
     elif kind == "mamba2":
@@ -45,7 +47,9 @@ def _make_stage(kind, in_dim, d_model, num_blocks, kw, device):
     elif kind == "mamba3":
         from mamba_controller.mamba3_controller import Mamba3ControllerWrapper as W
     else:
-        raise ValueError(f"hybrid_controller: unknown stage kind {kind!r}, expected one of {STAGE_KINDS}")
+        raise ValueError(
+            f"hybrid_controller: unknown stage kind {kind!r}, expected one of {STAGE_KINDS}"
+        )
     return W(in_dim=in_dim, d_model=d_model, num_blocks=num_blocks, device=device, **kw)
 
 
@@ -54,14 +58,20 @@ def build_hybrid_controller(spec, in_dim, d_model, blocks_per_kind, kwargs_per_k
     assert len(kinds) >= 2 and all(k in STAGE_KINDS for k in kinds), f"bad hybrid spec {spec!r}"
     stages, cur = [], in_dim
     for kind in kinds:
-        stages.append(_make_stage(kind, cur, d_model, blocks_per_kind[kind],
-                                  kwargs_per_kind.get(kind, {}), device))
+        stages.append(
+            _make_stage(
+                kind, cur, d_model, blocks_per_kind[kind], kwargs_per_kind.get(kind, {}), device
+            )
+        )
         cur = d_model
     return ChainedControllerWrapper(stages, stage_kinds=kinds)
 
 
-if __name__ == "__main__":  # smoke test: python -m LNN_controller.hybrid_controller (from project root)
+if (
+    __name__ == "__main__"
+):  # smoke test: python -m LNN_controller.hybrid_controller (from project root)
     import torch
+
     B, T, in_dim, d = 4, 6, 40, 64
     blocks = {"mamba": 1, "mamba2": 1, "mamba3": 1, "cfc": 1}
     kws = {"cfc": dict(backbone_units=64)}

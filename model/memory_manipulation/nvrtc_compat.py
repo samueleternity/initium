@@ -58,6 +58,7 @@ instead (matching nvidia-cuda-nvrtc-cuXX package reinstalled), this patch
 is a harmless no-op difference in float rounding at the ~1e-6 level, not
 a correctness regression - there is no reason to remove it once applied.
 """
+
 from __future__ import annotations
 
 import torch
@@ -75,8 +76,9 @@ def _log_space(input: torch.Tensor, dim, keepdim: bool, cumulative: bool) -> tor
     orig_dtype = input.dtype
     work = input if input.dtype.is_floating_point else input.float()
     logged = torch.log(work.clamp(min=_EPS))
-    reduced = (torch.cumsum(logged, dim=dim) if cumulative
-               else torch.sum(logged, dim=dim, keepdim=keepdim))
+    reduced = (
+        torch.cumsum(logged, dim=dim) if cumulative else torch.sum(logged, dim=dim, keepdim=keepdim)
+    )
     return torch.exp(reduced).to(orig_dtype)
 
 
@@ -86,22 +88,28 @@ def _patched_prod(input, dim=None, keepdim=False, *, dtype=None):
         if torch.isnan(result).any():
             # Negative-valued input -- log-space isn't valid here. Fall back
             # to the ORIGINAL op on CPU (never re-run the broken CUDA path).
-            cpu_out = _orig_prod(input.detach().cpu(), dim, keepdim=keepdim,
-                                 **({"dtype": dtype} if dtype is not None else {}))
+            cpu_out = _orig_prod(
+                input.detach().cpu(),
+                dim,
+                keepdim=keepdim,
+                **({"dtype": dtype} if dtype is not None else {}),
+            )
             return cpu_out.to(input.device)
         return result.to(dtype) if dtype is not None else result
     if dim is None:
         return _orig_prod(input, **({"dtype": dtype} if dtype is not None else {}))
-    return _orig_prod(input, dim, keepdim=keepdim,
-                      **({"dtype": dtype} if dtype is not None else {}))
+    return _orig_prod(
+        input, dim, keepdim=keepdim, **({"dtype": dtype} if dtype is not None else {})
+    )
 
 
 def _patched_cumprod(input, dim, *, dtype=None):
     if isinstance(input, torch.Tensor) and input.is_cuda:
         result = _log_space(input, dim, keepdim=False, cumulative=True)
         if torch.isnan(result).any():
-            cpu_out = _orig_cumprod(input.detach().cpu(), dim,
-                                    **({"dtype": dtype} if dtype is not None else {}))
+            cpu_out = _orig_cumprod(
+                input.detach().cpu(), dim, **({"dtype": dtype} if dtype is not None else {})
+            )
             return cpu_out.to(input.device)
         return result.to(dtype) if dtype is not None else result
     return _orig_cumprod(input, dim, **({"dtype": dtype} if dtype is not None else {}))
@@ -125,9 +133,11 @@ def patch_prod_jiterator() -> None:
     torch.Tensor.prod = _patched_tensor_prod
     torch.Tensor.cumprod = _patched_tensor_cumprod
     setattr(torch, _PATCHED_ATTR, True)
-    print("[nvrtc_compat] patched torch.prod/cumprod (module- and Tensor-level) "
-          "to avoid PyTorch's Jiterator on CUDA, working around this "
-          "environment's missing/mismatched libnvrtc-builtins. Every "
-          "dnc.memory.Memory call site (get_usage_vector, allocation "
-          "weighting, and any other prod/cumprod use) is covered "
-          "automatically - no per-method patching needed.")
+    print(
+        "[nvrtc_compat] patched torch.prod/cumprod (module- and Tensor-level) "
+        "to avoid PyTorch's Jiterator on CUDA, working around this "
+        "environment's missing/mismatched libnvrtc-builtins. Every "
+        "dnc.memory.Memory call site (get_usage_vector, allocation "
+        "weighting, and any other prod/cumprod use) is covered "
+        "automatically - no per-method patching needed."
+    )

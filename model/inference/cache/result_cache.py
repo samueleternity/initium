@@ -12,9 +12,8 @@ Result / lookup cache (GATI-style): memoizes the model output of a whole episode
 Exact-match only, deterministic models only (the setup gate refuses stochastic write
 heads unless overridden).
 """
-from __future__ import annotations
 
-from typing import Optional, Tuple
+from __future__ import annotations
 
 import torch
 
@@ -25,13 +24,13 @@ from inference.cache.state_utils import restore, snapshot
 class ResultCache(BaseCache):
     name = "result"
 
-    def applicable(self, *, reset_experience: bool, resumable: bool) -> Tuple[bool, str]:
+    def applicable(self, *, reset_experience: bool, resumable: bool) -> tuple[bool, str]:
         return True, ""
 
     def _key_for(self, ctx: EpisodeCtx) -> str:
         return self._key("F" if ctx.reset_experience else "P", ctx.chain, ctx.in_hash)
 
-    def lookup_episode(self, ctx: EpisodeCtx) -> Optional[EpisodeHit]:
+    def lookup_episode(self, ctx: EpisodeCtx) -> EpisodeHit | None:
         self.stats.lookups += 1
         got = self._get(self._key_for(ctx))
         if got is None:
@@ -43,12 +42,16 @@ class ResultCache(BaseCache):
             self.stats.misses += 1
             return None
         self.stats.hit(tier, entry["compute_ms"])
-        hidden = (restore(payload["hidden"], self.device)
-                  if payload.get("hidden") is not None else None)
+        hidden = (
+            restore(payload["hidden"], self.device) if payload.get("hidden") is not None else None
+        )
         return EpisodeHit(payload["output"].clone(), hidden, entry["compute_ms"])
 
-    def store_episode(self, ctx: EpisodeCtx, output: torch.Tensor, hidden_after,
-                      compute_ms: float) -> None:
-        payload = {"output": output.detach().cpu().clone(),
-                   "hidden": None if ctx.reset_experience else snapshot(hidden_after)}
+    def store_episode(
+        self, ctx: EpisodeCtx, output: torch.Tensor, hidden_after, compute_ms: float
+    ) -> None:
+        payload = {
+            "output": output.detach().cpu().clone(),
+            "hidden": None if ctx.reset_experience else snapshot(hidden_after),
+        }
         self._put(self._key_for(ctx), payload, compute_ms)

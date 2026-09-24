@@ -12,13 +12,13 @@ Sources of truth (in order):
      Dims that match nothing -> supported list is empty -> run refuses.
 Independently of (1)/(2), the task's dims must ALWAYS equal the model's dims.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List
 
 from inference.inference_config import WILDCARD_TYPE
-from inference.tasks.task_registry import canonical_type, IMPLEMENTED_TYPES, get_task_class
+from inference.tasks.task_registry import IMPLEMENTED_TYPES, canonical_type, get_task_class
 
 
 class IncompatibleModelError(Exception):
@@ -27,19 +27,21 @@ class IncompatibleModelError(Exception):
 
 @dataclass
 class ModelCapabilities:
-    supported_types: List[str]
+    supported_types: list[str]
     input_dim: int
     output_dim: int
-    source: str            # "recorded" | "inferred-legacy" | "unknown"
+    source: str  # "recorded" | "inferred-legacy" | "unknown"
     controller_type: str
 
     def supports(self, canon_type: str) -> bool:
         return WILDCARD_TYPE in self.supported_types or canon_type in self.supported_types
 
     def describe(self) -> str:
-        return (f"supported types={self.supported_types} (source: {self.source}) | "
-                f"input_dim={self.input_dim} output_dim={self.output_dim} | "
-                f"controller={self.controller_type}")
+        return (
+            f"supported types={self.supported_types} (source: {self.source}) | "
+            f"input_dim={self.input_dim} output_dim={self.output_dim} | "
+            f"controller={self.controller_type}"
+        )
 
 
 def detect_capabilities(ckpt: dict) -> ModelCapabilities:
@@ -60,7 +62,9 @@ def detect_capabilities(ckpt: dict) -> ModelCapabilities:
                 types.append(t)
         source = "inferred-legacy" if types else "unknown"
 
-    return ModelCapabilities(types, input_dim, output_dim, source, cfg.get("controller_type", "lstm"))
+    return ModelCapabilities(
+        types, input_dim, output_dim, source, cfg.get("controller_type", "lstm")
+    )
 
 
 def require_type_supported(caps: ModelCapabilities, dataset_type: str, ckpt_path: str) -> str:

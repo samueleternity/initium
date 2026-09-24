@@ -45,8 +45,10 @@ static-Option-2 call site can opt in by passing `optimizer=optimizer` too
 (not changed automatically here, since that changes reproducibility of
 already-running static-Option-2 experiments).
 """
+
 import torch.nn as nn
 from dnc.memory import Memory
+
 from memory_manipulation.link_matrix_ablation import AblatableSparseLinkMemory
 
 
@@ -81,8 +83,8 @@ def _resync_optimizer_after_resize(optimizer, old_named_params: dict, new_memory
 
 
 def resize_memory(model, new_nr_cells: int, device=None, layer: int = 0, optimizer=None):
-    old_memory: Memory = model.memories[layer]          # VERIFY attribute name
-    if old_memory.nr_cells == new_nr_cells:              # VERIFY kwarg/attr name
+    old_memory: Memory = model.memories[layer]  # VERIFY attribute name
+    if old_memory.nr_cells == new_nr_cells:  # VERIFY kwarg/attr name
         return old_memory
 
     # Captured before write_vector_transform is swapped to a placeholder
@@ -92,11 +94,11 @@ def resize_memory(model, new_nr_cells: int, device=None, layer: int = 0, optimiz
 
     new_memory = Memory(
         input_size=old_memory.input_size,
-        nr_cells=new_nr_cells,                           # VERIFY kwarg name
+        nr_cells=new_nr_cells,  # VERIFY kwarg name
         cell_size=old_memory.cell_size,
         read_heads=old_memory.read_heads,
         independent_linears=True,
-        device=device,                                    # VERIFY kwarg name -- see note below
+        device=device,  # VERIFY kwarg name -- see note below
     ).to(device)
 
     # Transplant every N-independent learned sublayer except
@@ -104,9 +106,9 @@ def resize_memory(model, new_nr_cells: int, device=None, layer: int = 0, optimiz
     # plain Linear, on old_memory -- move the module object itself instead
     # of trying to load_state_dict it).
     old_write_head = old_memory.write_vector_transform
-    old_memory.write_vector_transform = nn.Identity()   # placeholder so it's excluded below
+    old_memory.write_vector_transform = nn.Identity()  # placeholder so it's excluded below
     new_memory.load_state_dict(old_memory.state_dict(), strict=False)
-    new_memory.write_vector_transform = old_write_head    # move the actual module
+    new_memory.write_vector_transform = old_write_head  # move the actual module
 
     # Static Option 1 interaction: if old_memory was patched by
     # link_matrix_ablation.patch_link_matrix (its __class__ reassigned to

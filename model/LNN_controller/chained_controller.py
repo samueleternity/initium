@@ -16,6 +16,7 @@ future ones. Example (Mamba backbone -> CfC head):
 State is a list with one entry per stage. Also usable as a SplitGraphDNC
 combiner_wrapper (same protocol).
 """
+
 from __future__ import annotations
 
 import torch.nn as nn
@@ -37,15 +38,23 @@ class ChainedControllerWrapper(nn.Module):
             )
         self.stages = nn.ModuleList(stages)
         self.d_model = stages[-1].d_model
-        self.in_adapter = stages[0].in_adapter  # same object (not re-registered under a new path issue: shared reference)
+        self.in_adapter = stages[
+            0
+        ].in_adapter  # same object (not re-registered under a new path issue: shared reference)
         # plain python list (NOT ModuleList): the MoE blocks are already registered inside their stages
-        self.moe_blocks = [b for s in stages if getattr(s, "moe_enabled", False) for b in s.moe_blocks]
+        self.moe_blocks = [
+            b for s in stages if getattr(s, "moe_enabled", False) for b in s.moe_blocks
+        ]
         self.moe_enabled = len(self.moe_blocks) > 0
         # Names each stage (e.g. ["mamba", "cfc"] for "mamba+cfc") so the
         # training loop can log which stage a given ablation index refers
         # to. None only for the [f"stage{i}"...] fallback below when a
         # caller doesn't pass kinds.
-        self.stage_kinds = list(stage_kinds) if stage_kinds is not None else [f"stage{i}" for i in range(len(self.stages))]
+        self.stage_kinds = (
+            list(stage_kinds)
+            if stage_kinds is not None
+            else [f"stage{i}" for i in range(len(self.stages))]
+        )
 
     def init_state(self, batch_size, device=None, dtype=None):
         return [s.init_state(batch_size, device=device, dtype=dtype) for s in self.stages]

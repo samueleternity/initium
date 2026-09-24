@@ -22,6 +22,7 @@ or a stage in a ChainedControllerWrapper.
 Block = pre-norm residual (Add -> LN -> CfC), same pattern as the Mamba blocks.
 State per block: h (B, units) fp32, or (h, c) if mixed_memory=True (CfC-mmRNN).
 """
+
 from __future__ import annotations
 
 import torch
@@ -54,9 +55,20 @@ def _state_to_fp32(state):
 
 
 class CfCControllerBlock(nn.Module):
-    def __init__(self, d_model, units=None, mode="default", backbone_units=512,
-                 backbone_layers=1, backbone_dropout=0.0, activation="lecun_tanh",
-                 mixed_memory=False, residual=True, device=None, dtype=None):
+    def __init__(
+        self,
+        d_model,
+        units=None,
+        mode="default",
+        backbone_units=512,
+        backbone_layers=1,
+        backbone_dropout=0.0,
+        activation="lecun_tanh",
+        mixed_memory=False,
+        residual=True,
+        device=None,
+        dtype=None,
+    ):
         super().__init__()
         _require_ncps()
         units = d_model if units is None else units
@@ -64,11 +76,19 @@ class CfCControllerBlock(nn.Module):
         self.mixed_memory, self.residual = mixed_memory, residual
         self.norm = nn.LayerNorm(d_model, device=device, dtype=dtype)
         self.cfc = CfC(
-            input_size=d_model, units=units,
-            proj_size=None if units == d_model else d_model,  # project back to d_model if state is wider/narrower
-            return_sequences=True, batch_first=True, mixed_memory=mixed_memory,
-            mode=mode, activation=activation, backbone_units=backbone_units,
-            backbone_layers=backbone_layers, backbone_dropout=backbone_dropout,
+            input_size=d_model,
+            units=units,
+            proj_size=None
+            if units == d_model
+            else d_model,  # project back to d_model if state is wider/narrower
+            return_sequences=True,
+            batch_first=True,
+            mixed_memory=mixed_memory,
+            mode=mode,
+            activation=activation,
+            backbone_units=backbone_units,
+            backbone_layers=backbone_layers,
+            backbone_dropout=backbone_dropout,
         )
         if device is not None or dtype is not None:
             self.cfc.to(device=device, dtype=dtype)
@@ -80,8 +100,10 @@ class CfCControllerBlock(nn.Module):
 
     def step(self, x, state):
         with torch.autocast(device_type=x.device.type, enabled=False):
-            out, new_state = self.cfc(self.norm(x.float()).unsqueeze(1), 
-                                        _state_to_fp32(state) if state is not None else None)
+            out, new_state = self.cfc(
+                self.norm(x.float()).unsqueeze(1),
+                _state_to_fp32(state) if state is not None else None,
+            )
         out = out.squeeze(1).clamp(min=-1e4, max=1e4)
         y = x + out.to(x.dtype) if self.residual else out.to(x.dtype)
         return y, _state_to_fp32(new_state)
@@ -91,14 +113,29 @@ class CfCControllerWrapper(nn.Module):
     """Stack of `num_blocks` CfCControllerBlocks with the nn.LSTM-compatible
     call convention DNC._layer_forward expects (see module docstring)."""
 
-    def __init__(self, in_dim, d_model, num_blocks=2, units=None, mode="default",
-                 backbone_units=512, backbone_layers=1, backbone_dropout=0.0,
-                 activation="lecun_tanh", mixed_memory=False, residual=True,
-                 moe_enabled: bool = False, moe_num_experts: int = 8,
-                 moe_expert_dim: int | None = None, moe_top_k: int = 1,
-                 moe_capacity_factor: float = 1.5, moe_load_balance_alpha: float = 0.01,
-                 moe_source_dims: list[int] | None = None,
-                 device=None, dtype=None):
+    def __init__(
+        self,
+        in_dim,
+        d_model,
+        num_blocks=2,
+        units=None,
+        mode="default",
+        backbone_units=512,
+        backbone_layers=1,
+        backbone_dropout=0.0,
+        activation="lecun_tanh",
+        mixed_memory=False,
+        residual=True,
+        moe_enabled: bool = False,
+        moe_num_experts: int = 8,
+        moe_expert_dim: int | None = None,
+        moe_top_k: int = 1,
+        moe_capacity_factor: float = 1.5,
+        moe_load_balance_alpha: float = 0.01,
+        moe_source_dims: list[int] | None = None,
+        device=None,
+        dtype=None,
+    ):
         super().__init__()
         self.d_model, self.num_blocks = d_model, num_blocks
 
@@ -114,21 +151,36 @@ class CfCControllerWrapper(nn.Module):
         self.moe_source_dims = list(moe_source_dims) if moe_source_dims else None
         if self.moe_source_dims is not None:
             if sum(self.moe_source_dims) != in_dim:
-                raise ValueError(f"CfCControllerWrapper: sum(moe_source_dims)="
-                                 f"{sum(self.moe_source_dims)} != in_dim={in_dim}")
+                raise ValueError(
+                    f"CfCControllerWrapper: sum(moe_source_dims)="
+                    f"{sum(self.moe_source_dims)} != in_dim={in_dim}"
+                )
             if not moe_enabled:
                 raise ValueError("CfCControllerWrapper: moe_source_dims requires moe_enabled=True")
 
         self.in_adapter: nn.Module = (
-            nn.Identity() if in_dim == d_model else nn.Linear(in_dim, d_model, device=device, dtype=dtype)
+            nn.Identity()
+            if in_dim == d_model
+            else nn.Linear(in_dim, d_model, device=device, dtype=dtype)
         )
-        self.blocks = nn.ModuleList([
-            CfCControllerBlock(d_model, units=units, mode=mode, backbone_units=backbone_units,
-                               backbone_layers=backbone_layers, backbone_dropout=backbone_dropout,
-                               activation=activation, mixed_memory=mixed_memory, residual=residual,
-                               device=device, dtype=dtype)
-            for _ in range(num_blocks)
-        ])
+        self.blocks = nn.ModuleList(
+            [
+                CfCControllerBlock(
+                    d_model,
+                    units=units,
+                    mode=mode,
+                    backbone_units=backbone_units,
+                    backbone_layers=backbone_layers,
+                    backbone_dropout=backbone_dropout,
+                    activation=activation,
+                    mixed_memory=mixed_memory,
+                    residual=residual,
+                    device=device,
+                    dtype=dtype,
+                )
+                for _ in range(num_blocks)
+            ]
+        )
 
         self.moe_enabled = moe_enabled
         self.moe_blocks: nn.ModuleList | None = None
@@ -141,23 +193,47 @@ class CfCControllerWrapper(nn.Module):
             # MultiSourceMoEBlock so every existing "extend moe_layers from
             # layer_controller.moe_blocks" call site (MambaDNC,
             # ChainedControllerWrapper) keeps working with zero changes.
-            self.source_in_adapters = nn.ModuleList([
-                nn.Identity() if w == d_model else nn.Linear(w, d_model, device=device, dtype=dtype)
-                for w in self.moe_source_dims
-            ])
-            self.moe_blocks = nn.ModuleList([MultiSourceMoEBlock(
-                d_model, num_sources=len(self.moe_source_dims), num_experts=moe_num_experts,
-                expert_dim=moe_expert_dim, top_k=moe_top_k, capacity_factor=moe_capacity_factor,
-                load_balance_alpha=moe_load_balance_alpha, device=device, dtype=dtype)])
+            self.source_in_adapters = nn.ModuleList(
+                [
+                    nn.Identity()
+                    if w == d_model
+                    else nn.Linear(w, d_model, device=device, dtype=dtype)
+                    for w in self.moe_source_dims
+                ]
+            )
+            self.moe_blocks = nn.ModuleList(
+                [
+                    MultiSourceMoEBlock(
+                        d_model,
+                        num_sources=len(self.moe_source_dims),
+                        num_experts=moe_num_experts,
+                        expert_dim=moe_expert_dim,
+                        top_k=moe_top_k,
+                        capacity_factor=moe_capacity_factor,
+                        load_balance_alpha=moe_load_balance_alpha,
+                        device=device,
+                        dtype=dtype,
+                    )
+                ]
+            )
         elif moe_enabled:
             # Plain per-block external interleave, same convention as
             # MambaControllerWrapper / Mamba2ControllerWrapper.
-            self.moe_blocks = nn.ModuleList([
-                MoEBlock(d_model, num_experts=moe_num_experts, expert_dim=moe_expert_dim,
-                        top_k=moe_top_k, capacity_factor=moe_capacity_factor,
-                        load_balance_alpha=moe_load_balance_alpha, device=device, dtype=dtype)
-                for _ in range(num_blocks)
-            ])
+            self.moe_blocks = nn.ModuleList(
+                [
+                    MoEBlock(
+                        d_model,
+                        num_experts=moe_num_experts,
+                        expert_dim=moe_expert_dim,
+                        top_k=moe_top_k,
+                        capacity_factor=moe_capacity_factor,
+                        load_balance_alpha=moe_load_balance_alpha,
+                        device=device,
+                        dtype=dtype,
+                    )
+                    for _ in range(num_blocks)
+                ]
+            )
 
     def init_state(self, batch_size, device=None, dtype=None):
         if device is None:
@@ -170,8 +246,10 @@ class CfCControllerWrapper(nn.Module):
             f"(got shape {tuple(input.shape)})."
         )
         if self.moe_source_dims is not None:
-            raise RuntimeError("CfCControllerWrapper was configured with moe_source_dims -- "
-                               "call forward_multi_source(sources, hx) instead of forward().")
+            raise RuntimeError(
+                "CfCControllerWrapper was configured with moe_source_dims -- "
+                "call forward_multi_source(sources, hx) instead of forward()."
+            )
         x = self.in_adapter(input.squeeze(1))
         if hx is None:
             hx = self.init_state(x.size(0), device=x.device)
@@ -197,8 +275,8 @@ class CfCControllerWrapper(nn.Module):
         if self.moe_source_dims is None:
             raise RuntimeError("forward_multi_source requires moe_source_dims to have been set")
         projected = [adapter(s) for adapter, s in zip(self.source_in_adapters, sources)]
-        fused_per_source = self.moe_blocks[0](projected)             # list[Tensor], one per source
-        x = torch.stack(fused_per_source, dim=0).sum(dim=0)          # combine into one fused input
+        fused_per_source = self.moe_blocks[0](projected)  # list[Tensor], one per source
+        x = torch.stack(fused_per_source, dim=0).sum(dim=0)  # combine into one fused input
         if hx is None:
             hx = self.init_state(x.size(0), device=x.device)
         new_hx = []
@@ -208,8 +286,11 @@ class CfCControllerWrapper(nn.Module):
         return x.unsqueeze(1), new_hx
 
 
-if __name__ == "__main__":  # smoke test: python -m LNN_controller.cfc_controller (from project root)
+if (
+    __name__ == "__main__"
+):  # smoke test: python -m LNN_controller.cfc_controller (from project root)
     from LNN_controller.chained_controller import ChainedControllerWrapper
+
     B, T, in_dim, d = 4, 6, 40, 32
     for mm in (False, True):
         w = CfCControllerWrapper(in_dim, d, num_blocks=2, backbone_units=64, mixed_memory=mm)
@@ -220,8 +301,12 @@ if __name__ == "__main__":  # smoke test: python -m LNN_controller.cfc_controlle
             loss = loss + out.pow(2).mean()
         loss.backward()  # BPTT across chained steps must not raise
         print(f"standalone mixed_memory={mm}: OK (loss {float(loss):.4f})")
-    ch = ChainedControllerWrapper([CfCControllerWrapper(in_dim, d, 1, backbone_units=64),
-                                   CfCControllerWrapper(d, d, 1, backbone_units=64)])
+    ch = ChainedControllerWrapper(
+        [
+            CfCControllerWrapper(in_dim, d, 1, backbone_units=64),
+            CfCControllerWrapper(d, d, 1, backbone_units=64),
+        ]
+    )
     hx, loss = ch.init_state(B), 0.0
     for _ in range(T):
         out, hx = ch(torch.randn(B, 1, in_dim), hx)

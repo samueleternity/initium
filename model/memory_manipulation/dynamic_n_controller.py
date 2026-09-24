@@ -36,7 +36,7 @@ call site in Alter_PHASE3_mamba.py's training loop, not in this file --
 same "this module doesn't do the tensor work" split link_matrix_ablation.py
 uses relative to dynamic_memory_resize.py.
 """
-from typing import List, Optional, Tuple
+
 
 
 class DynamicNController:
@@ -89,7 +89,7 @@ class DynamicNController:
         self.cooldown_remaining: int = 0
         # (step, old_n, new_n) for every growth event this run has applied
         # (restored from checkpoint on resume -- see state_dict/load_state_dict).
-        self.growth_history: List[Tuple[int, int, int]] = []
+        self.growth_history: list[tuple[int, int, int]] = []
 
     def record(self, frac_saturated: float) -> None:
         """Update the sustained-saturation EMA. Call once per decision
@@ -102,7 +102,7 @@ class DynamicNController:
         if self.cooldown_remaining > 0:
             self.cooldown_remaining -= 1
 
-    def should_grow(self, current_nr_cells: int) -> Optional[int]:
+    def should_grow(self, current_nr_cells: int) -> int | None:
         """Returns the next nr_cells to resize to, or None if no growth
         should happen right now. Pure decision -- does not itself resize
         anything or mutate controller state (mark_grown does that, and only

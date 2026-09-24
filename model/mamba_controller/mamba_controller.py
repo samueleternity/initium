@@ -1,5 +1,5 @@
 """
-mamba_controller.py -- v1 
+mamba_controller.py -- v1
 
 Alternate Phase 3, Step 1 (see Experiment-Roadmap.md, "Alternative Phase 3 -
 fits better to the programs architecture"): wire a Mamba-1 (selective SSM)
@@ -161,7 +161,6 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 from dnc import DNC
 from dnc.memory import Memory
 from dnc.util import cuda
@@ -187,10 +186,24 @@ def _require_mamba_ssm() -> None:
     if Mamba is None:
         raise ImportError(_MAMBA_IMPORT_ERROR)
 
-from mamba_controller.mamba2_controller import Mamba2ControllerWrapper, _require_mamba2_ssm  # v10 (Mamba-2 standalone controller)
-from mamba_controller.mamba3_controller import Mamba3ControllerWrapper, _require_mamba3_ssm  # v12 (Mamba-3 controller)
-from LNN_controller.cfc_controller import CfCControllerWrapper, _require_ncps  # v13 (CfC / LNN controller)
-from LNN_controller.hybrid_controller import build_hybrid_controller, is_hybrid_rnn_type  # v14 (Mamba -> CfC chains)
+
+from LNN_controller.cfc_controller import (  # v13 (CfC / LNN controller)
+    CfCControllerWrapper,
+    _require_ncps,
+)
+from LNN_controller.hybrid_controller import (  # v14 (Mamba -> CfC chains)
+    build_hybrid_controller,
+    is_hybrid_rnn_type,
+)
+from mamba_controller.mamba2_controller import (  # v10 (Mamba-2 standalone controller)
+    Mamba2ControllerWrapper,
+    _require_mamba2_ssm,
+)
+from mamba_controller.mamba3_controller import (  # v12 (Mamba-3 controller)
+    Mamba3ControllerWrapper,
+    _require_mamba3_ssm,
+)
+
 
 # ==========================================================================
 # 1. MambaControllerCell -- one Mamba-1 block, single-timestep, BPTT-safe
@@ -315,22 +328,34 @@ class MambaControllerCell(nn.Module):
             dt32 = dt.clamp(min=1e-6, max=100.0)  # upper bound: normal dt is 0.001-0.1
             B32 = B.float()
             C32 = C.float()
-            A_log_c = m.A_log.float().clamp(min=-20.0, max=20.0)  # lower bound stops A -> 0 (undamped accumulator)
+            A_log_c = m.A_log.float().clamp(
+                min=-20.0, max=20.0
+            )  # lower bound stops A -> 0 (undamped accumulator)
             A32 = -torch.exp(A_log_c)  # (d_inner, d_state)
             dA = torch.exp(torch.einsum("bd,dn->bdn", dt32, A32))
             dB = torch.einsum("bd,bn->bdn", dt32, B32)
-            new_ssm_state32 = ssm_state.float() * dA + x_conv32.unsqueeze(-1) * dB  # (B, d_inner, d_state)
-            new_ssm_state32 = new_ssm_state32.clamp(min=-1e4, max=1e4)  # hard stop on undamped growth
+            new_ssm_state32 = (
+                ssm_state.float() * dA + x_conv32.unsqueeze(-1) * dB
+            )  # (B, d_inner, d_state)
+            new_ssm_state32 = new_ssm_state32.clamp(
+                min=-1e4, max=1e4
+            )  # hard stop on undamped growth
             if new_ssm_state32.abs().max() > 9999.0:
-                print(f"[clamp-hit] ssm_state clamped, pre-clamp max would have exceeded bound") #If you see [clamp-hit] printed and NaNs still occur afterward in the same run, that proves the overflow is happening in the backward pass, not the forward activations — i.e., gradients blowing up through the dA = exp(dt·A) term over the ~250-step unroll even though forward values are now bounded. clamp() zeroes the gradient outside its range, so that specific tensor can't be the source once clamped; the remaining unclamped path (particularly dt32 and A32 before the einsum) is the next suspect, since gradients through exp() compounded across hundreds of BPTT steps can still explode independent of forward-value magnitude.
+                print(
+                    "[clamp-hit] ssm_state clamped, pre-clamp max would have exceeded bound"
+                )  # If you see [clamp-hit] printed and NaNs still occur afterward in the same run, that proves the overflow is happening in the backward pass, not the forward activations — i.e., gradients blowing up through the dA = exp(dt·A) term over the ~250-step unroll even though forward values are now bounded. clamp() zeroes the gradient outside its range, so that specific tensor can't be the source once clamped; the remaining unclamped path (particularly dt32 and A32 before the einsum) is the next suspect, since gradients through exp() compounded across hundreds of BPTT steps can still explode independent of forward-value magnitude.
             y32 = torch.einsum("bdn,bn->bd", new_ssm_state32, C32)
             y32 = y32 + m.D.float() * x_conv32
             y32 = y32 * m.act(z).float()  # gated output
-            y32 = y32.clamp(min=-1e4, max=1e4)  # stay well inside fp16 range before out_proj re-enters autocast
+            y32 = y32.clamp(
+                min=-1e4, max=1e4
+            )  # stay well inside fp16 range before out_proj re-enters autocast
         new_ssm_state = new_ssm_state32.to(dtype)
         y = y32.to(dtype)
 
-        out = m.out_proj(y)  # (B, d_model) -- back under ambient autocast, safe now that y is bounded
+        out = m.out_proj(
+            y
+        )  # (B, d_model) -- back under ambient autocast, safe now that y is bounded
         return out, new_conv_state, new_ssm_state
 
 
@@ -357,11 +382,18 @@ class MambaControllerBlock(nn.Module):
         super().__init__()
         self.norm = nn.LayerNorm(d_model, device=device, dtype=dtype)
         self.cell = MambaControllerCell(
-            d_model, d_state=d_state, d_conv=d_conv, expand=expand,
-            layer_idx=layer_idx, device=device, dtype=dtype,
+            d_model,
+            d_state=d_state,
+            d_conv=d_conv,
+            expand=expand,
+            layer_idx=layer_idx,
+            device=device,
+            dtype=dtype,
         )
 
-    def init_state(self, batch_size: int, device: torch.device | None = None, dtype: torch.dtype | None = None):
+    def init_state(
+        self, batch_size: int, device: torch.device | None = None, dtype: torch.dtype | None = None
+    ):
         return self.cell.init_state(batch_size, device=device, dtype=dtype)
 
     def step(self, x: torch.Tensor, state: tuple[torch.Tensor, torch.Tensor]):
@@ -412,13 +444,20 @@ class MambaControllerWrapper(nn.Module):
         # hidden -> hidden). Identity when already matched (in_dim == d_model),
         # e.g. for DNC layers beyond the first when num_layers > 1.
         self.in_adapter: nn.Module = (
-            nn.Identity() if in_dim == d_model else nn.Linear(in_dim, d_model, device=device, dtype=dtype)
+            nn.Identity()
+            if in_dim == d_model
+            else nn.Linear(in_dim, d_model, device=device, dtype=dtype)
         )
         self.blocks = nn.ModuleList(
             [
                 MambaControllerBlock(
-                    d_model, d_state=d_state, d_conv=d_conv, expand=expand,
-                    layer_idx=i, device=device, dtype=dtype,
+                    d_model,
+                    d_state=d_state,
+                    d_conv=d_conv,
+                    expand=expand,
+                    layer_idx=i,
+                    device=device,
+                    dtype=dtype,
                 )
                 for i in range(num_blocks)
             ]
@@ -442,13 +481,16 @@ class MambaControllerWrapper(nn.Module):
                         capacity_factor=moe_capacity_factor,
                         load_balance_alpha=moe_load_balance_alpha,
                         top_k=moe_top_k,
-                        device=device, dtype=dtype,
+                        device=device,
+                        dtype=dtype,
                     )
                     for _ in range(num_blocks)
                 ]
             )
 
-    def init_state(self, batch_size: int, device: torch.device | None = None, dtype: torch.dtype | None = None):
+    def init_state(
+        self, batch_size: int, device: torch.device | None = None, dtype: torch.dtype | None = None
+    ):
         if device is None or dtype is None:
             p = next(self.parameters())
             device = device if device is not None else p.device
@@ -538,15 +580,15 @@ class MambaDNC(DNC):
         mamba3_headdim: int = 64,
         mamba3_rope_fraction: float = 0.5,
         # v13: CfC (LNN) controller hyperparameters -- rnn_type='cfc' only.
-        cfc_mode: str = "default",          # "default" | "pure" | "no_gate"
+        cfc_mode: str = "default",  # "default" | "pure" | "no_gate"
         cfc_backbone_units: int = 512,
         cfc_backbone_layers: int = 1,
         cfc_backbone_dropout: float = 0.0,
         cfc_activation: str = "lecun_tanh",
-        cfc_mixed_memory: bool = False,     # True = CfC-mmRNN variant
+        cfc_mixed_memory: bool = False,  # True = CfC-mmRNN variant
         cfc_residual: bool = True,
-        hybrid_cfc_num_blocks: int = 1,     # v14: depth of the CfC stage in "<mamba*>+cfc" rnn_types
-                                            # (the Mamba stage's depth is num_hidden_layers)
+        hybrid_cfc_num_blocks: int = 1,  # v14: depth of the CfC stage in "<mamba*>+cfc" rnn_types
+        # (the Mamba stage's depth is num_hidden_layers)
         moe_enabled: bool = False,
         moe_num_experts: int = 8,
         moe_expert_dim: int | None = None,
@@ -554,7 +596,9 @@ class MambaDNC(DNC):
         moe_load_balance_alpha: float = 0.01,
         moe_top_k: int = 1,
     ):
-        if rnn_type.lower() not in ("mamba", "mamba2", "mamba3", "cfc") and not is_hybrid_rnn_type(rnn_type):
+        if rnn_type.lower() not in ("mamba", "mamba2", "mamba3", "cfc") and not is_hybrid_rnn_type(
+            rnn_type
+        ):
             super().__init__(
                 input_size=input_size,
                 hidden_size=hidden_size,
@@ -591,10 +635,14 @@ class MambaDNC(DNC):
                 for layer in range(self.num_layers):
                     old_rnn = self.rnns[layer]
                     wrapped = MoERNNWrapper(
-                        old_rnn, d_model=self.output_size, num_experts=moe_num_experts,
-                        expert_dim=moe_expert_dim, top_k=moe_top_k,
+                        old_rnn,
+                        d_model=self.output_size,
+                        num_experts=moe_num_experts,
+                        expert_dim=moe_expert_dim,
+                        top_k=moe_top_k,
                         capacity_factor=moe_capacity_factor,
-                        load_balance_alpha=moe_load_balance_alpha, device=device,
+                        load_balance_alpha=moe_load_balance_alpha,
+                        device=device,
                     )
                     self.rnns[layer] = wrapped
                     for attr_name, submodule in list(self._modules.items()):
@@ -694,11 +742,18 @@ class MambaDNC(DNC):
                 # Every kind in the chain gets the SAME moe_* settings
                 # (its own per-block MoE sublayers -- ChainedControllerWrapper
                 # already aggregates every stage's moe_blocks generically).
-                _moe_per_kind = dict(
-                    moe_enabled=moe_enabled, moe_num_experts=moe_num_experts,
-                    moe_expert_dim=moe_expert_dim, moe_capacity_factor=moe_capacity_factor,
-                    moe_load_balance_alpha=moe_load_balance_alpha, moe_top_k=moe_top_k,
-                ) if moe_enabled else {}
+                _moe_per_kind = (
+                    dict(
+                        moe_enabled=moe_enabled,
+                        moe_num_experts=moe_num_experts,
+                        moe_expert_dim=moe_expert_dim,
+                        moe_capacity_factor=moe_capacity_factor,
+                        moe_load_balance_alpha=moe_load_balance_alpha,
+                        moe_top_k=moe_top_k,
+                    )
+                    if moe_enabled
+                    else {}
+                )
                 controller = build_hybrid_controller(
                     rnn_type.lower(),
                     in_dim=in_dim,
@@ -710,18 +765,37 @@ class MambaDNC(DNC):
                         "cfc": hybrid_cfc_num_blocks,
                     },
                     kwargs_per_kind={
-                        "mamba": dict(d_state=mamba_d_state, d_conv=mamba_d_conv, expand=mamba_expand,
-                                     **_moe_per_kind),
-                        "mamba2": dict(d_state=mamba2_d_state, d_conv=mamba2_d_conv, expand=mamba2_expand,
-                                       headdim=mamba2_headdim, ngroups=mamba2_ngroups, **_moe_per_kind),
-                        "mamba3": dict(d_state=mamba3_d_state, expand=mamba3_expand,
-                                       headdim=mamba3_headdim, rope_fraction=mamba3_rope_fraction,
-                                       **_moe_per_kind),
-                        "cfc": dict(mode=cfc_mode, backbone_units=cfc_backbone_units,
-                                    backbone_layers=cfc_backbone_layers,
-                                    backbone_dropout=cfc_backbone_dropout,
-                                    activation=cfc_activation, mixed_memory=cfc_mixed_memory,
-                                    residual=cfc_residual, **_moe_per_kind),
+                        "mamba": dict(
+                            d_state=mamba_d_state,
+                            d_conv=mamba_d_conv,
+                            expand=mamba_expand,
+                            **_moe_per_kind,
+                        ),
+                        "mamba2": dict(
+                            d_state=mamba2_d_state,
+                            d_conv=mamba2_d_conv,
+                            expand=mamba2_expand,
+                            headdim=mamba2_headdim,
+                            ngroups=mamba2_ngroups,
+                            **_moe_per_kind,
+                        ),
+                        "mamba3": dict(
+                            d_state=mamba3_d_state,
+                            expand=mamba3_expand,
+                            headdim=mamba3_headdim,
+                            rope_fraction=mamba3_rope_fraction,
+                            **_moe_per_kind,
+                        ),
+                        "cfc": dict(
+                            mode=cfc_mode,
+                            backbone_units=cfc_backbone_units,
+                            backbone_layers=cfc_backbone_layers,
+                            backbone_dropout=cfc_backbone_dropout,
+                            activation=cfc_activation,
+                            mixed_memory=cfc_mixed_memory,
+                            residual=cfc_residual,
+                            **_moe_per_kind,
+                        ),
                     },
                     device=device,
                 )
@@ -829,7 +903,7 @@ class MambaDNC(DNC):
                     independent_linears=self.independent_linears,
                 )
             )
-            setattr(self, "rnn_layer_memory_shared", self.memories[0])
+            self.rnn_layer_memory_shared = self.memories[0]
 
         # Option 4 (MoE): flat list of every installed MoEBlock across all
         # layers, for the training script's pop_total_moe_aux_loss() call --
@@ -849,7 +923,12 @@ class MambaDNC(DNC):
             self.to(self.device)
 
     def _init_hidden(self, hx, batch_size: int, reset_experience: bool):
-        if self.rnn_type.lower() not in ("mamba", "mamba2", "mamba3", "cfc") and not is_hybrid_rnn_type(self.rnn_type):
+        if self.rnn_type.lower() not in (
+            "mamba",
+            "mamba2",
+            "mamba3",
+            "cfc",
+        ) and not is_hybrid_rnn_type(self.rnn_type):
             return super()._init_hidden(hx, batch_size, reset_experience)
 
         # ---- controller-state branch: Mamba (conv_state, ssm_state) ------

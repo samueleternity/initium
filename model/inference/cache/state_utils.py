@@ -7,10 +7,12 @@ ALWAYS deep-copied on both sides: Memory.reset(..., hidden) rebinds entries of t
 dict it is given and the write path rebinds them again, so a cached dict passed
 straight into forward() would silently change under us.
 """
+
 from __future__ import annotations
 
 import math
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 import torch
 
@@ -25,14 +27,14 @@ def tree_map(fn: Callable[[torch.Tensor], Any], obj: Any) -> Any:
     if isinstance(obj, tuple):
         items = [tree_map(fn, v) for v in obj]
         return type(obj)(*items) if hasattr(obj, "_fields") else tuple(items)
-    return obj                                   # None, numbers, strings
+    return obj  # None, numbers, strings
 
 
-def snapshot(tree: Any) -> Any:                  # -> independent CPU copy
+def snapshot(tree: Any) -> Any:  # -> independent CPU copy
     return tree_map(lambda t: t.detach().to("cpu", copy=True), tree)
 
 
-def restore(tree: Any, device: torch.device) -> Any:   # -> independent copy on `device`
+def restore(tree: Any, device: torch.device) -> Any:  # -> independent copy on `device`
     return tree_map(lambda t: t.detach().to(device, copy=True), tree)
 
 

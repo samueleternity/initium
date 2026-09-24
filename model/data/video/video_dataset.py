@@ -20,6 +20,7 @@ Robustness axis: frame dropping / occlusion -- the WHOLE fact observation
 (key AND value) is zeroed with prob=severity, rather than corrupted in
 place (closer to "this frame was dropped/occluded" than to token noise).
 """
+
 import random
 
 import torch
@@ -28,8 +29,20 @@ from data.common.chain_task import KVChainDataset
 from data.common.real_data import build_video_kv_pool, split_train_test_facts
 
 VIDEO_CURRICULUM = [
-    (3, 2), (3, 3), (5, 3), (5, 4), (8, 4), (8, 5),
-    (10, 5), (10, 6), (12, 6), (12, 7), (15, 8), (15, 9), (20, 10), (20, 12),
+    (3, 2),
+    (3, 3),
+    (5, 3),
+    (5, 4),
+    (8, 4),
+    (8, 5),
+    (10, 5),
+    (10, 6),
+    (12, 6),
+    (12, 7),
+    (15, 8),
+    (15, 9),
+    (20, 10),
+    (20, 12),
 ]
 VIDEO_LESSON_NR_CELLS = [128, 128, 128, 128, 160, 160, 160, 160, 192, 192, 192, 192, 256, 256]
 assert len(VIDEO_CURRICULUM) == len(VIDEO_LESSON_NR_CELLS)
@@ -50,9 +63,11 @@ class VideoChainDataset(KVChainDataset):
                 self._test_fact_pool = build_video_kv_pool(test_dataset_link, self.label_range)
             else:
                 self._fact_pool, self._test_fact_pool = split_train_test_facts(pool)
-            print(f"[video-chain] {len(self._fact_pool)} train facts from {dataset_link} | "
-                  f"{len(self._test_fact_pool)} test facts"
-                  + (f" from {test_dataset_link}" if test_dataset_link else " (held-out split)"))
+            print(
+                f"[video-chain] {len(self._fact_pool)} train facts from {dataset_link} | "
+                f"{len(self._test_fact_pool)} test facts"
+                + (f" from {test_dataset_link}" if test_dataset_link else " (held-out split)")
+            )
         elif test_dataset_link is not None:
             # Inference-only real test pool -- see text_dataset.py's twin fix.
             self._test_fact_pool = build_video_kv_pool(test_dataset_link, self.label_range)

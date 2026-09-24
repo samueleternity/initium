@@ -7,13 +7,13 @@ plain dicts {"payload", "compute_ms", "nbytes", "kind"} made only of tensors /
 lists / tuples / dicts / numbers, so the disk tier can use torch.load(weights_only=True)
 (no arbitrary pickle execution).
 """
+
 from __future__ import annotations
 
 import glob
 import os
 from collections import OrderedDict
-from dataclasses import dataclass, asdict
-from typing import Optional, Tuple
+from dataclasses import asdict, dataclass
 
 import torch
 
@@ -27,7 +27,7 @@ class CacheStats:
     ram_hits: int = 0
     disk_hits: int = 0
     bytes_stored: int = 0
-    est_saved_ms: float = 0.0        # sum of recorded cold-compute time of every reused entry
+    est_saved_ms: float = 0.0  # sum of recorded cold-compute time of every reused entry
 
     def hit(self, tier: str, saved_ms: float) -> None:
         self.hits += 1
@@ -46,11 +46,11 @@ class CacheStats:
 class MemoryStore:
     def __init__(self, max_bytes: int):
         self.max_bytes = max_bytes
-        self._d: "OrderedDict[str, dict]" = OrderedDict()
+        self._d: OrderedDict[str, dict] = OrderedDict()
         self.bytes = 0
         self.evictions = 0
 
-    def get(self, key: str) -> Optional[dict]:
+    def get(self, key: str) -> dict | None:
         e = self._d.get(key)
         if e is not None:
             self._d.move_to_end(key)
@@ -82,15 +82,15 @@ class DiskStore:
     def _path(self, key: str) -> str:
         return os.path.join(self.root, key + ".pt")
 
-    def get(self, key: str) -> Optional[dict]:
+    def get(self, key: str) -> dict | None:
         p = self._path(key)
         if not os.path.isfile(p):
             return None
         try:
             entry = torch.load(p, map_location="cpu", weights_only=True)
-            os.utime(p, None)                    # recency for eviction
+            os.utime(p, None)  # recency for eviction
             return entry
-        except Exception:                        # corrupt / incompatible -> treat as miss
+        except Exception:  # corrupt / incompatible -> treat as miss
             try:
                 os.remove(p)
             except OSError:
@@ -102,7 +102,7 @@ class DiskStore:
         tmp = f"{p}.tmp{os.getpid()}"
         try:
             torch.save(entry, tmp)
-            os.replace(tmp, p)                   # atomic
+            os.replace(tmp, p)  # atomic
         except Exception as e:
             print(f"[cache] disk write failed for {key}: {e}")
             try:
@@ -113,8 +113,10 @@ class DiskStore:
         self._evict()
 
     def _evict(self) -> None:
-        files = [(os.path.getmtime(f), os.path.getsize(f), f)
-                 for f in glob.glob(os.path.join(self.root, "*.pt"))]
+        files = [
+            (os.path.getmtime(f), os.path.getsize(f), f)
+            for f in glob.glob(os.path.join(self.root, "*.pt"))
+        ]
         total = sum(s for _, s, _ in files)
         for _, size, f in sorted(files):
             if total <= self.max_bytes:
@@ -137,10 +139,10 @@ class TieredStore:
     """RAM first, disk second (disk hits are promoted to RAM). Shared by every cache
     of a run, so --cache-ram-mb / --cache-disk-mb are TOTAL budgets."""
 
-    def __init__(self, mem: MemoryStore, disk: Optional[DiskStore] = None):
+    def __init__(self, mem: MemoryStore, disk: DiskStore | None = None):
         self.mem, self.disk = mem, disk
 
-    def get(self, key: str) -> Optional[Tuple[dict, str]]:
+    def get(self, key: str) -> tuple[dict, str] | None:
         e = self.mem.get(key)
         if e is not None:
             return e, "ram"
@@ -157,6 +159,9 @@ class TieredStore:
             self.disk.put(key, entry)
 
     def info(self) -> dict:
-        return {"ram_mb": self.mem.bytes / 1e6, "ram_entries": len(self.mem),
-                "ram_evictions": self.mem.evictions,
-                "disk_dir": self.disk.root if self.disk else None}
+        return {
+            "ram_mb": self.mem.bytes / 1e6,
+            "ram_entries": len(self.mem),
+            "ram_evictions": self.mem.evictions,
+            "disk_dir": self.disk.root if self.disk else None,
+        }

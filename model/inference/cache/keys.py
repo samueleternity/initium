@@ -5,6 +5,7 @@ Hashing for cache keys. blake2b (fast, stdlib). A cache key always contains the
 MODEL FINGERPRINT (hash of every weight + config + the flags that change the
 forward pass), so entries can never leak between different checkpoints.
 """
+
 from __future__ import annotations
 
 import hashlib

@@ -19,6 +19,7 @@ build_parallel_backbone(variant=...): variant is "mamba1" | "mamba2" |
 in_dim -> d_model, later stages d_model -> d_model). num_blocks applies PER
 STAGE. This is the single dispatch point for new parallel backbones.
 """
+
 from __future__ import annotations
 
 import torch
@@ -32,19 +33,38 @@ _BACKBONE_KINDS = ("mamba1", "mamba2", "mamba3", "cfc")
 
 
 class _CfCParallelBlock(nn.Module):
-    def __init__(self, d_model, units, mode, backbone_units, backbone_layers, backbone_dropout,
-                 activation, mixed_memory, residual, force_fp32, device=None, dtype=None):
+    def __init__(
+        self,
+        d_model,
+        units,
+        mode,
+        backbone_units,
+        backbone_layers,
+        backbone_dropout,
+        activation,
+        mixed_memory,
+        residual,
+        force_fp32,
+        device=None,
+        dtype=None,
+    ):
         super().__init__()
         _require_ncps()
         units = d_model if units is None else units
         self.residual, self.force_fp32 = residual, force_fp32
         self.norm = nn.LayerNorm(d_model, device=device, dtype=dtype)
         self.cfc = CfC(
-            input_size=d_model, units=units,
+            input_size=d_model,
+            units=units,
             proj_size=None if units == d_model else d_model,
-            return_sequences=True, batch_first=True, mixed_memory=mixed_memory,
-            mode=mode, activation=activation, backbone_units=backbone_units,
-            backbone_layers=backbone_layers, backbone_dropout=backbone_dropout,
+            return_sequences=True,
+            batch_first=True,
+            mixed_memory=mixed_memory,
+            mode=mode,
+            activation=activation,
+            backbone_units=backbone_units,
+            backbone_layers=backbone_layers,
+            backbone_dropout=backbone_dropout,
         )
         if device is not None or dtype is not None:
             self.cfc.to(device=device, dtype=dtype)
@@ -60,35 +80,76 @@ class _CfCParallelBlock(nn.Module):
 
 
 class CfCBackboneParallel(nn.Module):
-    def __init__(self, in_dim, d_model, num_blocks=2, units=None, mode="default",
-                 backbone_units=512, backbone_layers=1, backbone_dropout=0.0,
-                 activation="lecun_tanh", mixed_memory=False, residual=True,
-                 force_fp32=True, moe_enabled: bool = False, moe_num_experts: int = 8,
-                 moe_expert_dim: int | None = None, moe_top_k: int = 1,
-                 moe_capacity_factor: float = 1.5, moe_load_balance_alpha: float = 0.01,
-                 device=None, dtype=None):
+    def __init__(
+        self,
+        in_dim,
+        d_model,
+        num_blocks=2,
+        units=None,
+        mode="default",
+        backbone_units=512,
+        backbone_layers=1,
+        backbone_dropout=0.0,
+        activation="lecun_tanh",
+        mixed_memory=False,
+        residual=True,
+        force_fp32=True,
+        moe_enabled: bool = False,
+        moe_num_experts: int = 8,
+        moe_expert_dim: int | None = None,
+        moe_top_k: int = 1,
+        moe_capacity_factor: float = 1.5,
+        moe_load_balance_alpha: float = 0.01,
+        device=None,
+        dtype=None,
+    ):
         super().__init__()
         self.d_model = d_model
         self.in_adapter: nn.Module = (
-            nn.Identity() if in_dim == d_model else nn.Linear(in_dim, d_model, device=device, dtype=dtype)
+            nn.Identity()
+            if in_dim == d_model
+            else nn.Linear(in_dim, d_model, device=device, dtype=dtype)
         )
-        self.blocks = nn.ModuleList([
-            _CfCParallelBlock(d_model, units, mode, backbone_units, backbone_layers, backbone_dropout,
-                              activation, mixed_memory, residual, force_fp32, device=device, dtype=dtype)
-            for _ in range(num_blocks)
-        ])
+        self.blocks = nn.ModuleList(
+            [
+                _CfCParallelBlock(
+                    d_model,
+                    units,
+                    mode,
+                    backbone_units,
+                    backbone_layers,
+                    backbone_dropout,
+                    activation,
+                    mixed_memory,
+                    residual,
+                    force_fp32,
+                    device=device,
+                    dtype=dtype,
+                )
+                for _ in range(num_blocks)
+            ]
+        )
         # External interleave, applied to the WHOLE (B, L, d_model) sequence
         # after each block (SwitchMoE reshapes any leading dims to a flat
         # token batch, so this costs nothing extra to support here).
         self.moe_enabled = moe_enabled
         self.moe_blocks: nn.ModuleList | None = None
         if moe_enabled:
-            self.moe_blocks = nn.ModuleList([
-                MoEBlock(d_model, num_experts=moe_num_experts, expert_dim=moe_expert_dim,
-                        top_k=moe_top_k, capacity_factor=moe_capacity_factor,
-                        load_balance_alpha=moe_load_balance_alpha, device=device, dtype=dtype)
-                for _ in range(num_blocks)
-            ])
+            self.moe_blocks = nn.ModuleList(
+                [
+                    MoEBlock(
+                        d_model,
+                        num_experts=moe_num_experts,
+                        expert_dim=moe_expert_dim,
+                        top_k=moe_top_k,
+                        capacity_factor=moe_capacity_factor,
+                        load_balance_alpha=moe_load_balance_alpha,
+                        device=device,
+                        dtype=dtype,
+                    )
+                    for _ in range(num_blocks)
+                ]
+            )
 
     def forward(self, x):  # (B, L, in_dim) -> (B, L, d_model), called ONCE per training step
         h = self.in_adapter(x)
@@ -99,30 +160,70 @@ class CfCBackboneParallel(nn.Module):
         return h
 
 
-def build_parallel_backbone(in_dim, d_model, num_blocks=2, variant="mamba1", d_state=16,
-                            d_conv=4, expand=2, headdim=64, cfc_kwargs=None,
-                            moe_enabled: bool = False, moe_num_experts: int = 8,
-                            moe_expert_dim: int | None = None, moe_top_k: int = 1,
-                            moe_capacity_factor: float = 1.5, moe_load_balance_alpha: float = 0.01,
-                            device=None, dtype=None):
+def build_parallel_backbone(
+    in_dim,
+    d_model,
+    num_blocks=2,
+    variant="mamba1",
+    d_state=16,
+    d_conv=4,
+    expand=2,
+    headdim=64,
+    cfc_kwargs=None,
+    moe_enabled: bool = False,
+    moe_num_experts: int = 8,
+    moe_expert_dim: int | None = None,
+    moe_top_k: int = 1,
+    moe_capacity_factor: float = 1.5,
+    moe_load_balance_alpha: float = 0.01,
+    device=None,
+    dtype=None,
+):
     kinds = [k.strip().lower() for k in variant.split("+")]
     bad = [k for k in kinds if k not in _BACKBONE_KINDS]
     if bad:
-        raise ValueError(f"build_parallel_backbone: unknown variant part(s) {bad} in {variant!r}, "
-                         f"expected '+'-joined parts of {_BACKBONE_KINDS}")
-    moe_kw = dict(moe_enabled=moe_enabled, moe_num_experts=moe_num_experts, moe_expert_dim=moe_expert_dim,
-                 moe_top_k=moe_top_k, moe_capacity_factor=moe_capacity_factor,
-                 moe_load_balance_alpha=moe_load_balance_alpha)
+        raise ValueError(
+            f"build_parallel_backbone: unknown variant part(s) {bad} in {variant!r}, "
+            f"expected '+'-joined parts of {_BACKBONE_KINDS}"
+        )
+    moe_kw = dict(
+        moe_enabled=moe_enabled,
+        moe_num_experts=moe_num_experts,
+        moe_expert_dim=moe_expert_dim,
+        moe_top_k=moe_top_k,
+        moe_capacity_factor=moe_capacity_factor,
+        moe_load_balance_alpha=moe_load_balance_alpha,
+    )
     stages, cur = [], in_dim
     for kind in kinds:
         if kind == "cfc":
-            stages.append(CfCBackboneParallel(cur, d_model, num_blocks=num_blocks,
-                                              device=device, dtype=dtype, **moe_kw, **(cfc_kwargs or {})))
+            stages.append(
+                CfCBackboneParallel(
+                    cur,
+                    d_model,
+                    num_blocks=num_blocks,
+                    device=device,
+                    dtype=dtype,
+                    **moe_kw,
+                    **(cfc_kwargs or {}),
+                )
+            )
         else:
-            stages.append(MambaBackboneParallel(
-                in_dim=cur, d_model=d_model, num_blocks=num_blocks, variant=kind,
-                d_state=d_state, d_conv=d_conv, expand=expand, headdim=headdim,
-                device=device, dtype=dtype, **moe_kw))
+            stages.append(
+                MambaBackboneParallel(
+                    in_dim=cur,
+                    d_model=d_model,
+                    num_blocks=num_blocks,
+                    variant=kind,
+                    d_state=d_state,
+                    d_conv=d_conv,
+                    expand=expand,
+                    headdim=headdim,
+                    device=device,
+                    dtype=dtype,
+                    **moe_kw,
+                )
+            )
         cur = d_model
     return stages[0] if len(stages) == 1 else nn.Sequential(*stages)
 
@@ -136,11 +237,14 @@ def collect_backbone_moe_layers(backbone: nn.Module) -> list:
     return [b for s in stages if getattr(s, "moe_enabled", False) for b in s.moe_blocks]
 
 
-if __name__ == "__main__":  # smoke test: python -m LNN_controller.cfc_backbone_parallel (from project root)
+if (
+    __name__ == "__main__"
+):  # smoke test: python -m LNN_controller.cfc_backbone_parallel (from project root)
     B, L, in_dim, d = 4, 12, 40, 32
     for variant in ("cfc", "cfc+cfc"):
-        m = build_parallel_backbone(in_dim, d, num_blocks=1, variant=variant,
-                                    cfc_kwargs=dict(backbone_units=64))
+        m = build_parallel_backbone(
+            in_dim, d, num_blocks=1, variant=variant, cfc_kwargs=dict(backbone_units=64)
+        )
         y = m(torch.randn(B, L, in_dim))
         assert y.shape == (B, L, d), y.shape
         y.pow(2).mean().backward()

@@ -145,7 +145,9 @@ class SwitchMoE(nn.Module):
 
         self._aux_losses: list[torch.Tensor] = []
         self._last_diag: dict = {}
-        self._last_topk_idx: torch.Tensor | None = None  # (T, k), detached -- for per-source breakdowns
+        self._last_topk_idx: torch.Tensor | None = (
+            None  # (T, k), detached -- for per-source breakdowns
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         orig_shape = x.shape
@@ -156,13 +158,17 @@ class SwitchMoE(nn.Module):
         flat = x.reshape(-1, d_model)  # (num_tokens, d_model)
         num_tokens = flat.shape[0]
 
-        logits32 = self.router(flat).float()  # router kept in fp32 (Switch's own selective-precision fix)
+        logits32 = self.router(
+            flat
+        ).float()  # router kept in fp32 (Switch's own selective-precision fix)
         if self.training and self.router_noise_eps > 0:
             # Switch's own exploration mechanism (Appendix C): multiplicative
             # jitter noise. We apply it directly to the router logits here
             # (a commonly-used equivalent of jittering the router input) for
             # simplicity.
-            noise = torch.empty_like(logits32).uniform_(1.0 - self.router_noise_eps, 1.0 + self.router_noise_eps)
+            noise = torch.empty_like(logits32).uniform_(
+                1.0 - self.router_noise_eps, 1.0 + self.router_noise_eps
+            )
             logits32 = logits32 * noise
         probs = torch.softmax(logits32, dim=-1)  # (num_tokens, num_experts)
 
@@ -177,7 +183,7 @@ class SwitchMoE(nn.Module):
         # all T tokens), not run as k sequential passes -- this is what
         # "multiple experts active at once" means at this project's scale.
         top_k = self.top_k
-        topk_prob, topk_idx = probs.topk(top_k, dim=-1)              # (T, k) each
+        topk_prob, topk_idx = probs.topk(top_k, dim=-1)  # (T, k) each
         gate_weights = topk_prob / topk_prob.sum(dim=-1, keepdim=True).clamp(min=1e-9)
 
         # f_i/P_i are cheap to compute regardless of mode; only the aux LOSS
@@ -206,17 +212,19 @@ class SwitchMoE(nn.Module):
         # per-expert buffer).
         capacity = max(1, int((num_tokens * top_k / self.num_experts) * self.capacity_factor))
 
-        w_in = torch.stack([e.w_in.weight for e in self.experts], dim=0)    # (E, expert_dim, d_model)
-        b_in = torch.stack([e.w_in.bias for e in self.experts], dim=0)      # (E, expert_dim)
-        w_out = torch.stack([e.w_out.weight for e in self.experts], dim=0)  # (E, d_model, expert_dim)
-        b_out = torch.stack([e.w_out.bias for e in self.experts], dim=0)    # (E, d_model)
+        w_in = torch.stack([e.w_in.weight for e in self.experts], dim=0)  # (E, expert_dim, d_model)
+        b_in = torch.stack([e.w_in.bias for e in self.experts], dim=0)  # (E, expert_dim)
+        w_out = torch.stack(
+            [e.w_out.weight for e in self.experts], dim=0
+        )  # (E, d_model, expert_dim)
+        b_out = torch.stack([e.w_out.bias for e in self.experts], dim=0)  # (E, d_model)
 
         # Dense pass over EVERY expert for EVERY token -- the single fused
         # computation that makes the top-k selected experts per token
         # simultaneous rather than sequential.
-        hidden = torch.einsum('td,exd->tex', flat, w_in) + b_in            # (T, E, expert_dim)
+        hidden = torch.einsum("td,exd->tex", flat, w_in) + b_in  # (T, E, expert_dim)
         hidden = F.relu(hidden)
-        expert_out_all = torch.einsum('tex,edx->ted', hidden, w_out) + b_out  # (T, E, d_model)
+        expert_out_all = torch.einsum("tex,edx->ted", hidden, w_out) + b_out  # (T, E, d_model)
 
         gathered = torch.gather(
             expert_out_all, 1, topk_idx.unsqueeze(-1).expand(-1, -1, d_model)
@@ -294,9 +302,13 @@ class MoEBlock(nn.Module):
         super().__init__()
         self.norm = nn.LayerNorm(d_model, device=device, dtype=dtype)
         self.moe = SwitchMoE(
-            d_model, num_experts=num_experts, expert_dim=expert_dim,
-            capacity_factor=capacity_factor, router_noise_eps=router_noise_eps,
-            load_balance_alpha=load_balance_alpha, top_k=top_k,
+            d_model,
+            num_experts=num_experts,
+            expert_dim=expert_dim,
+            capacity_factor=capacity_factor,
+            router_noise_eps=router_noise_eps,
+            load_balance_alpha=load_balance_alpha,
+            top_k=top_k,
         )
         if device is not None and getattr(device, "type", None) == "cuda":
             self.to(device)
@@ -309,6 +321,7 @@ class MoEBlock(nn.Module):
 
     def last_diagnostics(self) -> dict:
         return self.moe.last_diagnostics()
+
 
 class SourceEmbedding(nn.Module):
     """Learned per-source bias added to a token's representation before
@@ -352,28 +365,47 @@ class MultiSourceMoEBlock(nn.Module):
     router/gather overhead only, never extra kernel launches.
     """
 
-    def __init__(self, d_model: int, num_sources: int, num_experts: int = 8,
-                 expert_dim: int | None = None, top_k: int = 1,
-                 capacity_factor: float = 1.5, router_noise_eps: float = 1e-2,
-                 load_balance_alpha: float = 0.01, device=None, dtype=None):
+    def __init__(
+        self,
+        d_model: int,
+        num_sources: int,
+        num_experts: int = 8,
+        expert_dim: int | None = None,
+        top_k: int = 1,
+        capacity_factor: float = 1.5,
+        router_noise_eps: float = 1e-2,
+        load_balance_alpha: float = 0.01,
+        device=None,
+        dtype=None,
+    ):
         super().__init__()
         if num_sources < 1:
             raise ValueError(f"MultiSourceMoEBlock: num_sources must be >= 1, got {num_sources}")
         self.num_sources = num_sources
         self.norm = nn.LayerNorm(d_model, device=device, dtype=dtype)
         self.source_embed = SourceEmbedding(num_sources, d_model, device=device, dtype=dtype)
-        self.moe = SwitchMoE(d_model, num_experts=num_experts, expert_dim=expert_dim, top_k=top_k,
-                             capacity_factor=capacity_factor, router_noise_eps=router_noise_eps,
-                             load_balance_alpha=load_balance_alpha)
+        self.moe = SwitchMoE(
+            d_model,
+            num_experts=num_experts,
+            expert_dim=expert_dim,
+            top_k=top_k,
+            capacity_factor=capacity_factor,
+            router_noise_eps=router_noise_eps,
+            load_balance_alpha=load_balance_alpha,
+        )
         if device is not None and getattr(device, "type", None) == "cuda":
             self.to(device)
 
     def forward(self, sources: list[torch.Tensor]) -> list[torch.Tensor]:
         if len(sources) != self.num_sources:
-            raise ValueError(f"MultiSourceMoEBlock: expected {self.num_sources} source tensors, "
-                             f"got {len(sources)}")
+            raise ValueError(
+                f"MultiSourceMoEBlock: expected {self.num_sources} source tensors, "
+                f"got {len(sources)}"
+            )
         batch_sizes = [s.shape[0] for s in sources]
-        tagged = torch.cat([self.source_embed(self.norm(s), i) for i, s in enumerate(sources)], dim=0)
+        tagged = torch.cat(
+            [self.source_embed(self.norm(s), i) for i, s in enumerate(sources)], dim=0
+        )
         routed = self.moe(tagged)
 
         # Per-source routing breakdown: which experts did THIS source's rows
@@ -388,21 +420,23 @@ class MultiSourceMoEBlock(nn.Module):
             num_experts = self.moe.num_experts
             source_diag, offset = [], 0
             for i, b in enumerate(batch_sizes):
-                idx_slice = topk_idx[offset:offset + b].reshape(-1)
+                idx_slice = topk_idx[offset : offset + b].reshape(-1)
                 counts = torch.bincount(idx_slice, minlength=num_experts).float()
                 frac = (counts / counts.sum().clamp(min=1)).tolist()
                 top_expert = int(counts.argmax().item())
-                source_diag.append({
-                    "expert_frac": frac,
-                    "top_expert": top_expert,
-                    "top_expert_frac": frac[top_expert],
-                })
+                source_diag.append(
+                    {
+                        "expert_frac": frac,
+                        "top_expert": top_expert,
+                        "top_expert_frac": frac[top_expert],
+                    }
+                )
                 offset += b
             self._last_source_diag = source_diag
 
         outs, offset = [], 0
         for i, b in enumerate(batch_sizes):
-            outs.append(sources[i] + routed[offset:offset + b])  # per-source residual
+            outs.append(sources[i] + routed[offset : offset + b])  # per-source residual
             offset += b
         return outs
 
@@ -437,24 +471,42 @@ class MoERNNWrapper(nn.Module):
     else in dnc.DNC's forward path.
     """
 
-    def __init__(self, rnn: nn.Module, d_model: int, num_experts: int = 8,
-                 expert_dim: int | None = None, top_k: int = 1,
-                 capacity_factor: float = 1.5, load_balance_alpha: float = 0.01,
-                 device=None, dtype=None):
+    def __init__(
+        self,
+        rnn: nn.Module,
+        d_model: int,
+        num_experts: int = 8,
+        expert_dim: int | None = None,
+        top_k: int = 1,
+        capacity_factor: float = 1.5,
+        load_balance_alpha: float = 0.01,
+        device=None,
+        dtype=None,
+    ):
         super().__init__()
         self.rnn = rnn
         self.d_model = d_model
         self.moe_enabled = True
-        self.moe_blocks = nn.ModuleList([
-            MoEBlock(d_model, num_experts=num_experts, expert_dim=expert_dim, top_k=top_k,
-                    capacity_factor=capacity_factor, load_balance_alpha=load_balance_alpha,
-                    device=device, dtype=dtype)
-        ])
+        self.moe_blocks = nn.ModuleList(
+            [
+                MoEBlock(
+                    d_model,
+                    num_experts=num_experts,
+                    expert_dim=expert_dim,
+                    top_k=top_k,
+                    capacity_factor=capacity_factor,
+                    load_balance_alpha=load_balance_alpha,
+                    device=device,
+                    dtype=dtype,
+                )
+            ]
+        )
 
     def forward(self, input: torch.Tensor, hx):
         out, new_hx = self.rnn(input, hx)
         out = self.moe_blocks[0](out)
         return out, new_hx
+
 
 def pop_total_moe_aux_loss(moe_layers: list) -> tuple:
     """Sum pop_aux_loss() across all installed MoEBlock/SwitchMoE layers and

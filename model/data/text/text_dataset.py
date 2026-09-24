@@ -18,14 +18,27 @@ held-out slice of the same file.
 Depth axis: number of queries (reasoning-chain-length / context-length
 analogue). Fields: value (lookup), cumsum (chained state).
 """
+
 import random
 
 from data.common.chain_task import KVChainDataset
 from data.common.real_data import build_text_kv_pool, split_train_test_facts
 
 TEXT_CURRICULUM = [
-    (3, 2), (3, 3), (5, 3), (5, 4), (8, 4), (8, 5),
-    (10, 5), (10, 6), (12, 6), (12, 7), (15, 8), (15, 9), (20, 10), (20, 12),
+    (3, 2),
+    (3, 3),
+    (5, 3),
+    (5, 4),
+    (8, 4),
+    (8, 5),
+    (10, 5),
+    (10, 6),
+    (12, 6),
+    (12, 7),
+    (15, 8),
+    (15, 9),
+    (20, 10),
+    (20, 12),
 ]
 TEXT_LESSON_NR_CELLS = [128, 128, 128, 128, 160, 160, 160, 160, 192, 192, 192, 192, 256, 256]
 assert len(TEXT_CURRICULUM) == len(TEXT_LESSON_NR_CELLS)
@@ -46,9 +59,11 @@ class TextChainDataset(KVChainDataset):
                 self._test_fact_pool = build_text_kv_pool(test_dataset_link, self.label_range)
             else:
                 self._fact_pool, self._test_fact_pool = split_train_test_facts(pool)
-            print(f"[text-chain] {len(self._fact_pool)} train facts from {dataset_link} | "
-                  f"{len(self._test_fact_pool)} test facts"
-                  + (f" from {test_dataset_link}" if test_dataset_link else " (held-out split)"))
+            print(
+                f"[text-chain] {len(self._fact_pool)} train facts from {dataset_link} | "
+                f"{len(self._test_fact_pool)} test facts"
+                + (f" from {test_dataset_link}" if test_dataset_link else " (held-out split)")
+            )
         elif test_dataset_link is not None:
             # Inference-only: no training pool needed, just a fixed real test
             # pool -- every inference/tasks/*_task.py passes --dataset-link

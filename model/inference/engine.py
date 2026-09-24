@@ -14,10 +14,10 @@ Two regimes (the reset_experience switch):
                            state persist across the whole run. NO weights change;
                            any "learning" is in-context via memory + controller state.
 """
+
 from __future__ import annotations
 
 import time
-from typing import List
 
 import torch
 
@@ -27,8 +27,15 @@ FRESH_HIDDEN = (None, None, None)
 
 
 class InferenceEngine:
-    def __init__(self, model, output_proj, task, device, ablate_memory: bool = False,
-                 combiner_skip_stages: frozenset | None = None):
+    def __init__(
+        self,
+        model,
+        output_proj,
+        task,
+        device,
+        ablate_memory: bool = False,
+        combiner_skip_stages: frozenset | None = None,
+    ):
         self.model, self.output_proj, self.task = model, output_proj, task
         self.device, self.ablate_memory = device, ablate_memory
         self.combiner_skip_stages = combiner_skip_stages
@@ -37,19 +44,25 @@ class InferenceEngine:
 
     @torch.no_grad()
     def _forward(self, episode, hidden, reset_experience: bool):
-        x = episode.input_seq.unsqueeze(0).to(self.device)            # (1, T, input_dim)
+        x = episode.input_seq.unsqueeze(0).to(self.device)  # (1, T, input_dim)
         kw = dict(reset_experience=reset_experience, pass_through_memory=not self.ablate_memory)
         if self.combiner_skip_stages:
             kw["combiner_skip_stages"] = self.combiner_skip_stages
         output, new_hidden = self.model(x, hidden, **kw)
-        output = output.transpose(0, 1).contiguous().squeeze(0)       # (T, input_dim)
-        output = self.output_proj(output)                             # (T, output_dim)
+        output = output.transpose(0, 1).contiguous().squeeze(0)  # (T, input_dim)
+        output = self.output_proj(output)  # (T, output_dim)
         return output.float().cpu(), new_hidden
 
-    def run(self, episodes, reset_experience: bool, verbose_n: int = 0,
-            progress_every: int = 0, label: str = "") -> List[EpisodeResult]:
+    def run(
+        self,
+        episodes,
+        reset_experience: bool,
+        verbose_n: int = 0,
+        progress_every: int = 0,
+        label: str = "",
+    ) -> list[EpisodeResult]:
         hidden = FRESH_HIDDEN
-        results: List[EpisodeResult] = []
+        results: list[EpisodeResult] = []
         run_items = run_correct = 0
         for i, ep in enumerate(episodes):
             if reset_experience:
@@ -65,6 +78,8 @@ class InferenceEngine:
             run_items += score.n_items
             run_correct += score.n_correct
             if progress_every and ((i + 1) % progress_every == 0 or i + 1 == len(episodes)):
-                print(f"[engine{label}] episode {i + 1}/{len(episodes)} | "
-                      f"running item acc {100.0 * run_correct / max(run_items, 1):.2f}%")
+                print(
+                    f"[engine{label}] episode {i + 1}/{len(episodes)} | "
+                    f"running item acc {100.0 * run_correct / max(run_items, 1):.2f}%"
+                )
         return results

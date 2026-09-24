@@ -46,18 +46,18 @@ Decoding goes through the `ffmpeg`/`ffprobe` CLI directly rather than
 torchaudio's I/O backend, whose legacy info()/load() API has been removed
 or changed across torchaudio releases -- see _require_ffmpeg()'s docstring.
 """
+
 from __future__ import annotations
 
 import glob as _glob
 import os
 import random
 from collections import Counter
-from typing import List, Tuple
 
 LABEL_RANGE = 1000
 
 
-def resolve_link_paths(link) -> List[str]:
+def resolve_link_paths(link) -> list[str]:
     """Expand a dataset link into a sorted, de-duplicated list of one or
     more file paths. Accepts: a single file path; a directory (every
     regular file directly inside it is used -- e.g. "/data/audio_clips" to
@@ -85,7 +85,7 @@ def resolve_link_paths(link) -> List[str]:
     else:
         specs = str(link).split("+")
 
-    paths: List[str] = []
+    paths: list[str] = []
     for spec in specs:
         spec = spec.strip()
         if not spec:
@@ -103,7 +103,9 @@ def resolve_link_paths(link) -> List[str]:
         elif os.path.isfile(spec):
             paths.append(spec)
         else:
-            raise FileNotFoundError(f"resolve_link_paths: {spec!r} is not a file, directory, or glob match")
+            raise FileNotFoundError(
+                f"resolve_link_paths: {spec!r} is not a file, directory, or glob match"
+            )
 
     seen, deduped = set(), []
     for p in paths:
@@ -120,8 +122,9 @@ import numpy as np
 try:
     from tokenizers import Tokenizer as _HFTokenizer
     from tokenizers.models import BPE as _HFBPEModel
-    from tokenizers.trainers import BpeTrainer as _HFBpeTrainer
     from tokenizers.pre_tokenizers import ByteLevel as _HFByteLevel
+    from tokenizers.trainers import BpeTrainer as _HFBpeTrainer
+
     _HF_TOKENIZERS_AVAILABLE = True
 except ImportError:
     _HF_TOKENIZERS_AVAILABLE = False
@@ -146,11 +149,15 @@ class BPETokenizer:
 
     def __init__(self, vocab_size: int = LABEL_RANGE):
         if vocab_size <= 256:
-            raise ValueError(f"BPETokenizer: vocab_size must be > 256 (raw bytes), got {vocab_size}")
+            raise ValueError(
+                f"BPETokenizer: vocab_size must be > 256 (raw bytes), got {vocab_size}"
+            )
         self.vocab_size = vocab_size
-        self.merges: List[Tuple[int, int]] = []   # ordered (a, b) merges, applied in order at encode time
+        self.merges: list[
+            tuple[int, int]
+        ] = []  # ordered (a, b) merges, applied in order at encode time
 
-    def train(self, text: str) -> "BPETokenizer":
+    def train(self, text: str) -> BPETokenizer:
         data = text.encode("utf-8", errors="ignore")[:_BPE_TRAIN_CHARS_CAP]
         tokens = list(data)  # ids 0..255
         next_id = 256
@@ -175,7 +182,7 @@ class BPETokenizer:
             next_id += 1
         return self
 
-    def encode(self, text: str) -> List[int]:
+    def encode(self, text: str) -> list[int]:
         tokens = list(text.encode("utf-8", errors="ignore"))
         next_id = 256
         for a, b in self.merges:
@@ -193,8 +200,8 @@ class BPETokenizer:
         return tokens
 
 
-_TEXT_STREAM_CHUNK_CHARS = 1_000_000   # read/encode in ~1M-char chunks -- the corpus is
-                                        # never materialized whole as one Python str
+_TEXT_STREAM_CHUNK_CHARS = 1_000_000  # read/encode in ~1M-char chunks -- the corpus is
+# never materialized whole as one Python str
 
 
 def _iter_text_chunks(path: str, chunk_chars: int = _TEXT_STREAM_CHUNK_CHARS):
@@ -224,8 +231,10 @@ def _text_token_stream_hf(path: str, vocab_size: int):
     trainer = _HFBpeTrainer(vocab_size=vocab_size, min_frequency=2, show_progress=False)
     tok.train([path], trainer=trainer)  # streams the file itself; no full-corpus string needed
 
-    chunks = [np.asarray(tok.encode(chunk_text).ids, dtype=np.int64)
-              for chunk_text in _iter_text_chunks(path)]
+    chunks = [
+        np.asarray(tok.encode(chunk_text).ids, dtype=np.int64)
+        for chunk_text in _iter_text_chunks(path)
+    ]
     ids = np.concatenate(chunks) if chunks else np.empty(0, dtype=np.int64)
 
     # ByteLevel BPE's vocabulary is capped at vocab_size by the trainer
@@ -266,7 +275,7 @@ def _text_token_stream_hf_chunks(path: str, vocab_size: int):
         yield ids
 
 
-def text_token_stream(path: str, vocab_size: int = LABEL_RANGE) -> List[int]:
+def text_token_stream(path: str, vocab_size: int = LABEL_RANGE) -> list[int]:
     if _HF_TOKENIZERS_AVAILABLE:
         with open(path, encoding="utf-8", errors="ignore") as f:
             if not f.read(1):
@@ -281,7 +290,8 @@ def text_token_stream(path: str, vocab_size: int = LABEL_RANGE) -> List[int]:
     tok = BPETokenizer(vocab_size=vocab_size).train(text)
     return tok.encode(text)
 
-def build_text_kv_pool(path, label_range: int = LABEL_RANGE) -> List[Tuple[int, int]]:
+
+def build_text_kv_pool(path, label_range: int = LABEL_RANGE) -> list[tuple[int, int]]:
     """Streaming AND multi-file: `path` may be a single text file, or a
     directory / glob pattern / '+'-joined list of these (see
     resolve_link_paths) -- e.g. an entire folder of text files, each
@@ -309,6 +319,7 @@ def build_text_kv_pool(path, label_range: int = LABEL_RANGE) -> List[Tuple[int, 
             _accumulate_bigram_chunk(matrix, tokens, label_range, None)
     return _pool_from_bigram_matrix(matrix, label_range)
 
+
 # ==========================================================================
 # audio: waveform -> quantized spectrogram-frame token stream
 # ==========================================================================
@@ -322,6 +333,7 @@ def build_text_kv_pool(path, label_range: int = LABEL_RANGE) -> List[Tuple[int, 
 # Colab ships it preinstalled.
 def _require_ffmpeg() -> None:
     import shutil
+
     missing = [exe for exe in ("ffmpeg", "ffprobe") if shutil.which(exe) is None]
     if missing:
         raise RuntimeError(
@@ -337,9 +349,20 @@ def _ffmpeg_audio_info(path: str) -> int:
     video file's embedded audio track, e.g. mp4/mkv)."""
     import json as _json
     import subprocess
+
     _require_ffmpeg()
-    cmd = ["ffprobe", "-v", "error", "-select_streams", "a:0",
-           "-show_entries", "stream=sample_rate", "-of", "json", path]
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "a:0",
+        "-show_entries",
+        "stream=sample_rate",
+        "-of",
+        "json",
+        path,
+    ]
     try:
         out = subprocess.run(cmd, capture_output=True, text=True, check=True)
     except subprocess.CalledProcessError as e:
@@ -359,8 +382,22 @@ def _ffmpeg_decode_mono_f32(path: str, sample_rate: int):
     pipe's OS buffer. Caller must read stdout to EOF and check the return
     code (see _load_waveform / _iter_waveform_chunks)."""
     import subprocess
-    cmd = ["ffmpeg", "-v", "error", "-i", path, "-vn", "-ac", "1",
-           "-ar", str(sample_rate), "-f", "f32le", "-"]
+
+    cmd = [
+        "ffmpeg",
+        "-v",
+        "error",
+        "-i",
+        path,
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        str(sample_rate),
+        "-f",
+        "f32le",
+        "-",
+    ]
     return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
@@ -372,27 +409,37 @@ def _load_waveform(path: str):
     recording in memory (see that function's docstring)."""
     import numpy as _np
     import torch
+
     sr = _ffmpeg_audio_info(path)
     proc = _ffmpeg_decode_mono_f32(path, sr)
     raw, stderr = proc.communicate()
     if proc.returncode != 0:
-        raise RuntimeError(f"ffmpeg failed decoding {path!r}: {stderr.decode(errors='ignore')[-2000:]}")
+        raise RuntimeError(
+            f"ffmpeg failed decoding {path!r}: {stderr.decode(errors='ignore')[-2000:]}"
+        )
     usable = len(raw) - (len(raw) % 4)
     arr = _np.frombuffer(raw[:usable], dtype=_np.float32).copy()
     return torch.from_numpy(arr), sr
 
 
-def audio_token_stream(path: str, label_range: int = LABEL_RANGE,
-                       n_fft: int = 400, hop_length: int = 160) -> List[int]:
+def audio_token_stream(
+    path: str, label_range: int = LABEL_RANGE, n_fft: int = 400, hop_length: int = 160
+) -> list[int]:
     """Each STFT frame's magnitude spectrum is collapsed to a single integer
     id in [0, label_range) via its dominant-frequency-bin index, rescaled
     into the label range. This is a coarse "spectral shape" codebook, not a
     real acoustic-unit tokenizer -- adequate to build a real, non-synthetic
     fact stream out of an actual audio file."""
     import torch
+
     waveform, _sr = _load_waveform(path)
-    spec = torch.stft(waveform, n_fft=n_fft, hop_length=hop_length,
-                      window=torch.hann_window(n_fft), return_complex=True)
+    spec = torch.stft(
+        waveform,
+        n_fft=n_fft,
+        hop_length=hop_length,
+        window=torch.hann_window(n_fft),
+        return_complex=True,
+    )
     mag = spec.abs()  # (freq_bins, n_frames)
     freq_bins = mag.shape[0]
     dominant_bin = mag.argmax(dim=0)  # (n_frames,) in [0, freq_bins)
@@ -400,8 +447,8 @@ def audio_token_stream(path: str, label_range: int = LABEL_RANGE,
     return scaled.clamp(0, label_range - 1).tolist()
 
 
-_AUDIO_CHUNK_SECONDS = 30.0   # ~1.3M samples/chunk at 44.1kHz -> a stft matrix of tens of MB,
-                              # not the multi-GB single-shot matrix a multi-hour file used to need
+_AUDIO_CHUNK_SECONDS = 30.0  # ~1.3M samples/chunk at 44.1kHz -> a stft matrix of tens of MB,
+# not the multi-GB single-shot matrix a multi-hour file used to need
 
 
 def _iter_waveform_chunks(path: str, chunk_seconds: float = _AUDIO_CHUNK_SECONDS):
@@ -414,6 +461,7 @@ def _iter_waveform_chunks(path: str, chunk_seconds: float = _AUDIO_CHUNK_SECONDS
     (mono_waveform_chunk: torch.Tensor, sample_rate)."""
     import numpy as _np
     import torch
+
     sr = _ffmpeg_audio_info(path)
     chunk_frames = max(1, int(chunk_seconds * sr))
     bytes_per_frame = 4  # f32le, already downmixed to mono by -ac 1
@@ -435,13 +483,19 @@ def _iter_waveform_chunks(path: str, chunk_seconds: float = _AUDIO_CHUNK_SECONDS
         proc.stderr.close()
         ret = proc.wait()
         if ret != 0:
-            raise RuntimeError(f"ffmpeg failed decoding {path!r} (exit {ret}): "
-                               f"{stderr.decode(errors='ignore')[-2000:]}")
+            raise RuntimeError(
+                f"ffmpeg failed decoding {path!r} (exit {ret}): "
+                f"{stderr.decode(errors='ignore')[-2000:]}"
+            )
 
 
-def audio_token_stream_chunks(path: str, label_range: int = LABEL_RANGE,
-                              n_fft: int = 400, hop_length: int = 160,
-                              chunk_seconds: float = _AUDIO_CHUNK_SECONDS):
+def audio_token_stream_chunks(
+    path: str,
+    label_range: int = LABEL_RANGE,
+    n_fft: int = 400,
+    hop_length: int = 160,
+    chunk_seconds: float = _AUDIO_CHUNK_SECONDS,
+):
     """Streaming replacement for audio_token_stream(): computes the STFT
     chunk_seconds worth of audio at a time instead of loading the whole
     waveform and running one torch.stft call over it. A small per-chunk
@@ -456,6 +510,7 @@ def audio_token_stream_chunks(path: str, label_range: int = LABEL_RANGE,
     this pipeline builds. Yields one int64 numpy array of token ids per
     chunk (a very short final chunk may yield nothing)."""
     import torch
+
     overlap = max(0, n_fft - hop_length)
     carry = None
     first = True
@@ -466,8 +521,14 @@ def audio_token_stream_chunks(path: str, label_range: int = LABEL_RANGE,
             carry = wf  # too short to STFT yet -- fold into the next chunk instead
             continue
         carry = wf[-overlap:].clone() if overlap > 0 else None
-        spec = torch.stft(wf, n_fft=n_fft, hop_length=hop_length,
-                          window=torch.hann_window(n_fft), center=False, return_complex=True)
+        spec = torch.stft(
+            wf,
+            n_fft=n_fft,
+            hop_length=hop_length,
+            window=torch.hann_window(n_fft),
+            center=False,
+            return_complex=True,
+        )
         mag = spec.abs()  # (freq_bins, n_frames)
         freq_bins = mag.shape[0]
         dominant_bin = mag.argmax(dim=0)
@@ -481,9 +542,13 @@ def audio_token_stream_chunks(path: str, label_range: int = LABEL_RANGE,
             yield ids.numpy().astype(np.int64)
 
 
-def build_audio_kv_pool(path, label_range: int = LABEL_RANGE,
-                        n_fft: int = 400, hop_length: int = 160,
-                        chunk_seconds: float = _AUDIO_CHUNK_SECONDS) -> List[Tuple[int, int]]:
+def build_audio_kv_pool(
+    path,
+    label_range: int = LABEL_RANGE,
+    n_fft: int = 400,
+    hop_length: int = 160,
+    chunk_seconds: float = _AUDIO_CHUNK_SECONDS,
+) -> list[tuple[int, int]]:
     """Multi-file AND streaming counterpart of build_text_kv_pool/
     build_video_kv_pool for audio: `path` may be a single audio file, or a
     directory / glob pattern / '+'-joined list of these (see
@@ -500,8 +565,9 @@ def build_audio_kv_pool(path, label_range: int = LABEL_RANGE,
     matrix = np.zeros(label_range * label_range, dtype=np.int64)
     for p in paths:
         prev_last = None
-        for chunk in audio_token_stream_chunks(p, label_range, n_fft=n_fft,
-                                               hop_length=hop_length, chunk_seconds=chunk_seconds):
+        for chunk in audio_token_stream_chunks(
+            p, label_range, n_fft=n_fft, hop_length=hop_length, chunk_seconds=chunk_seconds
+        ):
             prev_last = _accumulate_bigram_chunk(matrix, chunk, label_range, prev_last)
     return _pool_from_bigram_matrix(matrix, label_range)
 
@@ -530,7 +596,8 @@ def _iter_video_frames(path: str):
     finally:
         cap.release()
 
-def video_token_stream(path: str, label_range: int = LABEL_RANGE, grid: int = 8) -> List[int]:
+
+def video_token_stream(path: str, label_range: int = LABEL_RANGE, grid: int = 8) -> list[int]:
     """Each frame is downsampled to a `grid`x`grid` grayscale thumbnail and
     its mean intensity quantized to [0, label_range) -- a coarse "scene
     brightness/shape" codebook, analogous in spirit to audio_token_stream's
@@ -546,12 +613,15 @@ def video_token_stream(path: str, label_range: int = LABEL_RANGE, grid: int = 8)
         small = cv2.resize(gray, (grid, grid), interpolation=cv2.INTER_AREA)
         means.append(float(small.mean()))
     means_arr = np.asarray(means, dtype=np.float32)
-    scaled = np.clip((means_arr / 255.0 * (label_range - 1)).round().astype(np.int64),
-                     0, label_range - 1)
+    scaled = np.clip(
+        (means_arr / 255.0 * (label_range - 1)).round().astype(np.int64), 0, label_range - 1
+    )
     return scaled.tolist()
 
-def build_video_kv_pool(path, label_range: int = LABEL_RANGE, grid: int = 8,
-                        chunk_frames: int = 200_000) -> List[Tuple[int, int]]:
+
+def build_video_kv_pool(
+    path, label_range: int = LABEL_RANGE, grid: int = 8, chunk_frames: int = 200_000
+) -> list[tuple[int, int]]:
     """Streaming AND multi-file: `path` may be a single video file, or a
     directory / glob pattern / '+'-joined list of these (see
     resolve_link_paths) -- e.g. an entire folder of clips. Quantizes and
@@ -561,9 +631,13 @@ def build_video_kv_pool(path, label_range: int = LABEL_RANGE, grid: int = 8,
     no bigram is stitched across a file boundary."""
     paths = resolve_link_paths(path)
     matrix = np.zeros(label_range * label_range, dtype=np.int64)
+
     def _flush(buf):
         arr = np.asarray(buf, dtype=np.float32)
-        return np.clip((arr / 255.0 * (label_range - 1)).round(), 0, label_range - 1).astype(np.int64)
+        return np.clip((arr / 255.0 * (label_range - 1)).round(), 0, label_range - 1).astype(
+            np.int64
+        )
+
     for p in paths:
         prev_last = None
         buf = []
@@ -578,10 +652,11 @@ def build_video_kv_pool(path, label_range: int = LABEL_RANGE, grid: int = 8,
             prev_last = _accumulate_bigram_chunk(matrix, _flush(buf), label_range, prev_last)
     return _pool_from_bigram_matrix(matrix, label_range)
 
+
 # ==========================================================================
 # shared: token stream -> fact pool -> train/test split
 # ==========================================================================
-def build_kv_pool_from_tokens(token_ids, label_range: int = LABEL_RANGE) -> List[Tuple[int, int]]:
+def build_kv_pool_from_tokens(token_ids, label_range: int = LABEL_RANGE) -> list[tuple[int, int]]:
     """Consecutive-pair (bigram) counts -> one (key, most_common_value) fact
     per distinct key seen. Accumulates into a FIXED label_range x label_range
     int64 count matrix (8 MB at label_range=1000, independent of corpus
@@ -600,18 +675,22 @@ def build_kv_pool_from_tokens(token_ids, label_range: int = LABEL_RANGE) -> List
     synthetic/real fact pool."""
     n = len(token_ids)
     if n < 2:
-        raise ValueError("real-data source produced 0 distinct facts "
-                         "(need at least 4) -- source is too short/uniform to train on.")
+        raise ValueError(
+            "real-data source produced 0 distinct facts "
+            "(need at least 4) -- source is too short/uniform to train on."
+        )
     matrix = np.zeros(label_range * label_range, dtype=np.int64)
     prev_last = None
     slice_size = 5_000_000
     for start in range(0, n, slice_size):
-        chunk = np.asarray(token_ids[start:start + slice_size], dtype=np.int64)
+        chunk = np.asarray(token_ids[start : start + slice_size], dtype=np.int64)
         prev_last = _accumulate_bigram_chunk(matrix, chunk, label_range, prev_last)
     return _pool_from_bigram_matrix(matrix, label_range)
 
 
-def _accumulate_bigram_chunk(matrix_flat: np.ndarray, chunk: np.ndarray, label_range: int, prev_last):
+def _accumulate_bigram_chunk(
+    matrix_flat: np.ndarray, chunk: np.ndarray, label_range: int, prev_last
+):
     """Folds one chunk's consecutive-pair counts into `matrix_flat` (a flat,
     length label_range**2 int64 array) in place, and returns this chunk's
     last token id so the NEXT chunk's caller can pass it back in as
@@ -623,9 +702,11 @@ def _accumulate_bigram_chunk(matrix_flat: np.ndarray, chunk: np.ndarray, label_r
         return prev_last
     bad = (chunk < 0) | (chunk >= label_range)
     if bad.any():
-        raise ValueError(f"_accumulate_bigram_chunk: {int(bad.sum())} token id(s) fell "
-                         f"outside [0, {label_range}) -- upstream tokenizer/quantizer is "
-                         "misconfigured; ids must already be valid.")
+        raise ValueError(
+            f"_accumulate_bigram_chunk: {int(bad.sum())} token id(s) fell "
+            f"outside [0, {label_range}) -- upstream tokenizer/quantizer is "
+            "misconfigured; ids must already be valid."
+        )
     if prev_last is not None:
         matrix_flat[prev_last * label_range + int(chunk[0])] += 1
     if chunk.size >= 2:
@@ -634,19 +715,22 @@ def _accumulate_bigram_chunk(matrix_flat: np.ndarray, chunk: np.ndarray, label_r
     return int(chunk[-1])
 
 
-def _pool_from_bigram_matrix(matrix_flat: np.ndarray, label_range: int) -> List[Tuple[int, int]]:
+def _pool_from_bigram_matrix(matrix_flat: np.ndarray, label_range: int) -> list[tuple[int, int]]:
     matrix = matrix_flat.reshape(label_range, label_range)
     row_sums = matrix.sum(axis=1)
     keys_present = np.nonzero(row_sums)[0]
     if keys_present.size < 4:
-        raise ValueError(f"real-data source produced only {keys_present.size} distinct facts "
-                         "(need at least 4) -- source is too short/uniform to train on.")
+        raise ValueError(
+            f"real-data source produced only {keys_present.size} distinct facts "
+            "(need at least 4) -- source is too short/uniform to train on."
+        )
     vals = matrix[keys_present].argmax(axis=1)
     return list(zip(keys_present.tolist(), vals.tolist()))
 
 
-def split_train_test_facts(pool: List[Tuple[int, int]], test_frac: float = 0.1,
-                           seed: int = 1234) -> Tuple[List[Tuple[int, int]], List[Tuple[int, int]]]:
+def split_train_test_facts(
+    pool: list[tuple[int, int]], test_frac: float = 0.1, seed: int = 1234
+) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
     """Disjoint-by-key split so the test pool is genuinely unseen during
     training -- the token-stream analogue of the graph dataset's
     London-Underground-is-a-different-graph OOD guarantee."""
@@ -656,6 +740,8 @@ def split_train_test_facts(pool: List[Tuple[int, int]], test_frac: float = 0.1,
     n_test = max(1, int(len(pool) * test_frac))
     test_pool, train_pool = pool[:n_test], pool[n_test:]
     if len(train_pool) < 4:
-        raise ValueError(f"real-data source only has {len(train_pool)} training facts after "
-                         f"reserving {n_test} for the test split -- source is too short.")
+        raise ValueError(
+            f"real-data source only has {len(train_pool)} training facts after "
+            f"reserving {n_test} for the test split -- source is too short."
+        )
     return train_pool, test_pool

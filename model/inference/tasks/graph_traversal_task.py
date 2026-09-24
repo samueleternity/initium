@@ -21,6 +21,7 @@ from __future__ import annotations
 import torch
 
 import os
+from typing import List
 
 from data.common.graph_io import load_raw_edges, build_graph_from_raw_edges
 from data.graph_traversal.graph_traversal import (

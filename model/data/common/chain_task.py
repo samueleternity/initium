@@ -359,7 +359,7 @@ class KVChainDataset(BaseDataset):
                           torch.tensor(answer_mask, dtype=torch.float32), nq)
                 else:
                     ep = self.build_episode(num_facts_range, num_queries_range, rng=_rng, perturb=perturb)
-                input_seq, target_digits, answer_mask = input_seq, target_digits, answer_mask
+                input_seq, target_digits, answer_mask, _ = ep
                 input_seq = input_seq.unsqueeze(0).to(device)
                 output, _ = model(input_seq, (None, None, None), reset_experience=True,
                                    pass_through_memory=not ablate_memory,

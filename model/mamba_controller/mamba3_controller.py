@@ -121,7 +121,7 @@ class Mamba3ControllerWrapper(Mamba2ControllerWrapper):
 
     def __init__(self, in_dim, d_model, num_blocks=2, moe_enabled=False, moe_num_experts=8,
                  moe_expert_dim=None, moe_capacity_factor=1.5, moe_load_balance_alpha=0.01,
-                 d_state=64, expand=2, headdim=64, ngroups=1, rope_fraction=0.5,
+                 moe_top_k=1, d_state=64, expand=2, headdim=64, ngroups=1, rope_fraction=0.5,
                  device=None, dtype=None):
         nn.Module.__init__(self)
         self.d_model, self.num_blocks = d_model, num_blocks
@@ -136,6 +136,6 @@ class Mamba3ControllerWrapper(Mamba2ControllerWrapper):
         if moe_enabled:
             self.moe_blocks = nn.ModuleList([
                 MoEBlock(d_model, num_experts=moe_num_experts, expert_dim=moe_expert_dim,
-                         capacity_factor=moe_capacity_factor,
+                         capacity_factor=moe_capacity_factor, top_k=moe_top_k,
                          load_balance_alpha=moe_load_balance_alpha, device=device, dtype=dtype)
                 for _ in range(num_blocks)])

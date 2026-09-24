@@ -40,6 +40,7 @@ class LoadedModel:
     run_id: str
     beta_target: float
     sampled_writes: bool
+    combiner_stage_kinds: list | None = None
 
 
 class _Cfg:
@@ -62,6 +63,7 @@ def _moe_kwargs(c: _Cfg) -> dict:
         moe_expert_dim=c.cfg.get("moe_expert_dim", cc.MOE_EXPERT_DIM),   # None is legitimate
         moe_capacity_factor=c.get("moe_capacity_factor", cc.MOE_CAPACITY_FACTOR),
         moe_load_balance_alpha=c.get("moe_load_balance_alpha", cc.MOE_LOAD_BALANCE_ALPHA),
+        moe_top_k=c.get("moe_top_k", cc.MOE_TOP_K),
     )
 
 
@@ -95,11 +97,11 @@ def _controller_kwargs(controller: str, c: _Cfg) -> dict:
     if controller == "mamba3":
         return {**_mamba3(c), **moe}
     if controller == "cfc":
-        return {**_cfc(c), "moe_enabled": moe["moe_enabled"]}
+        return {**_cfc(c), **moe}
     if "+" in controller:
         return {**_mamba1(c), **_mamba2(c), **_mamba3(c), **_cfc(c),
                 "hybrid_cfc_num_blocks": c.get("hybrid_cfc_num_blocks", cc.HYBRID_CFC_NUM_BLOCKS),
-                "moe_enabled": moe["moe_enabled"]}
+                **moe}
     return {}   # lstm: identical to training (no extra kwargs)
 
 
@@ -117,6 +119,7 @@ def _build_split_graph(c: _Cfg, input_dim, hidden, nr_cells, cell_size, read_hea
         mode=cc.CFC_MODE, backbone_units=cc.CFC_BACKBONE_UNITS, backbone_layers=cc.CFC_BACKBONE_LAYERS,
         backbone_dropout=cc.CFC_BACKBONE_DROPOUT, activation=cc.CFC_ACTIVATION,
         mixed_memory=cc.CFC_MIXED_MEMORY, residual=cc.CFC_RESIDUAL))
+    _moe = _moe_kwargs(c)
     return SplitGraphDNC(
         input_size=input_dim, hidden_size=hidden, nr_cells=nr_cells, cell_size=cell_size,
         read_heads=read_heads,
@@ -130,6 +133,11 @@ def _build_split_graph(c: _Cfg, input_dim, hidden, nr_cells, cell_size, read_hea
         combiner_variant=c.get("split_graph_combiner_variant", cc.SPLIT_GRAPH_COMBINER_VARIANT),
         combiner_num_blocks=c.get("split_graph_combiner_num_blocks", cc.SPLIT_GRAPH_COMBINER_NUM_BLOCKS),
         independent_linears=True,
+        moe_enabled=_moe["moe_enabled"], moe_num_experts=_moe["moe_num_experts"],
+        moe_expert_dim=_moe["moe_expert_dim"], moe_top_k=_moe["moe_top_k"],
+        moe_capacity_factor=_moe["moe_capacity_factor"], moe_load_balance_alpha=_moe["moe_load_balance_alpha"],
+        moe_cfc_multi_source=c.get("split_graph_combiner_cfc_multi_source_moe",
+                                   cc.SPLIT_GRAPH_COMBINER_CFC_MULTI_SOURCE_MOE),
         device=device,
     ).to(device)
 
@@ -186,8 +194,10 @@ def load_model(ckpt: dict, device: torch.device, deterministic_write: bool = Fal
 
     rnn.eval()
     output_proj.eval()
+    combiner_stage_kinds = list(getattr(getattr(rnn, "combiner_wrapper", None), "stage_kinds", []) or []) or None
     return LoadedModel(
         rnn=rnn, output_proj=output_proj, heads=heads, config=raw,
         step=int(ckpt.get("step", -1)), run_id=str(ckpt.get("run_id", "?")),
         beta_target=beta, sampled_writes=bool(heads and heads[0].sample),
+        combiner_stage_kinds=combiner_stage_kinds,
     )

@@ -27,19 +27,21 @@ FRESH_HIDDEN = (None, None, None)
 
 
 class InferenceEngine:
-    def __init__(self, model, output_proj, task, device, ablate_memory: bool = False):
+    def __init__(self, model, output_proj, task, device, ablate_memory: bool = False,
+                 combiner_skip_stages: frozenset | None = None):
         self.model, self.output_proj, self.task = model, output_proj, task
         self.device, self.ablate_memory = device, ablate_memory
+        self.combiner_skip_stages = combiner_skip_stages
         self.model.eval()
         self.output_proj.eval()
 
     @torch.no_grad()
     def _forward(self, episode, hidden, reset_experience: bool):
         x = episode.input_seq.unsqueeze(0).to(self.device)            # (1, T, input_dim)
-        output, new_hidden = self.model(
-            x, hidden, reset_experience=reset_experience,
-            pass_through_memory=not self.ablate_memory,
-        )
+        kw = dict(reset_experience=reset_experience, pass_through_memory=not self.ablate_memory)
+        if self.combiner_skip_stages:
+            kw["combiner_skip_stages"] = self.combiner_skip_stages
+        output, new_hidden = self.model(x, hidden, **kw)
         output = output.transpose(0, 1).contiguous().squeeze(0)       # (T, input_dim)
         output = self.output_proj(output)                             # (T, output_dim)
         return output.float().cpu(), new_hidden

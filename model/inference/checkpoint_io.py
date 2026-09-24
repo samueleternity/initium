@@ -43,4 +43,12 @@ def describe_checkpoint(ckpt: dict) -> str:
         + (f"({c.get('split_graph_variant')})" if c.get("split_graph_enabled") else "")
         + f" dynamic_n={c.get('dynamic_n_mode', False)}",
     ]
+    combiner_variant = c.get("split_graph_combiner_variant")
+    if c.get("split_graph_enabled") and c.get("split_graph_combiner_mode") == "controller" and combiner_variant:
+        if "+" in combiner_variant:
+            lines.append(f"combiner=controller stages={list(enumerate(combiner_variant.split('+')))} "
+                         f"(use --ablate-combiner-stage <name|index>)")
+        else:
+            lines.append(f"combiner=controller variant={combiner_variant!r} (single stage -- "
+                         f"multi-source MoE routing applies only here, not to hybrid chains)")
     return "\n".join(lines)

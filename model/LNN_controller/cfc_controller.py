@@ -27,6 +27,8 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from MoE.moe_layer import MoEBlock, MultiSourceMoEBlock
+
 try:
     from ncps.torch import CfC
 except ImportError as _e:  # pragma: no cover - environment-dependent
@@ -92,9 +94,31 @@ class CfCControllerWrapper(nn.Module):
     def __init__(self, in_dim, d_model, num_blocks=2, units=None, mode="default",
                  backbone_units=512, backbone_layers=1, backbone_dropout=0.0,
                  activation="lecun_tanh", mixed_memory=False, residual=True,
+                 moe_enabled: bool = False, moe_num_experts: int = 8,
+                 moe_expert_dim: int | None = None, moe_top_k: int = 1,
+                 moe_capacity_factor: float = 1.5, moe_load_balance_alpha: float = 0.01,
+                 moe_source_dims: list[int] | None = None,
                  device=None, dtype=None):
         super().__init__()
         self.d_model, self.num_blocks = d_model, num_blocks
+
+        # moe_source_dims: when given (>=1 entries, each an input SOURCE's
+        # OWN raw width -- e.g. [hidden_size, read_vectors_size] for
+        # SplitGraphDNC's [backbone_output, prev_read_vector] combiner
+        # input), this wrapper is driven via forward_multi_source() instead
+        # of forward(); widths need not match each other, which is exactly
+        # the "variable-length inputs" property CfC must keep once MoE
+        # sits in front of it. sum(moe_source_dims) must still equal
+        # in_dim, since in_dim is what every other bookkeeping path in this
+        # project (checkpoints, dim-compat checks) reads as one number.
+        self.moe_source_dims = list(moe_source_dims) if moe_source_dims else None
+        if self.moe_source_dims is not None:
+            if sum(self.moe_source_dims) != in_dim:
+                raise ValueError(f"CfCControllerWrapper: sum(moe_source_dims)="
+                                 f"{sum(self.moe_source_dims)} != in_dim={in_dim}")
+            if not moe_enabled:
+                raise ValueError("CfCControllerWrapper: moe_source_dims requires moe_enabled=True")
+
         self.in_adapter: nn.Module = (
             nn.Identity() if in_dim == d_model else nn.Linear(in_dim, d_model, device=device, dtype=dtype)
         )
@@ -105,10 +129,35 @@ class CfCControllerWrapper(nn.Module):
                                device=device, dtype=dtype)
             for _ in range(num_blocks)
         ])
-        # MoE deliberately not wired (Concept 16/SP-10 isolation); attributes exist so
-        # MambaDNC / ChainedControllerWrapper can read them uniformly.
-        self.moe_enabled = False
-        self.moe_blocks = None
+
+        self.moe_enabled = moe_enabled
+        self.moe_blocks: nn.ModuleList | None = None
+        self.source_in_adapters: nn.ModuleList | None = None
+        if moe_enabled and self.moe_source_dims is not None:
+            # Multi-source front-end: each raw source is projected to
+            # d_model, routed+combined by ONE source-aware Top-K MoE bank
+            # BEFORE entering the recurrent CfC stack (see
+            # forward_multi_source). self.moe_blocks holds this single
+            # MultiSourceMoEBlock so every existing "extend moe_layers from
+            # layer_controller.moe_blocks" call site (MambaDNC,
+            # ChainedControllerWrapper) keeps working with zero changes.
+            self.source_in_adapters = nn.ModuleList([
+                nn.Identity() if w == d_model else nn.Linear(w, d_model, device=device, dtype=dtype)
+                for w in self.moe_source_dims
+            ])
+            self.moe_blocks = nn.ModuleList([MultiSourceMoEBlock(
+                d_model, num_sources=len(self.moe_source_dims), num_experts=moe_num_experts,
+                expert_dim=moe_expert_dim, top_k=moe_top_k, capacity_factor=moe_capacity_factor,
+                load_balance_alpha=moe_load_balance_alpha, device=device, dtype=dtype)])
+        elif moe_enabled:
+            # Plain per-block external interleave, same convention as
+            # MambaControllerWrapper / Mamba2ControllerWrapper.
+            self.moe_blocks = nn.ModuleList([
+                MoEBlock(d_model, num_experts=moe_num_experts, expert_dim=moe_expert_dim,
+                        top_k=moe_top_k, capacity_factor=moe_capacity_factor,
+                        load_balance_alpha=moe_load_balance_alpha, device=device, dtype=dtype)
+                for _ in range(num_blocks)
+            ])
 
     def init_state(self, batch_size, device=None, dtype=None):
         if device is None:
@@ -120,7 +169,36 @@ class CfCControllerWrapper(nn.Module):
             "CfCControllerWrapper only supports single-timestep calls "
             f"(got shape {tuple(input.shape)})."
         )
+        if self.moe_source_dims is not None:
+            raise RuntimeError("CfCControllerWrapper was configured with moe_source_dims -- "
+                               "call forward_multi_source(sources, hx) instead of forward().")
         x = self.in_adapter(input.squeeze(1))
+        if hx is None:
+            hx = self.init_state(x.size(0), device=x.device)
+        new_hx = []
+        for i, (block, state) in enumerate(zip(self.blocks, hx)):
+            x, new_state = block.step(x, state)
+            if self.moe_enabled:
+                x = self.moe_blocks[i](x)
+            new_hx.append(new_state)
+        return x.unsqueeze(1), new_hx
+
+    def forward_multi_source(self, sources: list[torch.Tensor], hx):
+        """Multi-source entry point (requires moe_source_dims). `sources[i]`
+        is a (B, moe_source_dims[i]) tensor -- e.g. SplitGraphDNC's
+        controller combiner passes [h_t, read_vec] directly instead of
+        pre-concatenating them. Each source is projected to d_model by its
+        own adapter, then routed+combined by the shared, source-aware
+        Top-K MoE bank BEFORE entering the recurrent CfC stack -- this is
+        what preserves CfC's "many inputs, specialized handling per input"
+        property once MoE sits in front of it, while the recurrent stack
+        itself still only ever sees one fused (B, d_model) vector per step
+        (CfC block internals are completely unchanged)."""
+        if self.moe_source_dims is None:
+            raise RuntimeError("forward_multi_source requires moe_source_dims to have been set")
+        projected = [adapter(s) for adapter, s in zip(self.source_in_adapters, sources)]
+        fused_per_source = self.moe_blocks[0](projected)             # list[Tensor], one per source
+        x = torch.stack(fused_per_source, dim=0).sum(dim=0)          # combine into one fused input
         if hx is None:
             hx = self.init_state(x.size(0), device=x.device)
         new_hx = []

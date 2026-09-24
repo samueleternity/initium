@@ -40,8 +40,8 @@ def parse_cache_spec(spec: str) -> List[str]:
 
 
 def setup_caches(spec, *, ckpt, device, sampled_writes, deterministic_write, ablate_memory,
-                 cache_dir=None, ram_mb=512.0, disk_mb=2048.0, clear=False,
-                 allow_stochastic=False):
+                 combiner_skip_stages=None, cache_dir=None, ram_mb=512.0, disk_mb=2048.0,
+                 clear=False, allow_stochastic=False):
     """-> (caches, notes, model_fingerprint|None). Returns no caches (with a note) when
     the requested caching cannot be done safely."""
     notes: List[str] = []
@@ -63,7 +63,8 @@ def setup_caches(spec, *, ckpt, device, sampled_writes, deterministic_write, abl
     print("[cache] fingerprinting model weights (once) ...")
     fp = model_fingerprint(ckpt, {"deterministic_write": bool(deterministic_write),
                                   "sampled_writes": bool(sampled_writes),
-                                  "ablate_memory": bool(ablate_memory)})
+                                  "ablate_memory": bool(ablate_memory),
+                                  "combiner_skip_stages": sorted(combiner_skip_stages) if combiner_skip_stages else None})
     disk = None
     if cache_dir:
         disk = DiskStore(os.path.join(cache_dir, fp), int(disk_mb * 1e6))

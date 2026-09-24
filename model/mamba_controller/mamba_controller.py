@@ -166,7 +166,7 @@ from dnc import DNC
 from dnc.memory import Memory
 from dnc.util import cuda
 
-from MoE.moe_layer import MoEBlock 
+from MoE.moe_layer import MoEBlock, MoERNNWrapper
 
 try:
     from mamba_ssm.modules.mamba_simple import Mamba
@@ -396,6 +396,7 @@ class MambaControllerWrapper(nn.Module):
         moe_expert_dim: int | None = None,
         moe_capacity_factor: float = 1.5,
         moe_load_balance_alpha: float = 0.01,
+        moe_top_k: int = 1,
         d_state: int = 16,
         d_conv: int = 4,
         expand: int = 2,
@@ -440,6 +441,7 @@ class MambaControllerWrapper(nn.Module):
                         expert_dim=moe_expert_dim,
                         capacity_factor=moe_capacity_factor,
                         load_balance_alpha=moe_load_balance_alpha,
+                        top_k=moe_top_k,
                         device=device, dtype=dtype,
                     )
                     for _ in range(num_blocks)
@@ -550,23 +552,9 @@ class MambaDNC(DNC):
         moe_expert_dim: int | None = None,
         moe_capacity_factor: float = 1.5,
         moe_load_balance_alpha: float = 0.01,
+        moe_top_k: int = 1,
     ):
         if rnn_type.lower() not in ("mamba", "mamba2", "mamba3", "cfc") and not is_hybrid_rnn_type(rnn_type):
-            if moe_enabled:
-                raise NotImplementedError(
-                    "MambaDNC: moe_enabled=True is only wired for "
-                    "rnn_type in ('mamba', 'mamba2') so far (Alternative "
-                    "Phase 3, Step 2, "
-                    "Option 4). moe_layer.py's SwitchMoE/MoEBlock are "
-                    "controller-agnostic by design -- see its module "
-                    "docstring -- so wiring this into the LSTM path (or a "
-                    "future Transformer controller) only requires "
-                    "instantiating MoEBlock alongside that controller's own "
-                    "per-layer blocks, not a redesign of the MoE mechanism "
-                    "itself. Not done here because the LSTM path is the "
-                    "validated baseline this run compares against and "
-                    "should stay byte-identical."
-                )
             super().__init__(
                 input_size=input_size,
                 hidden_size=hidden_size,
@@ -586,6 +574,35 @@ class MambaDNC(DNC):
                 clip=clip,
                 device=device,
             )
+            if moe_enabled:
+                # Basic MoE for the plain LSTM/GRU/RNN baseline (per the
+                # roadmap: the shallow baseline controller only needs a
+                # single Top-K MoE sublayer wrapped around its own output,
+                # not per-block/per-source specialization -- see
+                # moe_layer.MoERNNWrapper). ASSUMPTION FLAGGED FOR
+                # VERIFICATION: this assumes dnc.DNC registers each
+                # self.rnns[layer] as a genuine submodule under SOME
+                # attribute on `self` (every other external-library
+                # assumption in this project, e.g. split_graph_dnc.py's
+                # Memory-return-shape note, is flagged the same way) -- the
+                # sweep below finds and rebinds whichever attribute that is,
+                # the same technique dynamic_memory_resize.resize_memory()
+                # already uses for Memory swaps.
+                for layer in range(self.num_layers):
+                    old_rnn = self.rnns[layer]
+                    wrapped = MoERNNWrapper(
+                        old_rnn, d_model=self.output_size, num_experts=moe_num_experts,
+                        expert_dim=moe_expert_dim, top_k=moe_top_k,
+                        capacity_factor=moe_capacity_factor,
+                        load_balance_alpha=moe_load_balance_alpha, device=device,
+                    )
+                    self.rnns[layer] = wrapped
+                    for attr_name, submodule in list(self._modules.items()):
+                        if submodule is old_rnn:
+                            setattr(self, attr_name, wrapped)
+                self.moe_layers = []
+                for controller in self.rnns:
+                    self.moe_layers.extend(list(controller.moe_blocks))
             return
 
         if rnn_type.lower() == "mamba2":
@@ -594,16 +611,8 @@ class MambaDNC(DNC):
             _require_mamba3_ssm()
         elif is_hybrid_rnn_type(rnn_type):
             _require_ncps()
-            if moe_enabled:
-                raise NotImplementedError(
-                    "MambaDNC: moe_enabled=True is not wired for hybrid rnn_types"
-                )
         elif rnn_type.lower() == "cfc":
             _require_ncps()
-            if moe_enabled:
-                raise NotImplementedError(
-                    "MambaDNC: moe_enabled=True is not wired for rnn_type='cfc' "
-                )
         else:
             _require_mamba_ssm()
 
@@ -667,6 +676,7 @@ class MambaDNC(DNC):
         self.moe_expert_dim = moe_expert_dim
         self.moe_capacity_factor = moe_capacity_factor
         self.moe_load_balance_alpha = moe_load_balance_alpha
+        self.moe_top_k = moe_top_k
 
         self.w = self.cell_size
         self.r = self.read_heads
@@ -681,6 +691,14 @@ class MambaDNC(DNC):
         for layer in range(self.num_layers):
             in_dim = self.nn_input_size if layer == 0 else self.nn_output_size
             if is_hybrid_rnn_type(rnn_type):
+                # Every kind in the chain gets the SAME moe_* settings
+                # (its own per-block MoE sublayers -- ChainedControllerWrapper
+                # already aggregates every stage's moe_blocks generically).
+                _moe_per_kind = dict(
+                    moe_enabled=moe_enabled, moe_num_experts=moe_num_experts,
+                    moe_expert_dim=moe_expert_dim, moe_capacity_factor=moe_capacity_factor,
+                    moe_load_balance_alpha=moe_load_balance_alpha, moe_top_k=moe_top_k,
+                ) if moe_enabled else {}
                 controller = build_hybrid_controller(
                     rnn_type.lower(),
                     in_dim=in_dim,
@@ -692,16 +710,18 @@ class MambaDNC(DNC):
                         "cfc": hybrid_cfc_num_blocks,
                     },
                     kwargs_per_kind={
-                        "mamba": dict(d_state=mamba_d_state, d_conv=mamba_d_conv, expand=mamba_expand),
+                        "mamba": dict(d_state=mamba_d_state, d_conv=mamba_d_conv, expand=mamba_expand,
+                                     **_moe_per_kind),
                         "mamba2": dict(d_state=mamba2_d_state, d_conv=mamba2_d_conv, expand=mamba2_expand,
-                                       headdim=mamba2_headdim, ngroups=mamba2_ngroups),
+                                       headdim=mamba2_headdim, ngroups=mamba2_ngroups, **_moe_per_kind),
                         "mamba3": dict(d_state=mamba3_d_state, expand=mamba3_expand,
-                                       headdim=mamba3_headdim, rope_fraction=mamba3_rope_fraction),
+                                       headdim=mamba3_headdim, rope_fraction=mamba3_rope_fraction,
+                                       **_moe_per_kind),
                         "cfc": dict(mode=cfc_mode, backbone_units=cfc_backbone_units,
                                     backbone_layers=cfc_backbone_layers,
                                     backbone_dropout=cfc_backbone_dropout,
                                     activation=cfc_activation, mixed_memory=cfc_mixed_memory,
-                                    residual=cfc_residual),
+                                    residual=cfc_residual, **_moe_per_kind),
                     },
                     device=device,
                 )
@@ -717,6 +737,12 @@ class MambaDNC(DNC):
                     activation=cfc_activation,
                     mixed_memory=cfc_mixed_memory,
                     residual=cfc_residual,
+                    moe_enabled=moe_enabled,
+                    moe_num_experts=moe_num_experts,
+                    moe_expert_dim=moe_expert_dim,
+                    moe_top_k=moe_top_k,
+                    moe_capacity_factor=moe_capacity_factor,
+                    moe_load_balance_alpha=moe_load_balance_alpha,
                     device=device,
                 )
             elif rnn_type.lower() == "mamba3":
@@ -733,6 +759,7 @@ class MambaDNC(DNC):
                     moe_expert_dim=moe_expert_dim,
                     moe_capacity_factor=moe_capacity_factor,
                     moe_load_balance_alpha=moe_load_balance_alpha,
+                    moe_top_k=moe_top_k,
                     device=device,
                 )
             elif rnn_type.lower() == "mamba2":
@@ -750,6 +777,7 @@ class MambaDNC(DNC):
                     moe_expert_dim=moe_expert_dim,
                     moe_capacity_factor=moe_capacity_factor,
                     moe_load_balance_alpha=moe_load_balance_alpha,
+                    moe_top_k=moe_top_k,
                     device=device,
                 )
             else:
@@ -765,6 +793,7 @@ class MambaDNC(DNC):
                     moe_expert_dim=moe_expert_dim,
                     moe_capacity_factor=moe_capacity_factor,
                     moe_load_balance_alpha=moe_load_balance_alpha,
+                    moe_top_k=moe_top_k,
                     device=device,
                 )
             self.rnns.append(controller)

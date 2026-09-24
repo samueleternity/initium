@@ -48,6 +48,12 @@ MOE_NUM_EXPERTS = 8
 MOE_EXPERT_DIM = None
 MOE_CAPACITY_FACTOR = 1.5
 MOE_LOAD_BALANCE_ALPHA = 0.01
+MOE_LOAD_BALANCE_ALPHA = 0.01
+MOE_TOP_K = 1                  # experts simultaneously active per token/source (Top-K routing)
+SPLIT_GRAPH_COMBINER_CFC_MULTI_SOURCE_MOE = True  # combiner_variant="cfc" + moe: route
+                                                    # [backbone_output, prev_read_vector] through
+                                                    # per-source specialized experts (see
+                                                    # cfc_controller.py / moe_layer.MultiSourceMoEBlock)
 
 # ---- Option 5: split-compute-graph controller (off unless --split-graph) ------
 SPLIT_GRAPH_ENABLED = False

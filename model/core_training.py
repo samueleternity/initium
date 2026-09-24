@@ -40,6 +40,9 @@ import torch.nn as nn
 
 from dnc import DNC 
 
+from memory_manipulation.nvrtc_compat import patch_prod_jiterator
+patch_prod_jiterator()  # environment workaround -- see module docstring
+
 from mamba_controller.mamba_controller import MambaDNC  
 from MoE.moe_layer import pop_total_moe_aux_loss 
 from mamba_controller.split_graph_dnc import SplitGraphDNC  
@@ -72,6 +75,7 @@ from config.controller_config import (
     CFC_MODE, CFC_BACKBONE_UNITS, CFC_BACKBONE_LAYERS, CFC_BACKBONE_DROPOUT,
     CFC_ACTIVATION, CFC_MIXED_MEMORY, CFC_RESIDUAL, HYBRID_CFC_NUM_BLOCKS,
     MOE_ENABLED, MOE_NUM_EXPERTS, MOE_EXPERT_DIM, MOE_CAPACITY_FACTOR, MOE_LOAD_BALANCE_ALPHA,
+    MOE_TOP_K, SPLIT_GRAPH_COMBINER_CFC_MULTI_SOURCE_MOE,
     SPLIT_GRAPH_ENABLED, SPLIT_GRAPH_MAMBA_VARIANT, SPLIT_GRAPH_NUM_BLOCKS,
     SPLIT_GRAPH_MAMBA_HEADDIM, SPLIT_GRAPH_COMBINE_READS, SPLIT_GRAPH_COMBINER_MODE,
     SPLIT_GRAPH_COMBINER_VARIANT, SPLIT_GRAPH_COMBINER_NUM_BLOCKS,
@@ -113,7 +117,7 @@ def save_checkpoint(path, rnn, output_proj, stochastic_heads, optimizer,
                      dynamic_n_mode=DYNAMIC_N_MODE, dynamic_n_state=None,  # Dynamic-N (macro-scale)
                      moe_enabled=MOE_ENABLED, moe_num_experts=MOE_NUM_EXPERTS,
                      moe_expert_dim=MOE_EXPERT_DIM, moe_capacity_factor=MOE_CAPACITY_FACTOR,
-                     moe_load_balance_alpha=MOE_LOAD_BALANCE_ALPHA,  
+                     moe_load_balance_alpha=MOE_LOAD_BALANCE_ALPHA, moe_top_k=MOE_TOP_K,  
                      split_graph_enabled=SPLIT_GRAPH_ENABLED,  
                      split_graph_variant=SPLIT_GRAPH_MAMBA_VARIANT, extra_model_config=None):
     """Save everything needed to resume training or re-run eval later:
@@ -195,7 +199,7 @@ def save_checkpoint(path, rnn, output_proj, stochastic_heads, optimizer,
         "dynamic_n_mode": dynamic_n_mode,  # Dynamic-N (macro-scale)
         "moe_enabled": moe_enabled, "moe_num_experts": moe_num_experts,  # v8 (Option 4)
         "moe_expert_dim": moe_expert_dim, "moe_capacity_factor": moe_capacity_factor,
-        "moe_load_balance_alpha": moe_load_balance_alpha,
+        "moe_load_balance_alpha": moe_load_balance_alpha, "moe_top_k": moe_top_k,
         "split_graph_enabled": split_graph_enabled,  # v9 (Option 5)
         "split_graph_variant": split_graph_variant,
     }
@@ -320,7 +324,9 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
         moe_expert_dim: int = MOE_EXPERT_DIM,
         moe_capacity_factor: float = MOE_CAPACITY_FACTOR,
         moe_load_balance_alpha: float = MOE_LOAD_BALANCE_ALPHA,
-        split_graph_enabled: bool = SPLIT_GRAPH_ENABLED,  
+        moe_top_k: int = MOE_TOP_K,
+        split_graph_combiner_cfc_multi_source_moe: bool = SPLIT_GRAPH_COMBINER_CFC_MULTI_SOURCE_MOE,
+        split_graph_enabled: bool = SPLIT_GRAPH_ENABLED,
         split_graph_variant: str = SPLIT_GRAPH_MAMBA_VARIANT,
         split_graph_num_blocks: int = SPLIT_GRAPH_NUM_BLOCKS,
         split_graph_headdim: int = SPLIT_GRAPH_MAMBA_HEADDIM,
@@ -535,6 +541,7 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
             moe_expert_dim=moe_expert_dim,
             moe_capacity_factor=moe_capacity_factor,
             moe_load_balance_alpha=moe_load_balance_alpha,
+            moe_top_k=moe_top_k,
         )
     elif controller == "mamba2":  
         mamba_kwargs = dict(
@@ -548,6 +555,7 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
             moe_expert_dim=moe_expert_dim,
             moe_capacity_factor=moe_capacity_factor,
             moe_load_balance_alpha=moe_load_balance_alpha,
+            moe_top_k=moe_top_k,
         )
 
     if controller == "mamba3":
@@ -561,6 +569,7 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
             moe_expert_dim=moe_expert_dim,
             moe_capacity_factor=moe_capacity_factor,
             moe_load_balance_alpha=moe_load_balance_alpha,
+            moe_top_k=moe_top_k,
         )
 
     if controller == "cfc":  
@@ -573,6 +582,7 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
             cfc_mixed_memory=CFC_MIXED_MEMORY,
             cfc_residual=CFC_RESIDUAL,
             moe_enabled=moe_enabled,  # MambaDNC raises if True (not wired for cfc)
+            moe_top_k=moe_top_k,
         )
 
     if "+" in controller:  # v14: hybrid chain, e.g. "mamba+cfc"
@@ -587,16 +597,19 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
             cfc_activation=CFC_ACTIVATION, cfc_mixed_memory=CFC_MIXED_MEMORY,
             cfc_residual=CFC_RESIDUAL, hybrid_cfc_num_blocks=HYBRID_CFC_NUM_BLOCKS,
             moe_enabled=moe_enabled,  # MambaDNC raises if True (not wired for hybrids)
+            moe_top_k=moe_top_k,
         )
 
     if split_graph_enabled:
         if moe_enabled:
-            print(f"[{run_id}] WARNING: split_graph_enabled=True AND moe_enabled=True "
-                  f"-- these are two independent optimizations (Options 4 and 5) that "
-                  f"Concept 16/SP-10 says must be isolated before combining. The combination will be considered in distant future "
-                  f"SplitGraphDNC does not wire MoE into its backbone (see "
-                  f"split_graph_dnc.py) -- moe_enabled will be silently ignored this run.")
-            
+            print(f"[{run_id}] moe_enabled=True with split_graph_enabled=True: MoE is now "
+                  f"wired into both the parallel backbone and the sequential combiner (see "
+                  f"split_graph_dnc.py). A combiner_variant='cfc' additionally routes its two "
+                  f"natural input sources (backbone output, previous read vector) through "
+                  f"per-source specialized experts when "
+                  f"split_graph_combiner_cfc_multi_source_moe={split_graph_combiner_cfc_multi_source_moe} "
+                  f"(see moe_layer.MultiSourceMoEBlock).")
+
         # v10: variant-matched hyperparameter defaults instead of always
         # reusing the Mamba-1 constants here -- harmless previously (any
         # d_state/headdim is accepted), but not what the SSD paper's own
@@ -628,6 +641,13 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
             combiner_variant=split_graph_combiner_variant,
             combiner_num_blocks=split_graph_combiner_num_blocks,
             independent_linears=True,
+            moe_enabled=moe_enabled,
+            moe_num_experts=moe_num_experts,
+            moe_expert_dim=moe_expert_dim,
+            moe_top_k=moe_top_k,
+            moe_capacity_factor=moe_capacity_factor,
+            moe_load_balance_alpha=moe_load_balance_alpha,
+            moe_cfc_multi_source=split_graph_combiner_cfc_multi_source_moe,
             device=device,
         ).to(device)
     else:
@@ -677,6 +697,7 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
                  activation=CFC_ACTIVATION, mixed_memory=CFC_MIXED_MEMORY,
                  residual=CFC_RESIDUAL)
             if split_graph_enabled else None),
+        "split_graph_combiner_cfc_multi_source_moe": split_graph_combiner_cfc_multi_source_moe
     }
 
     if link_matrix_mode != "dense":
@@ -1079,7 +1100,7 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
                 parts.append(f"amp_scale {amp_scale:.1f}")
             parts.append(f"gpu_mem_peak_mb {gpu_mem_peak_mb:.1f}")
             if moe_enabled:
-                parts += [f"moe_aux {float(moe_aux_loss):.4f}",
+                parts += [f"moe_aux {float(moe_aux_loss.detach()):.4f}",
                           f"moe_cv_load {moe_diag.get('moe_cv_load', 0.0):.4f}",
                           f"moe_max_load_frac {moe_diag.get('moe_max_load_frac', 0.0):.4f}"]
             if dyn_n_str:
@@ -1093,7 +1114,7 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
                 kl_diag["clamp_frac"], current_lr, avg_grad_norm, amp_scale, total_elapsed,
                 kl_diag["snapshot_step"],
                 gpu_mem_peak_mb, param_count,
-                float(moe_aux_loss), moe_diag.get("moe_cv_importance", 0.0),
+                float(moe_aux_loss.detach()), moe_diag.get("moe_cv_importance", 0.0),
                 moe_diag.get("moe_cv_load", 0.0), moe_diag.get("moe_max_load_frac", 0.0),
             ])
             if torch.cuda.is_available():
@@ -1262,6 +1283,7 @@ def run(beta_target: float, run_id: str, seed: int = SEED, resume_from: str = No
                              moe_enabled=moe_enabled, moe_num_experts=moe_num_experts,  
                              moe_expert_dim=moe_expert_dim, moe_capacity_factor=moe_capacity_factor,
                              moe_load_balance_alpha=moe_load_balance_alpha,
+                             moe_top_k=moe_top_k,
                              split_graph_enabled=split_graph_enabled,  
                              split_graph_variant=split_graph_variant,
                              extra_model_config=extra_model_config)            
@@ -1419,7 +1441,7 @@ if __name__ == "__main__":
     parser.add_argument("--moe", action="store_true",
                          help="Alternative Phase 3, Step 2, Option 4: interleave external "
                               "SwitchMoE blocks between Mamba controller blocks (mamba_controller.py "
-                              "/ moe_layer.py). Only wired for --controller=mamba.")
+                              "/ moe_layer.py).")
     parser.add_argument("--moe-num-experts", type=int, default=MOE_NUM_EXPERTS,
                          help="Number of experts per MoE block (>=4 enforced by SwitchMoE; "
                               "roadmap recommends 8+, per Dead-End #45).")
@@ -1430,6 +1452,8 @@ if __name__ == "__main__":
                          help="Switch-style expert capacity buffer above an even token split.")
     parser.add_argument("--moe-load-balance-alpha", type=float, default=MOE_LOAD_BALANCE_ALPHA,
                          help="Weight on the Switch-style auxiliary load-balancing loss.")
+    parser.add_argument("--moe-top-k", type=int, default=MOE_TOP_K, 
+                         help="Number of top-k")
     parser.add_argument("--split-graph", action="store_true",
                          help="Alternate Phase 3, Step 2, Option 5: enable the "
                               "split-compute-graph controller (parallel Mamba backbone + "
@@ -1556,6 +1580,7 @@ if __name__ == "__main__":
                        moe_expert_dim=args.moe_expert_dim,
                        moe_capacity_factor=args.moe_capacity_factor,
                        moe_load_balance_alpha=args.moe_load_balance_alpha,
+                       moe_top_k=args.moe_top_k,
                        split_graph_enabled=args.split_graph,
                        split_graph_variant=args.split_graph_variant,
                        split_graph_num_blocks=args.split_graph_num_blocks,

@@ -314,6 +314,7 @@ class Mamba2ControllerWrapper(nn.Module):
         moe_expert_dim: int | None = None,
         moe_capacity_factor: float = 1.5,
         moe_load_balance_alpha: float = 0.01,
+        moe_top_k: int = 1,
         d_state: int = 64,
         d_conv: int = 4,
         expand: int = 2,
@@ -349,6 +350,7 @@ class Mamba2ControllerWrapper(nn.Module):
                         expert_dim=moe_expert_dim,
                         capacity_factor=moe_capacity_factor,
                         load_balance_alpha=moe_load_balance_alpha,
+                        top_k=moe_top_k,
                         device=device, dtype=dtype,
                     )
                     for _ in range(num_blocks)

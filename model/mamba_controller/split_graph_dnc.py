@@ -116,7 +116,7 @@ import torch.nn as nn
 from dnc.memory import Memory
 
 from mamba_controller.mamba_backbone_parallel import MambaBackboneParallel
-from LNN_controller.cfc_backbone_parallel import build_parallel_backbone 
+from LNN_controller.cfc_backbone_parallel import build_parallel_backbone, collect_backbone_moe_layers
 from LNN_controller.hybrid_controller import build_hybrid_controller, is_hybrid_rnn_type  # v15: hybrid combiner 
 from mamba_controller.mamba_controller import MambaControllerWrapper       
 from mamba_controller.mamba2_controller import Mamba2ControllerWrapper 
@@ -172,11 +172,22 @@ class SplitGraphDNC(nn.Module):
         combiner_ngroups: int = 1,          # mamba2 combiner_variant only
         independent_linears: bool = True,
         device: torch.device | None = None,
-        moe_enabled: bool = False,     # deliberately NOT wired in -- see below
+        moe_enabled: bool = False,
         moe_num_experts: int = 8,
         moe_expert_dim: int | None = None,
+        moe_top_k: int = 1,
         moe_capacity_factor: float = 1.5,
         moe_load_balance_alpha: float = 0.01,
+        # When combiner_variant == "cfc" (standalone, not part of a hybrid
+        # combiner chain) and moe_enabled, route the combiner's two natural
+        # inputs -- backbone output h_t and the previous read vector --
+        # through per-source specialized experts (see
+        # cfc_controller.CfCControllerWrapper's moe_source_dims) instead of
+        # a single pre-concatenated MoE pass. True is the recommended
+        # default per this project's own CfC-property requirement; set
+        # False to fall back to plain per-block MoE on the pre-concatenated
+        # input, for direct A/B comparison.
+        moe_cfc_multi_source: bool = True,
     ):
         super().__init__()
         if not independent_linears:
@@ -218,6 +229,12 @@ class SplitGraphDNC(nn.Module):
             expand=mamba_expand,
             headdim=mamba_headdim,
             cfc_kwargs=cfc_kwargs,
+            moe_enabled=moe_enabled,
+            moe_num_experts=moe_num_experts,
+            moe_expert_dim=moe_expert_dim,
+            moe_top_k=moe_top_k,
+            moe_capacity_factor=moe_capacity_factor,
+            moe_load_balance_alpha=moe_load_balance_alpha,
             device=device,
         )
 
@@ -272,6 +289,12 @@ class SplitGraphDNC(nn.Module):
                     expand=combiner_expand,
                     headdim=combiner_headdim,
                     ngroups=combiner_ngroups,
+                    moe_enabled=moe_enabled,
+                    moe_num_experts=moe_num_experts,
+                    moe_expert_dim=moe_expert_dim,
+                    moe_top_k=moe_top_k,
+                    moe_capacity_factor=moe_capacity_factor,
+                    moe_load_balance_alpha=moe_load_balance_alpha,
                     device=device,
                 )
             elif combiner_variant == "mamba3":
@@ -282,6 +305,12 @@ class SplitGraphDNC(nn.Module):
                     d_state=_d_state,
                     expand=combiner_expand,
                     headdim=combiner_headdim,
+                    moe_enabled=moe_enabled,
+                    moe_num_experts=moe_num_experts,
+                    moe_expert_dim=moe_expert_dim,
+                    moe_top_k=moe_top_k,
+                    moe_capacity_factor=moe_capacity_factor,
+                    moe_load_balance_alpha=moe_load_balance_alpha,
                     device=device,
                 )
             elif is_hybrid_rnn_type(combiner_variant):  # v15: e.g. "mamba+cfc" (hybrid_controller kind names: mamba, not mamba1)
@@ -291,10 +320,27 @@ class SplitGraphDNC(nn.Module):
                     d_model=hidden_size,
                     blocks_per_kind={k: combiner_num_blocks for k in ("mamba", "mamba2", "mamba3", "cfc")},
                     kwargs_per_kind={
-                        "mamba": dict(d_state=16, d_conv=combiner_d_conv, expand=combiner_expand),
+                        "mamba": dict(d_state=16, d_conv=combiner_d_conv, expand=combiner_expand,                     
+                                        moe_enabled=moe_enabled,
+                                        moe_num_experts=moe_num_experts,
+                                        moe_expert_dim=moe_expert_dim,
+                                        moe_top_k=moe_top_k,
+                                        moe_capacity_factor=moe_capacity_factor,
+                                        moe_load_balance_alpha=moe_load_balance_alpha),
                         "mamba2": dict(d_state=64, d_conv=combiner_d_conv, expand=combiner_expand,
-                                       headdim=combiner_headdim, ngroups=combiner_ngroups),
-                        "mamba3": dict(d_state=64, expand=combiner_expand, headdim=combiner_headdim),
+                                        headdim=combiner_headdim, ngroups=combiner_ngroups,                     
+                                        moe_enabled=moe_enabled,
+                                        moe_num_experts=moe_num_experts,
+                                        moe_expert_dim=moe_expert_dim,
+                                        moe_top_k=moe_top_k,
+                                        moe_capacity_factor=moe_capacity_factor,
+                                        moe_load_balance_alpha=moe_load_balance_alpha),
+                        "mamba3": dict(d_state=64, expand=combiner_expand, headdim=combiner_headdim,                     moe_enabled=moe_enabled,
+                                        moe_num_experts=moe_num_experts,
+                                        moe_expert_dim=moe_expert_dim,
+                                        moe_top_k=moe_top_k,
+                                        moe_capacity_factor=moe_capacity_factor,
+                                        moe_load_balance_alpha=moe_load_balance_alpha),
                         "cfc": dict(cfc_kwargs or {}),
                     },
                     device=device,
@@ -304,6 +350,20 @@ class SplitGraphDNC(nn.Module):
                     in_dim=combiner_in_dim,
                     d_model=hidden_size,
                     num_blocks=combiner_num_blocks,
+                    moe_enabled=moe_enabled,
+                    moe_num_experts=moe_num_experts,
+                    moe_expert_dim=moe_expert_dim,
+                    moe_top_k=moe_top_k,
+                    moe_capacity_factor=moe_capacity_factor,
+                    moe_load_balance_alpha=moe_load_balance_alpha,
+                    # Preserve CfC's "distinct input sources" property: the
+                    # combiner's two natural sources are backbone output
+                    # (hidden_size) and the previous read vector
+                    # (read_vectors_size), routed by a shared source-aware
+                    # Top-K expert bank rather than a single flattened
+                    # concat -- see moe_layer.MultiSourceMoEBlock.
+                    moe_source_dims=([hidden_size, self.read_vectors_size]
+                                     if (moe_enabled and moe_cfc_multi_source) else None),
                     device=device,
                 )
             elif combiner_variant == "mamba1":
@@ -314,6 +374,12 @@ class SplitGraphDNC(nn.Module):
                     d_state=_d_state,
                     d_conv=combiner_d_conv,
                     expand=combiner_expand,
+                    moe_enabled=moe_enabled,
+                    moe_num_experts=moe_num_experts,
+                    moe_expert_dim=moe_expert_dim,
+                    moe_top_k=moe_top_k,
+                    moe_capacity_factor=moe_capacity_factor,
+                    moe_load_balance_alpha=moe_load_balance_alpha,
                     device=device,
                 )
             else:
@@ -352,15 +418,15 @@ class SplitGraphDNC(nn.Module):
         # unconditionally from the training script regardless of which
         # controller is active this run.
         self.moe_enabled = moe_enabled
-        self.moe_layers = []
-        if moe_enabled:
-            raise NotImplementedError(
-                "SplitGraphDNC: moe_enabled=True is not wired here on "
-                "purpose -- see the Concept 16/SP-10 isolation note in this "
-                "file's module docstring. Run Option 5 on its own first; "
-                "combining with Option 4 is a deliberate future follow-up, "
-                "not a default."
-            )
+        self.moe_cfc_multi_source = moe_cfc_multi_source
+        # Flat list every pop_total_moe_aux_loss() call sums over: the
+        # backbone's own per-block MoE sublayers, PLUS the combiner's (a
+        # single MultiSourceMoEBlock for a standalone cfc combiner, a
+        # ChainedControllerWrapper's own aggregated moe_blocks for a hybrid
+        # combiner, or a per-block list for any other controller combiner).
+        self.moe_layers = collect_backbone_moe_layers(self.backbone)
+        if self.combiner_wrapper is not None and getattr(self.combiner_wrapper, "moe_enabled", False):
+            self.moe_layers.extend(list(self.combiner_wrapper.moe_blocks))
 
         if self.device is not None and getattr(self.device, "type", None) == "cuda":
             self.to(self.device)
@@ -455,11 +521,17 @@ class SplitGraphDNC(nn.Module):
             h_t = H[:, t, :]  # (B, hidden_size)
 
             if self.combiner_mode == "controller":
-                combiner_in = torch.cat([h_t, read_vec], dim=-1).unsqueeze(1)  # (B, 1, hidden+read)
-                if combiner_skip_stages is not None:
-                    xi_out, combiner_hx = self.combiner_wrapper(combiner_in, combiner_hx, skip_stages=combiner_skip_stages)
+                _cfc_multi_source = (self.combiner_variant == "cfc"
+                                     and getattr(self.combiner_wrapper, "moe_source_dims", None) is not None)
+                if _cfc_multi_source:
+                    xi_out, combiner_hx = self.combiner_wrapper.forward_multi_source(
+                        [h_t, read_vec], combiner_hx)
                 else:
-                    xi_out, combiner_hx = self.combiner_wrapper(combiner_in, combiner_hx)
+                    combiner_in = torch.cat([h_t, read_vec], dim=-1).unsqueeze(1)  # (B, 1, hidden+read)
+                    if combiner_skip_stages is not None:
+                        xi_out, combiner_hx = self.combiner_wrapper(combiner_in, combiner_hx, skip_stages=combiner_skip_stages)
+                    else:
+                        xi_out, combiner_hx = self.combiner_wrapper(combiner_in, combiner_hx)
                 xi_t = h_t + xi_out.squeeze(1)
             elif self.combine_reads:
                 xi_t = h_t + self.combiner(torch.cat([h_t, read_vec], dim=-1))

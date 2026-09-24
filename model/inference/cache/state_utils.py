@@ -47,7 +47,7 @@ def tree_nbytes(obj: Any) -> int:
         return obj.numel() * obj.element_size()
     if isinstance(obj, dict):
         return sum(tree_nbytes(v) for v in obj.values())
-    if isinstance(obj, (list, tuple)):
+    if isinstance(obj, list | tuple):
         return sum(tree_nbytes(v) for v in obj)
     return 0
 
@@ -65,7 +65,7 @@ def tree_max_abs_diff(a: Any, b: Any) -> float:
         if a.keys() != b.keys():
             return math.inf
         return max([0.0] + [tree_max_abs_diff(a[k], b[k]) for k in a])
-    if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
+    if isinstance(a, list | tuple) and isinstance(b, list | tuple):
         if len(a) != len(b):
             return math.inf
         return max([0.0] + [tree_max_abs_diff(x, y) for x, y in zip(a, b)])

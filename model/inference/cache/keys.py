@@ -55,7 +55,7 @@ def _update_obj(h, obj: Any) -> None:
         for k in sorted(obj, key=str):
             h.update(str(k).encode())
             _update_obj(h, obj[k])
-    elif isinstance(obj, (list, tuple)):
+    elif isinstance(obj, list | tuple):
         for v in obj:
             _update_obj(h, v)
     else:

@@ -117,7 +117,7 @@ def write_value_cumsum_field_log(writer, file, step, lesson, eval_type, field_lo
         )
     file.flush()
     agg = {}
-    for (depth, hop_pos), v in field_log.items():
+    for (_depth, hop_pos), v in field_log.items():
         a = agg.setdefault(hop_pos, [0, 0, 0])
         for i in range(3):
             a[i] += v[i]
@@ -192,7 +192,7 @@ class ChainCurriculum:
 
 def _as_range(v):
     """Accept either a fixed int or an (lo, hi) range; normalize to a range."""
-    return tuple(v) if isinstance(v, (tuple, list)) else (v, v)
+    return tuple(v) if isinstance(v, tuple | list) else (v, v)
 
 
 class KVChainDataset(BaseDataset):

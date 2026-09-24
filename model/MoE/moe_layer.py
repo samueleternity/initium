@@ -310,6 +310,9 @@ class MoEBlock(nn.Module):
             load_balance_alpha=load_balance_alpha,
             top_k=top_k,
         )
+        self._cumulative_source_counts: list[torch.Tensor] | None = (
+            None  # per-source, (num_experts,)
+        )
         if device is not None and getattr(device, "type", None) == "cuda":
             self.to(device)
 
@@ -418,17 +421,22 @@ class MultiSourceMoEBlock(nn.Module):
         topk_idx = self.moe.last_routing()  # (sum(batch_sizes), top_k) or None
         if topk_idx is not None:
             num_experts = self.moe.num_experts
+            if self._cumulative_source_counts is None:
+                self._cumulative_source_counts = [torch.zeros(num_experts) for _ in batch_sizes]
             source_diag, offset = [], 0
             for i, b in enumerate(batch_sizes):
-                idx_slice = topk_idx[offset : offset + b].reshape(-1)
+                idx_slice = topk_idx[offset : offset + b].reshape(-1).cpu()
                 counts = torch.bincount(idx_slice, minlength=num_experts).float()
-                frac = (counts / counts.sum().clamp(min=1)).tolist()
-                top_expert = int(counts.argmax().item())
+                self._cumulative_source_counts[i] += counts  # never reset -- spans the whole run
+                cum = self._cumulative_source_counts[i]
+                frac = (cum / cum.sum().clamp(min=1)).tolist()
+                top_expert = int(cum.argmax().item())
                 source_diag.append(
                     {
                         "expert_frac": frac,
                         "top_expert": top_expert,
                         "top_expert_frac": frac[top_expert],
+                        "n_calls_accumulated": int(cum.sum().item()),
                     }
                 )
                 offset += b

@@ -292,7 +292,7 @@ def main(argv=None) -> int:
         )
         require_dims_match(caps, task, args.checkpoint)
     except (IncompatibleModelError, NotImplementedError, ValueError, FileNotFoundError) as e:
-        raise SystemExit(f"[inference] ABORT: {e}")
+        raise SystemExit(f"[inference] ABORT: {e}") from e
     print(f"[inference] task: {task.describe()}")
 
     torch.manual_seed(args.seed)

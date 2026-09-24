@@ -80,7 +80,7 @@ def resolve_link_paths(link) -> list[str]:
     Sorted (not glob's arbitrary OS order) so the resulting pool is
     reproducible across runs/machines for the same directory/pattern.
     """
-    if isinstance(link, (list, tuple)):
+    if isinstance(link, list | tuple):
         specs = list(link)
     else:
         specs = str(link).split("+")
@@ -582,7 +582,7 @@ def _iter_video_frames(path: str):
         raise ImportError(
             "video real-data loading requires `opencv-python` (`pip install opencv-python`). "
             f"Original import error: {e}"
-        )
+        ) from e
     cap = cv2.VideoCapture(path)
     try:
         n = 0

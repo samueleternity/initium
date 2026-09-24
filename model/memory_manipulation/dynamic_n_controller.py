@@ -38,7 +38,6 @@ uses relative to dynamic_memory_resize.py.
 """
 
 
-
 class DynamicNController:
     """Usage-triggered nr_cells growth, macro-scale (between episodes).
 

@@ -567,7 +567,7 @@ def write_field_log(writer, file, step, lesson, eval_type, field_log):
         )
     file.flush()
     agg = {}
-    for (path_len, hop_pos), v in field_log.items():
+    for (_path_len, hop_pos), v in field_log.items():
         a = agg.setdefault(hop_pos, [0] * 9)
         for i in range(9):
             a[i] += v[i]

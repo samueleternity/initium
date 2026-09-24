@@ -1055,8 +1055,8 @@ def run(
     # ramp restarts at 0 from the switch point instead of reading the
     # already-large absolute step and jumping straight to full beta_target
     # on the first post-switch update.
-    lesson_dip_start_step = (
-        -(10**9)
+    lesson_dip_start_step = -(
+        10**9
     )  # idle at run start (so the dip ramp is already at 1.0 immediately);
     # reset to `step` on every lesson advance instead
     if resuming:

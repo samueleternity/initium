@@ -95,11 +95,11 @@ known-first-party = [
 
 [tool.ruff.lint.per-file-ignores]
 # Intentional import-after-code (env patches, sys.path bootstrap, circular-import avoidance).
-"core_training.py" = ["E402"]
-"inference/run_inference.py" = ["E402"]
-"data/common/real_data.py" = ["E402"]
-"mamba_controller/mamba_controller.py" = ["E402"]
-"data/multimodal/multimodal_dataset.py" = ["B023"]   # lambdas are called immediately
+"model/core_training.py" = ["E402"]
+"model/inference/run_inference.py" = ["E402"]
+"model/data/common/real_data.py" = ["E402"]
+"model/mamba_controller/mamba_controller.py" = ["E402"]
+"model/data/multimodal/multimodal_dataset.py" = ["B023"]   # lambdas are called immediately
 
 # ---------------------------------------------------------------- mypy
 [tool.mypy]

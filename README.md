@@ -1,6 +1,6 @@
 # Initium
 
-Initium is an experimental research framework for combining a Differentiable Neural Computer (DNC) with interchangeable sequence controllers and task/data pipelines. Its central idea is to keep an explicit, addressable external memory while exploring controllers such as LSTM, Mamba-family state-space models, and closed-form continuous-time (CfC) networks. The code also includes stochastic memory-write regularization, sparse expert layers, split-graph models, memory-structure experiments, and checkpoint-driven inference.
+Initium is an experimental research framework for combining a Differentiable Neural Computer (DNC)/augmented memory with interchangeable sequence controllers and task/data pipelines. Its central idea is to keep an explicit, addressable external memory while exploring controllers such as LSTM, Mamba-family state-space models, and closed-form continuous-time (CfC) networks. The code also includes stochastic memory-write regularization, sparse expert layers, split-graph models, memory-structure experiments, and checkpoint-driven inference.
 
 > **Research status:** Alpha and actively changing. Results below are experiment-specific observations, not guarantees that a configuration will reproduce on another machine, code revision, or dataset. This README is deliberately maintained as a working guide: update it when the code, default configuration, or evidence changes.
 
@@ -57,7 +57,7 @@ The training core exposes controller choices through its command-line interface 
 - **Mamba-2 and Mamba-3:** additional state-space variants; current experiment notes report that these configurations underperformed in earlier tests and need further investigation.
 - **CfC:** closed-form continuous-time controller.
 - **Hybrid chains:** compositions of supported controller stages, such as a Mamba/CfC sequence.
-- **Split-graph:** a parallel sequence backbone plus a separate combiner for the sequential memory-addressing work. It is an experimental way to expose more of the controller computation to parallel execution while retaining the memory interface.
+- **Split-graph:** a parallel sequence backbone plus a separate combiner for the sequential memory-addressing work. It is an experimental way to expose more of the controller computation to parallel execution while retaining the memory interface and currently performs the best out of all options.
 
 Some options require optional or hardware-sensitive dependencies, particularly `mamba-ssm` and `causal-conv1d`. A controller being selectable in code should not be read as evidence that it is equally mature or portable on every platform.
 
@@ -66,6 +66,8 @@ Some options require optional or hardware-sensitive dependencies, particularly `
 The write-head extension models a write vector as a diagonal Gaussian. It can sample a write using the reparameterization trick and add a KL penalty to a prior distribution. The implementation supports a fixed standard-normal prior and a learned prior updated from recent write statistics on a periodic, detached snapshot schedule. The loss can include KL annealing and free bits; the learned-prior path logs its snapshot state separately.
 
 The intended locality distinction is important: the per-write KL is computed from the current write distribution and a prior snapshot. In the learned-prior variant, the prior itself is fitted from recent writes periodically, outside the per-step gradient path. That makes the overall mechanism periodically data-conditioned even though the per-write calculation uses the current write and frozen prior snapshot.
+
+Also KL regularization has specific, uninvestigated behaviour: it tends to stabilize grad_norms allowing the model to not collapse (detected once and needs further investigations) - it was mildly visible in graph-traversal experiments but its full strength occured in multimodal tasks where a model managed to collapse in lesson 14 with beta=0.0, meanwhile with beta=0.001(KL term active) the same model kept going with no issues.
 
 ### Other experimental mechanisms
 
@@ -102,7 +104,7 @@ python -m pip install -e .
 
 Optional dependencies are grouped by modality, for example `text`, `video`, and `real-data` in the project metadata. Audio/video processing may also rely on system tools such as FFmpeg. Mamba-family components can require packages beyond the base install. The default training path is intended to be usable without those optional controller dependencies.
 
-> **Packaging note for contributors:** the repository currently contains a `model/` source tree while some package metadata and module examples refer to top-level package names. Treat packaging/install instructions as provisional and verify them against the checkout you're using; keep this section synchronized when packaging is consolidated.
+> **Packaging note for contributors:** the repository currently contains a `model/` source tree while some package metadata and module examples refer to top-level package names. Treat packaging/install instructions as provisional and verify them against the checkout you're using; keep this section synchronized when packaging is consolidated. -> This will be fixed soon.
 
 ## Training
 
@@ -147,11 +149,11 @@ The loader checks checkpoint/task compatibility and refuses unsupported task typ
 
 ## Experiments and current evidence
 
-The supplied experiment records describe a staged investigation of a KL penalty on DNC memory writes. They are summarized here as results rather than by the names of the individual working files, so this overview can remain useful if those files are renamed or reorganized.
+The supplied experiment records describe a staged investigation of a KL penalty on DNC memory writes. They are summarized here as results rather than by the names of the individual working files, so this overview can remain useful if those files are renamed or reorganized. -> If anyone wishes to see the original files, you can create an issue and will be contacted afterwards.
 
 ### Fixed-prior multi-seed study
 
-The first study compared a no-KL anchor with a small fixed-prior KL weight over multiple random seeds. It found meaningful heterogeneity: several seeds showed non-collapsed OOD gains, some showed little benefit, and two seeds showed genuine reversals. The strongest observed seed improved OOD triple accuracy by roughly 11–12 percentage points over its own anchor. The study therefore supports a **conditional** positive result for the tested configuration, not a claim that the effect is universal or statistically settled. The measured OOD perfect-traversal fraction also did not track triple accuracy uniformly, so the metric definition matters.
+The first study compared a no-KL anchor with a small fixed-prior KL weight over multiple random seeds with --controller lstm. It found meaningful heterogeneity: several seeds showed non-collapsed OOD gains, some showed little benefit, and two seeds showed genuine reversals. The strongest observed seed improved OOD triple accuracy by roughly 11–12 percentage points over its own anchor. The study therefore supports a **conditional** positive result for the tested configuration, not a claim that the effect is universal or statistically settled. The measured OOD perfect-traversal fraction also did not track triple accuracy uniformly, so the metric definition matters.
 
 ### Learned-prior study
 

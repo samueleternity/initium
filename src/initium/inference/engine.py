@@ -21,7 +21,7 @@ from typing import List
 
 import torch
 
-from inference.metrics import EpisodeResult
+from src.initium.inference.metrics import EpisodeResult
 
 FRESH_HIDDEN = (None, None, None)
 

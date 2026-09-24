@@ -19,8 +19,8 @@ New parallel backbone kind: add it to _BACKBONE_KINDS and the loop in build_para
 """
 from __future__ import annotations
 
-from LNN_controller.cfc_controller import CfCControllerWrapper
-from LNN_controller.chained_controller import ChainedControllerWrapper
+from src.initium.LNN_controller.cfc_controller import CfCControllerWrapper
+from src.initium.LNN_controller.chained_controller import ChainedControllerWrapper
 
 STAGE_KINDS = ("mamba", "mamba2", "mamba3", "cfc")
 

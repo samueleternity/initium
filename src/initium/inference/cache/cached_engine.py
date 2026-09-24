@@ -30,12 +30,12 @@ from typing import List
 
 import torch
 
-from inference.cache.base_cache import EpisodeCtx
-from inference.cache.cache_config import ROOT_CHAIN, DEFAULT_VERIFY_HITS, DEFAULT_VERIFY_TOL
-from inference.cache.keys import hash_tensor, chain_next
-from inference.cache.state_utils import clone_tree, tree_max_abs_diff
-from inference.engine import InferenceEngine, FRESH_HIDDEN
-from inference.metrics import EpisodeResult
+from src.initium.inference.cache.base_cache import EpisodeCtx
+from src.initium.inference.cache.cache_config import ROOT_CHAIN, DEFAULT_VERIFY_HITS, DEFAULT_VERIFY_TOL
+from src.initium.inference.cache.keys import hash_tensor, chain_next
+from src.initium.inference.cache.state_utils import clone_tree, tree_max_abs_diff
+from src.initium.inference.engine import InferenceEngine, FRESH_HIDDEN
+from src.initium.inference.metrics import EpisodeResult
 
 
 def model_supports_resume(model) -> bool:

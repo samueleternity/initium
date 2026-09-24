@@ -30,24 +30,24 @@ import time
 
 import torch
 
-from inference.inference_config import (
+from src.initium.inference.inference_config import (
     INFERENCE_LOG_DIR, DEFAULT_DATASET_TYPE, DEFAULT_DATASET_LINK, DEFAULT_NUM_EPISODES,
     DEFAULT_WINDOW, DEFAULT_SEED, DEFAULT_VERBOSE_N, PROGRESS_EVERY,
 )
-from inference.cache.cache_config import (
+from src.initium.inference.cache.cache_config import (
     DEFAULT_CACHE, DEFAULT_CACHE_RAM_MB, DEFAULT_CACHE_DISK_MB, DEFAULT_VERIFY_HITS,
 )
-from inference.cache.cache_registry import parse_cache_spec, setup_caches
-from inference.cache.cached_engine import CachedInferenceEngine
-from inference.checkpoint_io import load_checkpoint, describe_checkpoint
-from inference.capabilities import (
+from src.initium.inference.cache.cache_registry import parse_cache_spec, setup_caches
+from src.initium.inference.cache.cached_engine import CachedInferenceEngine
+from src.initium.inference.checkpoint_io import load_checkpoint, describe_checkpoint
+from src.initium.inference.capabilities import (
     detect_capabilities, require_type_supported, require_dims_match, IncompatibleModelError,
 )
-from inference.tasks.task_registry import get_task
-from inference.model_loader import load_model
-from inference.engine import InferenceEngine
-from inference.metrics import aggregate, windowed, adaptation_trend
-from inference import run_logging as rl
+from src.initium.inference.tasks.task_registry import get_task
+from src.initium.inference.model_loader import load_model
+from src.initium.inference.engine import InferenceEngine
+from src.initium.inference.metrics import aggregate, windowed, adaptation_trend
+from src.initium.inference import run_logging as rl
 
 
 def parse_args(argv=None):

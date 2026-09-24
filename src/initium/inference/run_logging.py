@@ -13,7 +13,7 @@ import os
 import re
 from typing import List
 
-from inference.metrics import EpisodeResult
+from src.initium.inference.metrics import EpisodeResult
 
 
 def make_run_id(ckpt_path: str, task_name: str, reset_experience: bool,

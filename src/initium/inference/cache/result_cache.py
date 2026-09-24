@@ -18,8 +18,8 @@ from typing import Optional, Tuple
 
 import torch
 
-from inference.cache.base_cache import BaseCache, EpisodeCtx, EpisodeHit
-from inference.cache.state_utils import restore, snapshot
+from src.initium.inference.cache.base_cache import BaseCache, EpisodeCtx, EpisodeHit
+from src.initium.inference.cache.state_utils import restore, snapshot
 
 
 class ResultCache(BaseCache):

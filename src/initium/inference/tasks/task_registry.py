@@ -38,19 +38,19 @@ def canonical_type(dataset_type: str) -> str:
 def get_task_class(dataset_type: str):
     t = canonical_type(dataset_type)
     if t == "graph":
-        from inference.tasks.graph_traversal_task import GraphTraversalTask
+        from src.initium.inference.tasks.graph_traversal_task import GraphTraversalTask
         return GraphTraversalTask
     if t == "text":
-        from inference.tasks.text_task import TextChainTask
+        from src.initium.inference.tasks.text_task import TextChainTask
         return TextChainTask
     if t == "audio":
-        from inference.tasks.audio_task import AudioChainTask
+        from src.initium.inference.tasks.audio_task import AudioChainTask
         return AudioChainTask
     if t == "video":
-        from inference.tasks.video_task import VideoChainTask
+        from src.initium.inference.tasks.video_task import VideoChainTask
         return VideoChainTask
     if t == "multimodal":
-        from inference.tasks.multimodal_task import MultimodalTask
+        from src.initium.inference.tasks.multimodal_task import MultimodalTask
         return MultimodalTask
     raise ValueError(f"unknown dataset type {dataset_type!r}")
 

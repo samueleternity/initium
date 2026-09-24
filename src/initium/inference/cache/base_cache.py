@@ -18,9 +18,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
-from inference.cache.keys import digest, hash_tensor
-from inference.cache.state_utils import tree_nbytes
-from inference.cache.stores import CacheStats, TieredStore
+from src.initium.inference.cache.keys import digest, hash_tensor
+from src.initium.inference.cache.state_utils import tree_nbytes
+from src.initium.inference.cache.stores import CacheStats, TieredStore
 
 
 @dataclass

@@ -24,7 +24,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from LNN_controller.cfc_controller import CfC, _require_ncps
+from src.initium.LNN_controller.cfc_controller import CfC, _require_ncps
 from mamba_controller.mamba_backbone_parallel import MambaBackboneParallel
 
 _BACKBONE_KINDS = ("mamba1", "mamba2", "mamba3", "cfc")

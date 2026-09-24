@@ -22,7 +22,7 @@ from typing import List
 
 import torch
 
-from inference.metrics import EpisodeScore
+from src.initium.inference.metrics import EpisodeScore
 
 
 @dataclass

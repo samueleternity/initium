@@ -12,8 +12,8 @@ from typing import List
 import torch
 
 from data.multimodal.multimodal_dataset import MultimodalDataset
-from inference.metrics import EpisodeScore
-from inference.tasks.base_task import BaseInferenceTask, Episode
+from src.initium.inference.metrics import EpisodeScore
+from src.initium.inference.tasks.base_task import BaseInferenceTask, Episode
 
 
 class MultimodalTask(BaseInferenceTask):

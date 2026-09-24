@@ -1,8 +1,8 @@
 """
-file: inference/tasks/text_task.py
+file: inference/tasks/audio_task.py
 
-Text-modality inference task. Delegates episode-building/decoding to
-data.text.text_dataset.TextChainDataset (same pattern graph_traversal_task.py
+Audio-modality inference task. Delegates episode-building/decoding to
+data.audio.audio_dataset.AudioChainDataset (same pattern graph_traversal_task.py
 uses relative to graph_traversal.py - training and inference can never
 silently drift apart).
 """
@@ -12,24 +12,23 @@ from typing import List
 
 import torch
 
-from data.text.text_dataset import TextChainDataset
-from inference.metrics import EpisodeScore
-from inference.tasks.base_task import BaseInferenceTask, Episode
+from data.audio.audio_dataset import AudioChainDataset
+from src.initium.inference.metrics import EpisodeScore
+from src.initium.inference.tasks.base_task import BaseInferenceTask, Episode
 
-BUILTIN_LINKS = (None, "", "text-chain")
+BUILTIN_LINKS = (None, "", "audio-chain")
 
-
-class TextChainTask(BaseInferenceTask):
-    name = "text-chain"
-    dataset_type = "text"
+class AudioChainTask(BaseInferenceTask):
+    name = "audio-chain"
+    dataset_type = "audio"
 
     def __init__(self, dataset_link=None, path_length_range=None, **kwargs):
         # Inference always tests a trained model, so --dataset-link here plays the
         # role of test_dataset_link on the training-side dataset class: a real
-        # text file used as the held-out fact source, instead of the synthetic
+        # audio file used as the held-out fact source, instead of the synthetic
         # seeded table. Omit (or pass one of BUILTIN_LINKS) for that default.
         link = None if dataset_link in BUILTIN_LINKS else dataset_link
-        self._ds = TextChainDataset(test_dataset_link=link)
+        self._ds = AudioChainDataset(test_dataset_link=link)
         self.input_dim, self.output_dim = self._ds.input_dim, self._ds.output_dim
         self.query_range = tuple(path_length_range) if path_length_range else self._ds.ood_query_range
         self.facts = self._ds.build_ood_facts()

@@ -131,7 +131,7 @@ class CfCControllerWrapper(nn.Module):
 
 
 if __name__ == "__main__":  # smoke test: python -m LNN_controller.cfc_controller (from project root)
-    from LNN_controller.chained_controller import ChainedControllerWrapper
+    from src.initium.LNN_controller.chained_controller import ChainedControllerWrapper
     B, T, in_dim, d = 4, 6, 40, 32
     for mm in (False, True):
         w = CfCControllerWrapper(in_dim, d, num_blocks=2, backbone_units=64, mixed_memory=mm)

@@ -29,8 +29,8 @@ from data.graph_traversal.graph_traversal import (
     build_london_underground_eval, build_traversal_episode_from_graph, decode_prediction,
     encode_triple, triple_to_digit_targets,
 )
-from inference.metrics import EpisodeScore
-from inference.tasks.base_task import BaseInferenceTask, Episode
+from src.initium.inference.metrics import EpisodeScore
+from src.initium.inference.tasks.base_task import BaseInferenceTask, Episode
 
 BUILTIN_LINKS = (None, "", "graph-traversal", "london", "london-underground")
 

@@ -16,8 +16,8 @@ from __future__ import annotations
 
 from typing import Optional, Tuple
 
-from inference.cache.base_cache import BaseCache, EpisodeCtx, ResumePoint
-from inference.cache.state_utils import restore, snapshot
+from src.initium.inference.cache.base_cache import BaseCache, EpisodeCtx, ResumePoint
+from src.initium.inference.cache.state_utils import restore, snapshot
 
 
 class PrefixStateCache(BaseCache):

@@ -17,8 +17,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List
 
-from inference.inference_config import WILDCARD_TYPE
-from inference.tasks.task_registry import canonical_type, IMPLEMENTED_TYPES, get_task_class
+from src.initium.inference.inference_config import WILDCARD_TYPE
+from src.initium.inference.tasks.task_registry import canonical_type, IMPLEMENTED_TYPES, get_task_class
 
 
 class IncompatibleModelError(Exception):

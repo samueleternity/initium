@@ -87,7 +87,7 @@ project's expected surface area that other files depend on:
     named_modules() walk in stochastic_write_head_v2.py, and for
     resize_memory()'s "find the attribute name pointing at old_memory"
     swap in dynamic_memory_resize.py). Same convention MambaDNC uses.
-  - forward(input, hx=(chx, mhx, last_read), reset_experience, 
+  - forward(input, hx=(chx, mhx, last_read), reset_experience,
     pass_through_memory) -> (output, (chx, mhx, last_read)), with output
     shaped (T, B, input_size) -- matching the (T, B, C) convention the
     rest of this project's training/eval code already expects from
@@ -112,16 +112,17 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
-
 from dnc.memory import Memory
 
-from mamba_controller.mamba_backbone_parallel import MambaBackboneParallel
-from LNN_controller.cfc_backbone_parallel import build_parallel_backbone 
-from LNN_controller.hybrid_controller import build_hybrid_controller, is_hybrid_rnn_type  # v15: hybrid combiner 
-from mamba_controller.mamba_controller import MambaControllerWrapper       
-from mamba_controller.mamba2_controller import Mamba2ControllerWrapper 
+from LNN_controller.cfc_backbone_parallel import build_parallel_backbone
+from LNN_controller.cfc_controller import CfCControllerWrapper
+from LNN_controller.hybrid_controller import (  # v15: hybrid combiner
+    build_hybrid_controller,
+    is_hybrid_rnn_type,
+)
+from mamba_controller.mamba2_controller import Mamba2ControllerWrapper
 from mamba_controller.mamba3_controller import Mamba3ControllerWrapper
-from LNN_controller.cfc_controller import CfCControllerWrapper 
+from mamba_controller.mamba_controller import MambaControllerWrapper
 
 
 class SplitGraphDNC(nn.Module):
@@ -142,9 +143,10 @@ class SplitGraphDNC(nn.Module):
         mamba_d_state: int = 16,
         mamba_d_conv: int = 4,
         mamba_expand: int = 2,
-        cfc_kwargs: dict | None = None,   # v14: CfC hyperparameters for variants containing "cfc" (None -> defaults)
-        mamba_headdim: int = 64,       # mamba2-only
-        combine_reads: bool = True,    # built-in ablation switch, see module docstring
+        cfc_kwargs: dict
+        | None = None,  # v14: CfC hyperparameters for variants containing "cfc" (None -> defaults)
+        mamba_headdim: int = 64,  # mamba2-only
+        combine_reads: bool = True,  # built-in ablation switch, see module docstring
         # v11: combiner mechanism for the sequential addressing step. This is
         # ORTHOGONAL to the backbone (mamba_variant above, still parallel,
         # unchanged) -- it only changes how xi_t is produced from (h_t,
@@ -162,17 +164,17 @@ class SplitGraphDNC(nn.Module):
         #       recurrent SSM capacity instead of a stateless projection,
         #       while the backbone stays exactly as parallel as before.
         combiner_mode: str = "linear",
-        combiner_variant: str = "mamba1",   # "mamba1" | "mamba2", only used when combiner_mode="controller"
-        combiner_num_blocks: int = 1,       # kept small on purpose -- see module docstring's
-                                             # "much smaller and cheaper" framing of this step
-        combiner_d_state: int | None = None,   # None -> variant's own paper default (16 / 64)
+        combiner_variant: str = "mamba1",  # "mamba1" | "mamba2", only used when combiner_mode="controller"
+        combiner_num_blocks: int = 1,  # kept small on purpose -- see module docstring's
+        # "much smaller and cheaper" framing of this step
+        combiner_d_state: int | None = None,  # None -> variant's own paper default (16 / 64)
         combiner_d_conv: int = 4,
         combiner_expand: int = 2,
-        combiner_headdim: int = 64,         # mamba2 combiner_variant only
-        combiner_ngroups: int = 1,          # mamba2 combiner_variant only
+        combiner_headdim: int = 64,  # mamba2 combiner_variant only
+        combiner_ngroups: int = 1,  # mamba2 combiner_variant only
         independent_linears: bool = True,
         device: torch.device | None = None,
-        moe_enabled: bool = False,     # deliberately NOT wired in -- see below
+        moe_enabled: bool = False,  # deliberately NOT wired in -- see below
         moe_num_experts: int = 8,
         moe_expert_dim: int | None = None,
         moe_capacity_factor: float = 1.5,
@@ -222,8 +224,10 @@ class SplitGraphDNC(nn.Module):
         )
 
         if combiner_mode not in ("linear", "controller"):
-            raise ValueError(f"SplitGraphDNC: unknown combiner_mode {combiner_mode!r}, "
-                              "expected 'linear' or 'controller'.")
+            raise ValueError(
+                f"SplitGraphDNC: unknown combiner_mode {combiner_mode!r}, "
+                "expected 'linear' or 'controller'."
+            )
         self.combiner_mode = combiner_mode
         self.combiner_variant = combiner_variant
         self.combiner = None
@@ -231,7 +235,9 @@ class SplitGraphDNC(nn.Module):
 
         if combiner_mode == "linear":
             if combine_reads:
-                self.combiner = nn.Linear(hidden_size + self.read_vectors_size, hidden_size, device=device)
+                self.combiner = nn.Linear(
+                    hidden_size + self.read_vectors_size, hidden_size, device=device
+                )
                 # Zero-init: at step 0 of training, xi_t == h_t exactly (the
                 # split model starts by ignoring the previous read vector
                 # entirely and has to learn to use it). Same "start equal to
@@ -250,16 +256,20 @@ class SplitGraphDNC(nn.Module):
             # Use combiner_mode="linear", combine_reads=False for that check
             # instead (unchanged, still available).
             if combiner_variant == "mamba2":
-                print("[SplitGraphDNC] WARNING: combiner_mode='controller' with "
-                      "combiner_variant='mamba2' constructs a genuine per-timestep "
-                      "interleaved Mamba-2 cell for the addressing step. This is "
-                      "known to be inefficient (same reason standalone "
-                      "--controller mamba2 runs aren't being pursued) and is wired "
-                      "here only for completeness/future comparison -- "
-                      "combiner_variant='mamba1' is the configuration expected to "
-                      "actually be used.")
-            _d_state = combiner_d_state if combiner_d_state is not None else (
-                64 if combiner_variant in ("mamba2", "mamba3") else 16
+                print(
+                    "[SplitGraphDNC] WARNING: combiner_mode='controller' with "
+                    "combiner_variant='mamba2' constructs a genuine per-timestep "
+                    "interleaved Mamba-2 cell for the addressing step. This is "
+                    "known to be inefficient (same reason standalone "
+                    "--controller mamba2 runs aren't being pursued) and is wired "
+                    "here only for completeness/future comparison -- "
+                    "combiner_variant='mamba1' is the configuration expected to "
+                    "actually be used."
+                )
+            _d_state = (
+                combiner_d_state
+                if combiner_d_state is not None
+                else (64 if combiner_variant in ("mamba2", "mamba3") else 16)
             )
             combiner_in_dim = hidden_size + self.read_vectors_size
             if combiner_variant == "mamba2":
@@ -284,17 +294,28 @@ class SplitGraphDNC(nn.Module):
                     headdim=combiner_headdim,
                     device=device,
                 )
-            elif is_hybrid_rnn_type(combiner_variant):  # v15: e.g. "mamba+cfc" (hybrid_controller kind names: mamba, not mamba1)
+            elif is_hybrid_rnn_type(
+                combiner_variant
+            ):  # v15: e.g. "mamba+cfc" (hybrid_controller kind names: mamba, not mamba1)
                 self.combiner_wrapper = build_hybrid_controller(
                     combiner_variant.lower(),
                     in_dim=combiner_in_dim,
                     d_model=hidden_size,
-                    blocks_per_kind={k: combiner_num_blocks for k in ("mamba", "mamba2", "mamba3", "cfc")},
+                    blocks_per_kind={
+                        k: combiner_num_blocks for k in ("mamba", "mamba2", "mamba3", "cfc")
+                    },
                     kwargs_per_kind={
                         "mamba": dict(d_state=16, d_conv=combiner_d_conv, expand=combiner_expand),
-                        "mamba2": dict(d_state=64, d_conv=combiner_d_conv, expand=combiner_expand,
-                                       headdim=combiner_headdim, ngroups=combiner_ngroups),
-                        "mamba3": dict(d_state=64, expand=combiner_expand, headdim=combiner_headdim),
+                        "mamba2": dict(
+                            d_state=64,
+                            d_conv=combiner_d_conv,
+                            expand=combiner_expand,
+                            headdim=combiner_headdim,
+                            ngroups=combiner_ngroups,
+                        ),
+                        "mamba3": dict(
+                            d_state=64, expand=combiner_expand, headdim=combiner_headdim
+                        ),
                         "cfc": dict(cfc_kwargs or {}),
                     },
                     device=device,
@@ -317,10 +338,14 @@ class SplitGraphDNC(nn.Module):
                     device=device,
                 )
             else:
-                raise ValueError(f"SplitGraphDNC: unknown combiner_variant {combiner_variant!r}, "
-                                  "expected 'mamba1' or 'mamba2'.")
-            
-            _ad = self.combiner_wrapper.in_adapter  # read-vector columns start at 0, like the zero-init linear combiner
+                raise ValueError(
+                    f"SplitGraphDNC: unknown combiner_variant {combiner_variant!r}, "
+                    "expected 'mamba1' or 'mamba2'."
+                )
+
+            _ad = (
+                self.combiner_wrapper.in_adapter
+            )  # read-vector columns start at 0, like the zero-init linear combiner
             if isinstance(_ad, nn.Linear):
                 with torch.no_grad():
                     _ad.weight[:, hidden_size:].zero_()
@@ -338,7 +363,7 @@ class SplitGraphDNC(nn.Module):
         )
         # See module docstring's API-compatibility section for why this
         # setattr (not just the list append above) is required.
-        setattr(self, "rnn_layer_memory_shared", self.memories[0])
+        self.rnn_layer_memory_shared = self.memories[0]
 
         self.output = nn.Linear(self.nn_output_size, self.input_size, device=device)
         torch.nn.init.kaiming_uniform_(self.output.weight)
@@ -372,7 +397,7 @@ class SplitGraphDNC(nn.Module):
         reset_experience: bool = False,
         pass_through_memory: bool = True,
         combiner_skip_stages=None,
-        start_step: int = 0,   # v20: resume the sequential loop mid-sequence (inference caching)
+        start_step: int = 0,  # v20: resume the sequential loop mid-sequence (inference caching)
     ):
         """
         input: (B, T, input_size) -- batch-first, the whole padded episode
@@ -446,8 +471,10 @@ class SplitGraphDNC(nn.Module):
         # as the starting state instead of a fresh zero-init.
         combiner_hx = None
         if self.combiner_mode == "controller":
-            combiner_hx = chx if chx is not None else self.combiner_wrapper.init_state(
-                B, device=device, dtype=H.dtype
+            combiner_hx = (
+                chx
+                if chx is not None
+                else self.combiner_wrapper.init_state(B, device=device, dtype=H.dtype)
             )
 
         outputs = []
@@ -457,7 +484,9 @@ class SplitGraphDNC(nn.Module):
             if self.combiner_mode == "controller":
                 combiner_in = torch.cat([h_t, read_vec], dim=-1).unsqueeze(1)  # (B, 1, hidden+read)
                 if combiner_skip_stages is not None:
-                    xi_out, combiner_hx = self.combiner_wrapper(combiner_in, combiner_hx, skip_stages=combiner_skip_stages)
+                    xi_out, combiner_hx = self.combiner_wrapper(
+                        combiner_in, combiner_hx, skip_stages=combiner_skip_stages
+                    )
                 else:
                     xi_out, combiner_hx = self.combiner_wrapper(combiner_in, combiner_hx)
                 xi_t = h_t + xi_out.squeeze(1)
@@ -470,7 +499,9 @@ class SplitGraphDNC(nn.Module):
 
             if pass_through_memory:
                 read_vec, mem_state = self.memories[0](xi_t, mem_state)
-                read_vec = read_vec.reshape(B, -1)  # dnc.memory.Memory returns (B, r, w) unflattened
+                read_vec = read_vec.reshape(
+                    B, -1
+                )  # dnc.memory.Memory returns (B, r, w) unflattened
             else:
                 # LB-9/Concept 6 functional-usage check: skip memory read
                 # AND write for this timestep, matching every other
@@ -482,7 +513,7 @@ class SplitGraphDNC(nn.Module):
 
         if self.combiner_mode == "controller":
             chx = combiner_hx  # v11: expose the controller combiner's final state, same
-                                # convention as mem_state -> mhx just above
+            # convention as mem_state -> mhx just above
 
         mhx = [mem_state]
         output = torch.stack(outputs, dim=0)  # (T, B, input_size)

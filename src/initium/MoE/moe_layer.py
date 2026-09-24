@@ -151,13 +151,17 @@ class SwitchMoE(nn.Module):
         flat = x.reshape(-1, d_model)  # (num_tokens, d_model)
         num_tokens = flat.shape[0]
 
-        logits32 = self.router(flat).float()  # router kept in fp32 (Switch's own selective-precision fix)
+        logits32 = self.router(
+            flat
+        ).float()  # router kept in fp32 (Switch's own selective-precision fix)
         if self.training and self.router_noise_eps > 0:
             # Switch's own exploration mechanism (Appendix C): multiplicative
             # jitter noise. We apply it directly to the router logits here
             # (a commonly-used equivalent of jittering the router input) for
             # simplicity.
-            noise = torch.empty_like(logits32).uniform_(1.0 - self.router_noise_eps, 1.0 + self.router_noise_eps)
+            noise = torch.empty_like(logits32).uniform_(
+                1.0 - self.router_noise_eps, 1.0 + self.router_noise_eps
+            )
             logits32 = logits32 * noise
         probs = torch.softmax(logits32, dim=-1)  # (num_tokens, num_experts)
 
@@ -173,8 +177,8 @@ class SwitchMoE(nn.Module):
             # tokens THIS forward() call sees -- no scan of anything outside
             # this one call, matching Phase 1/2's "local to this call" bar.
             one_hot = F.one_hot(top1_idx, num_classes=self.num_experts).float()
-            f_i = one_hot.mean(dim=0)          # (num_experts,)
-            P_i = probs.mean(dim=0)            # (num_experts,)
+            f_i = one_hot.mean(dim=0)  # (num_experts,)
+            P_i = probs.mean(dim=0)  # (num_experts,)
             aux_loss = self.load_balance_alpha * self.num_experts * (f_i * P_i).sum()
             self._aux_losses.append(aux_loss)
 
@@ -211,7 +215,6 @@ class SwitchMoE(nn.Module):
 
         return output.reshape(orig_shape)
         """
-    
 
         # Vectorized dispatch: at this project's scale (num_tokens ==
         # batch_size, e.g. 16, called once per DNC timestep), the old
@@ -225,17 +228,21 @@ class SwitchMoE(nn.Module):
         # first-N-tokens-in-order-per-expert semantics as the loop
         # version -- computed via a cumulative count instead of
         # per-expert slicing.
-        w_in = torch.stack([e.w_in.weight for e in self.experts], dim=0)    # (E, expert_dim, d_model)
-        b_in = torch.stack([e.w_in.bias for e in self.experts], dim=0)      # (E, expert_dim)
-        w_out = torch.stack([e.w_out.weight for e in self.experts], dim=0)  # (E, d_model, expert_dim)
-        b_out = torch.stack([e.w_out.bias for e in self.experts], dim=0)    # (E, d_model)
+        w_in = torch.stack([e.w_in.weight for e in self.experts], dim=0)  # (E, expert_dim, d_model)
+        b_in = torch.stack([e.w_in.bias for e in self.experts], dim=0)  # (E, expert_dim)
+        w_out = torch.stack(
+            [e.w_out.weight for e in self.experts], dim=0
+        )  # (E, d_model, expert_dim)
+        b_out = torch.stack([e.w_out.bias for e in self.experts], dim=0)  # (E, d_model)
 
-        hidden = torch.einsum('td,exd->tex', flat, w_in) + b_in            # (T, E, expert_dim)
+        hidden = torch.einsum("td,exd->tex", flat, w_in) + b_in  # (T, E, expert_dim)
         hidden = F.relu(hidden)
-        expert_out_all = torch.einsum('tex,edx->ted', hidden, w_out) + b_out  # (T, E, d_model)
+        expert_out_all = torch.einsum("tex,edx->ted", hidden, w_out) + b_out  # (T, E, d_model)
 
         # Every token only ever uses its top-1 expert's output.
-        expert_out = expert_out_all[torch.arange(num_tokens, device=flat.device), top1_idx]  # (T, d_model)
+        expert_out = expert_out_all[
+            torch.arange(num_tokens, device=flat.device), top1_idx
+        ]  # (T, d_model)
 
         # Capacity mask: keep only the first `capacity` tokens (in
         # original token order) routed to each expert -- identical drop
@@ -249,10 +256,10 @@ class SwitchMoE(nn.Module):
         gate = (top1_prob * keep.to(top1_prob.dtype)).unsqueeze(-1).to(expert_out.dtype)
         output = (expert_out * gate).to(flat.dtype)
 
-        # One caveat: this computes all 8 experts for all tokens rather than skipping unused ones, 
-        # so if you ever scale num_tokens way up (e.g. via BATCH_SIZE) the FLOPs cost of this dense approach grows 
-        # faster than the old sparse loop's would. At your current scale that's irrelevant; 
-        # if you ever do increase batch size significantly later, worth re-benchmarking which approach 
+        # One caveat: this computes all 8 experts for all tokens rather than skipping unused ones,
+        # so if you ever scale num_tokens way up (e.g. via BATCH_SIZE) the FLOPs cost of this dense approach grows
+        # faster than the old sparse loop's would. At your current scale that's irrelevant;
+        # if you ever do increase batch size significantly later, worth re-benchmarking which approach
         # wins at that point.
         return output.reshape(orig_shape)
 
@@ -304,8 +311,11 @@ class MoEBlock(nn.Module):
         super().__init__()
         self.norm = nn.LayerNorm(d_model, device=device, dtype=dtype)
         self.moe = SwitchMoE(
-            d_model, num_experts=num_experts, expert_dim=expert_dim,
-            capacity_factor=capacity_factor, router_noise_eps=router_noise_eps,
+            d_model,
+            num_experts=num_experts,
+            expert_dim=expert_dim,
+            capacity_factor=capacity_factor,
+            router_noise_eps=router_noise_eps,
             load_balance_alpha=load_balance_alpha,
         )
         if device is not None and getattr(device, "type", None) == "cuda":

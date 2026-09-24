@@ -30,6 +30,7 @@ see that file. This module doesn't need to do anything for that to work;
 it's noted here so the coupling isn't a surprise when reading either file
 in isolation.
 """
+
 import torch
 from dnc.memory import Memory
 

@@ -5,6 +5,7 @@ Hashing for cache keys. blake2b (fast, stdlib). A cache key always contains the
 MODEL FINGERPRINT (hash of every weight + config + the flags that change the
 forward pass), so entries can never leak between different checkpoints.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -54,7 +55,7 @@ def _update_obj(h, obj: Any) -> None:
         for k in sorted(obj, key=str):
             h.update(str(k).encode())
             _update_obj(h, obj[k])
-    elif isinstance(obj, (list, tuple)):
+    elif isinstance(obj, list | tuple):
         for v in obj:
             _update_obj(h, v)
     else:

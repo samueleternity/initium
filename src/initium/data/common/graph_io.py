@@ -16,13 +16,13 @@ Names are mapped to distinct 0..999 labels with a fixed random.Random(seed)
 unless every field is already an integer in [0,1000), in which case the
 integers are used directly.
 """
+
 from __future__ import annotations
 
 import csv
 import json
 import os
 import random
-from typing import List, Tuple
 
 from data.common.real_data import resolve_link_paths
 
@@ -37,7 +37,7 @@ def _is_label(x: str) -> bool:
         return False
 
 
-def _load_raw_edges_one(path: str) -> List[Tuple[str, str, str]]:
+def _load_raw_edges_one(path: str) -> list[tuple[str, str, str]]:
     ext = os.path.splitext(path)[1].lower()
     rows = []
     if ext == ".json":
@@ -70,7 +70,7 @@ def _load_raw_edges_one(path: str) -> List[Tuple[str, str, str]]:
     return edges
 
 
-def load_raw_edges(path) -> List[Tuple[str, str, str]]:
+def load_raw_edges(path) -> list[tuple[str, str, str]]:
     """`path` may be a single edge file, or a directory / glob pattern /
     '+'-joined list of these (see real_data.resolve_link_paths) -- e.g. an
     entire folder of edge-list files, each contributing its own edges to
@@ -78,7 +78,7 @@ def load_raw_edges(path) -> List[Tuple[str, str, str]]:
     per-file header-row / '#'-comment skip still applies independently to
     each file (so each file may have its own header)."""
     paths = resolve_link_paths(path)
-    all_edges: List[Tuple[str, str, str]] = []
+    all_edges: list[tuple[str, str, str]] = []
     for p in paths:
         all_edges.extend(_load_raw_edges_one(p))
     return all_edges
@@ -104,8 +104,8 @@ def build_graph_from_raw_edges(raw_edges, label_seed: int = 1234):
             raise ValueError(f"graph has {need} distinct stations+lines; max is {LABEL_RANGE}")
         rng = random.Random(label_seed)
         all_labels = rng.sample(range(LABEL_RANGE), need)
-        station_to_label = dict(zip(stations, all_labels[:len(stations)]))
-        line_to_label = dict(zip(lines, all_labels[len(stations):]))
+        station_to_label = dict(zip(stations, all_labels[: len(stations)]))
+        line_to_label = dict(zip(lines, all_labels[len(stations) :]))
 
     edges = [(station_to_label[s], line_to_label[l], station_to_label[d]) for s, d, l in raw_edges]
     station_idx = {s: i for i, s in enumerate(stations)}

@@ -18,8 +18,8 @@ Datasets without a curriculum should return a 1-lesson curriculum.
 
 class BaseDataset:
     name = "base"
-    input_dim: int = None          # model input/output width (DNC input_size)
-    output_dim: int = None         # output_proj width
+    input_dim: int = None  # model input/output width (DNC input_size)
+    output_dim: int = None  # output_proj width
     advance_threshold: float = 0.85  # default accuracy floor for dynamic beta
 
     def make_curriculum(self):
@@ -46,7 +46,9 @@ class BaseDataset:
         """Memory-off eval on lesson `lesson_idx` -> (acc_pct, perfect_pct)"""
         raise NotImplementedError
 
-    def evaluate_id_combiner_stage_ablated(self, model, device, curriculum, lesson_idx, skip_stages):
+    def evaluate_id_combiner_stage_ablated(
+        self, model, device, curriculum, lesson_idx, skip_stages
+    ):
         """Combiner-stage-off eval on lesson `lesson_idx` -> (acc_pct, perfect_pct).
         Optional: only implemented by datasets/models with a multi-stage
         split-graph combiner (see SplitGraphDNC)."""

@@ -45,4 +45,4 @@ test *args:
 # ---- environment ----------------------------------------------------------------
 # Install CUDA-matched mamba-ssm / causal-conv1d and git pytorch-dnc (args: --dry-run, --skip ...)
 setup *args:
-    python -m initium.setup_wheels {{args}}
+    python -m setup_wheels {{args}}

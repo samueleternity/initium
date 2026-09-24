@@ -164,7 +164,7 @@ class Mamba2ControllerCell(nn.Module):
         )
         self.d_model = d_model
         self.d_inner = self.mamba2.d_inner
-        self.d_ssm = self.mamba2.d_ssm          # == d_inner here (d_ssm kwarg left at default None)
+        self.d_ssm = self.mamba2.d_ssm  # == d_inner here (d_ssm kwarg left at default None)
         self.d_state = self.mamba2.d_state
         self.d_conv = self.mamba2.d_conv
         self.headdim = self.mamba2.headdim
@@ -179,7 +179,9 @@ class Mamba2ControllerCell(nn.Module):
         rationale as the Mamba-1 cell (Mamba2.allocate_inference_cache's
         own convention is also zero)."""
         conv_state = torch.zeros(batch_size, self.conv_dim, self.d_conv, device=device, dtype=dtype)
-        ssm_state = torch.zeros(batch_size, self.nheads, self.headdim, self.d_state, device=device, dtype=dtype)
+        ssm_state = torch.zeros(
+            batch_size, self.nheads, self.headdim, self.d_state, device=device, dtype=dtype
+        )
         return conv_state, ssm_state
 
     def step(
@@ -200,7 +202,9 @@ class Mamba2ControllerCell(nn.Module):
         dtype = hidden_states.dtype
 
         # ---- parallel [z, x, B, C, dt] projection ------------------------
-        zxbcdt = m.in_proj(hidden_states)  # (B, 2*d_ssm + 2*ngroups*d_state + nheads), d_mlp==0 here
+        zxbcdt = m.in_proj(
+            hidden_states
+        )  # (B, 2*d_ssm + 2*ngroups*d_state + nheads), d_mlp==0 here
         z, xBC, dt = torch.split(
             zxbcdt, [self.d_ssm, self.d_ssm + 2 * self.ngroups * self.d_state, self.nheads], dim=-1
         )
@@ -215,7 +219,9 @@ class Mamba2ControllerCell(nn.Module):
             xBC = xBC + m.conv1d.bias
         xBC = m.act(xBC).to(dtype=dtype)
 
-        x, B, C = torch.split(xBC, [self.d_ssm, self.ngroups * self.d_state, self.ngroups * self.d_state], dim=-1)
+        x, B, C = torch.split(
+            xBC, [self.d_ssm, self.ngroups * self.d_state, self.ngroups * self.d_state], dim=-1
+        )
 
         # ---- SSD recurrence, forced fp32 (same chronic-NaN fix as the
         # Mamba-1 cell's step() -- ssm_state persists across an entire
@@ -228,28 +234,38 @@ class Mamba2ControllerCell(nn.Module):
             B32 = B.float()
             C32 = C.float()
             dt_bias32 = m.dt_bias.float()
-            A_log_c = m.A_log.float().clamp(min=-20.0, max=20.0)  # same lower-bound guard as Mamba-1's cell
-            A32 = -torch.exp(A_log_c)  # (nheads,) -- scalar-per-head, SSD's defining structure (paper Sec. 5.1)
+            A_log_c = m.A_log.float().clamp(
+                min=-20.0, max=20.0
+            )  # same lower-bound guard as Mamba-1's cell
+            A32 = -torch.exp(
+                A_log_c
+            )  # (nheads,) -- scalar-per-head, SSD's defining structure (paper Sec. 5.1)
 
             dt32 = F.softplus(dt32 + dt_bias32)  # (B, nheads)
-            dt32 = dt32.clamp(min=1e-6, max=100.0)  # normal dt is ~0.001-0.1, same bound as Mamba-1's cell
-            dA = torch.exp(dt32 * A32)  # (B, nheads) -- scalar decay per head, not per (channel,state)
+            dt32 = dt32.clamp(
+                min=1e-6, max=100.0
+            )  # normal dt is ~0.001-0.1, same bound as Mamba-1's cell
+            dA = torch.exp(
+                dt32 * A32
+            )  # (B, nheads) -- scalar decay per head, not per (channel,state)
 
-            x32 = x32.view(x32.shape[0], self.nheads, self.headdim)          # (B, H, P)
+            x32 = x32.view(x32.shape[0], self.nheads, self.headdim)  # (B, H, P)
             # ngroups == 1: B/C are shared across every head (Mamba-2's own
             # MVA-equivalent default here -- see module docstring).
-            B32 = B32.view(B32.shape[0], self.d_state)                        # (B, N)
-            C32 = C32.view(C32.shape[0], self.d_state)                        # (B, N)
+            B32 = B32.view(B32.shape[0], self.d_state)  # (B, N)
+            C32 = C32.view(C32.shape[0], self.d_state)  # (B, N)
 
-            dBx = torch.einsum("bh,bn,bhp->bhpn", dt32, B32, x32)             # (B, H, P, N)
+            dBx = torch.einsum("bh,bn,bhp->bhpn", dt32, B32, x32)  # (B, H, P, N)
             new_ssm_state32 = ssm_state.float() * dA.view(-1, self.nheads, 1, 1) + dBx
-            new_ssm_state32 = new_ssm_state32.clamp(min=-1e4, max=1e4)        # same hard stop as Mamba-1's cell
+            new_ssm_state32 = new_ssm_state32.clamp(
+                min=-1e4, max=1e4
+            )  # same hard stop as Mamba-1's cell
 
-            y32 = torch.einsum("bhpn,bn->bhp", new_ssm_state32, C32)          # (B, H, P)
+            y32 = torch.einsum("bhpn,bn->bhp", new_ssm_state32, C32)  # (B, H, P)
             y32 = y32 + m.D.float().view(1, self.nheads, 1) * x32
-            y32 = y32.reshape(y32.shape[0], self.d_ssm)                       # (B, d_ssm)
-            y32 = y32 * m.act(z).float()                                     # rmsnorm=False -> plain silu gate
-            y32 = y32.clamp(min=-1e4, max=1e4)                                # stay in fp16 range before out_proj
+            y32 = y32.reshape(y32.shape[0], self.d_ssm)  # (B, d_ssm)
+            y32 = y32 * m.act(z).float()  # rmsnorm=False -> plain silu gate
+            y32 = y32.clamp(min=-1e4, max=1e4)  # stay in fp16 range before out_proj
         new_ssm_state = new_ssm_state32.to(dtype)
         y = y32.to(dtype)
 
@@ -279,11 +295,20 @@ class Mamba2ControllerBlock(nn.Module):
         super().__init__()
         self.norm = nn.LayerNorm(d_model, device=device, dtype=dtype)
         self.cell = Mamba2ControllerCell(
-            d_model, d_state=d_state, d_conv=d_conv, expand=expand, headdim=headdim,
-            ngroups=ngroups, layer_idx=layer_idx, device=device, dtype=dtype,
+            d_model,
+            d_state=d_state,
+            d_conv=d_conv,
+            expand=expand,
+            headdim=headdim,
+            ngroups=ngroups,
+            layer_idx=layer_idx,
+            device=device,
+            dtype=dtype,
         )
 
-    def init_state(self, batch_size: int, device: torch.device | None = None, dtype: torch.dtype | None = None):
+    def init_state(
+        self, batch_size: int, device: torch.device | None = None, dtype: torch.dtype | None = None
+    ):
         return self.cell.init_state(batch_size, device=device, dtype=dtype)
 
     def step(self, x: torch.Tensor, state: tuple[torch.Tensor, torch.Tensor]):
@@ -327,13 +352,22 @@ class Mamba2ControllerWrapper(nn.Module):
         self.num_blocks = num_blocks
         # Same first-block-only dimension-matching adapter as MambaControllerWrapper.
         self.in_adapter: nn.Module = (
-            nn.Identity() if in_dim == d_model else nn.Linear(in_dim, d_model, device=device, dtype=dtype)
+            nn.Identity()
+            if in_dim == d_model
+            else nn.Linear(in_dim, d_model, device=device, dtype=dtype)
         )
         self.blocks = nn.ModuleList(
             [
                 Mamba2ControllerBlock(
-                    d_model, d_state=d_state, d_conv=d_conv, expand=expand, headdim=headdim,
-                    ngroups=ngroups, layer_idx=i, device=device, dtype=dtype,
+                    d_model,
+                    d_state=d_state,
+                    d_conv=d_conv,
+                    expand=expand,
+                    headdim=headdim,
+                    ngroups=ngroups,
+                    layer_idx=i,
+                    device=device,
+                    dtype=dtype,
                 )
                 for i in range(num_blocks)
             ]
@@ -349,13 +383,16 @@ class Mamba2ControllerWrapper(nn.Module):
                         expert_dim=moe_expert_dim,
                         capacity_factor=moe_capacity_factor,
                         load_balance_alpha=moe_load_balance_alpha,
-                        device=device, dtype=dtype,
+                        device=device,
+                        dtype=dtype,
                     )
                     for _ in range(num_blocks)
                 ]
             )
 
-    def init_state(self, batch_size: int, device: torch.device | None = None, dtype: torch.dtype | None = None):
+    def init_state(
+        self, batch_size: int, device: torch.device | None = None, dtype: torch.dtype | None = None
+    ):
         if device is None or dtype is None:
             p = next(self.parameters())
             device = device if device is not None else p.device

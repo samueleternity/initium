@@ -19,6 +19,7 @@ Robustness axis: additive noise -- softly blends the clean value one-hot
 with a second random one-hot, weighted by severity, instead of a hard
 digit flip.
 """
+
 import random
 
 import torch
@@ -27,8 +28,20 @@ from data.common.chain_task import KVChainDataset
 from data.common.real_data import build_audio_kv_pool, split_train_test_facts
 
 AUDIO_CURRICULUM = [
-    (3, 2), (3, 3), (5, 3), (5, 4), (8, 4), (8, 5),
-    (10, 5), (10, 6), (12, 6), (12, 7), (15, 8), (15, 9), (20, 10), (20, 12),
+    (3, 2),
+    (3, 3),
+    (5, 3),
+    (5, 4),
+    (8, 4),
+    (8, 5),
+    (10, 5),
+    (10, 6),
+    (12, 6),
+    (12, 7),
+    (15, 8),
+    (15, 9),
+    (20, 10),
+    (20, 12),
 ]
 AUDIO_LESSON_NR_CELLS = [128, 128, 128, 128, 160, 160, 160, 160, 192, 192, 192, 192, 256, 256]
 assert len(AUDIO_CURRICULUM) == len(AUDIO_LESSON_NR_CELLS)
@@ -55,9 +68,11 @@ class AudioChainDataset(KVChainDataset):
                 self._test_fact_pool = build_audio_kv_pool(test_dataset_link, self.label_range)
             else:
                 self._fact_pool, self._test_fact_pool = split_train_test_facts(pool)
-            print(f"[audio-chain] {len(self._fact_pool)} train facts from {dataset_link} | "
-                  f"{len(self._test_fact_pool)} test facts"
-                  + (f" from {test_dataset_link}" if test_dataset_link else " (held-out split)"))
+            print(
+                f"[audio-chain] {len(self._fact_pool)} train facts from {dataset_link} | "
+                f"{len(self._test_fact_pool)} test facts"
+                + (f" from {test_dataset_link}" if test_dataset_link else " (held-out split)")
+            )
         elif test_dataset_link is not None:
             # Inference-only: no training pool needed, just a fixed real
             # test pool -- every inference/tasks/*_task.py passes

@@ -10,6 +10,7 @@ graph_traversal.py itself is left untouched (it predates this module and is a
 validated Phase-2+ dataset not worth touching) - this is purely for NEW
 dataset modules to import from.
 """
+
 from __future__ import annotations
 
 import torch
@@ -20,7 +21,7 @@ class DigitCodec:
         self.num_digits = num_digits
         self.digit_base = digit_base
         self.label_dim = num_digits * digit_base
-        self.label_range = digit_base ** num_digits
+        self.label_range = digit_base**num_digits
 
     def encode_label(self, label) -> torch.Tensor:
         vec = torch.zeros(self.label_dim)
@@ -49,8 +50,13 @@ class DigitCodec:
         return val
 
 
-def digit_field_loss(output: torch.Tensor, target_digits: torch.Tensor,
-                      answer_mask: torch.Tensor, num_fields: int, digit_base: int) -> torch.Tensor:
+def digit_field_loss(
+    output: torch.Tensor,
+    target_digits: torch.Tensor,
+    answer_mask: torch.Tensor,
+    num_fields: int,
+    digit_base: int,
+) -> torch.Tensor:
     """Generalizes graph_traversal.digit_loss to an arbitrary field count
     (graph uses num_fields=3 [src,edge,dst]; the chain-task family uses 2
     [value,cumsum])."""
@@ -66,8 +72,9 @@ def digit_field_loss(output: torch.Tensor, target_digits: torch.Tensor,
     return total / denom
 
 
-def digit_field_diversity(output: torch.Tensor, answer_mask: torch.Tensor,
-                           num_digits_total: int, digit_base: int) -> float:
+def digit_field_diversity(
+    output: torch.Tensor, answer_mask: torch.Tensor, num_digits_total: int, digit_base: int
+) -> float:
     mask = answer_mask.bool()
     if mask.sum() == 0:
         return 0.0

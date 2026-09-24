@@ -12,9 +12,8 @@ on inputs [0, p). Requires reset_experience=True (identical start state) and a t
 that declares cache_boundaries. If several boundaries are declared, the LONGEST cached
 one is used (longest-prefix match) and the remaining ones are stored on the way.
 """
-from __future__ import annotations
 
-from typing import Optional, Tuple
+from __future__ import annotations
 
 from src.initium.inference.cache.base_cache import BaseCache, EpisodeCtx, ResumePoint
 from src.initium.inference.cache.state_utils import restore, snapshot
@@ -24,30 +23,35 @@ class PrefixStateCache(BaseCache):
     name = "prefix"
     wants_boundaries = True
 
-    def applicable(self, *, reset_experience: bool, resumable: bool) -> Tuple[bool, str]:
+    def applicable(self, *, reset_experience: bool, resumable: bool) -> tuple[bool, str]:
         if not reset_experience:
-            return False, ("needs reset_experience=True: in persistent mode every episode starts "
-                           "from a different state, so a prefix snapshot is never reusable")
+            return False, (
+                "needs reset_experience=True: in persistent mode every episode starts "
+                "from a different state, so a prefix snapshot is never reusable"
+            )
         if not resumable:
-            return False, ("this model cannot resume mid-sequence (SplitGraphDNC needs the "
-                           "start_step edit in split_graph_dnc.py)")
+            return False, (
+                "this model cannot resume mid-sequence (SplitGraphDNC needs the "
+                "start_step edit in split_graph_dnc.py)"
+            )
         return True, ""
 
     def _key_for(self, ctx: EpisodeCtx, boundary: int) -> str:
         return self._key(boundary, ctx.prefix_hash(boundary))
 
-    def find_resume(self, ctx: EpisodeCtx) -> Optional[ResumePoint]:
+    def find_resume(self, ctx: EpisodeCtx) -> ResumePoint | None:
         if not ctx.boundaries:
             return None
         self.stats.lookups += 1
-        for b in reversed(ctx.boundaries):                  # longest prefix first
+        for b in reversed(ctx.boundaries):  # longest prefix first
             got = self._get(self._key_for(ctx, b))
             if got is None:
                 continue
             entry, tier = got
             self.stats.hit(tier, entry["compute_ms"])
-            return ResumePoint(b, restore(entry["payload"], self.device),
-                               entry["compute_ms"], self.name)
+            return ResumePoint(
+                b, restore(entry["payload"], self.device), entry["compute_ms"], self.name
+            )
         self.stats.misses += 1
         return None
 

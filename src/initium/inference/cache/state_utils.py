@@ -7,10 +7,12 @@ ALWAYS deep-copied on both sides: Memory.reset(..., hidden) rebinds entries of t
 dict it is given and the write path rebinds them again, so a cached dict passed
 straight into forward() would silently change under us.
 """
+
 from __future__ import annotations
 
 import math
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 import torch
 
@@ -25,14 +27,14 @@ def tree_map(fn: Callable[[torch.Tensor], Any], obj: Any) -> Any:
     if isinstance(obj, tuple):
         items = [tree_map(fn, v) for v in obj]
         return type(obj)(*items) if hasattr(obj, "_fields") else tuple(items)
-    return obj                                   # None, numbers, strings
+    return obj  # None, numbers, strings
 
 
-def snapshot(tree: Any) -> Any:                  # -> independent CPU copy
+def snapshot(tree: Any) -> Any:  # -> independent CPU copy
     return tree_map(lambda t: t.detach().to("cpu", copy=True), tree)
 
 
-def restore(tree: Any, device: torch.device) -> Any:   # -> independent copy on `device`
+def restore(tree: Any, device: torch.device) -> Any:  # -> independent copy on `device`
     return tree_map(lambda t: t.detach().to(device, copy=True), tree)
 
 
@@ -45,7 +47,7 @@ def tree_nbytes(obj: Any) -> int:
         return obj.numel() * obj.element_size()
     if isinstance(obj, dict):
         return sum(tree_nbytes(v) for v in obj.values())
-    if isinstance(obj, (list, tuple)):
+    if isinstance(obj, list | tuple):
         return sum(tree_nbytes(v) for v in obj)
     return 0
 
@@ -63,7 +65,7 @@ def tree_max_abs_diff(a: Any, b: Any) -> float:
         if a.keys() != b.keys():
             return math.inf
         return max([0.0] + [tree_max_abs_diff(a[k], b[k]) for k in a])
-    if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
+    if isinstance(a, list | tuple) and isinstance(b, list | tuple):
         if len(a) != len(b):
             return math.inf
         return max([0.0] + [tree_max_abs_diff(x, y) for x, y in zip(a, b)])

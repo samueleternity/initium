@@ -15,10 +15,10 @@ Contract:
     score_episode(output, episode, verbose) -> EpisodeScore
         `output` is the post-output_proj (T, output_dim) CPU tensor.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List
 
 import torch
 
@@ -27,14 +27,14 @@ from src.initium.inference.metrics import EpisodeScore
 
 @dataclass
 class Episode:
-    input_seq: torch.Tensor          # (T, input_dim)
-    target: torch.Tensor             # task-defined, aligned with input_seq's time axis
-    mask: torch.Tensor               # (T,) 1 where a step is scored
+    input_seq: torch.Tensor  # (T, input_dim)
+    target: torch.Tensor  # task-defined, aligned with input_seq's time axis
+    mask: torch.Tensor  # (T,) 1 where a step is scored
     meta: dict = field(default_factory=dict)
     # Step indices where the model state may be snapshotted/reused (sorted). Everything
     # before a boundary is a static prefix identical across episodes; no scored step
     # (mask==1) may lie before a boundary. Empty -> nothing cacheable by the prefix cache.
-    cache_boundaries: List[int] = field(default_factory=list)
+    cache_boundaries: list[int] = field(default_factory=list)
 
 
 class BaseInferenceTask:
@@ -43,15 +43,17 @@ class BaseInferenceTask:
     input_dim: int = None
     output_dim: int = None
 
-    def build_episodes(self, n: int, rng, perturbation=None) -> List[Episode]:
+    def build_episodes(self, n: int, rng, perturbation=None) -> list[Episode]:
         """perturbation: optional dataset-defined robustness probe (see
         data/base_dataset.py's evaluate_robustness for the training-side
         analogue), e.g. {'kind': 'noise', 'severity': 0.1}. None (default)
         builds ordinary, unperturbed episodes -- purely additive, existing
         tasks ignore it unless they opt in."""
         raise NotImplementedError
-    
-    def score_episode(self, output: torch.Tensor, episode: Episode, verbose: bool = False) -> EpisodeScore:
+
+    def score_episode(
+        self, output: torch.Tensor, episode: Episode, verbose: bool = False
+    ) -> EpisodeScore:
         raise NotImplementedError
 
     def describe(self) -> str:

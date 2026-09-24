@@ -31,14 +31,16 @@ MAMBA3_HEADDIM = 64
 MAMBA3_ROPE_FRACTION = 0.5
 
 # CfC (LNN, ncps) -- CONTROLLER_TYPE == "cfc"
-CFC_MODE = "default"          # "default" | "pure" | "no_gate"
+CFC_MODE = "default"  # "default" | "pure" | "no_gate"
 CFC_BACKBONE_UNITS = 512
 CFC_BACKBONE_LAYERS = 1
 CFC_BACKBONE_DROPOUT = 0.0
 CFC_ACTIVATION = "lecun_tanh"
-CFC_MIXED_MEMORY = False      # True = CfC-mmRNN (adds an LSTM cell)
+CFC_MIXED_MEMORY = False  # True = CfC-mmRNN (adds an LSTM cell)
 CFC_RESIDUAL = True
-HYBRID_CFC_NUM_BLOCKS = 1     # CfC stage depth for "<mamba*>+cfc" (Mamba stage depth = num_hidden_layers)
+HYBRID_CFC_NUM_BLOCKS = (
+    1  # CfC stage depth for "<mamba*>+cfc" (Mamba stage depth = num_hidden_layers)
+)
 
 # ---- Option 4: MoE in controller (mamba / mamba2 / mamba3 only) --------------
 # num_experts >= 4 required by SwitchMoE; expert_dim None -> 3*hidden_size;
@@ -51,28 +53,28 @@ MOE_LOAD_BALANCE_ALPHA = 0.01
 
 # ---- Option 5: split-compute-graph controller (off unless --split-graph) ------
 SPLIT_GRAPH_ENABLED = False
-SPLIT_GRAPH_MAMBA_VARIANT = "mamba1"   # "mamba1" | "mamba2" | "mamba3" | "cfc" | "<mamba*>+cfc"
+SPLIT_GRAPH_MAMBA_VARIANT = "mamba1"  # "mamba1" | "mamba2" | "mamba3" | "cfc" | "<mamba*>+cfc"
 SPLIT_GRAPH_NUM_BLOCKS = 2
-SPLIT_GRAPH_MAMBA_HEADDIM = 64         # mamba2/3 only
-SPLIT_GRAPH_COMBINE_READS = True       # False = built-in ablation
-SPLIT_GRAPH_COMBINER_MODE = "linear"   # "linear" (default) | "controller"
+SPLIT_GRAPH_MAMBA_HEADDIM = 64  # mamba2/3 only
+SPLIT_GRAPH_COMBINE_READS = True  # False = built-in ablation
+SPLIT_GRAPH_COMBINER_MODE = "linear"  # "linear" (default) | "controller"
 SPLIT_GRAPH_COMBINER_VARIANT = "mamba1"
 SPLIT_GRAPH_COMBINER_NUM_BLOCKS = 1
 
 # ---- Option 1: link-matrix ablation/sparsification at fixed N -----------------
-LINK_MATRIX_MODE = "dense"          # "dense" | "ablated" | "sparse_topk"
-LINK_MATRIX_TOPK = None             # int, required only for "sparse_topk"
-ISOLATE_LINK_ABLATION = False       # True: hold nr_cells fixed at MODEL_NR_CELLS for the
-                                    # whole run so only the link-matrix change is measured
+LINK_MATRIX_MODE = "dense"  # "dense" | "ablated" | "sparse_topk"
+LINK_MATRIX_TOPK = None  # int, required only for "sparse_topk"
+ISOLATE_LINK_ABLATION = False  # True: hold nr_cells fixed at MODEL_NR_CELLS for the
+# whole run so only the link-matrix change is measured
 
 # ---- Dynamic-N, macro-scale (usage-triggered nr_cells growth between episodes) ---
 # Mutually exclusive with curriculum-indexed resize (the core overrides the
 # curriculum's lesson_nr_cells to a constant when this is on).
 DYNAMIC_N_MODE = False
-DYNAMIC_N_FLOOR = 128                 # starting nr_cells
-DYNAMIC_N_CEILING = 512               # hard ceiling (sparse-link approx only validated to 512)
-DYNAMIC_N_GROWTH_FACTOR = 2.0         # 128 -> 256 -> 512
-DYNAMIC_N_USAGE_HIGH = 0.90           # a cell counts as "saturated" above this usage
-DYNAMIC_N_TRIGGER_FRAC = 0.75         # growth when EMA of saturated fraction exceeds this
-DYNAMIC_N_EMA_DECAY = 0.98            # "sustained, not a single-step spike" window
-DYNAMIC_N_COOLDOWN_STEPS = 2000       # wait after a growth event before another
+DYNAMIC_N_FLOOR = 128  # starting nr_cells
+DYNAMIC_N_CEILING = 512  # hard ceiling (sparse-link approx only validated to 512)
+DYNAMIC_N_GROWTH_FACTOR = 2.0  # 128 -> 256 -> 512
+DYNAMIC_N_USAGE_HIGH = 0.90  # a cell counts as "saturated" above this usage
+DYNAMIC_N_TRIGGER_FRAC = 0.75  # growth when EMA of saturated fraction exceeds this
+DYNAMIC_N_EMA_DECAY = 0.98  # "sustained, not a single-step spike" window
+DYNAMIC_N_COOLDOWN_STEPS = 2000  # wait after a growth event before another

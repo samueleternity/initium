@@ -11,10 +11,11 @@ Two hook families:
                   only used when the caches' `wants_boundaries` is True and the
                   episode declares cache_boundaries)
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import torch
 
@@ -26,12 +27,12 @@ from src.initium.inference.cache.stores import CacheStats, TieredStore
 @dataclass
 class EpisodeCtx:
     index: int
-    episode: Any                       # inference.tasks.base_task.Episode
+    episode: Any  # inference.tasks.base_task.Episode
     reset_experience: bool
-    in_hash: str                       # hash of the episode's full input sequence
-    chain: str                         # "root" in fresh mode; history hash in persistent mode
-    boundaries: List[int] = field(default_factory=list)   # validated cut points
-    _prefix_hashes: Dict[int, str] = field(default_factory=dict, repr=False)
+    in_hash: str  # hash of the episode's full input sequence
+    chain: str  # "root" in fresh mode; history hash in persistent mode
+    boundaries: list[int] = field(default_factory=list)  # validated cut points
+    _prefix_hashes: dict[int, str] = field(default_factory=dict, repr=False)
 
     def prefix_hash(self, boundary: int) -> str:
         h = self._prefix_hashes.get(boundary)
@@ -42,14 +43,14 @@ class EpisodeCtx:
 
 @dataclass
 class EpisodeHit:
-    output: torch.Tensor               # (T, output_dim) CPU float
-    hidden: Any                        # restored state (persistent mode) or None
+    output: torch.Tensor  # (T, output_dim) CPU float
+    hidden: Any  # restored state (persistent mode) or None
     saved_ms: float
 
 
 @dataclass
 class ResumePoint:
-    position: int                      # steps [0, position) are already reflected in `hidden`
+    position: int  # steps [0, position) are already reflected in `hidden`
     hidden: Any
     saved_ms: float
     cache_name: str
@@ -64,20 +65,23 @@ class BaseCache:
         self.stats = CacheStats()
 
     # ---- hooks ----------------------------------------------------------------
-    def applicable(self, *, reset_experience: bool, resumable: bool) -> Tuple[bool, str]:
+    def applicable(self, *, reset_experience: bool, resumable: bool) -> tuple[bool, str]:
         return True, ""
 
-    def lookup_episode(self, ctx: EpisodeCtx) -> Optional[EpisodeHit]:
+    def lookup_episode(self, ctx: EpisodeCtx) -> EpisodeHit | None:
         return None
 
-    def store_episode(self, ctx: EpisodeCtx, output: torch.Tensor, hidden_after: Any,
-                      compute_ms: float) -> None:
+    def store_episode(
+        self, ctx: EpisodeCtx, output: torch.Tensor, hidden_after: Any, compute_ms: float
+    ) -> None:
         pass
 
-    def find_resume(self, ctx: EpisodeCtx) -> Optional[ResumePoint]:
+    def find_resume(self, ctx: EpisodeCtx) -> ResumePoint | None:
         return None
 
-    def store_boundary(self, ctx: EpisodeCtx, boundary: int, hidden: Any, compute_ms: float) -> None:
+    def store_boundary(
+        self, ctx: EpisodeCtx, boundary: int, hidden: Any, compute_ms: float
+    ) -> None:
         pass
 
     # ---- helpers --------------------------------------------------------------
@@ -95,7 +99,14 @@ class BaseCache:
 
     def _put(self, key: str, payload: Any, compute_ms: float) -> None:
         nbytes = tree_nbytes(payload)
-        self.store.put(key, {"payload": payload, "compute_ms": float(compute_ms),
-                             "nbytes": nbytes, "kind": self.name})
+        self.store.put(
+            key,
+            {
+                "payload": payload,
+                "compute_ms": float(compute_ms),
+                "nbytes": nbytes,
+                "kind": self.name,
+            },
+        )
         self.stats.stores += 1
         self.stats.bytes_stored += nbytes

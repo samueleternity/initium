@@ -28,23 +28,29 @@ VIDEO_ALIASES = ("video",)
 MULTIMODAL_ALIASES = ("multimodal", "multi-modal", "multi_modal")
 
 
-def get_dataset(dataset_type: str = "graph", dataset_link: str = None,
-                test_dataset_link: str = None, **kwargs):
+def get_dataset(
+    dataset_type: str = "graph", dataset_link: str = None, test_dataset_link: str = None, **kwargs
+):
     t = (dataset_type or "graph").lower()
     if t in GRAPH_ALIASES:
         from data.graph_traversal.graph_traversal import GraphTraversalDataset
+
         link = None if dataset_link in (None, "graph-traversal") else dataset_link
         return GraphTraversalDataset(dataset_link=link, test_dataset_link=test_dataset_link)
     if t in TEXT_ALIASES:
         from data.text.text_dataset import TextChainDataset
+
         return TextChainDataset(dataset_link=dataset_link, test_dataset_link=test_dataset_link)
     if t in AUDIO_ALIASES:
         from data.audio.audio_dataset import AudioChainDataset
+
         return AudioChainDataset(dataset_link=dataset_link, test_dataset_link=test_dataset_link)
     if t in VIDEO_ALIASES:
         from data.video.video_dataset import VideoChainDataset
+
         return VideoChainDataset(dataset_link=dataset_link, test_dataset_link=test_dataset_link)
     if t in MULTIMODAL_ALIASES:
         from data.multimodal.multimodal_dataset import MultimodalDataset
+
         return MultimodalDataset((dataset_link or "text+audio").split("+"))
     raise ValueError(f"unknown dataset type {dataset_type!r}")

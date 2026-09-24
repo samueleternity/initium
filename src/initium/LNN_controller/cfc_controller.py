@@ -22,6 +22,7 @@ or a stage in a ChainedControllerWrapper.
 Block = pre-norm residual (Add -> LN -> CfC), same pattern as the Mamba blocks.
 State per block: h (B, units) fp32, or (h, c) if mixed_memory=True (CfC-mmRNN).
 """
+
 from __future__ import annotations
 
 import torch
@@ -52,9 +53,20 @@ def _state_to_fp32(state):
 
 
 class CfCControllerBlock(nn.Module):
-    def __init__(self, d_model, units=None, mode="default", backbone_units=512,
-                 backbone_layers=1, backbone_dropout=0.0, activation="lecun_tanh",
-                 mixed_memory=False, residual=True, device=None, dtype=None):
+    def __init__(
+        self,
+        d_model,
+        units=None,
+        mode="default",
+        backbone_units=512,
+        backbone_layers=1,
+        backbone_dropout=0.0,
+        activation="lecun_tanh",
+        mixed_memory=False,
+        residual=True,
+        device=None,
+        dtype=None,
+    ):
         super().__init__()
         _require_ncps()
         units = d_model if units is None else units
@@ -62,11 +74,19 @@ class CfCControllerBlock(nn.Module):
         self.mixed_memory, self.residual = mixed_memory, residual
         self.norm = nn.LayerNorm(d_model, device=device, dtype=dtype)
         self.cfc = CfC(
-            input_size=d_model, units=units,
-            proj_size=None if units == d_model else d_model,  # project back to d_model if state is wider/narrower
-            return_sequences=True, batch_first=True, mixed_memory=mixed_memory,
-            mode=mode, activation=activation, backbone_units=backbone_units,
-            backbone_layers=backbone_layers, backbone_dropout=backbone_dropout,
+            input_size=d_model,
+            units=units,
+            proj_size=None
+            if units == d_model
+            else d_model,  # project back to d_model if state is wider/narrower
+            return_sequences=True,
+            batch_first=True,
+            mixed_memory=mixed_memory,
+            mode=mode,
+            activation=activation,
+            backbone_units=backbone_units,
+            backbone_layers=backbone_layers,
+            backbone_dropout=backbone_dropout,
         )
         if device is not None or dtype is not None:
             self.cfc.to(device=device, dtype=dtype)
@@ -78,8 +98,10 @@ class CfCControllerBlock(nn.Module):
 
     def step(self, x, state):
         with torch.autocast(device_type=x.device.type, enabled=False):
-            out, new_state = self.cfc(self.norm(x.float()).unsqueeze(1), 
-                                        _state_to_fp32(state) if state is not None else None)
+            out, new_state = self.cfc(
+                self.norm(x.float()).unsqueeze(1),
+                _state_to_fp32(state) if state is not None else None,
+            )
         out = out.squeeze(1).clamp(min=-1e4, max=1e4)
         y = x + out.to(x.dtype) if self.residual else out.to(x.dtype)
         return y, _state_to_fp32(new_state)
@@ -89,22 +111,47 @@ class CfCControllerWrapper(nn.Module):
     """Stack of `num_blocks` CfCControllerBlocks with the nn.LSTM-compatible
     call convention DNC._layer_forward expects (see module docstring)."""
 
-    def __init__(self, in_dim, d_model, num_blocks=2, units=None, mode="default",
-                 backbone_units=512, backbone_layers=1, backbone_dropout=0.0,
-                 activation="lecun_tanh", mixed_memory=False, residual=True,
-                 device=None, dtype=None):
+    def __init__(
+        self,
+        in_dim,
+        d_model,
+        num_blocks=2,
+        units=None,
+        mode="default",
+        backbone_units=512,
+        backbone_layers=1,
+        backbone_dropout=0.0,
+        activation="lecun_tanh",
+        mixed_memory=False,
+        residual=True,
+        device=None,
+        dtype=None,
+    ):
         super().__init__()
         self.d_model, self.num_blocks = d_model, num_blocks
         self.in_adapter: nn.Module = (
-            nn.Identity() if in_dim == d_model else nn.Linear(in_dim, d_model, device=device, dtype=dtype)
+            nn.Identity()
+            if in_dim == d_model
+            else nn.Linear(in_dim, d_model, device=device, dtype=dtype)
         )
-        self.blocks = nn.ModuleList([
-            CfCControllerBlock(d_model, units=units, mode=mode, backbone_units=backbone_units,
-                               backbone_layers=backbone_layers, backbone_dropout=backbone_dropout,
-                               activation=activation, mixed_memory=mixed_memory, residual=residual,
-                               device=device, dtype=dtype)
-            for _ in range(num_blocks)
-        ])
+        self.blocks = nn.ModuleList(
+            [
+                CfCControllerBlock(
+                    d_model,
+                    units=units,
+                    mode=mode,
+                    backbone_units=backbone_units,
+                    backbone_layers=backbone_layers,
+                    backbone_dropout=backbone_dropout,
+                    activation=activation,
+                    mixed_memory=mixed_memory,
+                    residual=residual,
+                    device=device,
+                    dtype=dtype,
+                )
+                for _ in range(num_blocks)
+            ]
+        )
         # MoE deliberately not wired (Concept 16/SP-10 isolation); attributes exist so
         # MambaDNC / ChainedControllerWrapper can read them uniformly.
         self.moe_enabled = False
@@ -130,8 +177,11 @@ class CfCControllerWrapper(nn.Module):
         return x.unsqueeze(1), new_hx
 
 
-if __name__ == "__main__":  # smoke test: python -m LNN_controller.cfc_controller (from project root)
+if (
+    __name__ == "__main__"
+):  # smoke test: python -m LNN_controller.cfc_controller (from project root)
     from src.initium.LNN_controller.chained_controller import ChainedControllerWrapper
+
     B, T, in_dim, d = 4, 6, 40, 32
     for mm in (False, True):
         w = CfCControllerWrapper(in_dim, d, num_blocks=2, backbone_units=64, mixed_memory=mm)
@@ -142,8 +192,12 @@ if __name__ == "__main__":  # smoke test: python -m LNN_controller.cfc_controlle
             loss = loss + out.pow(2).mean()
         loss.backward()  # BPTT across chained steps must not raise
         print(f"standalone mixed_memory={mm}: OK (loss {float(loss):.4f})")
-    ch = ChainedControllerWrapper([CfCControllerWrapper(in_dim, d, 1, backbone_units=64),
-                                   CfCControllerWrapper(d, d, 1, backbone_units=64)])
+    ch = ChainedControllerWrapper(
+        [
+            CfCControllerWrapper(in_dim, d, 1, backbone_units=64),
+            CfCControllerWrapper(d, d, 1, backbone_units=64),
+        ]
+    )
     hx, loss = ch.init_state(B), 0.0
     for _ in range(T):
         out, hx = ch(torch.randn(B, 1, in_dim), hx)

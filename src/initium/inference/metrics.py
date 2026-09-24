@@ -6,21 +6,22 @@ returns an EpisodeScore; everything downstream (breakdowns, windows,
 adaptation trend, logging) only ever sees EpisodeScore, so a new task type
 needs no changes here.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Tuple
+from typing import Any
 
 import numpy as np
 
 
 @dataclass
 class EpisodeScore:
-    n_items: int                     # scored items in the episode (graph: answer triples)
+    n_items: int  # scored items in the episode (graph: answer triples)
     n_correct: int
-    perfect: bool                    # every item correct
-    group: Any = None                # bucket key for breakdowns (graph: walk length / hop count)
-    fields: Dict[str, Tuple[int, int]] = field(default_factory=dict)  # name -> (correct, total)
+    perfect: bool  # every item correct
+    group: Any = None  # bucket key for breakdowns (graph: walk length / hop count)
+    fields: dict[str, tuple[int, int]] = field(default_factory=dict)  # name -> (correct, total)
 
     @property
     def item_acc(self) -> float:
@@ -33,16 +34,17 @@ class EpisodeResult:
     score: EpisodeScore
     elapsed_ms: float
     reset_experience: bool
-    cache_event: str = ""            # "", "miss", "hit:result", "hit:prefix@22", ...
+    cache_event: str = ""  # "", "miss", "hit:result", "hit:prefix@22", ...
 
-def aggregate(scores: List[EpisodeScore]) -> dict:
+
+def aggregate(scores: list[EpisodeScore]) -> dict:
     n_eps = len(scores)
     n_items = sum(s.n_items for s in scores)
     n_correct = sum(s.n_correct for s in scores)
     n_perfect = sum(int(s.perfect) for s in scores)
 
-    by_group: Dict[Any, List[int]] = {}
-    field_tot: Dict[str, List[int]] = {}
+    by_group: dict[Any, list[int]] = {}
+    field_tot: dict[str, list[int]] = {}
     for s in scores:
         if s.group is not None:
             g = by_group.setdefault(s.group, [0, 0, 0, 0])
@@ -60,28 +62,30 @@ def aggregate(scores: List[EpisodeScore]) -> dict:
         "item_acc": 100.0 * n_correct / max(n_items, 1),
         "perfect_frac": 100.0 * n_perfect / max(n_eps, 1),
         "by_group": {
-            g: {"item_acc": 100.0 * v[1] / max(v[0], 1),
+            g: {
+                "item_acc": 100.0 * v[1] / max(v[0], 1),
                 "perfect_frac": 100.0 * v[3] / max(v[2], 1),
-                "n_episodes": v[2]}
+                "n_episodes": v[2],
+            }
             for g, v in sorted(by_group.items())
         },
         "field_acc": {n: 100.0 * c / max(t, 1) for n, (c, t) in field_tot.items()},
     }
 
 
-def windowed(scores: List[EpisodeScore], window: int) -> List[dict]:
+def windowed(scores: list[EpisodeScore], window: int) -> list[dict]:
     """Aggregate consecutive chunks of `window` episodes (persistent-mode adaptation view)."""
     window = max(1, window)
     out = []
     for w, start in enumerate(range(0, len(scores), window)):
-        chunk = scores[start:start + window]
+        chunk = scores[start : start + window]
         agg = aggregate(chunk)
         agg.update(window_index=w, start_episode=start, end_episode=start + len(chunk) - 1)
         out.append(agg)
     return out
 
 
-def adaptation_trend(scores: List[EpisodeScore], window: int) -> dict:
+def adaptation_trend(scores: list[EpisodeScore], window: int) -> dict:
     """First-window vs last-window accuracy and a least-squares slope of
     per-episode accuracy -- a compact 'did it adapt mid-inference' read."""
     if len(scores) < 2:

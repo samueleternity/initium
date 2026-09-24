@@ -120,10 +120,19 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         description="Install CUDA-matched mamba-ssm / causal-conv1d wheels and pytorch-dnc (git).",
     )
     p.add_argument("--installer", choices=("auto", "pip", "uv"), default="auto")
-    p.add_argument("--skip", nargs="+", choices=SKIPPABLE, default=[], metavar="STEP",
-                   help=f"steps to skip: {', '.join(SKIPPABLE)}")
-    p.add_argument("--wheel-index", default=WHEEL_INDEX_TEMPLATE,
-                   help="wheel index URL; may contain the {cuda_tag} placeholder (e.g. cu128)")
+    p.add_argument(
+        "--skip",
+        nargs="+",
+        choices=SKIPPABLE,
+        default=[],
+        metavar="STEP",
+        help=f"steps to skip: {', '.join(SKIPPABLE)}",
+    )
+    p.add_argument(
+        "--wheel-index",
+        default=WHEEL_INDEX_TEMPLATE,
+        help="wheel index URL; may contain the {cuda_tag} placeholder (e.g. cu128)",
+    )
     p.add_argument("--force", action="store_true", help="reinstall even if already satisfied")
     p.add_argument("--dry-run", action="store_true", help="print commands without running them")
     return p.parse_args(argv)

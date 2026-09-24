@@ -102,6 +102,7 @@ else:
     _MAMBA3_IMPORT_ERROR = None
 
 import os as _os
+
 # bf16 (the repo's own precision) when the GPU supports it; otherwise the fp32-under-fp16-autocast trick.
 _MAMBA3_BF16_OK = (
     torch.cuda.is_available()
@@ -118,8 +119,9 @@ def _require_variant(variant: str) -> None:
     if variant == "mamba3" and Mamba3 is None:
         raise ImportError(_MAMBA3_IMPORT_ERROR)
     if variant not in ("mamba1", "mamba2", "mamba3"):
-        raise ValueError(f"mamba_backbone_parallel: unknown variant {variant!r}, "
-                          "expected 'mamba1' or 'mamba2'.")
+        raise ValueError(
+            f"mamba_backbone_parallel: unknown variant {variant!r}, expected 'mamba1' or 'mamba2'."
+        )
 
 
 class _ParallelBlock(nn.Module):
@@ -132,8 +134,14 @@ class _ParallelBlock(nn.Module):
     call.
     """
 
-    def __init__(self, d_model: int, variant: str, mamba_kwargs: dict,
-                 device: torch.device | None = None, dtype: torch.dtype | None = None):
+    def __init__(
+        self,
+        d_model: int,
+        variant: str,
+        mamba_kwargs: dict,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ):
         super().__init__()
         _require_variant(variant)
         self.norm = nn.LayerNorm(d_model, device=device, dtype=dtype)
@@ -218,7 +226,9 @@ class MambaBackboneParallel(nn.Module):
         # applied to the WHOLE sequence at once (a single
         # (B, L, in_dim) -> (B, L, d_model) matmul), not per-timestep.
         self.in_adapter: nn.Module = (
-            nn.Identity() if in_dim == d_model else nn.Linear(in_dim, d_model, device=device, dtype=dtype)
+            nn.Identity()
+            if in_dim == d_model
+            else nn.Linear(in_dim, d_model, device=device, dtype=dtype)
         )
 
         mamba_kwargs = dict(d_state=d_state, d_conv=d_conv, expand=expand)
@@ -226,11 +236,15 @@ class MambaBackboneParallel(nn.Module):
             mamba_kwargs["headdim"] = headdim
         if variant == "mamba3":
             mamba_kwargs["headdim"] = headdim
-            mamba_kwargs["chunk_size"] = 64 if _MAMBA3_BF16_OK else 32  # repo: 64 bf16 / 32 otherwise
+            mamba_kwargs["chunk_size"] = (
+                64 if _MAMBA3_BF16_OK else 32
+            )  # repo: 64 bf16 / 32 otherwise
 
         self.blocks = nn.ModuleList(
-            [_ParallelBlock(d_model, variant, mamba_kwargs, device=device, dtype=dtype)
-             for _ in range(num_blocks)]
+            [
+                _ParallelBlock(d_model, variant, mamba_kwargs, device=device, dtype=dtype)
+                for _ in range(num_blocks)
+            ]
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

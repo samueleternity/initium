@@ -184,12 +184,14 @@ class StochasticWriteHead(nn.Module):
             mu_ok = torch.isfinite(mu).all()
             logvar_ok = torch.isfinite(logvar).all()
             if not (x_ok and mu_ok and logvar_ok):
-                print(f"[NaN-TRACE] StochasticWriteHead.forward: "
-                      f"x_finite={bool(x_ok)} mu_finite={bool(mu_ok)} "
-                      f"logvar_finite={bool(logvar_ok)} | "
-                      f"x.abs().max()={x.abs().max().item() if x_ok else float('nan')} "
-                      f"mu.abs().max()={mu.abs().max().item() if mu_ok else float('nan')} "
-                      f"logvar.abs().max()={logvar.abs().max().item() if logvar_ok else float('nan')}")
+                print(
+                    f"[NaN-TRACE] StochasticWriteHead.forward: "
+                    f"x_finite={bool(x_ok)} mu_finite={bool(mu_ok)} "
+                    f"logvar_finite={bool(logvar_ok)} | "
+                    f"x.abs().max()={x.abs().max().item() if x_ok else float('nan')} "
+                    f"mu.abs().max()={mu.abs().max().item() if mu_ok else float('nan')} "
+                    f"logvar.abs().max()={logvar.abs().max().item() if logvar_ok else float('nan')}"
+                )
 
         if self.sample:
             # Clamp for numerical stability (matters under AMP/fp16 autocast).
@@ -255,8 +257,12 @@ class StochasticWriteHead(nn.Module):
         if not self._kl_terms:
             zero = torch.zeros((), device=self.mu_transform.weight.device)
             return zero, {
-                "kl_mean": 0.0, "kl_max": 0.0, "kl_min": 0.0, "kl_std": 0.0,
-                "clamp_frac": 0.0, "floor_frac": 0.0,
+                "kl_mean": 0.0,
+                "kl_max": 0.0,
+                "kl_min": 0.0,
+                "kl_std": 0.0,
+                "clamp_frac": 0.0,
+                "floor_frac": 0.0,
                 "snapshot_step": self.last_snapshot_step,
             }
 
@@ -270,19 +276,20 @@ class StochasticWriteHead(nn.Module):
             "kl_min": kl_stack.min().item(),
             "kl_std": kl_stack.std().item(),
             "clamp_frac": torch.cat([t.flatten() for t in self._clamp_terms]).mean().item()
-                        if self._clamp_terms else 0.0,
+            if self._clamp_terms
+            else 0.0,
             "floor_frac": (kl_stack <= free_bits).float().mean().item() if free_bits > 0 else 0.0,
             "snapshot_step": self.last_snapshot_step,  # v2: audit tag, see module docstring point 6
         }
 
         if free_bits > 0:
-            floor_frac = (kl_stack <= free_bits).float().mean().item()  # diagnostic, unchanged: per-dim rate
-            per_step_kl = kl_stack.sum(dim=-1)                # (T*B,) — sum over dims, pre-clamp
-            free_bits_total = free_bits * kl_stack.shape[-1]  # scale per-dim threshold to the summed budget
+            per_step_kl = kl_stack.sum(dim=-1)  # (T*B,) — sum over dims, pre-clamp
+            free_bits_total = (
+                free_bits * kl_stack.shape[-1]
+            )  # scale per-dim threshold to the summed budget
             per_step_kl = torch.clamp(per_step_kl, min=free_bits_total)
             loss = per_step_kl.mean()
         else:
-            floor_frac = 0.0
             loss = kl_stack.sum(dim=-1).mean()
 
         self._kl_terms = []
@@ -437,7 +444,14 @@ def pop_total_kl(heads: list[StochasticWriteHead], free_bits: float = 0.0):
     head's snapshot is).
     """
     total = None
-    merged = {"kl_mean": [], "kl_max": [], "kl_min": [], "kl_std": [], "clamp_frac": [], "floor_frac": []}
+    merged = {
+        "kl_mean": [],
+        "kl_max": [],
+        "kl_min": [],
+        "kl_std": [],
+        "clamp_frac": [],
+        "floor_frac": [],
+    }
     snapshot_steps = []
     for h in heads:
         loss, diag = h.pop_kl(free_bits=free_bits)
@@ -466,10 +480,19 @@ def update_all_prior_snapshots(
     on its PRIOR_SNAPSHOT_EVERY cadence, outside of any per-step backward
     pass.
     """
-    per_head = [h.update_prior_snapshot(step, min_logvar=min_logvar, max_logvar=max_logvar)
-                for h in heads]
-    keys = ["mu_g_norm", "sigma_g_mean", "sigma_g_min", "sigma_g_max", "trace_sigma_g",
-            "raw_var_mean", "raw_var_max", "raw_hi_frac"]
+    per_head = [
+        h.update_prior_snapshot(step, min_logvar=min_logvar, max_logvar=max_logvar) for h in heads
+    ]
+    keys = [
+        "mu_g_norm",
+        "sigma_g_mean",
+        "sigma_g_min",
+        "sigma_g_max",
+        "trace_sigma_g",
+        "raw_var_mean",
+        "raw_var_max",
+        "raw_hi_frac",
+    ]
     merged = {k: sum(d[k] for d in per_head) / len(per_head) for k in keys}
     merged["n_samples"] = sum(d["n_samples"] for d in per_head)
     merged["snapshot_step"] = step

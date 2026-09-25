@@ -47,7 +47,7 @@ HYBRID_CFC_NUM_BLOCKS = (
 # alpha=0.01 is Switch Transformers' tuned value.
 MOE_ENABLED = False
 MOE_NUM_EXPERTS = 8
-MOE_EXPERT_DIM = None
+MOE_EXPERT_DIM: int | None = None
 MOE_CAPACITY_FACTOR = 1.5
 MOE_LOAD_BALANCE_ALPHA = 0.01
 MOE_LOAD_BALANCE_ALPHA = 0.01
@@ -69,7 +69,7 @@ SPLIT_GRAPH_COMBINER_NUM_BLOCKS = 1
 
 # ---- Option 1: link-matrix ablation/sparsification at fixed N -----------------
 LINK_MATRIX_MODE = "dense"  # "dense" | "ablated" | "sparse_topk"
-LINK_MATRIX_TOPK = None  # int, required only for "sparse_topk"
+LINK_MATRIX_TOPK: int | None = None  # int, required only for "sparse_topk"
 ISOLATE_LINK_ABLATION = False  # True: hold nr_cells fixed at MODEL_NR_CELLS for the
 # whole run so only the link-matrix change is measured
 

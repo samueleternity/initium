@@ -81,7 +81,7 @@ if (
         except ImportError as e:
             print(f"{spec}: SKIPPED ({e})")
             continue
-        hx, loss = w.init_state(B), 0.0
+        hx, loss = w.init_state(B), torch.zeros(())
         for _ in range(T):
             out, hx = w(torch.randn(B, 1, in_dim), hx)
             assert out.shape == (B, 1, d), out.shape

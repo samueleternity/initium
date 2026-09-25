@@ -64,10 +64,15 @@ mamba_controller.py.
 
 from __future__ import annotations
 
+import os as _os
+
 import torch
 import torch.nn as nn
-
 from MoE.moe_layer import MoEBlock
+
+_MAMBA1_IMPORT_ERROR: str | None
+_MAMBA2_IMPORT_ERROR: str | None
+_MAMBA3_IMPORT_ERROR: str | None
 
 try:
     from mamba_ssm.modules.mamba_simple import Mamba as Mamba1
@@ -102,8 +107,6 @@ except ImportError as _mamba3_err:  # pragma: no cover - environment-dependent
     )
 else:
     _MAMBA3_IMPORT_ERROR = None
-
-import os as _os
 
 # bf16 (the repo's own precision) when the GPU supports it; otherwise the fp32-under-fp16-autocast trick.
 _MAMBA3_BF16_OK = (
@@ -282,5 +285,6 @@ class MambaBackboneParallel(nn.Module):
         for i, block in enumerate(self.blocks):
             h = block(h)
             if self.moe_enabled:
+                assert self.moe_blocks is not None
                 h = self.moe_blocks[i](h)
         return h

@@ -27,8 +27,9 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
-
 from MoE.moe_layer import MoEBlock, MultiSourceMoEBlock
+
+_NCPS_IMPORT_ERROR: str | None
 
 try:
     from ncps.torch import CfC
@@ -257,6 +258,7 @@ class CfCControllerWrapper(nn.Module):
         for i, (block, state) in enumerate(zip(self.blocks, hx)):
             x, new_state = block.step(x, state)
             if self.moe_enabled:
+                assert self.moe_blocks is not None
                 x = self.moe_blocks[i](x)
             new_hx.append(new_state)
         return x.unsqueeze(1), new_hx
@@ -274,6 +276,7 @@ class CfCControllerWrapper(nn.Module):
         (CfC block internals are completely unchanged)."""
         if self.moe_source_dims is None:
             raise RuntimeError("forward_multi_source requires moe_source_dims to have been set")
+        assert self.source_in_adapters is not None and self.moe_blocks is not None
         projected = [adapter(s) for adapter, s in zip(self.source_in_adapters, sources)]
         fused_per_source = self.moe_blocks[0](projected)  # list[Tensor], one per source
         x = torch.stack(fused_per_source, dim=0).sum(dim=0)  # combine into one fused input
@@ -294,7 +297,7 @@ if (
     B, T, in_dim, d = 4, 6, 40, 32
     for mm in (False, True):
         w = CfCControllerWrapper(in_dim, d, num_blocks=2, backbone_units=64, mixed_memory=mm)
-        hx, loss = w.init_state(B), 0.0
+        hx, loss = w.init_state(B), torch.zeros(())
         for _ in range(T):
             out, hx = w(torch.randn(B, 1, in_dim), hx)
             assert out.shape == (B, 1, d), out.shape
@@ -307,7 +310,7 @@ if (
             CfCControllerWrapper(d, d, 1, backbone_units=64),
         ]
     )
-    hx, loss = ch.init_state(B), 0.0
+    hx, loss = ch.init_state(B), torch.zeros(())
     for _ in range(T):
         out, hx = ch(torch.randn(B, 1, in_dim), hx)
         loss = loss + out.pow(2).mean()

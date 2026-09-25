@@ -47,7 +47,7 @@ assert len(TEXT_CURRICULUM) == len(TEXT_LESSON_NR_CELLS)
 class TextChainDataset(KVChainDataset):
     name = "text-chain"
 
-    def __init__(self, dataset_link: str = None, test_dataset_link: str = None):
+    def __init__(self, dataset_link: str | None = None, test_dataset_link: str | None = None):
         self._table = TEXT_CURRICULUM
         self._lesson_nr_cells = TEXT_LESSON_NR_CELLS
         self._fact_pool = None

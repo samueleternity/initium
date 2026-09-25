@@ -51,7 +51,7 @@ assert len(VIDEO_CURRICULUM) == len(VIDEO_LESSON_NR_CELLS)
 class VideoChainDataset(KVChainDataset):
     name = "video-chain"
 
-    def __init__(self, dataset_link: str = None, test_dataset_link: str = None):
+    def __init__(self, dataset_link: str | None = None, test_dataset_link: str | None = None):
         self._table = VIDEO_CURRICULUM
         self._lesson_nr_cells = VIDEO_LESSON_NR_CELLS
         self._fact_pool = None

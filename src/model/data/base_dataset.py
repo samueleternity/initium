@@ -18,8 +18,8 @@ Datasets without a curriculum should return a 1-lesson curriculum.
 
 class BaseDataset:
     name = "base"
-    input_dim: int = None  # model input/output width (DNC input_size)
-    output_dim: int = None  # output_proj width
+    input_dim: int | None = None  # model input/output width (DNC input_size)
+    output_dim: int | None = None  # output_proj width
     advance_threshold: float = 0.85  # default accuracy floor for dynamic beta
 
     def make_curriculum(self):

@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
-
 from LNN_controller.cfc_controller import CfC, _require_ncps
 from mamba_controller.mamba_backbone_parallel import MambaBackboneParallel
 from MoE.moe_layer import MoEBlock
@@ -156,6 +155,7 @@ class CfCBackboneParallel(nn.Module):
         for i, block in enumerate(self.blocks):
             h = block(h)
             if self.moe_enabled:
+                assert self.moe_blocks is not None
                 h = self.moe_blocks[i](h)
         return h
 
@@ -186,14 +186,6 @@ def build_parallel_backbone(
             f"build_parallel_backbone: unknown variant part(s) {bad} in {variant!r}, "
             f"expected '+'-joined parts of {_BACKBONE_KINDS}"
         )
-    moe_kw = dict(
-        moe_enabled=moe_enabled,
-        moe_num_experts=moe_num_experts,
-        moe_expert_dim=moe_expert_dim,
-        moe_top_k=moe_top_k,
-        moe_capacity_factor=moe_capacity_factor,
-        moe_load_balance_alpha=moe_load_balance_alpha,
-    )
     stages, cur = [], in_dim
     for kind in kinds:
         if kind == "cfc":
@@ -204,7 +196,12 @@ def build_parallel_backbone(
                     num_blocks=num_blocks,
                     device=device,
                     dtype=dtype,
-                    **moe_kw,
+                    moe_enabled=moe_enabled,
+                    moe_num_experts=moe_num_experts,
+                    moe_expert_dim=moe_expert_dim,
+                    moe_top_k=moe_top_k,
+                    moe_capacity_factor=moe_capacity_factor,
+                    moe_load_balance_alpha=moe_load_balance_alpha,
                     **(cfc_kwargs or {}),
                 )
             )
@@ -221,7 +218,12 @@ def build_parallel_backbone(
                     headdim=headdim,
                     device=device,
                     dtype=dtype,
-                    **moe_kw,
+                    moe_enabled=moe_enabled,
+                    moe_num_experts=moe_num_experts,
+                    moe_expert_dim=moe_expert_dim,
+                    moe_top_k=moe_top_k,
+                    moe_capacity_factor=moe_capacity_factor,
+                    moe_load_balance_alpha=moe_load_balance_alpha,
                 )
             )
         cur = d_model

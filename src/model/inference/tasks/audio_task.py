@@ -10,8 +10,8 @@ silently drift apart).
 from __future__ import annotations
 
 import torch
-
 from data.audio.audio_dataset import AudioChainDataset
+
 from inference.metrics import EpisodeScore
 from inference.tasks.base_task import BaseInferenceTask, Episode
 

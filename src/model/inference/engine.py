@@ -18,6 +18,7 @@ Two regimes (the reset_experience switch):
 from __future__ import annotations
 
 import time
+from typing import Any
 
 import torch
 
@@ -45,7 +46,9 @@ class InferenceEngine:
     @torch.no_grad()
     def _forward(self, episode, hidden, reset_experience: bool):
         x = episode.input_seq.unsqueeze(0).to(self.device)  # (1, T, input_dim)
-        kw = dict(reset_experience=reset_experience, pass_through_memory=not self.ablate_memory)
+        kw: dict[str, Any] = dict(
+            reset_experience=reset_experience, pass_through_memory=not self.ablate_memory
+        )
         if self.combiner_skip_stages:
             kw["combiner_skip_stages"] = self.combiner_skip_stages
         output, new_hidden = self.model(x, hidden, **kw)

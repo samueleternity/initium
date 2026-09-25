@@ -164,8 +164,9 @@ import torch.nn.functional as F
 from dnc import DNC
 from dnc.memory import Memory
 from dnc.util import cuda
-
 from MoE.moe_layer import MoEBlock, MoERNNWrapper
+
+_MAMBA_IMPORT_ERROR: str | None
 
 try:
     from mamba_ssm.modules.mamba_simple import Mamba
@@ -516,6 +517,7 @@ class MambaControllerWrapper(nn.Module):
         for i, (block, state) in enumerate(zip(self.blocks, hx)):
             x, new_state = block.step(x, state)
             if self.moe_enabled:
+                assert self.moe_blocks is not None
                 x = self.moe_blocks[i](x)
             new_hx.append(new_state)
 
@@ -632,11 +634,11 @@ class MambaDNC(DNC):
                 # sweep below finds and rebinds whichever attribute that is,
                 # the same technique dynamic_memory_resize.resize_memory()
                 # already uses for Memory swaps.
-                for layer in range(self.num_layers):
+                for layer in range(num_layers):
                     old_rnn = self.rnns[layer]
                     wrapped = MoERNNWrapper(
                         old_rnn,
-                        d_model=self.output_size,
+                        d_model=hidden_size,
                         num_experts=moe_num_experts,
                         expert_dim=moe_expert_dim,
                         top_k=moe_top_k,

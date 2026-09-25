@@ -33,7 +33,7 @@ MODEL_READ_HEADS = 8
 # ---- Dataset selection (see data/dataset_registry.py) -----------------------
 # Overridable via --dataset-type / --dataset-link.
 DATASET_TYPE = "graph"  # "graph" | "text" | "audio" | "video" (only graph implemented)
-DATASET_LINK = None  # None / "graph-traversal" -> built-in synthetic graph curriculum
+DATASET_LINK: str | None = None  # None / "graph-traversal" -> built-in synthetic graph curriculum
 
 # ---- KL -----------------------------------------------------------
 BETAS_TO_SWEEP = [0.0]

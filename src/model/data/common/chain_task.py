@@ -40,10 +40,10 @@ from __future__ import annotations
 import random
 
 import torch
+from memory_manipulation.dynamic_memory_resize import resize_memory
 
 from data.base_dataset import BaseDataset
 from data.common.digit_codec import DigitCodec, digit_field_diversity, digit_field_loss
-from memory_manipulation.dynamic_memory_resize import resize_memory
 
 NUM_FIELDS = 2  # [value, cumsum]
 NUM_PHASE_CHANNELS = 2
@@ -215,8 +215,10 @@ class KVChainDataset(BaseDataset):
     # Real-data hook (v2): None -> unchanged synthetic behavior everywhere
     # below. Set by a subclass's __init__ when a real dataset_link/
     # test_dataset_link was given.
-    _fact_pool = None
-    _test_fact_pool = None
+    _fact_pool: list[tuple[int, int]] | None = None
+    _test_fact_pool: list[tuple[int, int]] | None = None
+    _table: list
+    _lesson_nr_cells: list[int]
 
     # ---- modality-specific hooks -------------------------------------------
     def build_ood_facts(self, n_facts: int = 20):

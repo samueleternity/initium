@@ -113,7 +113,6 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 from dnc.memory import Memory
-
 from LNN_controller.cfc_backbone_parallel import (
     build_parallel_backbone,
     collect_backbone_moe_layers,
@@ -466,6 +465,7 @@ class SplitGraphDNC(nn.Module):
         if self.combiner_wrapper is not None and getattr(
             self.combiner_wrapper, "moe_enabled", False
         ):
+            assert self.combiner_wrapper.moe_blocks is not None
             self.moe_layers.extend(list(self.combiner_wrapper.moe_blocks))
 
         if self.device is not None and getattr(self.device, "type", None) == "cuda":
@@ -552,6 +552,7 @@ class SplitGraphDNC(nn.Module):
         # as the starting state instead of a fresh zero-init.
         combiner_hx = None
         if self.combiner_mode == "controller":
+            assert self.combiner_wrapper is not None
             combiner_hx = (
                 chx
                 if chx is not None
@@ -563,6 +564,7 @@ class SplitGraphDNC(nn.Module):
             h_t = H[:, t, :]  # (B, hidden_size)
 
             if self.combiner_mode == "controller":
+                assert self.combiner_wrapper is not None
                 _cfc_multi_source = (
                     self.combiner_variant == "cfc"
                     and getattr(self.combiner_wrapper, "moe_source_dims", None) is not None
@@ -583,6 +585,7 @@ class SplitGraphDNC(nn.Module):
                         xi_out, combiner_hx = self.combiner_wrapper(combiner_in, combiner_hx)
                 xi_t = h_t + xi_out.squeeze(1)
             elif self.combine_reads:
+                assert self.combiner is not None
                 xi_t = h_t + self.combiner(torch.cat([h_t, read_vec], dim=-1))
             else:
                 # Built-in ablation (see module docstring): addressing

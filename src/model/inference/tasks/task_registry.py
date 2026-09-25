@@ -60,7 +60,7 @@ def get_task_class(dataset_type: str):
     raise ValueError(f"unknown dataset type {dataset_type!r}")
 
 
-def get_task(dataset_type: str = "graph", dataset_link: str = None, **kwargs):
+def get_task(dataset_type: str = "graph", dataset_link: str | None = None, **kwargs):
     t = canonical_type(dataset_type)
     cls = get_task_class(t)
     if t == "multimodal":

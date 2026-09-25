@@ -101,6 +101,8 @@ stay at their zero-init, i.e. N(0,I), reproducing Phase 1 bit-for-bit).
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 import torch.nn as nn
 
@@ -444,7 +446,7 @@ def pop_total_kl(heads: list[StochasticWriteHead], free_bits: float = 0.0):
     head's snapshot is).
     """
     total = None
-    merged = {
+    merged: dict[str, list[Any]] = {
         "kl_mean": [],
         "kl_max": [],
         "kl_min": [],
@@ -459,11 +461,11 @@ def pop_total_kl(heads: list[StochasticWriteHead], free_bits: float = 0.0):
         for k in merged:
             merged[k].append(diag[k])
         snapshot_steps.append(diag["snapshot_step"])
-    merged = {k: (sum(v) / len(v) if v else 0.0) for k, v in merged.items()}
-    merged["snapshot_step"] = min(snapshot_steps) if snapshot_steps else 0
+    averaged: dict[str, Any] = {k: (sum(v) / len(v) if v else 0.0) for k, v in merged.items()}
+    averaged["snapshot_step"] = min(snapshot_steps) if snapshot_steps else 0
     if total is None:
         total = torch.zeros(())
-    return total, merged
+    return total, averaged
 
 
 # ---- v2 (Phase 2): prior snapshot update / checkpoint helpers --------------

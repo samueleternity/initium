@@ -20,7 +20,6 @@ build_traversal_episode_from_graph(), so encoding is byte-identical to training.
 from __future__ import annotations
 
 import torch
-
 from data.common.graph_io import build_graph_from_raw_edges, load_raw_edges
 from data.graph_traversal.graph_traversal import (
     INPUT_DIM,
@@ -32,6 +31,7 @@ from data.graph_traversal.graph_traversal import (
     encode_triple,
     triple_to_digit_targets,
 )
+
 from inference.metrics import EpisodeScore
 from inference.tasks.base_task import BaseInferenceTask, Episode
 
@@ -88,7 +88,8 @@ class GraphTraversalTask(BaseInferenceTask):
     def build_episodes(self, n: int, rng, perturbation=None) -> list[Episode]:
         # perturbation: not wired for graph yet (see base_task.py) -- accepted
         # and ignored so the shared BaseInferenceTask interface stays uniform.
-        episodes, attempts = [], 0
+        episodes: list[Episode] = []
+        attempts = 0
         if self.shared_context:
             return self._build_shared_context_episodes(n, rng)
         while len(episodes) < n:
@@ -165,7 +166,8 @@ class GraphTraversalTask(BaseInferenceTask):
 
     def _build_shared_context_episodes(self, n: int, rng) -> list[Episode]:
         contexts = [self._make_context(rng) for _ in range(self.num_contexts)]
-        episodes, attempts = [], 0
+        episodes: list[Episode] = []
+        attempts = 0
         while len(episodes) < n:
             attempts += 1
             if attempts > 100 * n + 1000:

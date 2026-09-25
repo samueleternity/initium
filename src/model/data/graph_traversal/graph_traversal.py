@@ -31,10 +31,10 @@ import random
 
 import numpy as np
 import torch
+from memory_manipulation.dynamic_memory_resize import resize_memory
 
 from data.base_dataset import BaseDataset
 from data.common.graph_io import load_graph
-from memory_manipulation.dynamic_memory_resize import resize_memory
 
 # ==========================================
 # CONFIGURATION
@@ -620,8 +620,14 @@ class GraphTraversalDataset(BaseDataset):
     input_dim = INPUT_DIM
     output_dim = TRIPLE_DIM
     advance_threshold = ADVANCE_THRESHOLD
+    _custom_graph: (
+        tuple[list[tuple[int, int, int]], list[int], dict[int, list[tuple[int, int]]]] | None
+    )
+    _custom_test_graph: (
+        tuple[list[tuple[int, int, int]], list[int], dict[int, list[tuple[int, int]]]] | None
+    )
 
-    def __init__(self, dataset_link: str = None, test_dataset_link: str = None):
+    def __init__(self, dataset_link: str | None = None, test_dataset_link: str | None = None):
         # dataset_link: path to a real edge file (see data/common/graph_io.py
         # for the accepted formats) to TRAIN on, instead of the default
         # per-episode synthetic generate_graph(). None (default) -> unchanged
@@ -634,12 +640,12 @@ class GraphTraversalDataset(BaseDataset):
         self._custom_test_graph = (
             load_graph(test_dataset_link) if test_dataset_link is not None else None
         )
-        if dataset_link is not None:
+        if self._custom_graph is not None:
             print(
                 f"[graph-traversal] training graph loaded from {dataset_link}: "
                 f"{len(self._custom_graph[1])} nodes, {len(self._custom_graph[0])} edges"
             )
-        if test_dataset_link is not None:
+        if self._custom_test_graph is not None:
             print(
                 f"[graph-traversal] test graph loaded from {test_dataset_link}: "
                 f"{len(self._custom_test_graph[1])} nodes, {len(self._custom_test_graph[0])} edges"

@@ -21,10 +21,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+import config.controller_config as cc
 import torch
 import torch.nn as nn
-
-import config.controller_config as cc
 from mamba_controller.mamba_controller import MambaDNC
 from mamba_controller.split_graph_dnc import SplitGraphDNC
 from memory_manipulation.link_matrix_ablation import patch_link_matrix
@@ -51,7 +50,8 @@ class _Cfg:
     """dict wrapper that remembers which keys fell back to defaults."""
 
     def __init__(self, cfg: dict):
-        self.cfg, self.defaulted = cfg, []
+        self.cfg = cfg
+        self.defaulted: list[str] = []
 
     def get(self, key: str, default: Any):
         v = self.cfg.get(key)
@@ -201,7 +201,7 @@ def load_model(ckpt: dict, device: torch.device, deterministic_write: bool = Fal
     if raw.get("split_graph_enabled", False):
         rnn = _build_split_graph(c, input_dim, hidden, nr_cells, cell_size, read_heads, device)
     else:
-        extra = {}
+        extra: dict[str, Any] = {}
         if raw.get("num_hidden_layers") is not None:
             extra["num_hidden_layers"] = int(raw["num_hidden_layers"])
         rnn = MambaDNC(

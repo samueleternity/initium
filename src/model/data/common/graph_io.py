@@ -55,16 +55,18 @@ def _load_raw_edges_one(path: str) -> list[tuple[str, str, str]]:
                     continue
                 rows.append(row)
 
-    edges = []
+    edges: list[tuple[str, str, str]] = []
     for i, row in enumerate(rows):
         if isinstance(row, dict):
-            row = [row.get("src"), row.get("dst"), row.get("line")]
-        if len(row) != 3 or any(x is None for x in row):
-            raise ValueError(f"{path}: row {i} is not 'src,dst,line': {row!r}")
-        row = [str(x).strip() for x in row]
-        if i == 0 and row[0].lower() in _HEADER_FIRST_FIELDS:
+            values = [row.get("src"), row.get("dst"), row.get("line")]
+        else:
+            values = row
+        if len(values) != 3 or any(x is None for x in values):
+            raise ValueError(f"{path}: row {i} is not 'src,dst,line': {values!r}")
+        fields = [str(x).strip() for x in values]
+        if i == 0 and fields[0].lower() in _HEADER_FIRST_FIELDS:
             continue
-        edges.append(tuple(row))
+        edges.append((fields[0], fields[1], fields[2]))
     if not edges:
         raise ValueError(f"{path}: no edges found")
     return edges
@@ -109,7 +111,7 @@ def build_graph_from_raw_edges(raw_edges, label_seed: int = 1234):
 
     edges = [(station_to_label[s], line_to_label[l], station_to_label[d]) for s, d, l in raw_edges]
     station_idx = {s: i for i, s in enumerate(stations)}
-    adjacency = {i: [] for i in range(len(stations))}
+    adjacency: dict[int, list[tuple[int, int]]] = {i: [] for i in range(len(stations))}
     for s, d, l in raw_edges:
         adjacency[station_idx[s]].append((station_idx[d], line_to_label[l]))
     node_labels = [station_to_label[s] for s in stations]

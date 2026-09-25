@@ -4,12 +4,12 @@ build-backend = "hatchling.build"
 
 [project]
 name = "initium"                     # verify the name is free on PyPI before publishing
-dynamic = ["version"]                # from initium/__init__.py
+dynamic = ["version"]                # from src/model/__init__.py
 description = "Differentiable Neural Computer research framework with pluggable LSTM/Mamba/CfC controllers, MoE, split-graph and stochastic write heads."
 readme = "README.md"
 requires-python = ">=3.10"           # code uses `X | None` at runtime
 authors = [{ name = "samueleternity" }]
-license = "GPL-3.0" 
+license = "GPL-3.0"
 license-files = ["LICENSE"]
 keywords = ["dnc", "differentiable-neural-computer", "mamba", "liquid-neural-networks", "pytorch"]
 classifiers = [
@@ -22,7 +22,7 @@ classifiers = [
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 # Only what PyPI can express. GPU wheels (mamba-ssm, causal-conv1d) and git-pinned pytorch-dnc
-# are installed by `initium-setup` (initium/setup_wheels.py).
+# are installed by `initium-setup` (model/setup_wheels.py).
 dependencies = [
   "torch>=2.4",
   "numpy>=1.26",
@@ -36,8 +36,8 @@ video = ["opencv-python>=4.8"]       # real video data (audio additionally needs
 real-data = ["initium[text,video]"]
 
 [project.scripts]
-initium-setup = "initium.setup_wheels:main"
-initium-infer = "inference.run_inference:main"
+initium-setup = "model.setup_wheels:main"
+initium-infer = "model.inference.run_inference:main"
 
 [project.urls]
 Homepage = "https://github.com/samueleternity/initium"
@@ -56,20 +56,15 @@ dev = [
 
 # ---------------------------------------------------------------- build
 [tool.hatch.version]
-path = "initium/__init__.py"
+path = "src/model/__init__.py"
 
-# Keep in sync with the package list (see note on moving everything under initium/).
+# src-layout: hatchling picks up everything under src/model as the "model" package.
 [tool.hatch.build.targets.wheel]
-only-include = [
-  "initium", "config", "data", "inference", "memory_manipulation",
-  "mamba_controller", "LNN_controller", "MoE", "core_training.py",
-]
+packages = ["src/model"]
 
 [tool.hatch.build.targets.sdist]
 include = [
-  "/initium", "/config", "/data", "/inference", "/memory_manipulation",
-  "/mamba_controller", "/LNN_controller", "/MoE", "/core_training.py",
-  "/tests", "/README.md", "/pyproject.toml",
+  "/src", "/tests", "/README.md", "/pyproject.toml", "/LICENSE",
 ]
 
 [tool.uv]
@@ -79,6 +74,7 @@ required-version = ">=0.8.0"
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+src = ["src"]
 
 [tool.ruff.lint]
 select = ["E4", "E7", "E9", "F", "I", "UP", "B"]
@@ -88,27 +84,21 @@ ignore = [
 ]
 
 [tool.ruff.lint.isort]
-known-first-party = [
-  "initium", "config", "data", "inference", "memory_manipulation",
-  "mamba_controller", "LNN_controller", "MoE", "core_training",
-]
+known-first-party = ["model"]
 
 [tool.ruff.lint.per-file-ignores]
 # Intentional import-after-code (env patches, sys.path bootstrap, circular-import avoidance).
-"model/core_training.py" = ["E402"]
-"model/inference/run_inference.py" = ["E402"]
-"model/data/common/real_data.py" = ["E402"]
-"model/mamba_controller/mamba_controller.py" = ["E402"]
-"model/data/multimodal/multimodal_dataset.py" = ["B023"]   # lambdas are called immediately
+"src/model/core_training.py" = ["E402"]
+"src/model/inference/run_inference.py" = ["E402"]
+"src/model/data/common/real_data.py" = ["E402"]
+"src/model/mamba_controller/mamba_controller.py" = ["E402"]
+"src/model/data/multimodal/multimodal_dataset.py" = ["B023"]   # lambdas are called immediately
 
 # ---------------------------------------------------------------- mypy
 [tool.mypy]
 python_version = "3.10"
-files = [
-  "initium", "config", "data", "inference", "memory_manipulation",
-  "mamba_controller", "LNN_controller", "MoE", "core_training.py",
-]
-mypy_path = "."
+files = ["src/model"]
+mypy_path = "src/model"
 namespace_packages = true
 explicit_package_bases = true
 warn_unused_configs = true

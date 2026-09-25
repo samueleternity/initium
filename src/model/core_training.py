@@ -33,11 +33,11 @@ import os
 import random
 import shutil
 import time
+from typing import Any
 
 import numpy as np
 import torch
 import torch.nn as nn
-
 from memory_manipulation.nvrtc_compat import patch_prod_jiterator
 
 patch_prod_jiterator()  # environment workaround -- see module docstring
@@ -427,13 +427,13 @@ def run(
     beta_target: float,
     run_id: str,
     seed: int = SEED,
-    resume_from: str = None,
+    resume_from: str | None = None,
     controller: str = CONTROLLER_TYPE,  # v7 (Alternate Phase 3, Step 1)
     beta_mode: str = BETA_MODE,  # dynamic-beta toggle: "static" or "dynamic"
     total_steps: int = TOTAL_STEPS,  # see --total-steps.
     checkpoint_every: int = CHECKPOINT_EVERY,  # see --checkpoint-every.
     link_matrix_mode: str = LINK_MATRIX_MODE,  # Static Option 1
-    link_matrix_topk: int = LINK_MATRIX_TOPK,  # Static Option 1
+    link_matrix_topk: int | None = LINK_MATRIX_TOPK,  # Static Option 1
     isolate_link_ablation: bool = ISOLATE_LINK_ABLATION,  # Static Option 1
     dynamic_n_mode: bool = DYNAMIC_N_MODE,  # Dynamic-N (macro-scale)
     dynamic_n_floor: int = DYNAMIC_N_FLOOR,
@@ -442,7 +442,7 @@ def run(
     dynamic_n_cooldown_steps: int = DYNAMIC_N_COOLDOWN_STEPS,
     moe_enabled: bool = MOE_ENABLED,
     moe_num_experts: int = MOE_NUM_EXPERTS,
-    moe_expert_dim: int = MOE_EXPERT_DIM,
+    moe_expert_dim: int | None = MOE_EXPERT_DIM,
     moe_capacity_factor: float = MOE_CAPACITY_FACTOR,
     moe_load_balance_alpha: float = MOE_LOAD_BALANCE_ALPHA,
     moe_top_k: int = MOE_TOP_K,
@@ -456,8 +456,8 @@ def run(
     split_graph_combiner_variant: str = SPLIT_GRAPH_COMBINER_VARIANT,
     split_graph_combiner_num_blocks: int = SPLIT_GRAPH_COMBINER_NUM_BLOCKS,
     dataset_type: str = DATASET_TYPE,
-    dataset_link: str = DATASET_LINK,
-    test_dataset_link: str = None,
+    dataset_link: str | None = DATASET_LINK,
+    test_dataset_link: str | None = None,
 ):
     # Deliberately does NOT touch LR_DECAY_STEPS - that's a separate
     # module-level constant, fixed at import time from the *original*
@@ -736,7 +736,7 @@ def run(
                 f"actually what you meant to measure per Concept 16/SP-10."
             )
 
-    mamba_kwargs = {}
+    mamba_kwargs: dict[str, Any] = {}
     if controller == "mamba":
         mamba_kwargs = dict(
             mamba_d_state=MAMBA_D_STATE,
@@ -1332,6 +1332,7 @@ def run(
                     f"{dynamic_n_ctrl.trigger_frac:.2f} trigger, sustained "
                     f"past cooldown)"
                 )
+                assert dynamic_n_log_writer is not None and dynamic_n_log_file is not None
                 dynamic_n_log_writer.writerow(
                     [
                         step,
@@ -1536,12 +1537,13 @@ def run(
                 scale_at_last_eval = scaler.get_scale()
                 grad_was_finite_since_eval = True
 
+            ood_field_log: dict[tuple[int, int], list[int]] = {}
             ood_triple_acc, ood_perfect_frac, ood_hop_breakdown = dataset.evaluate_ood(
                 rnn,
                 device,
                 num_episodes=OOD_EVAL_EPISODES_PERIODIC,
                 rng=ood_rng,
-                field_log=(ood_field_log := {}),
+                field_log=ood_field_log,
             )
 
             ood_log_writer.writerow(

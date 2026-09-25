@@ -40,8 +40,8 @@ class Episode:
 class BaseInferenceTask:
     name: str = "base"
     dataset_type: str = "base"
-    input_dim: int = None
-    output_dim: int = None
+    input_dim: int | None = None
+    output_dim: int | None = None
 
     def build_episodes(self, n: int, rng, perturbation=None) -> list[Episode]:
         """perturbation: optional dataset-defined robustness probe (see

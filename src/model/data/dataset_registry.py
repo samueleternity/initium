@@ -29,7 +29,10 @@ MULTIMODAL_ALIASES = ("multimodal", "multi-modal", "multi_modal")
 
 
 def get_dataset(
-    dataset_type: str = "graph", dataset_link: str = None, test_dataset_link: str = None, **kwargs
+    dataset_type: str = "graph",
+    dataset_link: str | None = None,
+    test_dataset_link: str | None = None,
+    **kwargs,
 ):
     t = (dataset_type or "graph").lower()
     if t in GRAPH_ALIASES:

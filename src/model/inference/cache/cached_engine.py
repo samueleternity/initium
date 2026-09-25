@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import inspect
 import time
+from typing import Any
 
 import torch
 
@@ -112,7 +113,9 @@ class CachedInferenceEngine(InferenceEngine):
     def _forward_segment(
         self, x_full: torch.Tensor, start: int, end: int, hidden, reset_experience: bool
     ):
-        kw = dict(reset_experience=reset_experience, pass_through_memory=not self.ablate_memory)
+        kw: dict[str, Any] = dict(
+            reset_experience=reset_experience, pass_through_memory=not self.ablate_memory
+        )
         if self.combiner_skip_stages:
             kw["combiner_skip_stages"] = self.combiner_skip_stages
         if hasattr(self.model, "backbone"):  # SplitGraphDNC

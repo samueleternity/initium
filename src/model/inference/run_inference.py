@@ -30,6 +30,7 @@ import random
 import time
 
 import torch
+from memory_manipulation.nvrtc_compat import patch_prod_jiterator
 
 from inference.cache.cache_config import (
     DEFAULT_CACHE,
@@ -58,7 +59,6 @@ from inference.inference_config import (
 )
 from inference.model_loader import load_model
 from inference.tasks.task_registry import get_task
-from memory_manipulation.nvrtc_compat import patch_prod_jiterator
 
 patch_prod_jiterator()  # environment workaround - see that module's docstring
 from inference import run_logging as rl
@@ -365,6 +365,7 @@ def main(argv=None) -> int:
     for note in cache_notes:
         print(f"[inference] cache: {note}")
     if caches:
+        assert cache_fp is not None
         print(
             f"[inference] cache: {', '.join(c.name for c in caches)} | model fingerprint "
             f"{cache_fp[:12]} | RAM {args.cache_ram_mb:.0f} MB"
@@ -379,6 +380,7 @@ def main(argv=None) -> int:
             )
             print(f"[inference] cache: {cache_notes[-1]}")
 
+    engine: InferenceEngine | CachedInferenceEngine
     if caches:
         engine = CachedInferenceEngine(
             loaded.rnn,
@@ -433,6 +435,7 @@ def main(argv=None) -> int:
         "mean_episode_ms": sum(r.elapsed_ms for r in results) / max(len(results), 1),
     }
     if caches:
+        assert isinstance(engine, CachedInferenceEngine)
         summary["cache"] = {
             "requested": args.cache,
             "active": [c.name for c in caches],
@@ -462,6 +465,7 @@ def main(argv=None) -> int:
                 summary["result"]["item_acc"] - summary["fresh_baseline"]["item_acc"]
             )
             if caches:
+                assert isinstance(engine, CachedInferenceEngine)
                 summary["cache"]["baseline_report"] = engine.cache_report(reset=True)
                 summary["cache"]["notes"] = cache_notes + engine.notes
     summary["elapsed_sec"] = time.time() - t0

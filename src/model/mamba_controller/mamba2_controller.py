@@ -92,8 +92,9 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 from MoE.moe_layer import MoEBlock
+
+_MAMBA2_IMPORT_ERROR: str | None
 
 try:
     from mamba_ssm.modules.mamba2 import Mamba2
@@ -419,6 +420,7 @@ class Mamba2ControllerWrapper(nn.Module):
         for i, (block, state) in enumerate(zip(self.blocks, hx)):
             x, new_state = block.step(x, state)
             if self.moe_enabled:
+                assert self.moe_blocks is not None
                 x = self.moe_blocks[i](x)
             new_hx.append(new_state)
 

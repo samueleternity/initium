@@ -153,7 +153,7 @@ jobs:
         id: install-mamba
         continue-on-error: true
         run: |
-          MAMBA_SKIP_CUDA_BUILD=TRUE uv pip install --python .venv/bin/python --no-build-isolation "mamba-ssm==2.3.2.post1"
+          MAMBA_FORCE_BUILD=TRUE MAMBA_SKIP_CUDA_BUILD=TRUE uv pip install --python .venv/bin/python --no-build-isolation "mamba-ssm==2.3.2.post1"
       - name: Run Mamba controller tests on CPU
         id: mamba-tests
         if: steps.install-mamba.outcome == 'success'

@@ -279,6 +279,7 @@ def save_checkpoint(
     model_config = {
         "input_size": rnn.input_size,
         "hidden_size": MODEL_HIDDEN_SIZE,
+        "num_hidden_layers": getattr(rnn, "num_hidden_layers", None),
         "nr_cells": rnn.memories[0].nr_cells,
         "cell_size": MODEL_CELL_SIZE,
         "read_heads": MODEL_READ_HEADS,

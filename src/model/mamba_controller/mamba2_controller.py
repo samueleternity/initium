@@ -89,6 +89,9 @@ Mamba-2's parameterization forces a different shape or formula.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+from typing import cast
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -358,7 +361,7 @@ class Mamba2ControllerWrapper(nn.Module):
             if in_dim == d_model
             else nn.Linear(in_dim, d_model, device=device, dtype=dtype)
         )
-        self.blocks: nn.ModuleList[Mamba2ControllerBlock] = nn.ModuleList(
+        self.blocks: nn.ModuleList = nn.ModuleList(
             [
                 Mamba2ControllerBlock(
                     d_model,
@@ -400,7 +403,8 @@ class Mamba2ControllerWrapper(nn.Module):
             p = next(self.parameters())
             device = device if device is not None else p.device
             dtype = dtype if dtype is not None else p.dtype
-        return [blk.init_state(batch_size, device=device, dtype=dtype) for blk in self.blocks]
+        blocks = cast(Iterable[Mamba2ControllerBlock], self.blocks)
+        return [blk.init_state(batch_size, device=device, dtype=dtype) for blk in blocks]
 
     def forward(self, input: torch.Tensor, hx):
         # input: (B, 1, in_dim) -- same single-timestep contract as
@@ -417,7 +421,8 @@ class Mamba2ControllerWrapper(nn.Module):
             hx = self.init_state(x.size(0), device=x.device, dtype=x.dtype)
 
         new_hx = []
-        for i, (block, state) in enumerate(zip(self.blocks, hx)):
+        blocks = cast(Iterable[Mamba2ControllerBlock], self.blocks)
+        for i, (block, state) in enumerate(zip(blocks, hx)):
             x, new_state = block.step(x, state)
             if self.moe_enabled:
                 assert self.moe_blocks is not None

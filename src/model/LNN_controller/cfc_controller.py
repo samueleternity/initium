@@ -25,6 +25,9 @@ State per block: h (B, units) fp32, or (h, c) if mixed_memory=True (CfC-mmRNN).
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+from typing import cast
+
 import torch
 import torch.nn as nn
 from MoE.moe_layer import MoEBlock, MultiSourceMoEBlock
@@ -164,7 +167,7 @@ class CfCControllerWrapper(nn.Module):
             if in_dim == d_model
             else nn.Linear(in_dim, d_model, device=device, dtype=dtype)
         )
-        self.blocks: nn.ModuleList[CfCControllerBlock] = nn.ModuleList(
+        self.blocks: nn.ModuleList = nn.ModuleList(
             [
                 CfCControllerBlock(
                     d_model,
@@ -239,7 +242,8 @@ class CfCControllerWrapper(nn.Module):
     def init_state(self, batch_size, device=None, dtype=None):
         if device is None:
             device = next(self.parameters()).device
-        return [blk.init_state(batch_size, device=device) for blk in self.blocks]
+        blocks = cast(Iterable[CfCControllerBlock], self.blocks)
+        return [blk.init_state(batch_size, device=device) for blk in blocks]
 
     def forward(self, input, hx):
         assert input.dim() == 3 and input.size(1) == 1, (
@@ -255,7 +259,8 @@ class CfCControllerWrapper(nn.Module):
         if hx is None:
             hx = self.init_state(x.size(0), device=x.device)
         new_hx = []
-        for i, (block, state) in enumerate(zip(self.blocks, hx)):
+        blocks = cast(Iterable[CfCControllerBlock], self.blocks)
+        for i, (block, state) in enumerate(zip(blocks, hx)):
             x, new_state = block.step(x, state)
             if self.moe_enabled:
                 assert self.moe_blocks is not None
@@ -283,7 +288,8 @@ class CfCControllerWrapper(nn.Module):
         if hx is None:
             hx = self.init_state(x.size(0), device=x.device)
         new_hx = []
-        for block, state in zip(self.blocks, hx):
+        blocks = cast(Iterable[CfCControllerBlock], self.blocks)
+        for block, state in zip(blocks, hx):
             x, new_state = block.step(x, state)
             new_hx.append(new_state)
         return x.unsqueeze(1), new_hx

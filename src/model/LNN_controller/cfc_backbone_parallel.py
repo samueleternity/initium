@@ -109,7 +109,7 @@ class CfCBackboneParallel(nn.Module):
             if in_dim == d_model
             else nn.Linear(in_dim, d_model, device=device, dtype=dtype)
         )
-        self.blocks: nn.ModuleList[_CfCParallelBlock] = nn.ModuleList(
+        self.blocks: nn.ModuleList = nn.ModuleList(
             [
                 _CfCParallelBlock(
                     d_model,

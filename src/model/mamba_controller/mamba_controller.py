@@ -158,6 +158,9 @@ Design choices specific to this wiring (Step 1 scope)
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+from typing import Any, cast
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -449,7 +452,7 @@ class MambaControllerWrapper(nn.Module):
             if in_dim == d_model
             else nn.Linear(in_dim, d_model, device=device, dtype=dtype)
         )
-        self.blocks: nn.ModuleList[MambaControllerBlock] = nn.ModuleList(
+        self.blocks: nn.ModuleList = nn.ModuleList(
             [
                 MambaControllerBlock(
                     d_model,
@@ -496,7 +499,8 @@ class MambaControllerWrapper(nn.Module):
             p = next(self.parameters())
             device = device if device is not None else p.device
             dtype = dtype if dtype is not None else p.dtype
-        return [blk.init_state(batch_size, device=device, dtype=dtype) for blk in self.blocks]
+        blocks = cast(Iterable[MambaControllerBlock], self.blocks)
+        return [blk.init_state(batch_size, device=device, dtype=dtype) for blk in blocks]
 
     def forward(self, input: torch.Tensor, hx):
         # input: (B, 1, in_dim) -- DNC's `_layer_forward` always calls with
@@ -514,7 +518,8 @@ class MambaControllerWrapper(nn.Module):
             hx = self.init_state(x.size(0), device=x.device, dtype=x.dtype)
 
         new_hx = []
-        for i, (block, state) in enumerate(zip(self.blocks, hx)):
+        blocks = cast(Iterable[MambaControllerBlock], self.blocks)
+        for i, (block, state) in enumerate(zip(blocks, hx)):
             x, new_state = block.step(x, state)
             if self.moe_enabled:
                 assert self.moe_blocks is not None
@@ -650,9 +655,9 @@ class MambaDNC(DNC):
                     for attr_name, submodule in list(self._modules.items()):
                         if submodule is old_rnn:
                             setattr(self, attr_name, wrapped)
-                self.moe_layers = []
+                self.moe_layers: list[nn.Module] = []
                 for controller in self.rnns:
-                    self.moe_layers.extend(controller.moe_blocks)
+                    self.moe_layers.extend(cast(Any, controller).moe_blocks)
             return
 
         if rnn_type.lower() == "mamba2":
@@ -912,10 +917,10 @@ class MambaDNC(DNC):
         # same "give the caller one flat list" convention
         # install_stochastic_write_heads() already uses for stochastic
         # write heads in stochastic_write_head_v2.py.
-        self.moe_layers = []
+        self.moe_layers: list[nn.Module] = []
         if self.moe_enabled:
             for layer_controller in self.rnns:
-                self.moe_layers.extend(layer_controller.moe_blocks)
+                self.moe_layers.extend(cast(Any, layer_controller).moe_blocks)
 
         # final output layer -- copied verbatim from dnc.DNC.__init__
         self.output = nn.Linear(self.nn_output_size, self.input_size)
@@ -941,7 +946,7 @@ class MambaDNC(DNC):
 
         if chx is None:
             chx = [
-                self.rnns[layer].init_state(batch_size, device=self.device)
+                cast(Any, self.rnns[layer]).init_state(batch_size, device=self.device)
                 for layer in range(self.num_layers)
             ]
 

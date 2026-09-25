@@ -81,6 +81,8 @@ itself check (see Experiment-Roadmap.md, "Option 4" failure-mode table):
 
 from __future__ import annotations
 
+from typing import cast
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -215,12 +217,14 @@ class SwitchMoE(nn.Module):
         # per-expert buffer).
         capacity = max(1, int((num_tokens * top_k / self.num_experts) * self.capacity_factor))
 
-        w_in = torch.stack([e.w_in.weight for e in self.experts], dim=0)  # (E, expert_dim, d_model)
-        b_in = torch.stack([e.w_in.bias for e in self.experts], dim=0)  # (E, expert_dim)
+        w_in = torch.stack(
+            [cast(nn.Linear, e.w_in).weight for e in self.experts], dim=0
+        )  # (E, expert_dim, d_model)
+        b_in = torch.stack([cast(nn.Linear, e.w_in).bias for e in self.experts], dim=0)
         w_out = torch.stack(
-            [e.w_out.weight for e in self.experts], dim=0
+            [cast(nn.Linear, e.w_out).weight for e in self.experts], dim=0
         )  # (E, d_model, expert_dim)
-        b_out = torch.stack([e.w_out.bias for e in self.experts], dim=0)  # (E, d_model)
+        b_out = torch.stack([cast(nn.Linear, e.w_out).bias for e in self.experts], dim=0)
 
         # Dense pass over EVERY expert for EVERY token -- the single fused
         # computation that makes the top-k selected experts per token

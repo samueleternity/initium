@@ -6,7 +6,7 @@ import torch
 
 def test_cfc_with_moe_forward_and_aux_loss(build_tiny_rnn):
     model, _, _, _ = build_tiny_rnn("cfc", moe_enabled=True, moe_num_experts=4)
-    output, _ = model(torch.randn(2, 2, 8))
+    output, _ = model(torch.randn(2, 2, 8), None)
     assert output.shape[:2] == (2, 2)
     output.square().mean().backward()
     moe_layers = model.moe_layers
@@ -20,7 +20,7 @@ def test_cfc_with_moe_forward_and_aux_loss(build_tiny_rnn):
 )
 def test_hybrid_mamba_cfc_with_moe(build_tiny_rnn):
     model, _, _, _ = build_tiny_rnn("mamba+cfc", moe_enabled=True, moe_num_experts=4)
-    output, _ = model(torch.randn(2, 2, 8))
+    output, _ = model(torch.randn(2, 2, 8), None)
     output.square().mean().backward()
     assert model.moe_layers
     assert all(torch.isfinite(layer.pop_aux_loss()) for layer in model.moe_layers)

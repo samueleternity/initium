@@ -11,6 +11,7 @@ def test_switch_moe_validation_routing_and_aux_gradient():
     with torch.no_grad():
         moe.router.weight.zero_()
         moe.router.weight[2, 0] = 1
+        moe.router.weight[0, 0] = -1
     x = torch.tensor([[1.0, 0, 0, 0], [-1.0, 0, 0, 0]])
     y = moe(x)
     assert y.shape == x.shape
@@ -40,8 +41,8 @@ def test_capacity_drop_zeros_overflow_token_output():
 
 def test_multisource_moe_preserves_source_shapes():
     block = MultiSourceMoEBlock(num_sources=2, d_model=4, num_experts=4)
-    outputs = block([torch.randn(2, 3), torch.randn(1, 3)])
-    assert [tuple(x.shape) for x in outputs] == [(2, 3), (1, 3)]
+    outputs = block([torch.randn(2, 4), torch.randn(1, 4)])
+    assert [tuple(x.shape) for x in outputs] == [(2, 4), (1, 4)]
     diagnostics = block.last_source_diagnostics()
     assert len(diagnostics) == 2
     assert all(sum(item["expert_frac"]) == pytest.approx(1.0) for item in diagnostics)

@@ -35,7 +35,7 @@ def test_model_state_roundtrip_rebuilds_independently(build_tiny_rnn, tmp_checkp
     first.eval()
     torch.manual_seed(41)
     with torch.no_grad():
-        expected, _ = first(x)
+        expected, _ = first(x, None)
 
     src_model = Path(__file__).resolve().parents[2] / "src" / "model"
     env = os.environ.copy()
@@ -47,7 +47,7 @@ def test_model_state_roundtrip_rebuilds_independently(build_tiny_rnn, tmp_checkp
         "loaded=load_model(ckpt, torch.device('cpu'), deterministic_write=True); "
         "x=torch.load(sys.argv[2], map_location='cpu', weights_only=True); "
         "torch.manual_seed(41); "
-        "y=loaded.rnn(x)[0]; torch.save(y, sys.argv[3])"
+        "y=loaded.rnn(x, None)[0]; torch.save(y, sys.argv[3])"
     )
     subprocess.run(
         [sys.executable, "-c", script, str(path), str(x_path), str(y_path)],

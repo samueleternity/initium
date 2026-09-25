@@ -26,8 +26,11 @@ def test_controller_forward_backward(build_tiny_rnn, controller, split_graph, va
     options = {"split_graph": True, "split_graph_variant": variant} if split_graph else {}
     model, _, _, _ = build_tiny_rnn(controller, **options)
     x = torch.randn(3, 2, 8)
-    output, _ = model(x)
-    assert output.shape[0] == 3
+    output, _ = model(x, None) if not split_graph else model(x)
+    # The stock DNC consumes sequence-first input; SplitGraphDNC accepts
+    # batch-first input and returns sequence-first output.
+    expected_steps = x.shape[0] if not split_graph else x.shape[1]
+    assert output.shape[0] == expected_steps
     loss = output.float().square().mean()
     loss.backward()
     grads = [p.grad for p in model.parameters() if p.requires_grad and p.grad is not None]

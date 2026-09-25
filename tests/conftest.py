@@ -13,7 +13,7 @@ def has_mamba_ssm() -> bool:
 
 
 requires_mamba_ssm = pytest.mark.skipif(
-    not has_mamba_ssm(), reason="mamba-ssm is an optional GPU dependency"
+    not has_mamba_ssm(), reason="mamba-ssm is not installed in this environment"
 )
 
 

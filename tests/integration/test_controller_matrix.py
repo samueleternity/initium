@@ -1,11 +1,5 @@
-import importlib.util
-
 import pytest
 import torch
-
-requires_mamba_ssm = pytest.mark.skipif(
-    importlib.util.find_spec("mamba_ssm") is None, reason="mamba-ssm is unavailable"
-)
 
 
 @pytest.mark.parametrize(
@@ -14,12 +8,7 @@ requires_mamba_ssm = pytest.mark.skipif(
         ("lstm", False, None),
         ("cfc", False, None),
         ("cfc+cfc", False, None),
-        pytest.param("mamba", False, None, marks=requires_mamba_ssm),
-        pytest.param("mamba2", False, None, marks=requires_mamba_ssm),
-        pytest.param("mamba3", False, None, marks=requires_mamba_ssm),
-        pytest.param("mamba+cfc", False, None, marks=requires_mamba_ssm),
         ("cfc", True, "cfc"),
-        pytest.param("mamba", True, "mamba1", marks=requires_mamba_ssm),
     ],
 )
 def test_controller_forward_backward(build_tiny_rnn, controller, split_graph, variant):

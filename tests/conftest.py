@@ -1,20 +1,10 @@
 """Shared CPU-sized fixtures for the test suite."""
 
-import importlib.util
 import random
 
 import numpy as np
 import pytest
 import torch
-
-
-def has_mamba_ssm() -> bool:
-    return importlib.util.find_spec("mamba_ssm") is not None
-
-
-requires_mamba_ssm = pytest.mark.skipif(
-    not has_mamba_ssm(), reason="mamba-ssm is not installed in this environment"
-)
 
 
 @pytest.fixture

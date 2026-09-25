@@ -1,5 +1,6 @@
 import torch
-from memory_manipulation.stochastic_write_head_v2 import StochasticWriteHead
+
+from initium.memory_manipulation.stochastic_write_head_v2 import StochasticWriteHead
 
 
 def test_kl_path_reaches_shared_mean_parameters():

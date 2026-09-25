@@ -1,6 +1,7 @@
 import pytest
 import torch
-from MoE.moe_layer import MultiSourceMoEBlock, SwitchMoE
+
+from initium.MoE.moe_layer import MultiSourceMoEBlock, SwitchMoE
 
 
 def test_switch_moe_validation_routing_and_aux_gradient():

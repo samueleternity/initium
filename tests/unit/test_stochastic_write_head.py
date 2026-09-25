@@ -1,5 +1,6 @@
 import torch
-from memory_manipulation.stochastic_write_head_v2 import (
+
+from initium.memory_manipulation.stochastic_write_head_v2 import (
     StochasticWriteHead,
     get_prior_state,
     load_prior_state,

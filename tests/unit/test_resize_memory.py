@@ -1,7 +1,8 @@
 import random
 
 import torch
-from memory_manipulation.dynamic_memory_resize import resize_memory
+
+from initium.memory_manipulation.dynamic_memory_resize import resize_memory
 
 
 def test_resize_transplants_weights_head_and_optimizer_state(build_tiny_rnn):
@@ -27,9 +28,9 @@ def test_resize_transplants_weights_head_and_optimizer_state(build_tiny_rnn):
 def test_resized_cell_count_is_checkpointed_and_reloaded(
     build_tiny_rnn, tmp_checkpoint_dir, monkeypatch
 ):
-    import core_training
-    from inference.checkpoint_io import load_checkpoint
-    from inference.model_loader import load_model
+    import initium.core_training as core_training
+    from initium.inference.checkpoint_io import load_checkpoint
+    from initium.inference.model_loader import load_model
 
     model, _, heads, optimizer = build_tiny_rnn("lstm")
     resize_memory(model, 20, device="cpu", optimizer=optimizer)

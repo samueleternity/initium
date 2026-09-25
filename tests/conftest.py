@@ -51,13 +51,15 @@ def tmp_checkpoint_dir(tmp_path):
 @pytest.fixture
 def build_tiny_rnn(tiny_model_kwargs):
     def build(controller_type="lstm", **overrides):
-        from mamba_controller.mamba_controller import MambaDNC
-        from memory_manipulation.stochastic_write_head_v2 import install_stochastic_write_heads
+        from initium.mamba_controller.mamba_controller import MambaDNC
+        from initium.memory_manipulation.stochastic_write_head_v2 import (
+            install_stochastic_write_heads,
+        )
 
         options = {**tiny_model_kwargs, **overrides}
         split_graph = options.pop("split_graph", False)
         if split_graph:
-            from mamba_controller.split_graph_dnc import SplitGraphDNC
+            from initium.mamba_controller.split_graph_dnc import SplitGraphDNC
 
             model = SplitGraphDNC(
                 input_size=options["input_size"],
@@ -116,8 +118,8 @@ def synthetic_kv_facts():
 
 @pytest.fixture
 def configure_tiny_training(monkeypatch, tmp_path):
-    import core_training
-    import data.graph_traversal.graph_traversal as graph
+    import initium.core_training as core_training
+    import initium.data.graph_traversal.graph_traversal as graph
 
     monkeypatch.setattr(core_training, "LOG_DIR", str(tmp_path / "logs"))
     monkeypatch.setattr(core_training, "CHECKPOINT_DIR", str(tmp_path / "checkpoints"))

@@ -1,5 +1,8 @@
-from memory_manipulation.dynamic_memory_resize import resize_memory
-from memory_manipulation.link_matrix_ablation import AblatableSparseLinkMemory, patch_link_matrix
+from initium.memory_manipulation.dynamic_memory_resize import resize_memory
+from initium.memory_manipulation.link_matrix_ablation import (
+    AblatableSparseLinkMemory,
+    patch_link_matrix,
+)
 
 
 def test_link_mode_survives_resize_and_rebinds_module(build_tiny_rnn):

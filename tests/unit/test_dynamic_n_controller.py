@@ -1,5 +1,6 @@
 import pytest
-from memory_manipulation.dynamic_n_controller import DynamicNController
+
+from initium.memory_manipulation.dynamic_n_controller import DynamicNController
 
 
 def test_ema_growth_cooldown_and_state_roundtrip():

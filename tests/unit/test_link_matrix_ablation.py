@@ -1,6 +1,7 @@
 import torch
 from dnc.memory import Memory
-from memory_manipulation.link_matrix_ablation import (
+
+from initium.memory_manipulation.link_matrix_ablation import (
     AblatableSparseLinkMemory,
     patch_link_matrix,
 )

@@ -46,7 +46,7 @@ Issues = "https://github.com/samueleternity/initium/issues"
 # PEP 735 groups: pip>=25.1 (--group), uv, pdm>=2.13.
 [dependency-groups]
 lint = ["ruff>=0.12"]                # pin exactly once you settle on a version (format output drifts)
-typecheck = ["mypy>=1.13", "numpy>=1.26"]
+typecheck = ["mypy>=1.13", "numpy>=1.26,<2.5"]  # NumPy 2.5 stubs use Python 3.12-only syntax
 test = ["pytest>=8", "pytest-cov>=5"]
 dev = [
   { include-group = "lint" },

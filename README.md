@@ -16,6 +16,32 @@ The project studies how a neural controller can interact with a differentiable e
 
 These are research questions, not all established project claims. In particular, supported dataset interfaces do not imply that every modality has been trained and validated to the same standard as graph traversal.
 
+## Launch
+
+You can either fork/clone the repository and customize everything you need or you can use pip/pdm/uv for ready to use installation.
+
+Guide for pip usage:
+
+To install the whole framework: pip install initium-deeplearning
+
+For ANY mamba related operation you need: python -m initium.setup_wheels 
+
+Optionally you can try:
+pip install "initium-deeplearning[text]"
+pip install "initium-deeplearning[video]"
+pip install "initium-deeplearning[real-data]"
+
+To see all CLI optionality:
+initium-infer --help
+python initium.core_training --help
+
+Example usage:
+
+python -m initium.core_training 0.0 --controller lstm
+python -m initium.core_training 0.0 --split-graph --split-graph-variant mamba1 ...
+
+For any inference you need a checkpoint first, the built in inferencing tool will analyze the checkpoint and if any of the parameters are not supported you will NOT be able to launch the checkpoint (in case you made some custom changes to the training code).
+
 ## High-level flow
 
 ```text

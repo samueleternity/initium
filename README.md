@@ -214,3 +214,9 @@ Because the repository is new and research directions are still changing:
 ## License
 
 Initium is distributed under the GNU General Public License v3.0. See [`LICENSE`](LICENSE).
+
+## Publishing to PyPI
+
+Package versions come from `__version__` in `src/__init__.py`. After merging a version update into `main`, create a GitHub Release whose tag matches that version (for example, `v0.1.0`). The `Publish to PyPI` workflow builds and validates the wheel and source distribution, then publishes them automatically. It refuses releases whose tag points to a commit outside `main` or whose tag does not match the package version.
+
+One-time setup: configure a PyPI Trusted Publisher for project `initium` with owner `samueleternity`, repository `initium`, workflow `publish-pypi.yml`, and GitHub environment `pypi`. This uses short-lived OIDC credentials; no PyPI API token needs to be stored in GitHub. The PyPI project name was checked and currently returns 404, but PyPI reserves it only after the first successful publication.

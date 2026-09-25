@@ -103,7 +103,7 @@ def _dnc_from_git() -> bool:
         raw = metadata.distribution("dnc").read_text("direct_url.json")
     except metadata.PackageNotFoundError:
         return False
-    return bool(raw) and "vcs_info" in json.loads(raw)
+    return raw is not None and "vcs_info" in json.loads(raw)
 
 
 def _gpu_satisfied(requirements: list[str]) -> bool:

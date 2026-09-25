@@ -1,6 +1,7 @@
 import random
 
 import torch
+
 from initium.memory_manipulation.dynamic_memory_resize import resize_memory
 
 

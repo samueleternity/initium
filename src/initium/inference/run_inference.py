@@ -30,7 +30,6 @@ import random
 import time
 
 import torch
-from initium.memory_manipulation.nvrtc_compat import patch_prod_jiterator
 
 from initium.inference.cache.cache_config import (
     DEFAULT_CACHE,
@@ -59,6 +58,7 @@ from initium.inference.inference_config import (
 )
 from initium.inference.model_loader import load_model
 from initium.inference.tasks.task_registry import get_task
+from initium.memory_manipulation.nvrtc_compat import patch_prod_jiterator
 
 patch_prod_jiterator()  # environment workaround - see that module's docstring
 from initium.inference import run_logging as rl

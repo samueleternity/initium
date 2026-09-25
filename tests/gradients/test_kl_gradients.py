@@ -1,4 +1,5 @@
 import torch
+
 from initium.memory_manipulation.stochastic_write_head_v2 import StochasticWriteHead
 
 

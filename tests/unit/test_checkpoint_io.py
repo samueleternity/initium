@@ -1,4 +1,5 @@
 import pytest
+
 from initium.inference.checkpoint_io import describe_checkpoint, load_checkpoint
 
 

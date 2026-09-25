@@ -1,4 +1,5 @@
 import numpy as np
+
 from initium.data.common.real_data import _pool_from_bigram_matrix, split_train_test_facts
 
 

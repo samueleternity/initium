@@ -31,10 +31,10 @@ import random
 
 import numpy as np
 import torch
-from initium.memory_manipulation.dynamic_memory_resize import resize_memory
 
 from initium.data.base_dataset import BaseDataset
 from initium.data.common.graph_io import load_graph
+from initium.memory_manipulation.dynamic_memory_resize import resize_memory
 
 # ==========================================
 # CONFIGURATION

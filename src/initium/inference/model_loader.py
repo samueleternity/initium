@@ -21,9 +21,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-import initium.config.controller_config as cc
 import torch
 import torch.nn as nn
+
+import initium.config.controller_config as cc
 from initium.mamba_controller.mamba_controller import MambaDNC
 from initium.mamba_controller.split_graph_dnc import SplitGraphDNC
 from initium.memory_manipulation.link_matrix_ablation import patch_link_matrix

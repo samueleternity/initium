@@ -1,4 +1,5 @@
 import torch
+
 from initium.inference.model_loader import load_model
 
 

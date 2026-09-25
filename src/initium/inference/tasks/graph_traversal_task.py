@@ -20,6 +20,7 @@ build_traversal_episode_from_graph(), so encoding is byte-identical to training.
 from __future__ import annotations
 
 import torch
+
 from initium.data.common.graph_io import build_graph_from_raw_edges, load_raw_edges
 from initium.data.graph_traversal.graph_traversal import (
     INPUT_DIM,
@@ -31,7 +32,6 @@ from initium.data.graph_traversal.graph_traversal import (
     encode_triple,
     triple_to_digit_targets,
 )
-
 from initium.inference.metrics import EpisodeScore
 from initium.inference.tasks.base_task import BaseInferenceTask, Episode
 

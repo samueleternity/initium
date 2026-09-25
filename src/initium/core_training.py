@@ -38,6 +38,7 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn as nn
+
 from initium.memory_manipulation.nvrtc_compat import patch_prod_jiterator
 
 patch_prod_jiterator()  # environment workaround -- see module docstring

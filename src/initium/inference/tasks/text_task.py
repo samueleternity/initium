@@ -10,8 +10,8 @@ silently drift apart).
 from __future__ import annotations
 
 import torch
-from initium.data.text.text_dataset import TextChainDataset
 
+from initium.data.text.text_dataset import TextChainDataset
 from initium.inference.metrics import EpisodeScore
 from initium.inference.tasks.base_task import BaseInferenceTask, Episode
 

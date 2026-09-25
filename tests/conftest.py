@@ -52,7 +52,9 @@ def tmp_checkpoint_dir(tmp_path):
 def build_tiny_rnn(tiny_model_kwargs):
     def build(controller_type="lstm", **overrides):
         from initium.mamba_controller.mamba_controller import MambaDNC
-        from initium.memory_manipulation.stochastic_write_head_v2 import install_stochastic_write_heads
+        from initium.memory_manipulation.stochastic_write_head_v2 import (
+            install_stochastic_write_heads,
+        )
 
         options = {**tiny_model_kwargs, **overrides}
         split_graph = options.pop("split_graph", False)

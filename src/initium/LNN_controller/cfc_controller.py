@@ -30,6 +30,7 @@ from typing import cast
 
 import torch
 import torch.nn as nn
+
 from initium.MoE.moe_layer import MoEBlock, MultiSourceMoEBlock
 
 _NCPS_IMPORT_ERROR: str | None

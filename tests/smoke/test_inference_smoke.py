@@ -1,6 +1,7 @@
 import random
 
 import torch
+
 from initium.inference.cache.cached_engine import CachedInferenceEngine
 from initium.inference.cache.prefix_cache import PrefixStateCache
 from initium.inference.cache.result_cache import ResultCache

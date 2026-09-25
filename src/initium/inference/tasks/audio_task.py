@@ -10,8 +10,8 @@ silently drift apart).
 from __future__ import annotations
 
 import torch
-from initium.data.audio.audio_dataset import AudioChainDataset
 
+from initium.data.audio.audio_dataset import AudioChainDataset
 from initium.inference.metrics import EpisodeScore
 from initium.inference.tasks.base_task import BaseInferenceTask, Episode
 

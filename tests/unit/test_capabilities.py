@@ -1,5 +1,6 @@
 import pytest
 import torch
+
 from initium.inference.capabilities import (
     IncompatibleModelError,
     detect_capabilities,

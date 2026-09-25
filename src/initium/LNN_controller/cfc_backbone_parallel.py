@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+
 from initium.LNN_controller.cfc_controller import CfC, _require_ncps
 from initium.mamba_controller.mamba_backbone_parallel import MambaBackboneParallel
 from initium.MoE.moe_layer import MoEBlock

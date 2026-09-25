@@ -1,4 +1,5 @@
 import pytest
+
 from initium.memory_manipulation.dynamic_n_controller import DynamicNController
 
 

@@ -22,7 +22,7 @@ from typing import Any
 
 import torch
 
-from inference.metrics import EpisodeResult
+from initium.inference.metrics import EpisodeResult
 
 FRESH_HIDDEN = (None, None, None)
 

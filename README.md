@@ -81,14 +81,14 @@ Also KL regularization has specific, uninvestigated behaviour: it tends to stabi
 
 | Path | Role |
 | --- | --- |
-| `model/core_training.py` | Dataset-agnostic training loop, CLI, evaluation, logging, checkpointing, and orchestration of model options. |
-| `model/config/` | Training, regularization, controller, and architecture defaults. |
-| `model/data/` | Dataset registry, task episodes, curriculum/data handling, codecs, and real-data utilities. |
-| `model/mamba_controller/` | DNC controller integration, Mamba variants, hybrid controllers, and split-graph implementation. |
-| `model/LNN_controller/` | CfC and hybrid continuous-time controller implementations. |
-| `model/memory_manipulation/` | Stochastic write heads, prior snapshots, memory resizing, link-matrix ablations, and compatibility helpers. |
-| `model/MoE/` | Sparse expert layer and its local usage notes. |
-| `model/inference/` | Checkpoint loading, task registry, inference engine, metrics, logging, and cache support. |
+| `src/initium/core_training.py` | Dataset-agnostic training loop, CLI, evaluation, logging, checkpointing, and orchestration of model options. |
+| `src/initium/config/` | Training, regularization, controller, and architecture defaults. |
+| `src/initium/data/` | Dataset registry, task episodes, curriculum/data handling, codecs, and real-data utilities. |
+| `src/initium/mamba_controller/` | DNC controller integration, Mamba variants, hybrid controllers, and split-graph implementation. |
+| `src/initium/LNN_controller/` | CfC and hybrid continuous-time controller implementations. |
+| `src/initium/memory_manipulation/` | Stochastic write heads, prior snapshots, memory resizing, link-matrix ablations, and compatibility helpers. |
+| `src/initium/MoE/` | Sparse expert layer and its local usage notes. |
+| `src/initium/inference/` | Checkpoint loading, task registry, inference engine, metrics, logging, and cache support. |
 | `setup_wheels.py` | Environment/dependency setup entry point for specialized wheels. |
 | `pyproject.toml` | Package metadata, base and optional dependencies, and development tooling groups. |
 
@@ -104,23 +104,23 @@ python -m pip install -e .
 
 Optional dependencies are grouped by modality, for example `text`, `video`, and `real-data` in the project metadata. Audio/video processing may also rely on system tools such as FFmpeg. Mamba-family components can require packages beyond the base install. The default training path is intended to be usable without those optional controller dependencies.
 
-> **Packaging note for contributors:** the repository currently contains a `model/` source tree while some package metadata and module examples refer to top-level package names. Treat packaging/install instructions as provisional and verify them against the checkout you're using; keep this section synchronized when packaging is consolidated. -> This will be fixed soon.
+The source tree is packaged as `initium`; internal modules use the `initium.*` namespace.
 
 ## Training
 
-The main entry point is `model/core_training.py`. From the repository root, inspect the available arguments with:
+The main entry point is `src/initium/core_training.py`. From the repository root, inspect the available arguments with:
 
 ```bash
-python model/core_training.py --help
+python -m initium.core_training --help
 ```
 
 The script accepts a positional KL weight (`beta`); omitting it runs the configured beta sweep. It also accepts a random seed and controller/task/architecture options. A representative graph-task run with the Mamba controller and the dynamic-memory/split-graph experiments enabled is:
 
 ```bash
-python model/core_training.py 0.0 --seed 0 --controller mamba --dynamic-n-mode --split-graph
+python -m initium.core_training 0.0 --seed 0 --controller mamba --dynamic-n-mode --split-graph
 ```
 
-This is an example of the CLI shape, not a universal best configuration. Check `model/config/train_config.py` and `model/config/controller_config.py` for the defaults in the checkout you're running. In particular, training duration, model size, beta sweep, dataset, evaluation cadence, and memory options may have changed since older experiment records were produced.
+This is an example of the CLI shape, not a universal best configuration. Check `src/initium/config/train_config.py` and `src/initium/config/controller_config.py` for the defaults in the checkout you're running. In particular, training duration, model size, beta sweep, dataset, evaluation cadence, and memory options may have changed since older experiment records were produced.
 
 Training runs typically produce:
 
@@ -133,16 +133,16 @@ Keep seeds, source revision, full command, configuration, device/dependency vers
 
 ## Evaluation and inference
 
-The checkpoint-based inference CLI lives at `model/inference/run_inference.py`. Its help output is the current reference for arguments:
+The checkpoint-based inference CLI lives at `src/initium/inference/run_inference.py`. Its help output is the current reference for arguments:
 
 ```bash
-python -m model.inference.run_inference --help
+python -m initium.inference.run_inference --help
 ```
 
 The command accepts a checkpoint, task type, optional data link, episode count, seed, device, and task-specific settings. It can inspect checkpoint capabilities, compare reset and persistent experience modes, report memory-ablation behavior, and optionally configure inference caches. A basic invocation has this form:
 
 ```bash
-python -m model.inference.run_inference path/to/checkpoint.pt --dataset-type graph
+python -m initium.inference.run_inference path/to/checkpoint.pt --dataset-type graph
 ```
 
 The loader checks checkpoint/task compatibility and refuses unsupported task types or dimensions. Graph, text, audio, and video task runners are registered; multimodal execution is also represented in the code but its input dimensions depend on the selected modality combination. Verify the checkpoint's recorded dataset configuration before comparing results across task types.

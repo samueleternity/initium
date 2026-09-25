@@ -68,7 +68,7 @@ import os as _os
 
 import torch
 import torch.nn as nn
-from MoE.moe_layer import MoEBlock
+from initium.MoE.moe_layer import MoEBlock
 
 _MAMBA1_IMPORT_ERROR: str | None
 _MAMBA2_IMPORT_ERROR: str | None

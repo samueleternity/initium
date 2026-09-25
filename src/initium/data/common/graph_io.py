@@ -24,7 +24,7 @@ import json
 import os
 import random
 
-from data.common.real_data import resolve_link_paths
+from initium.data.common.real_data import resolve_link_paths
 
 LABEL_RANGE = 1000
 _HEADER_FIRST_FIELDS = {"src", "source", "from"}

@@ -1,5 +1,5 @@
 import torch
-from inference.model_loader import load_model
+from initium.inference.model_loader import load_model
 
 
 def test_loader_rebuilds_from_checkpoint_architecture(build_tiny_rnn):
@@ -32,7 +32,7 @@ def test_loader_rebuilds_from_checkpoint_architecture(build_tiny_rnn):
 
 
 def test_legacy_loader_uses_controller_defaults(build_tiny_rnn, monkeypatch):
-    import inference.model_loader as model_loader
+    import initium.inference.model_loader as model_loader
 
     monkeypatch.setattr(model_loader.cc, "CFC_BACKBONE_UNITS", 16)
     rnn, _, _, _ = build_tiny_rnn("cfc")

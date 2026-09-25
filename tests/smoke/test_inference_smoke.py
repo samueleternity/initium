@@ -1,19 +1,19 @@
 import random
 
 import torch
-from inference.cache.cached_engine import CachedInferenceEngine
-from inference.cache.prefix_cache import PrefixStateCache
-from inference.cache.result_cache import ResultCache
-from inference.cache.stores import MemoryStore, TieredStore
-from inference.capabilities import detect_capabilities
-from inference.checkpoint_io import load_checkpoint
-from inference.engine import InferenceEngine
-from inference.inference_config import WILDCARD_TYPE
-from inference.metrics import aggregate
-from inference.model_loader import load_model
-from inference.tasks.graph_traversal_task import GraphTraversalTask
-from mamba_controller.mamba_controller import MambaDNC
-from memory_manipulation.stochastic_write_head_v2 import install_stochastic_write_heads
+from initium.inference.cache.cached_engine import CachedInferenceEngine
+from initium.inference.cache.prefix_cache import PrefixStateCache
+from initium.inference.cache.result_cache import ResultCache
+from initium.inference.cache.stores import MemoryStore, TieredStore
+from initium.inference.capabilities import detect_capabilities
+from initium.inference.checkpoint_io import load_checkpoint
+from initium.inference.engine import InferenceEngine
+from initium.inference.inference_config import WILDCARD_TYPE
+from initium.inference.metrics import aggregate
+from initium.inference.model_loader import load_model
+from initium.inference.tasks.graph_traversal_task import GraphTraversalTask
+from initium.mamba_controller.mamba_controller import MambaDNC
+from initium.memory_manipulation.stochastic_write_head_v2 import install_stochastic_write_heads
 
 
 def test_inference_and_result_prefix_cache_smoke(tmp_path, synthetic_graph_edges):

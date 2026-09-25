@@ -10,11 +10,11 @@ from __future__ import annotations
 
 import os
 
-from inference.cache.base_cache import BaseCache
-from inference.cache.keys import model_fingerprint
-from inference.cache.prefix_cache import PrefixStateCache
-from inference.cache.result_cache import ResultCache
-from inference.cache.stores import DiskStore, MemoryStore, TieredStore
+from initium.inference.cache.base_cache import BaseCache
+from initium.inference.cache.keys import model_fingerprint
+from initium.inference.cache.prefix_cache import PrefixStateCache
+from initium.inference.cache.result_cache import ResultCache
+from initium.inference.cache.stores import DiskStore, MemoryStore, TieredStore
 
 CACHE_CLASSES = {"prefix": PrefixStateCache, "result": ResultCache}
 _OFF = {"", "off", "none", "false", "0", "no"}

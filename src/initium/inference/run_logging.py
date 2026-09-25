@@ -13,7 +13,7 @@ import json
 import os
 import re
 
-from inference.metrics import EpisodeResult
+from initium.inference.metrics import EpisodeResult
 
 
 def make_run_id(

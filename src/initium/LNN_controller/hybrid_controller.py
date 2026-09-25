@@ -20,8 +20,8 @@ New parallel backbone kind: add it to _BACKBONE_KINDS and the loop in build_para
 
 from __future__ import annotations
 
-from LNN_controller.cfc_controller import CfCControllerWrapper
-from LNN_controller.chained_controller import ChainedControllerWrapper
+from initium.LNN_controller.cfc_controller import CfCControllerWrapper
+from initium.LNN_controller.chained_controller import ChainedControllerWrapper
 
 STAGE_KINDS = ("mamba", "mamba2", "mamba3", "cfc")
 
@@ -41,11 +41,11 @@ def _make_stage(kind, in_dim, d_model, num_blocks, kw, device):
             in_dim=in_dim, d_model=d_model, num_blocks=num_blocks, device=device, **kw
         )
     if kind == "mamba":
-        from mamba_controller.mamba_controller import MambaControllerWrapper as W
+        from initium.mamba_controller.mamba_controller import MambaControllerWrapper as W
     elif kind == "mamba2":
-        from mamba_controller.mamba2_controller import Mamba2ControllerWrapper as W
+        from initium.mamba_controller.mamba2_controller import Mamba2ControllerWrapper as W
     elif kind == "mamba3":
-        from mamba_controller.mamba3_controller import Mamba3ControllerWrapper as W
+        from initium.mamba_controller.mamba3_controller import Mamba3ControllerWrapper as W
     else:
         raise ValueError(
             f"hybrid_controller: unknown stage kind {kind!r}, expected one of {STAGE_KINDS}"

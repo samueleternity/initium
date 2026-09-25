@@ -40,10 +40,10 @@ from __future__ import annotations
 import random
 
 import torch
-from memory_manipulation.dynamic_memory_resize import resize_memory
+from initium.memory_manipulation.dynamic_memory_resize import resize_memory
 
-from data.base_dataset import BaseDataset
-from data.common.digit_codec import DigitCodec, digit_field_diversity, digit_field_loss
+from initium.data.base_dataset import BaseDataset
+from initium.data.common.digit_codec import DigitCodec, digit_field_diversity, digit_field_loss
 
 NUM_FIELDS = 2  # [value, cumsum]
 NUM_PHASE_CHANNELS = 2

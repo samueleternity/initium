@@ -10,10 +10,10 @@ silently drift apart).
 from __future__ import annotations
 
 import torch
-from data.text.text_dataset import TextChainDataset
+from initium.data.text.text_dataset import TextChainDataset
 
-from inference.metrics import EpisodeScore
-from inference.tasks.base_task import BaseInferenceTask, Episode
+from initium.inference.metrics import EpisodeScore
+from initium.inference.tasks.base_task import BaseInferenceTask, Episode
 
 BUILTIN_LINKS = (None, "", "text-chain")
 

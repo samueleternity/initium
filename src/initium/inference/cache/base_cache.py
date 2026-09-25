@@ -19,9 +19,9 @@ from typing import Any
 
 import torch
 
-from inference.cache.keys import digest, hash_tensor
-from inference.cache.state_utils import tree_nbytes
-from inference.cache.stores import CacheStats, TieredStore
+from initium.inference.cache.keys import digest, hash_tensor
+from initium.inference.cache.state_utils import tree_nbytes
+from initium.inference.cache.stores import CacheStats, TieredStore
 
 
 @dataclass

@@ -15,8 +15,8 @@ one is used (longest-prefix match) and the remaining ones are stored on the way.
 
 from __future__ import annotations
 
-from inference.cache.base_cache import BaseCache, EpisodeCtx, ResumePoint
-from inference.cache.state_utils import restore, snapshot
+from initium.inference.cache.base_cache import BaseCache, EpisodeCtx, ResumePoint
+from initium.inference.cache.state_utils import restore, snapshot
 
 
 class PrefixStateCache(BaseCache):

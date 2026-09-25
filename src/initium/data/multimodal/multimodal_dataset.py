@@ -32,16 +32,16 @@ import random
 
 import torch
 
-from data.audio.audio_dataset import AudioChainDataset
-from data.base_dataset import BaseDataset
-from data.common.chain_task import (
+from initium.data.audio.audio_dataset import AudioChainDataset
+from initium.data.base_dataset import BaseDataset
+from initium.data.common.chain_task import (
     ChainCurriculum,
     score_answer_steps,
     value_cumsum_field_log_header,
     write_value_cumsum_field_log,
 )
-from data.text.text_dataset import TextChainDataset
-from data.video.video_dataset import VideoChainDataset
+from initium.data.text.text_dataset import TextChainDataset
+from initium.data.video.video_dataset import VideoChainDataset
 
 _MODALITY_CLASSES = {
     "text": TextChainDataset,

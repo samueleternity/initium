@@ -38,11 +38,11 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn as nn
-from memory_manipulation.nvrtc_compat import patch_prod_jiterator
+from initium.memory_manipulation.nvrtc_compat import patch_prod_jiterator
 
 patch_prod_jiterator()  # environment workaround -- see module docstring
 
-from config.controller_config import (
+from initium.config.controller_config import (
     CFC_ACTIVATION,
     CFC_BACKBONE_DROPOUT,
     CFC_BACKBONE_LAYERS,
@@ -91,7 +91,7 @@ from config.controller_config import (
     SPLIT_GRAPH_MAMBA_VARIANT,
     SPLIT_GRAPH_NUM_BLOCKS,
 )
-from config.train_config import (
+from initium.config.train_config import (
     AMP_INIT_SCALE,
     BATCH_SIZE,
     BETA_CTRL_ACC_TARGET,
@@ -128,20 +128,20 @@ from config.train_config import (
     USE_AMP,
     WARMUP_STEPS,
 )
-from data.dataset_registry import get_dataset
-from mamba_controller.mamba_controller import MambaDNC
-from mamba_controller.split_graph_dnc import SplitGraphDNC
-from memory_manipulation.dynamic_memory_resize import resize_memory
-from memory_manipulation.dynamic_n_controller import DynamicNController
-from memory_manipulation.link_matrix_ablation import patch_link_matrix
-from memory_manipulation.stochastic_write_head_v2 import (
+from initium.data.dataset_registry import get_dataset
+from initium.mamba_controller.mamba_controller import MambaDNC
+from initium.mamba_controller.split_graph_dnc import SplitGraphDNC
+from initium.memory_manipulation.dynamic_memory_resize import resize_memory
+from initium.memory_manipulation.dynamic_n_controller import DynamicNController
+from initium.memory_manipulation.link_matrix_ablation import patch_link_matrix
+from initium.memory_manipulation.stochastic_write_head_v2 import (
     get_prior_state,
     install_stochastic_write_heads,
     load_prior_state,
     pop_total_kl,
     update_all_prior_snapshots,
 )
-from MoE.moe_layer import pop_total_moe_aux_loss
+from initium.MoE.moe_layer import pop_total_moe_aux_loss
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")

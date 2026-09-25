@@ -21,13 +21,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-import config.controller_config as cc
+import initium.config.controller_config as cc
 import torch
 import torch.nn as nn
-from mamba_controller.mamba_controller import MambaDNC
-from mamba_controller.split_graph_dnc import SplitGraphDNC
-from memory_manipulation.link_matrix_ablation import patch_link_matrix
-from memory_manipulation.stochastic_write_head_v2 import (
+from initium.mamba_controller.mamba_controller import MambaDNC
+from initium.mamba_controller.split_graph_dnc import SplitGraphDNC
+from initium.memory_manipulation.link_matrix_ablation import patch_link_matrix
+from initium.memory_manipulation.stochastic_write_head_v2 import (
     install_stochastic_write_heads,
     load_prior_state,
 )

@@ -1,6 +1,6 @@
 # Test suite guide
 
-This directory tests the model components, training/checkpoint behavior, and inference paths in `src/model`. Tests use small synthetic inputs so the CPU suite can run quickly without downloading datasets or pretrained models.
+This directory tests the model components, training/checkpoint behavior, and inference paths in `src/initium`. Tests use small synthetic inputs so the CPU suite can run quickly without downloading datasets or pretrained models.
 
 ## Running tests
 
@@ -10,7 +10,7 @@ The repository's `just test` recipe runs:
 pytest -m "not gpu"
 ```
 
-This is the default CPU suite and matches the test command in GitHub Actions. To run one test module directly, use `pytest tests/path/to/test_file.py`. Pytest's configured test root is this directory, and `pyproject.toml` adds `src/model` to the import path because current production modules import sibling packages by their top-level names.
+This is the default CPU suite and matches the test command in GitHub Actions. To run one test module directly, use `pytest tests/path/to/test_file.py`. Pytest's configured test root is this directory, and `pyproject.toml` adds `src` to the import path, where production modules use the `initium.*` package namespace.
 
 Tests marked `gpu` are excluded by `just test`. To select them explicitly, use `pytest -m gpu` on a machine with CUDA, the matching PyTorch build, and the required CUDA extensions installed. Selecting them on a CPU-only machine does not make them CPU-compatible.
 
@@ -133,5 +133,5 @@ Short end-to-end paths intended to catch wiring/configuration failures.
 - These tests validate small synthetic workloads and implementation contracts. They do not establish model quality or performance on full research datasets.
 - The standard test job has no CUDA device and intentionally omits GPU wheel installation; GPU-only coverage requires a GPU-enabled runner.
 - Mamba CPU support is not established by this suite. In the attempted CPU probe, the pinned `mamba-ssm==2.3.2.post1` package lacked `selective_scan_cuda` and failed before its controller tests could execute.
-- Mypy is currently configured for `src/model`, not the tests. Pytest runs the tests, while repository-wide Ruff commands lint and format-check them.
-- Production modules currently use top-level sibling imports from `src/model`; changing to a conventional `src/initium` package layout is outside this suite's scope.
+- Mypy is currently configured for `src/initium`, not the tests. Pytest runs the tests, while repository-wide Ruff commands lint and format-check them.
+- Production modules use package-qualified imports from `initium`.

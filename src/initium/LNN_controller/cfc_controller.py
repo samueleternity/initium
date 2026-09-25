@@ -30,7 +30,7 @@ from typing import cast
 
 import torch
 import torch.nn as nn
-from MoE.moe_layer import MoEBlock, MultiSourceMoEBlock
+from initium.MoE.moe_layer import MoEBlock, MultiSourceMoEBlock
 
 _NCPS_IMPORT_ERROR: str | None
 
@@ -298,7 +298,7 @@ class CfCControllerWrapper(nn.Module):
 if (
     __name__ == "__main__"
 ):  # smoke test: python -m LNN_controller.cfc_controller (from project root)
-    from LNN_controller.chained_controller import ChainedControllerWrapper
+    from initium.LNN_controller.chained_controller import ChainedControllerWrapper
 
     B, T, in_dim, d = 4, 6, 40, 32
     for mm in (False, True):

@@ -1,5 +1,5 @@
 import torch
-from MoE.moe_layer import SwitchMoE
+from initium.MoE.moe_layer import SwitchMoE
 
 
 def test_aux_loss_alone_trains_router():

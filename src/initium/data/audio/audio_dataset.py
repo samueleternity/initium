@@ -24,8 +24,8 @@ import random
 
 import torch
 
-from data.common.chain_task import KVChainDataset
-from data.common.real_data import build_audio_kv_pool, split_train_test_facts
+from initium.data.common.chain_task import KVChainDataset
+from initium.data.common.real_data import build_audio_kv_pool, split_train_test_facts
 
 AUDIO_CURRICULUM = [
     (3, 2),

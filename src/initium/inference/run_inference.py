@@ -1,5 +1,5 @@
 """
-file: inference/run_inference.py
+file: initium/inference/run_inference.py
 
 CLI entrypoint (counterpart of core_training.py's __main__). Flow:
   load checkpoint -> detect capabilities -> REFUSE if requested dataset type /
@@ -7,14 +7,14 @@ CLI entrypoint (counterpart of core_training.py's __main__). Flow:
   (optional) set up caches -> run -> summarize/log.
 
 Examples (from the project root):
-  python -m inference.run_inference CKPT.pt
-  python -m inference.run_inference CKPT.pt --inspect
-  python -m inference.run_inference CKPT.pt --no-reset-experience --loop 50 --window 10 --compare-fresh
-  python -m inference.run_inference CKPT.pt --dataset-link my_graph.csv --path-length 3 8
-  # caching (see inference/cache/):
-  python -m inference.run_inference CKPT.pt --shared-context --cache prefix
-  python -m inference.run_inference CKPT.pt --shared-context --num-contexts 3 --cache prefix,result --cache-dir ./inference_cache
-  python -m inference.run_inference CKPT.pt --no-reset-experience --loop 50 --cache result --cache-dir ./inference_cache
+  python -m initium.inference.run_inference CKPT.pt
+  python -m initium.inference.run_inference CKPT.pt --inspect
+  python -m initium.inference.run_inference CKPT.pt --no-reset-experience --loop 50 --window 10 --compare-fresh
+  python -m initium.inference.run_inference CKPT.pt --dataset-link my_graph.csv --path-length 3 8
+  # caching (see initium/inference/cache/):
+  python -m initium.inference.run_inference CKPT.pt --shared-context --cache prefix
+  python -m initium.inference.run_inference CKPT.pt --shared-context --num-contexts 3 --cache prefix,result --cache-dir ./inference_cache
+  python -m initium.inference.run_inference CKPT.pt --no-reset-experience --loop 50 --cache result --cache-dir ./inference_cache
 """
 
 import os
@@ -30,24 +30,24 @@ import random
 import time
 
 import torch
-from memory_manipulation.nvrtc_compat import patch_prod_jiterator
+from initium.memory_manipulation.nvrtc_compat import patch_prod_jiterator
 
-from inference.cache.cache_config import (
+from initium.inference.cache.cache_config import (
     DEFAULT_CACHE,
     DEFAULT_CACHE_DISK_MB,
     DEFAULT_CACHE_RAM_MB,
     DEFAULT_VERIFY_HITS,
 )
-from inference.cache.cache_registry import parse_cache_spec, setup_caches
-from inference.cache.cached_engine import CachedInferenceEngine
-from inference.capabilities import (
+from initium.inference.cache.cache_registry import parse_cache_spec, setup_caches
+from initium.inference.cache.cached_engine import CachedInferenceEngine
+from initium.inference.capabilities import (
     IncompatibleModelError,
     detect_capabilities,
     require_dims_match,
     require_type_supported,
 )
-from inference.checkpoint_io import describe_checkpoint, load_checkpoint
-from inference.inference_config import (
+from initium.inference.checkpoint_io import describe_checkpoint, load_checkpoint
+from initium.inference.inference_config import (
     DEFAULT_DATASET_LINK,
     DEFAULT_DATASET_TYPE,
     DEFAULT_NUM_EPISODES,
@@ -57,13 +57,13 @@ from inference.inference_config import (
     INFERENCE_LOG_DIR,
     PROGRESS_EVERY,
 )
-from inference.model_loader import load_model
-from inference.tasks.task_registry import get_task
+from initium.inference.model_loader import load_model
+from initium.inference.tasks.task_registry import get_task
 
 patch_prod_jiterator()  # environment workaround - see that module's docstring
-from inference import run_logging as rl
-from inference.engine import InferenceEngine
-from inference.metrics import adaptation_trend, aggregate, windowed
+from initium.inference import run_logging as rl
+from initium.inference.engine import InferenceEngine
+from initium.inference.metrics import adaptation_trend, aggregate, windowed
 
 
 def parse_args(argv=None):
@@ -202,7 +202,7 @@ def parse_args(argv=None):
         help="print the checkpoint's config + capabilities and exit.",
     )
 
-    g = p.add_argument_group("caching (inference/cache/)")
+    g = p.add_argument_group("caching (initium/inference/cache/)")
     g.add_argument(
         "--cache",
         type=str,

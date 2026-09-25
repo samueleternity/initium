@@ -21,8 +21,8 @@ analogue). Fields: value (lookup), cumsum (chained state).
 
 import random
 
-from data.common.chain_task import KVChainDataset
-from data.common.real_data import build_text_kv_pool, split_train_test_facts
+from initium.data.common.chain_task import KVChainDataset
+from initium.data.common.real_data import build_text_kv_pool, split_train_test_facts
 
 TEXT_CURRICULUM = [
     (3, 2),

@@ -1,5 +1,5 @@
 import numpy as np
-from data.common.real_data import _pool_from_bigram_matrix, split_train_test_facts
+from initium.data.common.real_data import _pool_from_bigram_matrix, split_train_test_facts
 
 
 def test_bigram_pool_and_split_are_deterministic():

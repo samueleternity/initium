@@ -95,7 +95,7 @@ from typing import cast
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from MoE.moe_layer import MoEBlock
+from initium.MoE.moe_layer import MoEBlock
 
 _MAMBA2_IMPORT_ERROR: str | None
 

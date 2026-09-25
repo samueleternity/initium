@@ -17,8 +17,8 @@ from __future__ import annotations
 
 import torch
 
-from inference.cache.base_cache import BaseCache, EpisodeCtx, EpisodeHit
-from inference.cache.state_utils import restore, snapshot
+from initium.inference.cache.base_cache import BaseCache, EpisodeCtx, EpisodeHit
+from initium.inference.cache.state_utils import restore, snapshot
 
 
 class ResultCache(BaseCache):

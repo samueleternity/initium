@@ -37,12 +37,12 @@ def test_model_state_roundtrip_rebuilds_independently(build_tiny_rnn, tmp_checkp
     with torch.no_grad():
         expected, _ = first(x, None)
 
-    src_model = Path(__file__).resolve().parents[2] / "src" / "model"
+    src_root = Path(__file__).resolve().parents[2] / "src"
     env = os.environ.copy()
-    env["PYTHONPATH"] = str(src_model) + os.pathsep + env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = str(src_root) + os.pathsep + env.get("PYTHONPATH", "")
     script = (
         "import sys, torch; "
-        "from inference.model_loader import load_model; "
+        "from initium.inference.model_loader import load_model; "
         "ckpt=torch.load(sys.argv[1], map_location='cpu', weights_only=False); "
         "loaded=load_model(ckpt, torch.device('cpu'), deterministic_write=True); "
         "x=torch.load(sys.argv[2], map_location='cpu', weights_only=True); "

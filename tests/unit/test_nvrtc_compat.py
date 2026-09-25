@@ -1,5 +1,5 @@
 import torch
-from memory_manipulation.nvrtc_compat import patch_prod_jiterator
+from initium.memory_manipulation.nvrtc_compat import patch_prod_jiterator
 
 
 def test_patch_is_idempotent_and_cpu_parity():

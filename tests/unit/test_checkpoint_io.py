@@ -1,5 +1,5 @@
 import pytest
-from inference.checkpoint_io import describe_checkpoint, load_checkpoint
+from initium.inference.checkpoint_io import describe_checkpoint, load_checkpoint
 
 
 def test_checkpoint_required_keys_and_override(tmp_path):

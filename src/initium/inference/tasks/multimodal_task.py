@@ -8,10 +8,10 @@ training-side dataset classes.
 
 from __future__ import annotations
 
-from data.multimodal.multimodal_dataset import MultimodalDataset
+from initium.data.multimodal.multimodal_dataset import MultimodalDataset
 
-from inference.metrics import EpisodeScore
-from inference.tasks.base_task import BaseInferenceTask, Episode
+from initium.inference.metrics import EpisodeScore
+from initium.inference.tasks.base_task import BaseInferenceTask, Episode
 
 
 class MultimodalTask(BaseInferenceTask):

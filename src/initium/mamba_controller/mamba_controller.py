@@ -167,7 +167,7 @@ import torch.nn.functional as F
 from dnc import DNC
 from dnc.memory import Memory
 from dnc.util import cuda
-from MoE.moe_layer import MoEBlock, MoERNNWrapper
+from initium.MoE.moe_layer import MoEBlock, MoERNNWrapper
 
 _MAMBA_IMPORT_ERROR: str | None
 
@@ -191,19 +191,19 @@ def _require_mamba_ssm() -> None:
         raise ImportError(_MAMBA_IMPORT_ERROR)
 
 
-from LNN_controller.cfc_controller import (  # v13 (CfC / LNN controller)
+from initium.LNN_controller.cfc_controller import (  # v13 (CfC / LNN controller)
     CfCControllerWrapper,
     _require_ncps,
 )
-from LNN_controller.hybrid_controller import (  # v14 (Mamba -> CfC chains)
+from initium.LNN_controller.hybrid_controller import (  # v14 (Mamba -> CfC chains)
     build_hybrid_controller,
     is_hybrid_rnn_type,
 )
-from mamba_controller.mamba2_controller import (  # v10 (Mamba-2 standalone controller)
+from initium.mamba_controller.mamba2_controller import (  # v10 (Mamba-2 standalone controller)
     Mamba2ControllerWrapper,
     _require_mamba2_ssm,
 )
-from mamba_controller.mamba3_controller import (  # v12 (Mamba-3 controller)
+from initium.mamba_controller.mamba3_controller import (  # v12 (Mamba-3 controller)
     Mamba3ControllerWrapper,
     _require_mamba3_ssm,
 )

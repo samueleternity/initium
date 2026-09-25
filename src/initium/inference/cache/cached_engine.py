@@ -31,12 +31,12 @@ from typing import Any
 
 import torch
 
-from inference.cache.base_cache import EpisodeCtx
-from inference.cache.cache_config import DEFAULT_VERIFY_HITS, DEFAULT_VERIFY_TOL, ROOT_CHAIN
-from inference.cache.keys import chain_next, hash_tensor
-from inference.cache.state_utils import clone_tree, tree_max_abs_diff
-from inference.engine import FRESH_HIDDEN, InferenceEngine
-from inference.metrics import EpisodeResult
+from initium.inference.cache.base_cache import EpisodeCtx
+from initium.inference.cache.cache_config import DEFAULT_VERIFY_HITS, DEFAULT_VERIFY_TOL, ROOT_CHAIN
+from initium.inference.cache.keys import chain_next, hash_tensor
+from initium.inference.cache.state_utils import clone_tree, tree_max_abs_diff
+from initium.inference.engine import FRESH_HIDDEN, InferenceEngine
+from initium.inference.metrics import EpisodeResult
 
 
 def model_supports_resume(model) -> bool:

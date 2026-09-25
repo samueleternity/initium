@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 
 import torch
 
-from inference.metrics import EpisodeScore
+from initium.inference.metrics import EpisodeScore
 
 
 @dataclass

@@ -22,7 +22,7 @@ classifiers = [
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 # Only what PyPI can express. GPU wheels (mamba-ssm, causal-conv1d) and git-pinned pytorch-dnc
-# are installed by `initium-setup` (model/setup_wheels.py).
+# are installed by `initium-setup` (initium/setup_wheels.py).
 dependencies = [
   "torch>=2.4",
   "numpy>=1.26",
@@ -36,8 +36,8 @@ video = ["opencv-python>=4.8"]       # real video data (audio additionally needs
 real-data = ["initium[text,video]"]
 
 [project.scripts]
-initium-setup = "model.setup_wheels:main"
-initium-infer = "model.inference.run_inference:main"
+initium-setup = "initium.setup_wheels:main"
+initium-infer = "initium.inference.run_inference:main"
 
 [project.urls]
 Homepage = "https://github.com/samueleternity/initium"
@@ -58,9 +58,9 @@ dev = [
 [tool.hatch.version]
 path = "src/__init__.py"
 
-# src-layout: hatchling picks up everything under src/model as the "model" package.
+# src-layout: hatchling picks up everything under src/initium as the "initium" package.
 [tool.hatch.build.targets.wheel]
-packages = ["src/model"]
+packages = ["src/initium"]
 
 [tool.hatch.build.targets.sdist]
 include = [
@@ -84,21 +84,21 @@ ignore = [
 ]
 
 [tool.ruff.lint.isort]
-known-first-party = ["model"]
+known-first-party = ["initium"]
 
 [tool.ruff.lint.per-file-ignores]
 # Intentional import-after-code (env patches, sys.path bootstrap, circular-import avoidance).
-"src/model/core_training.py" = ["E402"]
-"src/model/inference/run_inference.py" = ["E402"]
-"src/model/data/common/real_data.py" = ["E402"]
-"src/model/mamba_controller/mamba_controller.py" = ["E402"]
-"src/model/data/multimodal/multimodal_dataset.py" = ["B023"]   # lambdas are called immediately
+"src/initium/core_training.py" = ["E402"]
+"src/initium/inference/run_inference.py" = ["E402"]
+"src/initium/data/common/real_data.py" = ["E402"]
+"src/initium/mamba_controller/mamba_controller.py" = ["E402"]
+"src/initium/data/multimodal/multimodal_dataset.py" = ["B023"]   # lambdas are called immediately
 
 # ---------------------------------------------------------------- mypy
 [tool.mypy]
 python_version = "3.10"
-files = ["src/model"]
-mypy_path = "src/model"
+files = ["src/initium"]
+mypy_path = "src"
 namespace_packages = true
 explicit_package_bases = true
 warn_unused_configs = true
@@ -116,14 +116,14 @@ module = [
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
-module = "memory_manipulation.nvrtc_compat"    # deliberate torch.prod/cumprod monkeypatching
+module = "initium.memory_manipulation.nvrtc_compat"    # deliberate torch.prod/cumprod monkeypatching
 disable_error_code = ["assignment", "method-assign"]
 
 # ---------------------------------------------------------------- pytest (reserved)
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra --strict-markers"
-pythonpath = ["src/model"]
+pythonpath = ["src"]
 markers = [
   "gpu: requires a CUDA GPU with mamba-ssm/causal-conv1d installed",
   "slow: slower tests (tiny end-to-end training/inference runs)",

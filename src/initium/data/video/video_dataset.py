@@ -25,8 +25,8 @@ import random
 
 import torch
 
-from data.common.chain_task import KVChainDataset
-from data.common.real_data import build_video_kv_pool, split_train_test_facts
+from initium.data.common.chain_task import KVChainDataset
+from initium.data.common.real_data import build_video_kv_pool, split_train_test_facts
 
 VIDEO_CURRICULUM = [
     (3, 2),

@@ -115,18 +115,18 @@ from typing import Any
 import torch
 import torch.nn as nn
 from dnc.memory import Memory
-from LNN_controller.cfc_backbone_parallel import (
+from initium.LNN_controller.cfc_backbone_parallel import (
     build_parallel_backbone,
     collect_backbone_moe_layers,
 )
-from LNN_controller.cfc_controller import CfCControllerWrapper
-from LNN_controller.hybrid_controller import (  # v15: hybrid combiner
+from initium.LNN_controller.cfc_controller import CfCControllerWrapper
+from initium.LNN_controller.hybrid_controller import (  # v15: hybrid combiner
     build_hybrid_controller,
     is_hybrid_rnn_type,
 )
-from mamba_controller.mamba2_controller import Mamba2ControllerWrapper
-from mamba_controller.mamba3_controller import Mamba3ControllerWrapper
-from mamba_controller.mamba_controller import MambaControllerWrapper
+from initium.mamba_controller.mamba2_controller import Mamba2ControllerWrapper
+from initium.mamba_controller.mamba3_controller import Mamba3ControllerWrapper
+from initium.mamba_controller.mamba_controller import MambaControllerWrapper
 
 
 class SplitGraphDNC(nn.Module):

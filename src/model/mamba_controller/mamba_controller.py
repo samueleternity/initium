@@ -917,7 +917,7 @@ class MambaDNC(DNC):
         # same "give the caller one flat list" convention
         # install_stochastic_write_heads() already uses for stochastic
         # write heads in stochastic_write_head_v2.py.
-        self.moe_layers: list[nn.Module] = []
+        self.moe_layers = []
         if self.moe_enabled:
             for layer_controller in self.rnns:
                 self.moe_layers.extend(cast(Any, layer_controller).moe_blocks)

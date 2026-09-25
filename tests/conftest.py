@@ -116,7 +116,7 @@ def synthetic_kv_facts():
 
 @pytest.fixture
 def configure_tiny_training(monkeypatch, tmp_path):
-    import core_training
+    import initium.core_training as core_training
     import initium.data.graph_traversal.graph_traversal as graph
 
     monkeypatch.setattr(core_training, "LOG_DIR", str(tmp_path / "logs"))

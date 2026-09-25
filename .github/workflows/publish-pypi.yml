@@ -50,7 +50,7 @@ jobs:
           tag_version = os.environ["RELEASE_TAG"].removeprefix("v")
           if tag_version != version:
               raise SystemExit(f"Release tag {tag_version!r} does not match package version {version!r}.")
-          print(f"Building initium {version}")
+          print(f"Building initium-deeplearning {version}")
           PY
 
       - name: Install build tools
@@ -75,7 +75,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/project/initium/
+      url: https://pypi.org/project/initium-deeplearning/
     permissions:
       id-token: write
     steps:

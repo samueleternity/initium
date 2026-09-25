@@ -94,7 +94,7 @@ Also KL regularization has specific, uninvestigated behaviour: it tends to stabi
 
 ## Setup
 
-The project targets Python 3.10 or later. Core dependencies are declared in `pyproject.toml`; accelerated state-space controllers may need platform-specific PyTorch/CUDA wheels and additional packages. Install the project and optional task dependencies in an environment appropriate to your hardware. For specialized dependency setup, inspect the repository's `setup_wheels.py` and its help output before running it; GPU package compatibility depends on the installed PyTorch, CUDA, and Python versions.
+The PyPI distribution is named `initium-deeplearning`; its Python import package is `initium`. The project targets Python 3.10 or later. Core dependencies are declared in `pyproject.toml`; accelerated state-space controllers may need platform-specific PyTorch/CUDA wheels and additional packages. Install the project and optional task dependencies in an environment appropriate to your hardware. For specialized dependency setup, inspect the repository's `setup_wheels.py` and its help output before running it; GPU package compatibility depends on the installed PyTorch, CUDA, and Python versions.
 
 Typical editable installation for development:
 
@@ -219,4 +219,4 @@ Initium is distributed under the GNU General Public License v3.0. See [`LICENSE`
 
 Package versions come from `__version__` in `src/__init__.py`. After merging a version update into `main`, create a GitHub Release whose tag matches that version (for example, `v0.1.0`). The `Publish to PyPI` workflow builds and validates the wheel and source distribution, then publishes them automatically. It refuses releases whose tag points to a commit outside `main` or whose tag does not match the package version.
 
-One-time setup: configure a PyPI Trusted Publisher for project `initium` with owner `samueleternity`, repository `initium`, workflow `publish-pypi.yml`, and GitHub environment `pypi`. This uses short-lived OIDC credentials; no PyPI API token needs to be stored in GitHub. The PyPI project name was checked and currently returns 404, but PyPI reserves it only after the first successful publication.
+The PyPI distribution name is `initium-deeplearning`; the source directory and import namespace remain `initium`. The configured PyPI Trusted Publisher should target project `initium-deeplearning` with owner `samueleternity`, repository `initium`, workflow `publish-pypi.yml`, and GitHub environment `pypi`. Publishing uses short-lived OIDC credentials, so no PyPI API token is stored in GitHub.

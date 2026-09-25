@@ -3,7 +3,7 @@ requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
-name = "initium"                     # verify the name is free on PyPI before publishing
+name = "initium-deeplearning"       # PyPI distribution name; Python imports remain `initium`
 dynamic = ["version"]                # from src/__init__.py
 description = "Differentiable Neural Computer research framework with pluggable LSTM/Mamba/CfC controllers, MoE, split-graph and stochastic write heads."
 readme = "README.md"
@@ -33,7 +33,7 @@ dependencies = [
 [project.optional-dependencies]
 text = ["tokenizers>=0.19"]          # fast BPE for real text data
 video = ["opencv-python>=4.8"]       # real video data (audio additionally needs the ffmpeg CLI)
-real-data = ["initium[text,video]"]
+real-data = ["initium-deeplearning[text,video]"]
 
 [project.scripts]
 initium-setup = "initium.setup_wheels:main"

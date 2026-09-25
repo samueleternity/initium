@@ -240,7 +240,7 @@ def collect_backbone_moe_layers(backbone: nn.Module) -> list:
     moe_layers: list[nn.Module] = []
     for stage in stages:
         if getattr(stage, "moe_enabled", False):
-            blocks = getattr(stage, "moe_blocks")
+            blocks = stage.moe_blocks
             if not isinstance(blocks, nn.ModuleList):
                 raise TypeError(
                     "MoE-enabled backbone stages must expose a ModuleList of moe_blocks"

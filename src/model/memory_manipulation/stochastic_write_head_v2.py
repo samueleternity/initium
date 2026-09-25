@@ -220,10 +220,14 @@ class StochasticWriteHead(nn.Module):
             # prior buffers -- i.e. only this timestep's write-head output
             # and a constant -- nothing else is read, so the per-write
             # locality claim is identical to Phase 1's.
-            mu32 = mu.float()
-            logvar32 = logvar_c.float()
-            prior_mu32 = self.prior_mu.float()
-            prior_logvar32 = self.prior_logvar.float()
+            # Keep double precision for numerical gradient checks and
+            # scientific callers; use fp32 for lower-precision/autocast
+            # inputs so the KL remains stable under mixed precision.
+            kl_dtype = torch.float64 if mu.dtype == torch.float64 else torch.float32
+            mu32 = mu.to(dtype=kl_dtype)
+            logvar32 = logvar_c.to(dtype=kl_dtype)
+            prior_mu32 = self.prior_mu.to(dtype=kl_dtype)
+            prior_logvar32 = self.prior_logvar.to(dtype=kl_dtype)
             # General diagonal-Gaussian KL(N(mu,var) || N(prior_mu,prior_var)):
             #   0.5 * [ prior_logvar - logvar + (exp(logvar) + (mu-prior_mu)^2)/exp(prior_logvar) - 1 ]
             # Reduces exactly to Phase 1's 0.5*(exp(logvar)+mu^2-1-logvar) when

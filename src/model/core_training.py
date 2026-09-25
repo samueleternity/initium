@@ -279,6 +279,7 @@ def save_checkpoint(
     model_config = {
         "input_size": rnn.input_size,
         "hidden_size": MODEL_HIDDEN_SIZE,
+        "num_hidden_layers": getattr(rnn, "num_hidden_layers", None),
         "nr_cells": rnn.memories[0].nr_cells,
         "cell_size": MODEL_CELL_SIZE,
         "read_heads": MODEL_READ_HEADS,
@@ -787,7 +788,7 @@ def run(
             cfc_activation=CFC_ACTIVATION,
             cfc_mixed_memory=CFC_MIXED_MEMORY,
             cfc_residual=CFC_RESIDUAL,
-            moe_enabled=moe_enabled,  # MambaDNC raises if True (not wired for cfc)
+            moe_enabled=moe_enabled,
             moe_top_k=moe_top_k,
         )
 
@@ -813,7 +814,7 @@ def run(
             cfc_mixed_memory=CFC_MIXED_MEMORY,
             cfc_residual=CFC_RESIDUAL,
             hybrid_cfc_num_blocks=HYBRID_CFC_NUM_BLOCKS,
-            moe_enabled=moe_enabled,  # MambaDNC raises if True (not wired for hybrids)
+            moe_enabled=moe_enabled,
             moe_top_k=moe_top_k,
         )
 

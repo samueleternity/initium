@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "initium"                     # verify the name is free on PyPI before publishing
-dynamic = ["version"]                # from src/model/__init__.py
+dynamic = ["version"]                # from src/__init__.py
 description = "Differentiable Neural Computer research framework with pluggable LSTM/Mamba/CfC controllers, MoE, split-graph and stochastic write heads."
 readme = "README.md"
 requires-python = ">=3.10"           # code uses `X | None` at runtime
@@ -56,7 +56,7 @@ dev = [
 
 # ---------------------------------------------------------------- build
 [tool.hatch.version]
-path = "src/model/__init__.py"
+path = "src/__init__.py"
 
 # src-layout: hatchling picks up everything under src/model as the "model" package.
 [tool.hatch.build.targets.wheel]
@@ -123,3 +123,8 @@ disable_error_code = ["assignment", "method-assign"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra --strict-markers"
+pythonpath = ["src/model"]
+markers = [
+  "gpu: requires a CUDA GPU with mamba-ssm/causal-conv1d installed",
+  "slow: slower tests (tiny end-to-end training/inference runs)",
+]

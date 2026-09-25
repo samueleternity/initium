@@ -46,6 +46,7 @@ static-Option-2 call site can opt in by passing `optimizer=optimizer` too
 already-running static-Option-2 experiments).
 """
 
+import torch
 import torch.nn as nn
 from dnc.memory import Memory
 from memory_manipulation.link_matrix_ablation import AblatableSparseLinkMemory
@@ -82,6 +83,8 @@ def _resync_optimizer_after_resize(optimizer, old_named_params: dict, new_memory
 
 
 def resize_memory(model, new_nr_cells: int, device=None, layer: int = 0, optimizer=None):
+    if device is not None:
+        device = torch.device(device)
     old_memory: Memory = model.memories[layer]  # VERIFY attribute name
     if old_memory.nr_cells == new_nr_cells:  # VERIFY kwarg/attr name
         return old_memory

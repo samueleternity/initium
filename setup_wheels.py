@@ -47,7 +47,7 @@ def detect_torch() -> TorchEnv:
         import torch
     except ImportError as exc:
         raise SystemExit(
-            "torch is not installed. Install it first (Colab already provides it)."
+            "PyTorch is required to install GPU wheels. Install a compatible PyTorch build first."
         ) from exc
     version = torch.__version__.split("+", 1)[0]
     return TorchEnv(version, ".".join(version.split(".")[:2]), torch.version.cuda)
@@ -140,14 +140,14 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
-    env = detect_torch()
-    print(f"[initium-setup] torch={env.version} cuda={env.cuda or 'none (CPU build)'}")
     installer = resolve_installer(args.installer)
 
     plan: list[tuple[str, list[str]]] = []
     if "dnc" not in args.skip and (args.force or not _dnc_from_git()):
         plan.append(("pytorch-dnc (git)", dnc_command(installer)))
     if "gpu-wheels" not in args.skip:
+        env = detect_torch()
+        print(f"[initium-setup] torch={env.version} cuda={env.cuda or 'none (CPU build)'}")
         if env.cuda_tag is None:
             print("[initium-setup] CPU-only torch: skipping mamba-ssm/causal-conv1d (need CUDA).")
         else:

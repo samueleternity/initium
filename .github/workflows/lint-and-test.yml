@@ -118,9 +118,7 @@ jobs:
           uv venv
           uv pip install torch --index-url https://download.pytorch.org/whl/cpu
           uv pip install -e . --group test
-          python -m initium.setup_wheels --skip gpu-wheels   # pytorch-dnc from git; no CUDA on runners
+          .venv/bin/python setup_wheels.py --skip gpu-wheels   # pytorch-dnc from git; no CUDA on runners
           echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
       - name: Run tests
         run: just test
-        # TODO(tests): GPU-only tests (mamba/cfc kernels) need a marker such as
-        # `-m "not gpu"` here until a GPU runner exists.

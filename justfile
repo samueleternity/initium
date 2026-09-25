@@ -32,15 +32,9 @@ fix:
 # Format, then lint
 format-lint: format lint
 
-# ---- tests (reserved: no-op until tests/ exists) -------------------------------
+# ---- tests ---------------------------------------------------------------------
 test *args:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    if [ -d tests ]; then
-        pytest {{args}}
-    else
-        echo "tests/ not found - test suite not implemented yet, skipping."
-    fi
+    pytest -m "not gpu" {{args}}
 
 # ---- environment ----------------------------------------------------------------
 # Install CUDA-matched mamba-ssm / causal-conv1d and git pytorch-dnc (args: --dry-run, --skip ...)

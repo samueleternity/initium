@@ -1,5 +1,5 @@
-from memory_manipulation.dynamic_n_controller import DynamicNController
 from memory_manipulation.dynamic_memory_resize import resize_memory
+from memory_manipulation.dynamic_n_controller import DynamicNController
 
 
 def test_dynamic_n_decision_applies_live_resize(build_tiny_rnn):

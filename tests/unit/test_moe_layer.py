@@ -1,6 +1,5 @@
 import pytest
 import torch
-
 from MoE.moe_layer import MultiSourceMoEBlock, SwitchMoE
 
 

@@ -1,7 +1,6 @@
 import random
 
 import torch
-
 from memory_manipulation.dynamic_memory_resize import resize_memory
 
 
@@ -10,7 +9,6 @@ def test_resize_transplants_weights_head_and_optimizer_state(build_tiny_rnn):
     memory = model.memories[0]
     head = memory.write_vector_transform
     stable_layer = memory.read_keys_transform
-    before = stable_layer.weight.detach().clone()
     loss = sum(parameter.square().sum() for parameter in model.parameters())
     loss.backward()
     optimizer.step()

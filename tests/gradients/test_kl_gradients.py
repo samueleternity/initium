@@ -1,5 +1,4 @@
 import torch
-
 from memory_manipulation.stochastic_write_head_v2 import StochasticWriteHead
 
 

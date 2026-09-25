@@ -1,10 +1,11 @@
 import pytest
-
 from memory_manipulation.dynamic_n_controller import DynamicNController
 
 
 def test_ema_growth_cooldown_and_state_roundtrip():
-    ctl = DynamicNController(4, 10, growth_factor=2, trigger_frac=0.5, ema_decay=0.0, cooldown_steps=2)
+    ctl = DynamicNController(
+        4, 10, growth_factor=2, trigger_frac=0.5, ema_decay=0.0, cooldown_steps=2
+    )
     ctl.record(0.25)
     assert ctl.ema == pytest.approx(0.25)
     assert ctl.should_grow(4) is None
@@ -23,4 +24,3 @@ def test_ema_growth_cooldown_and_state_roundtrip():
     restored.record(1.0)
     assert restored.should_grow(8) is None
     assert restored.should_grow(6) is None
-

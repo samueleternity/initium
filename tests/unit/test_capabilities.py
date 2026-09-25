@@ -1,6 +1,5 @@
 import pytest
 import torch
-
 from inference.capabilities import (
     IncompatibleModelError,
     detect_capabilities,

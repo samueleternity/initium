@@ -1,5 +1,4 @@
 import torch
-
 from inference.model_loader import load_model
 
 

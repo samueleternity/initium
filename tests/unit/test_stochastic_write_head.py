@@ -1,5 +1,4 @@
 import torch
-
 from memory_manipulation.stochastic_write_head_v2 import (
     StochasticWriteHead,
     get_prior_state,
@@ -48,14 +47,18 @@ def test_learned_prior_kl_matches_diagonal_gaussian_formula():
     mu = head.mu_transform(torch.zeros(1, 2))
     logvar = head.logvar_transform(torch.zeros(1, 2))
     expected = (
-        0.5
-        * (
-            head.prior_logvar
-            - logvar
-            + (logvar.exp() + (mu - head.prior_mu).square()) / head.prior_logvar.exp()
-            - 1
+        (
+            0.5
+            * (
+                head.prior_logvar
+                - logvar
+                + (logvar.exp() + (mu - head.prior_mu).square()) / head.prior_logvar.exp()
+                - 1
+            )
         )
-    ).sum(-1).mean()
+        .sum(-1)
+        .mean()
+    )
     torch.testing.assert_close(actual, expected)
 
 

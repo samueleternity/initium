@@ -1,5 +1,4 @@
 import numpy as np
-
 from data.common.real_data import _pool_from_bigram_matrix, split_train_test_facts
 
 

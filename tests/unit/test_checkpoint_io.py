@@ -1,5 +1,4 @@
 import pytest
-
 from inference.checkpoint_io import describe_checkpoint, load_checkpoint
 
 

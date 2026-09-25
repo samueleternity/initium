@@ -2,7 +2,6 @@ import importlib.util
 
 import pytest
 import torch
-
 from LNN_controller.cfc_controller import CfCControllerBlock
 
 requires_mamba_ssm = pytest.mark.skipif(

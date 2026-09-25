@@ -1,7 +1,6 @@
 import random
 
 import torch
-
 from inference.cache.cached_engine import CachedInferenceEngine
 from inference.cache.prefix_cache import PrefixStateCache
 from inference.cache.result_cache import ResultCache
@@ -74,9 +73,7 @@ def test_inference_and_result_prefix_cache_smoke(tmp_path, synthetic_graph_edges
         synthetic_graph_edges, path_length_range=(1, 2), shared_context=True
     )
     shared_episodes = shared_task.build_episodes(2, random.Random(19))
-    prefix_cache = PrefixStateCache(
-        TieredStore(MemoryStore(8_000_000)), "fp", torch.device("cpu")
-    )
+    prefix_cache = PrefixStateCache(TieredStore(MemoryStore(8_000_000)), "fp", torch.device("cpu"))
     prefix_engine = CachedInferenceEngine(
         loaded.rnn, loaded.output_proj, shared_task, torch.device("cpu"), [prefix_cache]
     )

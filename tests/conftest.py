@@ -68,7 +68,19 @@ def build_tiny_rnn(tiny_model_kwargs):
                 num_backbone_blocks=options["num_hidden_layers"],
                 mamba_variant=options.pop("split_graph_variant", "cfc"),
                 cfc_kwargs={"backbone_units": 16},
-                **{k: v for k, v in options.items() if k not in {"input_size", "hidden_size", "nr_cells", "cell_size", "read_heads", "num_hidden_layers"}},
+                **{
+                    k: v
+                    for k, v in options.items()
+                    if k
+                    not in {
+                        "input_size",
+                        "hidden_size",
+                        "nr_cells",
+                        "cell_size",
+                        "read_heads",
+                        "num_hidden_layers",
+                    }
+                },
             )
             output_proj = None
         else:
@@ -134,8 +146,13 @@ def assert_run_artifacts(tmp_path):
         import math
 
         assert {
-            "run_id", "beta_target", "id_triple_acc", "id_perfect_frac",
-            "ood_triple_acc", "ood_perfect_frac", "total_elapsed_sec",
+            "run_id",
+            "beta_target",
+            "id_triple_acc",
+            "id_perfect_frac",
+            "ood_triple_acc",
+            "ood_perfect_frac",
+            "total_elapsed_sec",
         } <= summary.keys()
         checkpoint_paths = list((tmp_path / "checkpoints").glob("*.pt"))
         assert checkpoint_paths

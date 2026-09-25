@@ -93,6 +93,9 @@ class Expert(nn.Module):
     minimal is itself corpus-consistent (Dead-End #43: fancier internal
     placements underperformed the plain external design)."""
 
+    w_in: nn.Linear
+    w_out: nn.Linear
+
     def __init__(self, d_model: int, expert_dim: int):
         super().__init__()
         self.w_in = nn.Linear(d_model, expert_dim)
@@ -368,6 +371,8 @@ class MultiSourceMoEBlock(nn.Module):
     router/gather overhead only, never extra kernel launches.
     """
 
+    _cumulative_source_counts: list[torch.Tensor] | None
+
     def __init__(
         self,
         d_model: int,
@@ -396,6 +401,7 @@ class MultiSourceMoEBlock(nn.Module):
             router_noise_eps=router_noise_eps,
             load_balance_alpha=load_balance_alpha,
         )
+        self._cumulative_source_counts = None
         if device is not None and getattr(device, "type", None) == "cuda":
             self.to(device)
 

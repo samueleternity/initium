@@ -110,6 +110,8 @@ the opposite order, this is the one line to fix.
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 import torch.nn as nn
 from dnc.memory import Memory
@@ -250,7 +252,11 @@ class SplitGraphDNC(nn.Module):
         self.combiner_mode = combiner_mode
         self.combiner_variant = combiner_variant
         self.combiner = None
-        self.combiner_wrapper = None
+        # These wrappers share the runtime interface but have unrelated
+        # concrete classes (and the hybrid wrapper is composed dynamically).
+        # Keep the heterogeneous dispatch boundary dynamic; type their
+        # component classes independently at construction sites.
+        self.combiner_wrapper: Any = None
 
         if combiner_mode == "linear":
             if combine_reads:

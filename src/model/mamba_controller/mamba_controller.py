@@ -449,7 +449,7 @@ class MambaControllerWrapper(nn.Module):
             if in_dim == d_model
             else nn.Linear(in_dim, d_model, device=device, dtype=dtype)
         )
-        self.blocks = nn.ModuleList(
+        self.blocks: nn.ModuleList[MambaControllerBlock] = nn.ModuleList(
             [
                 MambaControllerBlock(
                     d_model,
@@ -652,7 +652,7 @@ class MambaDNC(DNC):
                             setattr(self, attr_name, wrapped)
                 self.moe_layers = []
                 for controller in self.rnns:
-                    self.moe_layers.extend(list(controller.moe_blocks))
+                    self.moe_layers.extend(getattr(controller, "moe_blocks"))
             return
 
         if rnn_type.lower() == "mamba2":
@@ -915,7 +915,7 @@ class MambaDNC(DNC):
         self.moe_layers = []
         if self.moe_enabled:
             for layer_controller in self.rnns:
-                self.moe_layers.extend(list(layer_controller.moe_blocks))
+                self.moe_layers.extend(getattr(layer_controller, "moe_blocks"))
 
         # final output layer -- copied verbatim from dnc.DNC.__init__
         self.output = nn.Linear(self.nn_output_size, self.input_size)
@@ -941,7 +941,7 @@ class MambaDNC(DNC):
 
         if chx is None:
             chx = [
-                self.rnns[layer].init_state(batch_size, device=self.device)
+                getattr(self.rnns[layer], "init_state")(batch_size, device=self.device)
                 for layer in range(self.num_layers)
             ]
 

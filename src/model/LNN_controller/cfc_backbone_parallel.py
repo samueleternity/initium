@@ -109,7 +109,7 @@ class CfCBackboneParallel(nn.Module):
             if in_dim == d_model
             else nn.Linear(in_dim, d_model, device=device, dtype=dtype)
         )
-        self.blocks = nn.ModuleList(
+        self.blocks: nn.ModuleList[_CfCParallelBlock] = nn.ModuleList(
             [
                 _CfCParallelBlock(
                     d_model,
@@ -186,7 +186,8 @@ def build_parallel_backbone(
             f"build_parallel_backbone: unknown variant part(s) {bad} in {variant!r}, "
             f"expected '+'-joined parts of {_BACKBONE_KINDS}"
         )
-    stages, cur = [], in_dim
+    stages: list[nn.Module] = []
+    cur = in_dim
     for kind in kinds:
         if kind == "cfc":
             stages.append(
@@ -236,7 +237,16 @@ def collect_backbone_moe_layers(backbone: nn.Module) -> list:
     of stages, each of which self-reports via .moe_enabled/.moe_blocks (same
     convention every controller wrapper in this project uses)."""
     stages = list(backbone) if isinstance(backbone, nn.Sequential) else [backbone]
-    return [b for s in stages if getattr(s, "moe_enabled", False) for b in s.moe_blocks]
+    moe_layers: list[nn.Module] = []
+    for stage in stages:
+        if getattr(stage, "moe_enabled", False):
+            blocks = getattr(stage, "moe_blocks")
+            if not isinstance(blocks, nn.ModuleList):
+                raise TypeError(
+                    "MoE-enabled backbone stages must expose a ModuleList of moe_blocks"
+                )
+            moe_layers.extend(blocks)
+    return moe_layers
 
 
 if (

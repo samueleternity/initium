@@ -164,7 +164,7 @@ class CfCControllerWrapper(nn.Module):
             if in_dim == d_model
             else nn.Linear(in_dim, d_model, device=device, dtype=dtype)
         )
-        self.blocks = nn.ModuleList(
+        self.blocks: nn.ModuleList[CfCControllerBlock] = nn.ModuleList(
             [
                 CfCControllerBlock(
                     d_model,

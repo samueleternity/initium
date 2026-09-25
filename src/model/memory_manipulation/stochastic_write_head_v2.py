@@ -134,8 +134,11 @@ class StochasticWriteHead(nn.Module):
         training. mu_transform is initialized from the original Linear's
         weights (see `install_stochastic_write_heads`), so beta=0 with
         sample=False is bit-for-bit Phase 0's write head at step 0, and
-        stays deterministic throughout that run.
+    stays deterministic throughout that run.
     """
+
+    prior_mu: torch.Tensor
+    prior_logvar: torch.Tensor
 
     def __init__(
         self,

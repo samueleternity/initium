@@ -358,7 +358,7 @@ class Mamba2ControllerWrapper(nn.Module):
             if in_dim == d_model
             else nn.Linear(in_dim, d_model, device=device, dtype=dtype)
         )
-        self.blocks = nn.ModuleList(
+        self.blocks: nn.ModuleList[Mamba2ControllerBlock] = nn.ModuleList(
             [
                 Mamba2ControllerBlock(
                     d_model,

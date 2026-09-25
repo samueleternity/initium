@@ -118,7 +118,7 @@ jobs:
           uv venv
           uv pip install torch --index-url https://download.pytorch.org/whl/cpu
           uv pip install -e . --group test
-          python setup_wheels.py --skip gpu-wheels   # pytorch-dnc from git; no CUDA on runners
+          .venv/bin/python setup_wheels.py --skip gpu-wheels   # pytorch-dnc from git; no CUDA on runners
           echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
       - name: Run tests
         run: just test

@@ -130,7 +130,7 @@ def patch_prod_jiterator() -> None:
     setattr(torch, _PATCHED_ATTR, True)
     print(
         "[nvrtc_compat] patched torch.prod/cumprod (module- and Tensor-level) "
-        "to avoid PyTorch's Jiterator on CUDA, working around this "
+        "with the CUDA no-sync fast path to avoid PyTorch's Jiterator, working around this "
         "environment's missing/mismatched libnvrtc-builtins. Every "
         "dnc.memory.Memory call site (get_usage_vector, allocation "
         "weighting, and any other prod/cumprod use) is covered "

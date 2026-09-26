@@ -594,6 +594,11 @@ def run(
         else OOD_EVAL_EPISODES
     )
     INPUT_DIM, TRIPLE_DIM = dataset.input_dim, dataset.output_dim
+    if getattr(dataset, "classic_track", False):
+        print(
+            f"[dataset] {dataset.name} window={dataset.window_size} input_dim={INPUT_DIM} "
+            f"probe_distances={dataset.probe_distances} batch_size={effective_batch_size}"
+        )
     beta_ctrl_acc_target = (
         BETA_CTRL_ACC_TARGET if BETA_CTRL_ACC_TARGET is not None else dataset.advance_threshold
     )

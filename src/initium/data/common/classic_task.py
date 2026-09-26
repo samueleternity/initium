@@ -91,9 +91,10 @@ class ClassicCurriculum:
 class ClassicDataset(BaseDataset):
     """Real-data language/audio/video windows with prediction and recall losses.
 
-    Input has one one-hot 1000-bin channel per modality plus one probe marker
-    per modality. Output uses the existing three-digit codec for 1000 token IDs.
-    Targets/masks have two columns: next-token prediction and recall probe.
+    Inputs encode each token with the existing three-digit one-hot codec
+    (30 values) plus a probe marker per modality, avoiding a 1000-wide
+    one-hot feature vector. Targets/masks have two columns: next-token
+    prediction and recall probe.
     """
 
     classic_track = True
@@ -123,10 +124,11 @@ class ClassicDataset(BaseDataset):
         self.eval_episodes = int(eval_episodes)
         self.ood_eval_episodes = int(ood_eval_episodes)
         self.name = "multimodal-classic" if len(modalities) > 1 else f"{modalities[0]}-classic"
-        self.input_dim = len(modalities) * (TOKEN_COUNT + 1)
         self.codec = DigitCodec(num_digits=3, digit_base=10)
+        self.input_dim = len(modalities) * (self.codec.label_dim + 1)
         self.output_dim = self.codec.label_dim
         self._output_proj = None
+        self._build_token_encodings()
 
         train_links = _parse_specs(dataset_link, self.modalities)
         test_links = _parse_specs(test_dataset_link, self.modalities) if test_dataset_link else {}
@@ -164,9 +166,21 @@ class ClassicDataset(BaseDataset):
                 self.test_sequences.append(test_parts)
         self._last_loss_terms = {"predict": 0.0, "probe": 0.0}
 
+    def _build_token_encodings(self):
+        token_ids = torch.arange(TOKEN_COUNT)
+        places = torch.tensor(
+            [self.codec.digit_base**i for i in reversed(range(self.codec.num_digits))]
+        )
+        token_digits = (token_ids[:, None] // places[None, :]) % self.codec.digit_base
+        self._token_encodings = torch.zeros(TOKEN_COUNT, self.codec.label_dim)
+        digit_indexes = torch.arange(self.codec.num_digits) * self.codec.digit_base
+        self._token_encodings[
+            torch.arange(TOKEN_COUNT)[:, None], digit_indexes[None, :] + token_digits
+        ] = 1.0
+
     @property
     def _channel_size(self):
-        return TOKEN_COUNT + 1
+        return self.codec.label_dim + 1
 
     def make_curriculum(self):
         return ClassicCurriculum(self)
@@ -188,6 +202,9 @@ class ClassicDataset(BaseDataset):
             raise ValueError("each probe distance must be smaller than the classic window size")
         self.window_size = window_size
         self.probe_distances = probe_distances
+        self.input_dim = len(self.modalities) * (self.codec.label_dim + 1)
+        if not hasattr(self, "_token_encodings"):
+            self._build_token_encodings()
         if probe_gamma is not None:
             self.probe_gamma = float(probe_gamma)
         if ood_eval_episodes is not None:
@@ -252,9 +269,9 @@ class ClassicDataset(BaseDataset):
         for i, (modality, token) in enumerate(tokens):
             base = modality * self._channel_size
             if i == probe[0]:
-                x[i, base + TOKEN_COUNT] = 1.0
+                x[i, base + self.codec.label_dim] = 1.0
             else:
-                x[i, base + token] = 1.0
+                x[i, base : base + self.codec.label_dim] = self._token_encodings[token]
             if i < self.window_size - 1:
                 targets[i, 0] = torch.tensor(self.codec.label_to_digit_targets(tokens[i + 1][1]))
                 masks[i, 0] = 1.0
@@ -398,7 +415,8 @@ class ClassicDataset(BaseDataset):
     def encode_generated_token(self, token, position=0):
         x = torch.zeros(self.input_dim, dtype=torch.float32)
         modality = int(position) % len(self.modalities)
-        x[modality * self._channel_size + int(token)] = 1.0
+        base = modality * self._channel_size
+        x[base : base + self.codec.label_dim] = self._token_encodings[int(token)]
         return x
 
     def decode_logits(self, logits):

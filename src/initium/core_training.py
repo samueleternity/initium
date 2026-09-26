@@ -1385,20 +1385,27 @@ def run(
         input_seq = input_seq.to(device, non_blocking=True)
         target_digits = target_digits.to(device, non_blocking=True)
         answer_mask = answer_mask.to(device, non_blocking=True)
-        _first_nonfinite_report(input_seq, "input_seq", step)
+        check_finite_this_step = (
+            not getattr(dataset, "classic_track", False) or step % LOG_EVERY == 0
+        )
+        if check_finite_this_step:
+            _first_nonfinite_report(input_seq, "input_seq", step)
         hidden = (None, None, None)
         optimizer.zero_grad(set_to_none=True)
 
         with torch.amp.autocast("cuda", enabled=amp_enabled):
             output, hidden = rnn(input_seq, hidden, reset_experience=True)
-            _first_nonfinite_report(output, "rnn_output", step)
+            if check_finite_this_step:
+                _first_nonfinite_report(output, "rnn_output", step)
             output = output.transpose(0, 1)  # (B, T, 92); Linear accepts non-contiguous input.
             output = output_proj(output)  # (B, T, 90)
             task_loss = dataset.loss(output, target_digits, answer_mask)
 
-        _first_nonfinite_report(task_loss, "task_loss", step)
+        if check_finite_this_step:
+            _first_nonfinite_report(task_loss, "task_loss", step)
         kl_loss, kl_diag = pop_total_kl(stochastic_heads, free_bits=FREE_BITS)  # Phase 1
-        _first_nonfinite_report(kl_loss, "kl_loss", step)
+        if check_finite_this_step:
+            _first_nonfinite_report(kl_loss, "kl_loss", step)
         moe_aux_loss, moe_diag = (
             pop_total_moe_aux_loss(rnn.moe_layers)
             if moe_enabled
@@ -1442,11 +1449,11 @@ def run(
         # numerically fragile part of this pipeline, so a clean β=0 baseline
         # of scaler behavior is useful context once β>0 introduces that path.
         amp_scale = scaler.get_scale()
-        running_task_loss += task_loss.item()
+        running_task_loss += task_loss.detach()
         if getattr(dataset, "classic_track", False):
             running_predict_loss += dataset._last_loss_terms["predict"]
             running_probe_loss += dataset._last_loss_terms["probe"]
-        running_kl_loss += kl_loss.item()
+        running_kl_loss += kl_loss.detach()
         running_div += dataset.diversity(output.detach(), target_digits, answer_mask)
         running_grad_norm += float(grad_norm)
         step += 1
@@ -1515,8 +1522,12 @@ def run(
             elapsed = time.time() - t0
             t0 = time.time()
             total_elapsed = time.time() - t_run_start  # log addition #5
-            avg_task = running_task_loss / LOG_EVERY
-            avg_kl = running_kl_loss / LOG_EVERY
+            avg_task = (
+                running_task_loss.item() if torch.is_tensor(running_task_loss) else running_task_loss
+            ) / LOG_EVERY
+            avg_kl = (
+                running_kl_loss.item() if torch.is_tensor(running_kl_loss) else running_kl_loss
+            ) / LOG_EVERY
             avg_div = running_div / LOG_EVERY
             avg_grad_norm = running_grad_norm / LOG_EVERY
             kl_contrib = (
@@ -1525,8 +1536,10 @@ def run(
             if classic_loss_writer is not None:
                 classic_loss_writer.writerow([
                     step,
-                    running_predict_loss / LOG_EVERY,
-                    running_probe_loss / LOG_EVERY,
+                    (running_predict_loss.item() if torch.is_tensor(running_predict_loss)
+                     else running_predict_loss) / LOG_EVERY,
+                    (running_probe_loss.item() if torch.is_tensor(running_probe_loss)
+                     else running_probe_loss) / LOG_EVERY,
                     dataset.probe_gamma,
                 ])
                 classic_loss_file.flush()

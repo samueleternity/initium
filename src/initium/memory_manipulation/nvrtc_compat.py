@@ -39,17 +39,15 @@ statically pre-compiled CUDA kernels for every dtype PyTorch ships - no
 Jiterator involved - so this sidesteps the missing-nvrtc-builtins
 failure without requiring a CUDA toolkit reinstall inside the notebook.
 
-Safety net: the log-space substitution is only mathematically valid for
-NON-NEGATIVE inputs (log of a negative number is NaN). Every known call
-site in dnc.memory operates on gates/usages/weights, which are always in
-[0,1] - but to stay correct even for an unknown future call site (some
-other library, or an edit to dnc.memory) with genuinely negative values,
-the patched functions check `torch.isnan(result).any()` after the
-log-space computation and, on a hit, recompute via the ORIGINAL op on a
-CPU copy of the input (never re-invoking the broken CUDA op) before
-moving the result back to the original device. This costs a device sync
-+ small copy only in that (expected-never, for this project) fallback
-path - the common case never sees it.
+The log-space substitution is valid for NON-NEGATIVE inputs. Every known
+call site in dnc.memory operates on gates/usages/weights in [0,1]. The old
+implementation checked for NaNs after each product, which forced a CUDA to
+CPU synchronization hundreds of times per long sequence; clamping also meant
+that check did not detect negative inputs as its comment claimed. The normal
+fast path now relies on the known non-negative DNC inputs and performs no
+host synchronization. Set INITIUM_NVRTC_COMPAT_STRICT=1 before starting
+Python to enable a slower negative-input check and CPU fallback for debugging
+other call sites.
 
 Call patch_prod_jiterator() once, before running any forward pass -
 idempotent, so importing this from multiple entry points (core_training.py,
@@ -61,10 +59,13 @@ a correctness regression - there is no reason to remove it once applied.
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 _EPS = 1e-6
 _PATCHED_ATTR = "_nvrtc_compat_patched"
+_STRICT_NEGATIVE_CHECK = os.environ.get("INITIUM_NVRTC_COMPAT_STRICT", "0") == "1"
 
 _orig_prod = torch.prod
 _orig_cumprod = torch.cumprod
@@ -74,7 +75,8 @@ _orig_tensor_cumprod = torch.Tensor.cumprod
 
 def _log_space(input: torch.Tensor, dim, keepdim: bool, cumulative: bool) -> torch.Tensor:
     orig_dtype = input.dtype
-    work = input if input.dtype.is_floating_point else input.float()
+    # DNC gates/usages are non-negative. Accumulate in fp32 even under AMP.
+    work = input.float()
     logged = torch.log(work.clamp(min=_EPS))
     reduced = (
         torch.cumsum(logged, dim=dim) if cumulative else torch.sum(logged, dim=dim, keepdim=keepdim)
@@ -84,17 +86,11 @@ def _log_space(input: torch.Tensor, dim, keepdim: bool, cumulative: bool) -> tor
 
 def _patched_prod(input, dim=None, keepdim=False, *, dtype=None):
     if isinstance(input, torch.Tensor) and input.is_cuda and dim is not None:
+        if not input.dtype.is_floating_point:
+            return _orig_prod(input, dim, keepdim=keepdim, dtype=dtype)
+        if _STRICT_NEGATIVE_CHECK and bool((input < 0).any()):
+            return _orig_prod(input.detach().cpu(), dim, keepdim=keepdim, dtype=dtype).to(input.device)
         result = _log_space(input, dim, keepdim, cumulative=False)
-        if torch.isnan(result).any():
-            # Negative-valued input -- log-space isn't valid here. Fall back
-            # to the ORIGINAL op on CPU (never re-run the broken CUDA path).
-            cpu_out = _orig_prod(
-                input.detach().cpu(),
-                dim,
-                keepdim=keepdim,
-                **({"dtype": dtype} if dtype is not None else {}),
-            )
-            return cpu_out.to(input.device)
         return result.to(dtype) if dtype is not None else result
     if dim is None:
         return _orig_prod(input, **({"dtype": dtype} if dtype is not None else {}))
@@ -105,12 +101,11 @@ def _patched_prod(input, dim=None, keepdim=False, *, dtype=None):
 
 def _patched_cumprod(input, dim, *, dtype=None):
     if isinstance(input, torch.Tensor) and input.is_cuda:
+        if not input.dtype.is_floating_point:
+            return _orig_cumprod(input, dim, dtype=dtype)
+        if _STRICT_NEGATIVE_CHECK and bool((input < 0).any()):
+            return _orig_cumprod(input.detach().cpu(), dim, dtype=dtype).to(input.device)
         result = _log_space(input, dim, keepdim=False, cumulative=True)
-        if torch.isnan(result).any():
-            cpu_out = _orig_cumprod(
-                input.detach().cpu(), dim, **({"dtype": dtype} if dtype is not None else {})
-            )
-            return cpu_out.to(input.device)
         return result.to(dtype) if dtype is not None else result
     return _orig_cumprod(input, dim, **({"dtype": dtype} if dtype is not None else {}))
 

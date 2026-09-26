@@ -282,16 +282,21 @@ class ClassicDataset(BaseDataset):
             output, target[..., 1, :], mask[..., 1], num_fields=1,
             digit_base=self.codec.digit_base,
         )
-        self._last_loss_terms = {"predict": predict.detach().item(), "probe": probe.detach().item()}
+        # Keep scalar metrics on device; the training loop transfers their
+        # accumulated values only once per log interval.
+        self._last_loss_terms = {"predict": predict.detach(), "probe": probe.detach()}
         return predict + self.probe_gamma * probe
 
     def diversity(self, output, target, mask):
         probe_mask = mask[..., 1].bool()
-        if not probe_mask.any():
-            return 0.0
         logits = output.view(*output.shape[:-1], self.codec.num_digits, self.codec.digit_base)
-        unique = {self.codec.decode_field(row) for row in logits[probe_mask]}
-        return float(len(unique))
+        digits = logits[probe_mask].argmax(dim=-1)
+        places = torch.tensor(
+            [self.codec.digit_base**i for i in reversed(range(self.codec.num_digits))],
+            device=digits.device,
+        )
+        labels = (digits * places).sum(dim=-1).detach().cpu().tolist()
+        return float(len(set(labels)))
 
     def field_log_header(self):
         return ["probe_distance", "modality", "probe_acc", "count"]

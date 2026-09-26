@@ -38,6 +38,33 @@ def get_dataset(
     if prepared_dataset is not None:
         return prepared_dataset
     t = (dataset_type or "graph").lower()
+    if t in {"text-classic", "audio-classic", "video-classic", "multimodal-classic"}:
+        from initium.config.classic_config import (
+            CLASSIC_PROBE_DISTANCES,
+            CLASSIC_PROBE_GAMMA,
+            CLASSIC_OOD_EVAL_EPISODES,
+            CLASSIC_WINDOW_SIZE,
+        )
+        from initium.data.common.classic_task import ClassicDataset
+
+        modalities = {
+            "text-classic": ["text"],
+            "audio-classic": ["audio"],
+            "video-classic": ["video"],
+            "multimodal-classic": kwargs.pop("modalities", ["text", "audio"]),
+        }[t]
+        if t == "multimodal-classic" and len(modalities) < 2:
+            raise ValueError("multimodal-classic requires at least two modalities")
+        return ClassicDataset(
+            modalities,
+            dataset_link,
+            test_dataset_link=test_dataset_link,
+            window_size=kwargs.pop("window_size", CLASSIC_WINDOW_SIZE),
+            probe_distances=tuple(kwargs.pop("probe_distances", CLASSIC_PROBE_DISTANCES)),
+            probe_gamma=kwargs.pop("probe_gamma", CLASSIC_PROBE_GAMMA),
+            eval_episodes=kwargs.pop("eval_episodes", 32),
+            ood_eval_episodes=kwargs.pop("ood_eval_episodes", CLASSIC_OOD_EVAL_EPISODES),
+        )
     if t in GRAPH_ALIASES:
         from initium.data.graph_traversal.graph_traversal import GraphTraversalDataset
 

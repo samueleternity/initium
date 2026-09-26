@@ -31,6 +31,11 @@ import time
 
 import torch
 
+from initium.config.classic_config import (
+    CLASSIC_PROBE_DISTANCES,
+    CLASSIC_PROBE_GAMMA,
+    CLASSIC_WINDOW_SIZE,
+)
 from initium.inference.cache.cache_config import (
     DEFAULT_CACHE,
     DEFAULT_CACHE_DISK_MB,
@@ -57,6 +62,7 @@ from initium.inference.inference_config import (
     PROGRESS_EVERY,
 )
 from initium.inference.model_loader import load_model
+from initium.inference.generate import generate
 from initium.inference.tasks.task_registry import canonical_type, get_task
 from initium.data.dataset_registry import get_dataset
 from initium.data.prepared_dataset import load_prepared_dataset, save_prepared_dataset
@@ -81,7 +87,8 @@ def parse_args(argv=None):
         "--dataset-type",
         type=str,
         default=DEFAULT_DATASET_TYPE,
-        help="task type to run (graph | text | audio | video). Must be supported by the checkpoint.",
+        choices=["graph", "text", "audio", "video", "multimodal", "text-classic", "audio-classic", "video-classic", "multimodal-classic"],
+        help="task type to run. '-classic' types select long-window prediction and recall probes.",
     )
     p.add_argument(
         "--dataset-link",
@@ -90,6 +97,18 @@ def parse_args(argv=None):
         help="test data location. Omit for the built-in London Underground graph; "
         "for graph, a .csv/.tsv/.txt/.json edge file (src,dst,line).",
     )
+    p.add_argument("--test-dataset-link", type=str, default=None,
+                   help="held-out source for classic tasks; otherwise the supplied source is split.")
+    p.add_argument("--classic-window", type=int, default=CLASSIC_WINDOW_SIZE)
+    p.add_argument("--probe-distances", type=int, nargs="+", default=list(CLASSIC_PROBE_DISTANCES))
+    p.add_argument("--probe-gamma", type=float, default=CLASSIC_PROBE_GAMMA)
+    p.add_argument("--classic-modalities", type=str, default="text+audio")
+    p.add_argument("--generate", action="store_true",
+                   help="run autoregressive generation and memory-on/off probe attribution (classic types only).")
+    p.add_argument("--max-new-steps", type=int, default=32)
+    p.add_argument("--temperature", type=float, default=1.0)
+    p.add_argument("--top-k", type=int, default=0,
+                   help="generation sampling top-k; 0 means unrestricted sampling.")
     p.add_argument("--save", type=str, default=None, metavar="DIRECTORY",
                    help="save prepared data under DIRECTORY/<type>/<name> [prepared].")
     p.add_argument("--load-prepared", type=str, default=None, metavar="DIRECTORY",
@@ -274,6 +293,16 @@ def parse_args(argv=None):
         p.error("checkpoint is required unless --prepare-only is used")
     if (args.load_prepared or args.save) and args.dataset_type == "multimodal":
         p.error("prepared dataset options currently support graph, text, audio, and video")
+    if args.classic_window < 2 or not args.probe_distances or min(args.probe_distances) < 1:
+        p.error("--classic-window must be >=2 and --probe-distances must be positive")
+    if max(args.probe_distances) >= args.classic_window:
+        p.error("every --probe-distances value must be smaller than --classic-window")
+    if args.probe_gamma < 0 or args.max_new_steps < 1 or args.temperature <= 0 or args.top_k < 0:
+        p.error("invalid classic/generation settings")
+    if args.generate and not args.dataset_type.endswith("-classic"):
+        p.error("--generate is available for classic dataset types only")
+    if args.generate and not args.reset_experience:
+        p.error("--generate starts each prompt with reset_experience=True")
     try:
         parse_cache_spec(args.cache)
     except ValueError as e:
@@ -293,7 +322,15 @@ def main(argv=None) -> int:
         if args.dataset_type == "multimodal":
             raise SystemExit("prepared dataset options currently support graph, text, audio, and video")
         try:
-            dataset = get_dataset(args.dataset_type, args.dataset_link)
+            dataset = get_dataset(
+                args.dataset_type,
+                args.dataset_link,
+                test_dataset_link=args.test_dataset_link,
+                window_size=args.classic_window,
+                probe_distances=args.probe_distances,
+                probe_gamma=args.probe_gamma,
+                modalities=args.classic_modalities.split("+"),
+            )
             save_prepared_dataset(dataset, args.save, args.dataset_type, args.dataset_link)
         except (ValueError, FileNotFoundError, ImportError) as e:
             raise SystemExit(f"[inference] ABORT: {e}") from e
@@ -321,7 +358,15 @@ def main(argv=None) -> int:
     try:
         canon = require_type_supported(caps, args.dataset_type, args.checkpoint)
         if args.save:
-            prepared_dataset = get_dataset(canon, args.dataset_link)
+            prepared_dataset = get_dataset(
+                canon,
+                args.dataset_link,
+                test_dataset_link=args.test_dataset_link,
+                window_size=args.classic_window,
+                probe_distances=args.probe_distances,
+                probe_gamma=args.probe_gamma,
+                modalities=args.classic_modalities.split("+"),
+            )
             save_prepared_dataset(prepared_dataset, args.save, canon, args.dataset_link)
         task = get_task(
             canon,
@@ -330,6 +375,11 @@ def main(argv=None) -> int:
             shared_context=args.shared_context,
             num_contexts=args.num_contexts,
             prepared_dataset=prepared_dataset,
+            classic_modalities=args.classic_modalities,
+            classic_window=args.classic_window,
+            probe_distances=tuple(args.probe_distances),
+            probe_gamma=args.probe_gamma,
+            test_dataset_link=args.test_dataset_link,
         )
         require_dims_match(caps, task, args.checkpoint)
     except (IncompatibleModelError, NotImplementedError, ValueError, FileNotFoundError) as e:
@@ -341,6 +391,61 @@ def main(argv=None) -> int:
     print(f"[inference] model loaded (step {loaded.step}, sampled_writes={loaded.sampled_writes})")
     if loaded.combiner_stage_kinds:
         print(f"[inference] combiner stages: {list(enumerate(loaded.combiner_stage_kinds))}")
+
+    if args.generate:
+        count = args.num_episodes or 32
+        prompts = task.generation_prompts(count, random.Random(args.seed))
+        records = []
+        correct_on = correct_off = 0
+        for prompt_index, (prompt, expected, meta) in enumerate(prompts):
+            pair_seed = args.seed + prompt_index
+            torch.manual_seed(pair_seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(pair_seed)
+            with_memory = generate(
+                loaded.rnn, loaded.output_proj, task, prompt, args.max_new_steps,
+                device, temperature=args.temperature, top_k=args.top_k, ablate_memory=False,
+            )
+            torch.manual_seed(pair_seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(pair_seed)
+            without_memory = generate(
+                loaded.rnn, loaded.output_proj, task, prompt, args.max_new_steps,
+                device, temperature=args.temperature, top_k=args.top_k, ablate_memory=True,
+            )
+            pred_on = with_memory["tokens"][0]
+            pred_off = without_memory["tokens"][0]
+            correct_on += int(pred_on == expected)
+            correct_off += int(pred_off == expected)
+            records.append({
+                "distance": meta["distance"],
+                "modality": meta["modality"],
+                "target_token_id": expected,
+                "memory_on_token_id": pred_on,
+                "memory_off_token_id": pred_off,
+                "memory_on_continuation": with_memory["tokens"],
+                "memory_off_continuation": without_memory["tokens"],
+            })
+        summary = {
+            "checkpoint": args.checkpoint,
+            "dataset_type": canon,
+            "prompts": count,
+            "memory_on_probe_accuracy": 100.0 * correct_on / max(count, 1),
+            "memory_off_probe_accuracy": 100.0 * correct_off / max(count, 1),
+            "memory_attributable_generation_probe": 100.0 * (correct_on - correct_off) / max(count, 1),
+            "max_new_steps": args.max_new_steps,
+            "temperature": args.temperature,
+            "top_k": args.top_k,
+            "records": records,
+        }
+        print(json.dumps(summary, indent=2))
+        if not args.no_log:
+            os.makedirs(args.log_dir, exist_ok=True)
+            path = os.path.join(args.log_dir, f"generation_{os.path.basename(args.checkpoint)}.json")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(summary, f, indent=2)
+            print(f"[inference] generation report: {path}")
+        return 0
 
     combiner_skip_stages = None
     if args.ablate_combiner_stage:

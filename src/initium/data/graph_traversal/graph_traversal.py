@@ -666,7 +666,9 @@ class GraphTraversalDataset(BaseDataset):
     def set_output_proj(self, proj):
         set_output_proj(proj)
 
-    def evaluate_ood(self, model, device, num_episodes, rng, verbose_n=0, field_log=None):
+    def evaluate_ood(
+        self, model, device, num_episodes, rng, verbose_n=0, field_log=None, ablate_memory=False
+    ):
         if self._custom_test_graph is not None:
             edges, node_labels, adjacency = self._custom_test_graph
         else:
@@ -681,7 +683,13 @@ class GraphTraversalDataset(BaseDataset):
             path_length_range=OOD_PATH_LENGTH_RANGE,
             rng=rng,
             hop_breakdown=True,
+            ablate_memory=ablate_memory,
         )
+
+    def evaluate_ood_ablated(self, model, device, num_episodes, rng):
+        return self.evaluate_ood(
+            model, device, num_episodes, rng, ablate_memory=True
+        )[:2]
 
     def _lesson_eval_graph_kwargs(self, curriculum, lesson_idx):
         """-> kwargs for evaluate_traversal() covering the 'which graph(s)'

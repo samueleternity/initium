@@ -291,6 +291,50 @@ def text_token_stream(path: str, vocab_size: int = LABEL_RANGE) -> list[int]:
     return tok.encode(text)
 
 
+def text_token_streams(train_paths, test_paths, vocab_size: int = LABEL_RANGE):
+    """Tokenize train and held-out text with one train-fitted BPE vocabulary."""
+    train_paths, test_paths = list(train_paths), list(test_paths)
+    if not train_paths:
+        raise ValueError("text_token_streams requires at least one training source")
+    if _HF_TOKENIZERS_AVAILABLE:
+        tok = _HFTokenizer(_HFBPEModel(unk_token=None))
+        tok.pre_tokenizer = _HFByteLevel(add_prefix_space=False)
+        trainer = _HFBpeTrainer(vocab_size=vocab_size, min_frequency=2, show_progress=False)
+        tok.train(train_paths, trainer=trainer)
+
+        def encode_path(path):
+            chunks = [
+                np.asarray(tok.encode(chunk).ids, dtype=np.int64)
+                for chunk in _iter_text_chunks(path)
+            ]
+            ids = np.concatenate(chunks) if chunks else np.empty(0, dtype=np.int64)
+            if ids.size and ((ids < 0).any() or (ids >= vocab_size).any()):
+                raise ValueError(f"{path}: shared BPE produced token IDs outside [0, {vocab_size})")
+            return ids
+
+        return [encode_path(p) for p in train_paths], [encode_path(p) for p in test_paths]
+
+    sample_parts = []
+    remaining = _BPE_TRAIN_CHARS_CAP
+    for p in train_paths:
+        for chunk in _iter_text_chunks(p):
+            sample_parts.append(chunk[:remaining])
+            remaining -= min(len(chunk), remaining)
+            if remaining <= 0:
+                break
+        if remaining <= 0:
+            break
+    sample = "".join(sample_parts)
+    if not sample.strip():
+        raise ValueError("text sources are empty")
+    tok = BPETokenizer(vocab_size=vocab_size).train(sample)
+
+    def encode_path(path):
+        return np.asarray(tok.encode("".join(_iter_text_chunks(path))), dtype=np.int64)
+
+    return [encode_path(p) for p in train_paths], [encode_path(p) for p in test_paths]
+
+
 def build_text_kv_pool(path, label_range: int = LABEL_RANGE) -> list[tuple[int, int]]:
     """Streaming AND multi-file: `path` may be a single text file, or a
     directory / glob pattern / '+'-joined list of these (see

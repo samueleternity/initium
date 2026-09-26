@@ -65,7 +65,7 @@ class ClassicInferenceTask(BaseInferenceTask):
 
     def score_episode(self, output, episode: Episode, verbose=False):
         pos = int(episode.meta["probe_pos"])
-        expected = self._ds.codec.decode_field(episode.target[pos, 1].float())
+        expected = self._ds.codec.decode_digits(episode.target[pos, 1])
         predicted = self._ds.codec.decode_field(output[pos])
         correct = int(predicted == expected)
         if verbose:

@@ -49,6 +49,20 @@ class DigitCodec:
             val = val * self.digit_base + d
         return val
 
+    def decode_digits(self, digits) -> int:
+        """Decode an already-decoded sequence of digit IDs into a label."""
+        if torch.is_tensor(digits):
+            digits = digits.tolist()
+        if len(digits) != self.num_digits:
+            raise ValueError(f"expected {self.num_digits} digit IDs, got {len(digits)}")
+        val = 0
+        for digit in digits:
+            digit = int(digit)
+            if not 0 <= digit < self.digit_base:
+                raise ValueError(f"digit ID {digit} is outside [0, {self.digit_base})")
+            val = val * self.digit_base + digit
+        return val
+
 
 def digit_field_loss(
     output: torch.Tensor,

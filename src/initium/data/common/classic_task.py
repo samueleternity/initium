@@ -390,7 +390,7 @@ class ClassicDataset(BaseDataset):
             logits = self._output_proj(output).squeeze(0)
             pos = meta["probe_pos"]
             prediction = self.codec.decode_field(logits[pos])
-            expected = self.codec.decode_field(target[pos, 1].float())
+            expected = self.codec.decode_digits(target[pos, 1])
             ok = int(prediction == expected)
             total += 1
             correct += ok
@@ -479,7 +479,7 @@ class ClassicDataset(BaseDataset):
         rng = rng or random.Random(123)
         tokens, probe = self._window_tokens(self.test_sequences, rng)
         x, target, _mask, meta = self._encode(tokens, probe)
-        return x, self.codec.decode_field(target[meta["probe_pos"], 1].float()), meta
+        return x, self.codec.decode_digits(target[meta["probe_pos"], 1]), meta
 
     def encode_generated_token(self, token, position=0):
         x = torch.zeros(self.input_dim, dtype=torch.float32)

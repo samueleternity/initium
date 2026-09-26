@@ -32,8 +32,16 @@ import math
 import os
 import random
 import shutil
+import sys
 import time
+from contextlib import contextmanager
 from typing import Any
+
+# Support both ``python -m initium.core_training`` and direct execution of
+# ``src/initium/core_training.py`` from a source checkout.
+_SRC_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _SRC_ROOT not in sys.path:
+    sys.path.insert(0, _SRC_ROOT)
 
 import numpy as np
 import torch
@@ -43,6 +51,14 @@ from initium.memory_manipulation.nvrtc_compat import patch_prod_jiterator
 
 patch_prod_jiterator()  # environment workaround -- see module docstring
 
+from initium.config.classic_config import (
+    CLASSIC_BATCH_SIZE,
+    CLASSIC_OOD_EVAL_EPISODES,
+    CLASSIC_PROBE_DISTANCES,
+    CLASSIC_PROBE_GAMMA,
+    CLASSIC_WINDOW_SIZE,
+    OGS_WEIGHTS,
+)
 from initium.config.controller_config import (
     CFC_ACTIVATION,
     CFC_BACKBONE_DROPOUT,
@@ -130,6 +146,7 @@ from initium.config.train_config import (
     WARMUP_STEPS,
 )
 from initium.data.dataset_registry import get_dataset
+from initium.data.prepared_dataset import load_prepared_dataset, save_prepared_dataset
 from initium.mamba_controller.mamba_controller import MambaDNC
 from initium.mamba_controller.split_graph_dnc import SplitGraphDNC
 from initium.memory_manipulation.dynamic_memory_resize import resize_memory
@@ -178,6 +195,96 @@ def _first_nonfinite_report(tensor, name, step):
             f"[NaN-TRACE] step {step}: non-finite in '{name}' ({bad_frac * 100:.2f}% of elements)"
         )
     return ok
+
+
+def _ogs_components(id_acc, ood_acc, ood_perfect, ood_memory_off, lesson, probe_ood_delta=None):
+    depth = max(int(lesson), 1)
+    offset_normalized = max(0.0, 1.0 - abs(float(id_acc) - float(ood_acc)) / (100.0 * depth))
+    components = {
+        "offset_normalized": offset_normalized,
+        "memory_attributable_ood": (
+            (float(ood_acc) - float(ood_memory_off)) / 100.0 if ood_memory_off is not None else None
+        ),
+        "ood_perfect_frac": float(ood_perfect) / 100.0,
+        "probe_ood_delta": (
+            float(probe_ood_delta) / 100.0 if probe_ood_delta is not None else None
+        ),
+    }
+    return components
+
+
+def _ogs_score(components, weights):
+    active = [(components[k], w) for k, w in zip(components, weights) if components[k] is not None]
+    return sum(value * weight for value, weight in active) / max(sum(w for _, w in active), 1e-12)
+
+
+def _write_ogs_row(
+    writer, step, lesson, id_acc, ood_acc, ood_perfect, ood_memory_off, weights, classic_track=False
+):
+    probe_delta = (
+        (ood_acc - ood_memory_off) if classic_track and ood_memory_off is not None else None
+    )
+    components = _ogs_components(id_acc, ood_acc, ood_perfect, ood_memory_off, lesson, probe_delta)
+    writer.writerow(
+        [
+            step,
+            lesson,
+            id_acc,
+            ood_acc,
+            components["offset_normalized"],
+            components["ood_perfect_frac"],
+            ood_acc,
+            ood_memory_off,
+            components["memory_attributable_ood"],
+            components["probe_ood_delta"],
+            *weights,
+            _ogs_score(components, weights),
+        ]
+    )
+
+
+def _write_classic_probe_pairs(writer, file, step, evaluation, on_log, off_log):
+    keys = sorted(set(on_log) | set(off_log))
+    for distance, modality in keys:
+        on_correct, on_count = on_log.get((distance, modality), (0, 0))
+        off_correct, off_count = off_log.get((distance, modality), (0, 0))
+        on_acc = 100.0 * on_correct / max(on_count, 1)
+        off_acc = 100.0 * off_correct / max(off_count, 1)
+        writer.writerow(
+            [
+                step,
+                evaluation,
+                distance,
+                modality,
+                on_acc,
+                off_acc,
+                on_acc - off_acc,
+                min(on_count, off_count),
+            ]
+        )
+    file.flush()
+
+
+def _capture_torch_rng():
+    return (
+        torch.get_rng_state(),
+        torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    )
+
+
+@contextmanager
+def _replay_torch_rng(state):
+    """Replay evaluation randomness, then preserve the caller's advanced state."""
+    advanced = _capture_torch_rng()
+    torch.set_rng_state(state[0])
+    if state[1] is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(state[1])
+    try:
+        yield
+    finally:
+        torch.set_rng_state(advanced[0])
+        if advanced[1] is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(advanced[1])
 
 
 def save_checkpoint(
@@ -460,6 +567,14 @@ def run(
     dataset_type: str = DATASET_TYPE,
     dataset_link: str | None = DATASET_LINK,
     test_dataset_link: str | None = None,
+    prepared_dataset=None,
+    classic_window: int = CLASSIC_WINDOW_SIZE,
+    probe_distances: tuple[int, ...] = CLASSIC_PROBE_DISTANCES,
+    probe_gamma: float = CLASSIC_PROBE_GAMMA,
+    classic_modalities: tuple[str, ...] = ("text", "audio"),
+    classic_ood_eval_episodes: int = CLASSIC_OOD_EVAL_EPISODES,
+    ogs_weights: tuple[float, float, float, float] = OGS_WEIGHTS,
+    batch_size: int | None = None,
 ):
     # Deliberately does NOT touch LR_DECAY_STEPS - that's a separate
     # module-level constant, fixed at import time from the *original*
@@ -467,8 +582,41 @@ def run(
     # name, not through this parameter. A pilot run still anneals LR on
     # the full 120000-step schedule and simply stops early partway
     # through it, exactly as the --total-steps help text promises.
-    dataset = get_dataset(dataset_type, dataset_link, test_dataset_link=test_dataset_link)
+    dataset = get_dataset(
+        dataset_type,
+        dataset_link,
+        test_dataset_link=test_dataset_link,
+        prepared_dataset=prepared_dataset,
+        window_size=classic_window,
+        probe_distances=probe_distances,
+        probe_gamma=probe_gamma,
+        modalities=list(classic_modalities),
+        ood_eval_episodes=classic_ood_eval_episodes,
+    )
+    if getattr(dataset, "classic_track", False):
+        dataset.configure(
+            window_size=classic_window,
+            probe_distances=probe_distances,
+            probe_gamma=probe_gamma,
+            ood_eval_episodes=classic_ood_eval_episodes,
+        )
+    effective_batch_size = batch_size or (
+        CLASSIC_BATCH_SIZE if getattr(dataset, "classic_track", False) else BATCH_SIZE
+    )
+    periodic_ood_episodes = (
+        dataset.ood_eval_episodes
+        if getattr(dataset, "classic_track", False)
+        else OOD_EVAL_EPISODES_PERIODIC
+    )
+    final_ood_episodes = (
+        dataset.ood_eval_episodes if getattr(dataset, "classic_track", False) else OOD_EVAL_EPISODES
+    )
     INPUT_DIM, TRIPLE_DIM = dataset.input_dim, dataset.output_dim
+    if getattr(dataset, "classic_track", False):
+        print(
+            f"[dataset] {dataset.name} window={dataset.window_size} input_dim={INPUT_DIM} "
+            f"probe_distances={dataset.probe_distances} batch_size={effective_batch_size}"
+        )
     beta_ctrl_acc_target = (
         BETA_CTRL_ACC_TARGET if BETA_CTRL_ACC_TARGET is not None else dataset.advance_threshold
     )
@@ -527,6 +675,61 @@ def run(
                 "ood_offset_perfect",
             ]
         )
+
+    ogs_log_path = os.path.join(LOG_DIR, f"run_{run_id}_ogs.csv")
+    ogs_log_file = open(ogs_log_path, "a" if resuming else "w", newline="")
+    ogs_log_writer = csv.writer(ogs_log_file)
+    if not resuming:
+        ogs_log_writer.writerow(
+            [
+                "step",
+                "lesson",
+                "id_acc",
+                "ood_acc",
+                "offset_normalized",
+                "ood_perfect_frac",
+                "ood_memory_on_acc",
+                "ood_memory_off_acc",
+                "memory_attributable_ood",
+                "classic_probe_ood_delta",
+                "weight_offset",
+                "weight_memory",
+                "weight_perfect",
+                "weight_probe",
+                "ogs",
+            ]
+        )
+
+    classic_loss_file = classic_loss_writer = None
+    classic_probe_file = classic_probe_writer = None
+    if getattr(dataset, "classic_track", False):
+        classic_loss_file = open(
+            os.path.join(LOG_DIR, f"run_{run_id}_classic_losses.csv"),
+            "a" if resuming else "w",
+            newline="",
+        )
+        classic_loss_writer = csv.writer(classic_loss_file)
+        if not resuming:
+            classic_loss_writer.writerow(["step", "predict_loss", "probe_loss", "gamma"])
+        classic_probe_file = open(
+            os.path.join(LOG_DIR, f"run_{run_id}_classic_probe_dependency.csv"),
+            "a" if resuming else "w",
+            newline="",
+        )
+        classic_probe_writer = csv.writer(classic_probe_file)
+        if not resuming:
+            classic_probe_writer.writerow(
+                [
+                    "step",
+                    "evaluation",
+                    "distance",
+                    "modality",
+                    "memory_on_acc",
+                    "memory_off_acc",
+                    "memory_dependency",
+                    "matched_n",
+                ]
+            )
 
     # Functional-usage check (LB-9/Concept 6): same-cadence, same-distribution
     # companion to the ID/OOD log above, but with the model's own memory
@@ -1198,6 +1401,7 @@ def run(
     # whatever LR was saved inside optimizer_state_dict at checkpoint time
     # (potentially still reflecting the old buggy drifted value).
     running_task_loss, running_kl_loss, running_div, running_grad_norm = 0.0, 0.0, 0, 0.0
+    running_predict_loss = running_probe_loss = 0.0
 
     # Dynamic-beta controller state (no-op / unused when beta_mode == "static").
     # Initialized post-resume so a resumed dynamic run starts its health check
@@ -1218,25 +1422,34 @@ def run(
     t_run_start = time.time()
 
     while step < total_steps:
-        input_seq, target_digits, answer_mask = dataset.sample_batch(curriculum, BATCH_SIZE)
+        input_seq, target_digits, answer_mask = dataset.sample_batch(
+            curriculum, effective_batch_size
+        )
 
         input_seq = input_seq.to(device, non_blocking=True)
         target_digits = target_digits.to(device, non_blocking=True)
         answer_mask = answer_mask.to(device, non_blocking=True)
-        _first_nonfinite_report(input_seq, "input_seq", step)
+        check_finite_this_step = (
+            not getattr(dataset, "classic_track", False) or step % LOG_EVERY == 0
+        )
+        if check_finite_this_step:
+            _first_nonfinite_report(input_seq, "input_seq", step)
         hidden = (None, None, None)
         optimizer.zero_grad(set_to_none=True)
 
         with torch.amp.autocast("cuda", enabled=amp_enabled):
             output, hidden = rnn(input_seq, hidden, reset_experience=True)
-            _first_nonfinite_report(output, "rnn_output", step)
-            output = output.transpose(0, 1).contiguous()  # (B, T, 92)
+            if check_finite_this_step:
+                _first_nonfinite_report(output, "rnn_output", step)
+            output = output.transpose(0, 1)  # (B, T, 92); Linear accepts non-contiguous input.
             output = output_proj(output)  # (B, T, 90)
             task_loss = dataset.loss(output, target_digits, answer_mask)
 
-        _first_nonfinite_report(task_loss, "task_loss", step)
+        if check_finite_this_step:
+            _first_nonfinite_report(task_loss, "task_loss", step)
         kl_loss, kl_diag = pop_total_kl(stochastic_heads, free_bits=FREE_BITS)  # Phase 1
-        _first_nonfinite_report(kl_loss, "kl_loss", step)
+        if check_finite_this_step:
+            _first_nonfinite_report(kl_loss, "kl_loss", step)
         moe_aux_loss, moe_diag = (
             pop_total_moe_aux_loss(rnn.moe_layers)
             if moe_enabled
@@ -1280,8 +1493,11 @@ def run(
         # numerically fragile part of this pipeline, so a clean β=0 baseline
         # of scaler behavior is useful context once β>0 introduces that path.
         amp_scale = scaler.get_scale()
-        running_task_loss += task_loss.item()
-        running_kl_loss += kl_loss.item()
+        running_task_loss += task_loss.detach()
+        if getattr(dataset, "classic_track", False):
+            running_predict_loss += dataset._last_loss_terms["predict"]
+            running_probe_loss += dataset._last_loss_terms["probe"]
+        running_kl_loss += kl_loss.detach()
         running_div += dataset.diversity(output.detach(), target_digits, answer_mask)
         running_grad_norm += float(grad_norm)
         step += 1
@@ -1350,13 +1566,39 @@ def run(
             elapsed = time.time() - t0
             t0 = time.time()
             total_elapsed = time.time() - t_run_start  # log addition #5
-            avg_task = running_task_loss / LOG_EVERY
-            avg_kl = running_kl_loss / LOG_EVERY
+            avg_task = (
+                running_task_loss.item()
+                if torch.is_tensor(running_task_loss)
+                else running_task_loss
+            ) / LOG_EVERY
+            avg_kl = (
+                running_kl_loss.item() if torch.is_tensor(running_kl_loss) else running_kl_loss
+            ) / LOG_EVERY
             avg_div = running_div / LOG_EVERY
             avg_grad_norm = running_grad_norm / LOG_EVERY
             kl_contrib = (
                 beta_eff * avg_kl
             )  # actual beta*L_KL added to total loss, vs. avg_kl (pre-beta, raw clamped sum)
+            if classic_loss_writer is not None:
+                classic_loss_writer.writerow(
+                    [
+                        step,
+                        (
+                            running_predict_loss.item()
+                            if torch.is_tensor(running_predict_loss)
+                            else running_predict_loss
+                        )
+                        / LOG_EVERY,
+                        (
+                            running_probe_loss.item()
+                            if torch.is_tensor(running_probe_loss)
+                            else running_probe_loss
+                        )
+                        / LOG_EVERY,
+                        dataset.probe_gamma,
+                    ]
+                )
+                classic_loss_file.flush()
             gpu_mem_peak_mb = (
                 torch.cuda.max_memory_allocated(device) / 1e6 if torch.cuda.is_available() else 0.0
             )
@@ -1432,6 +1674,7 @@ def run(
                 torch.cuda.reset_peak_memory_stats(device)  # so next window's peak isn't cumulative
             log_file.flush()
             running_task_loss, running_kl_loss, running_div, running_grad_norm = 0.0, 0.0, 0, 0.0
+            running_predict_loss = running_probe_loss = 0.0
 
         if kl_on and step % PRIOR_SNAPSHOT_EVERY == 0:
             # v5 (Phase 2): refit (mu_g, Sigma_g) from the writes
@@ -1478,6 +1721,7 @@ def run(
 
         if step % EVAL_EVERY == 0:
             pre_advance_lesson = curriculum.lesson  # capture before maybe_advance can bump it
+            id_eval_torch_rng = _capture_torch_rng()
             _, id_triple_acc, id_perfect_frac = curriculum.maybe_advance(
                 rnn, device, step=step, optimizer=optimizer
             )
@@ -1540,13 +1784,42 @@ def run(
                 grad_was_finite_since_eval = True
 
             ood_field_log: dict[tuple[int, int], list[int]] = {}
+            ood_rng_state = ood_rng.getstate()
+            ood_torch_rng = _capture_torch_rng()
             ood_triple_acc, ood_perfect_frac, ood_hop_breakdown = dataset.evaluate_ood(
                 rnn,
                 device,
-                num_episodes=OOD_EVAL_EPISODES_PERIODIC,
+                num_episodes=periodic_ood_episodes,
                 rng=ood_rng,
                 field_log=ood_field_log,
             )
+            ood_ablated_acc = None
+            if hasattr(dataset, "evaluate_ood_ablated"):
+                ood_ablated_rng = random.Random()
+                ood_ablated_rng.setstate(ood_rng_state)
+                if getattr(dataset, "classic_track", False):
+                    ood_ablated_field_log = {}
+                    with _replay_torch_rng(ood_torch_rng):
+                        ood_ablated_acc, _ood_ablated_perfect = dataset.evaluate_ood_ablated(
+                            rnn,
+                            device,
+                            periodic_ood_episodes,
+                            ood_ablated_rng,
+                            field_log=ood_ablated_field_log,
+                        )
+                    _write_classic_probe_pairs(
+                        classic_probe_writer,
+                        classic_probe_file,
+                        step,
+                        "ood",
+                        ood_field_log,
+                        ood_ablated_field_log,
+                    )
+                else:
+                    with _replay_torch_rng(ood_torch_rng):
+                        ood_ablated_acc, _ood_ablated_perfect = dataset.evaluate_ood_ablated(
+                            rnn, device, periodic_ood_episodes, ood_ablated_rng
+                        )
 
             ood_log_writer.writerow(
                 [
@@ -1561,6 +1834,18 @@ def run(
                 ]
             )
             ood_log_file.flush()
+            _write_ogs_row(
+                ogs_log_writer,
+                step,
+                pre_advance_lesson + 1,
+                id_triple_acc,
+                ood_triple_acc,
+                ood_perfect_frac,
+                ood_ablated_acc,
+                ogs_weights,
+                classic_track=getattr(dataset, "classic_track", False),
+            )
+            ogs_log_file.flush()
             dataset.write_field_log(
                 field_log_writer, field_log_file, step, curriculum.lesson + 1, "ood", ood_field_log
             )
@@ -1576,9 +1861,28 @@ def run(
             # Functional-usage check: same lesson distribution the ID eval
             # above just used (pre_advance_lesson, not curriculum.lesson --
             # this call may have just advanced it).
-            ablated_triple_acc, ablated_perfect_frac = dataset.evaluate_id_ablated(
-                rnn, device, curriculum, pre_advance_lesson
-            )
+            if getattr(dataset, "classic_track", False):
+                id_ablated_field_log = {}
+                with _replay_torch_rng(id_eval_torch_rng):
+                    ablated_triple_acc, ablated_perfect_frac = dataset.evaluate_id_ablated(
+                        rnn,
+                        device,
+                        curriculum,
+                        pre_advance_lesson,
+                        field_log=id_ablated_field_log,
+                    )
+                _write_classic_probe_pairs(
+                    classic_probe_writer,
+                    classic_probe_file,
+                    step,
+                    "id",
+                    curriculum.last_eval_field_log,
+                    id_ablated_field_log,
+                )
+            else:
+                ablated_triple_acc, ablated_perfect_frac = dataset.evaluate_id_ablated(
+                    rnn, device, curriculum, pre_advance_lesson
+                )
 
             mem_check_writer.writerow(
                 [
@@ -1699,12 +2003,16 @@ def run(
 
     print(f"\n[{run_id}] Generalization test:")
 
+    final_ood_rng_state = ood_rng.getstate()
+    final_ood_torch_rng = _capture_torch_rng()
+    final_ood_field_log = {}
     ood_triple_acc, ood_perfect_frac, ood_hop_breakdown = dataset.evaluate_ood(
         rnn,
         device,
-        num_episodes=OOD_EVAL_EPISODES,
+        num_episodes=final_ood_episodes,
         rng=ood_rng,
         verbose_n=10,
+        field_log=final_ood_field_log,
     )
 
     ood_offset_triple = id_triple_acc - ood_triple_acc
@@ -1723,6 +2031,45 @@ def run(
         ]
     )
     ood_log_file.flush()
+    final_ood_ablated_acc = None
+    if hasattr(dataset, "evaluate_ood_ablated"):
+        final_ood_ablated_rng = random.Random()
+        final_ood_ablated_rng.setstate(final_ood_rng_state)
+        if getattr(dataset, "classic_track", False):
+            final_ood_ablated_field_log = {}
+            with _replay_torch_rng(final_ood_torch_rng):
+                final_ood_ablated_acc, _final_ood_ablated_perfect = dataset.evaluate_ood_ablated(
+                    rnn,
+                    device,
+                    final_ood_episodes,
+                    final_ood_ablated_rng,
+                    field_log=final_ood_ablated_field_log,
+                )
+            _write_classic_probe_pairs(
+                classic_probe_writer,
+                classic_probe_file,
+                step,
+                "final_ood",
+                final_ood_field_log,
+                final_ood_ablated_field_log,
+            )
+        else:
+            with _replay_torch_rng(final_ood_torch_rng):
+                final_ood_ablated_acc, _final_ood_ablated_perfect = dataset.evaluate_ood_ablated(
+                    rnn, device, final_ood_episodes, final_ood_ablated_rng
+                )
+    _write_ogs_row(
+        ogs_log_writer,
+        step,
+        curriculum.lesson + 1,
+        id_triple_acc,
+        ood_triple_acc,
+        ood_perfect_frac,
+        final_ood_ablated_acc,
+        ogs_weights,
+        classic_track=getattr(dataset, "classic_track", False),
+    )
+    ogs_log_file.flush()
 
     for hops, (acc, pf, n) in sorted(ood_hop_breakdown.items()):
         hop_log_writer.writerow([step, curriculum.lesson + 1, "ood", hops, acc, pf, n])
@@ -1746,6 +2093,11 @@ def run(
     log_writer.writerow([""] + list(summary.values()))
     log_file.close()
     ood_log_file.close()
+    ogs_log_file.close()
+    if classic_loss_file is not None:
+        classic_loss_file.close()
+    if classic_probe_file is not None:
+        classic_probe_file.close()
     lesson_log_file.close()
     prior_log_file.close()
     field_log_file.close()  # v16
@@ -2043,9 +2395,19 @@ if __name__ == "__main__":
         "--dataset-type",
         type=str,
         default=DATASET_TYPE,
-        choices=["graph", "text", "audio", "video", "multimodal"],
-        help="Dataset plugged into the core loop (data/dataset_registry.py). "
-        "Only 'graph' (graph-traversal) is implemented so far.",
+        choices=[
+            "graph",
+            "text",
+            "audio",
+            "video",
+            "multimodal",
+            "text-classic",
+            "audio-classic",
+            "video-classic",
+            "multimodal-classic",
+        ],
+        help="Dataset plugged into the core loop. The '-classic' types select long-window "
+        "prediction plus retrieval-probe tasks; existing names keep the KV-chain track.",
     )
     parser.add_argument(
         "--dataset-link",
@@ -2068,7 +2430,120 @@ if __name__ == "__main__":
         "disjoint-key held-out slice of --dataset-link (or the fully synthetic "
         "seeded table if --dataset-link is also omitted).",
     )
+    parser.add_argument(
+        "--classic-window",
+        type=int,
+        default=CLASSIC_WINDOW_SIZE,
+        help="classic track window length in tokens/frames (default: 1024).",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="microbatch size; classic tasks default to 1 to bound full-window DNC activations, other tasks retain the configured default.",
+    )
+    parser.add_argument(
+        "--probe-distances",
+        type=int,
+        nargs="+",
+        default=list(CLASSIC_PROBE_DISTANCES),
+        help="classic retrieval distances to sample; pilot sweep default: 8 32 128 512.",
+    )
+    parser.add_argument(
+        "--probe-gamma",
+        type=float,
+        default=CLASSIC_PROBE_GAMMA,
+        help="classic-track weight gamma in L_predict + gamma*L_probe.",
+    )
+    parser.add_argument(
+        "--classic-ood-eval-episodes",
+        type=int,
+        default=CLASSIC_OOD_EVAL_EPISODES,
+        help="classic held-out probe episodes per OOD evaluation.",
+    )
+    parser.add_argument(
+        "--classic-modalities",
+        type=str,
+        default="text+audio",
+        help="modalities for multimodal-classic, e.g. text+audio or text+video.",
+    )
+    parser.add_argument(
+        "--ogs-weights",
+        type=float,
+        nargs=4,
+        default=list(OGS_WEIGHTS),
+        metavar=("OFFSET", "MEMORY", "PERFECT", "PROBE"),
+        help="nonnegative OGS component weights in the order shown.",
+    )
+    parser.add_argument(
+        "--save",
+        type=str,
+        default=None,
+        metavar="DIRECTORY",
+        help="save the prepared dataset under DIRECTORY/<type>/<name> [prepared].",
+    )
+    parser.add_argument(
+        "--load-prepared",
+        type=str,
+        default=None,
+        metavar="DIRECTORY",
+        help="load an already prepared dataset directory; --dataset-link is not needed.",
+    )
+    parser.add_argument(
+        "--prepare-only",
+        action="store_true",
+        help="prepare and optionally save the dataset, then exit without training.",
+    )
     args = parser.parse_args()
+
+    if args.prepare_only and args.load_prepared:
+        parser.error("--prepare-only cannot be combined with --load-prepared")
+    if args.prepare_only and not args.save:
+        parser.error("--prepare-only requires --save DIRECTORY")
+    if args.save and args.load_prepared:
+        parser.error("--save and --load-prepared cannot be combined")
+    if args.classic_window < 2 or not args.probe_distances or min(args.probe_distances) < 1:
+        parser.error("--classic-window must be >=2 and --probe-distances must be positive")
+    if max(args.probe_distances) >= args.classic_window:
+        parser.error("every --probe-distances value must be smaller than --classic-window")
+    if args.probe_gamma < 0:
+        parser.error("--probe-gamma must be >= 0")
+    if args.batch_size is not None and args.batch_size < 1:
+        parser.error("--batch-size must be >= 1")
+    if args.classic_ood_eval_episodes < 1:
+        parser.error("--classic-ood-eval-episodes must be >= 1")
+    if any(weight < 0 for weight in args.ogs_weights) or sum(args.ogs_weights) <= 0:
+        parser.error("--ogs-weights must be nonnegative and at least one must be positive")
+    if args.load_prepared and args.dataset_type == "multimodal":
+        parser.error("--load-prepared currently supports graph, text, audio, and video datasets")
+    prepared_dataset = None
+    if args.load_prepared:
+        prepared_dataset = load_prepared_dataset(args.load_prepared, args.dataset_type)
+        if getattr(prepared_dataset, "classic_track", False):
+            prepared_dataset.configure(
+                window_size=args.classic_window,
+                probe_distances=tuple(args.probe_distances),
+                probe_gamma=args.probe_gamma,
+                ood_eval_episodes=args.classic_ood_eval_episodes,
+            )
+    elif args.save or args.prepare_only:
+        if args.dataset_type == "multimodal":
+            parser.error("prepared dataset saving currently supports graph, text, audio, and video")
+        prepared_dataset = get_dataset(
+            args.dataset_type,
+            args.dataset_link,
+            test_dataset_link=args.test_dataset_link,
+            window_size=args.classic_window,
+            probe_distances=args.probe_distances,
+            probe_gamma=args.probe_gamma,
+            modalities=args.classic_modalities.split("+"),
+            ood_eval_episodes=args.classic_ood_eval_episodes,
+        )
+
+        if args.save:
+            save_prepared_dataset(prepared_dataset, args.save, args.dataset_type, args.dataset_link)
+        if args.prepare_only:
+            raise SystemExit(0)
 
     if args.resume is not None and args.beta is None:
         raise SystemExit(
@@ -2123,6 +2598,8 @@ if __name__ == "__main__":
                 run_id = f"{run_id}_combctrl{args.split_graph_combiner_variant.replace('+', '')}"
         if args.dataset_type != "graph":
             run_id = f"{run_id}_ds{args.dataset_type}"
+        if args.dataset_type.endswith("-classic"):
+            run_id = f"{run_id}_bs{args.batch_size or CLASSIC_BATCH_SIZE}"
         if args.run_id_suffix:
             run_id = f"{run_id}_{args.run_id_suffix}"
         summary = run(
@@ -2161,6 +2638,14 @@ if __name__ == "__main__":
             dataset_type=args.dataset_type,
             dataset_link=args.dataset_link,
             test_dataset_link=args.test_dataset_link,
+            prepared_dataset=prepared_dataset,
+            classic_window=args.classic_window,
+            probe_distances=tuple(args.probe_distances),
+            probe_gamma=args.probe_gamma,
+            classic_modalities=tuple(args.classic_modalities.split("+")),
+            classic_ood_eval_episodes=args.classic_ood_eval_episodes,
+            ogs_weights=tuple(args.ogs_weights),
+            batch_size=args.batch_size,
         )
         all_summaries.append(summary)
 

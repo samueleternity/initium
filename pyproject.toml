@@ -38,6 +38,7 @@ real-data = ["initium-deeplearning[text,video]"]
 [project.scripts]
 initium-setup = "initium.setup_wheels:main"
 initium-infer = "initium.inference.run_inference:main"
+initium-kl-attribution = "initium.analysis.kl_attribution:main"
 
 [project.urls]
 Homepage = "https://github.com/samueleternity/initium"

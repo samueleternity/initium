@@ -40,7 +40,26 @@ Example usage:
 python -m initium.core_training 0.0 --controller lstm
 python -m initium.core_training 0.0 --split-graph --split-graph-variant mamba1 ...
 
-For any inference you need a checkpoint first, the built in inferencing tool will analyze the checkpoint and if any of the parameters are not supported you will NOT be able to launch the checkpoint (in case you made some custom changes to the training code).
+# New additive long-window task family (requires a real source)
+python -m initium.core_training 0.0 --dataset-type text-classic --dataset-link ./corpus.txt --classic-window 1024 --probe-distances 8 32 128 512
+initium-infer classic_checkpoint.pt --dataset-type text-classic --dataset-link ./heldout.txt --generate --max-new-steps 32
+
+Inference runs need a checkpoint first. The built-in tool analyzes it and refuses unsupported task types or dimensions. Dataset preparation-only mode does not need a checkpoint.
+
+Classic task types (`text-classic`, `audio-classic`, `video-classic`, and `multimodal-classic`) are a separate long-window track. Each optimizes next-item prediction plus an explicitly weighted long-distance recall probe, logs the two losses separately, and measures memory-on/off probe accuracy by distance. Classic training defaults to a microbatch size of 1 to keep full-window DNC activations within GPU memory; override it with `--batch-size`. When using `--load-prepared`, runtime options such as `--classic-window`, `--probe-distances`, and `--probe-gamma` still apply to the saved token streams. The default distance list is a pilot sweep setting; use a short distance pilot to find the memory-off floor before choosing distances for full runs. `--generate` is available for classic checkpoints and writes a memory-on/off retrieval-probe report; text output remains token IDs because the current BPE path does not persist an inverse tokenizer. The CfC/MoE/split-graph flagship is a design-motivation analogy to continuous-time, sparsely routed, memory-indexed computation, not a literal biological claim or neuroscience validation.
+
+### Reusing prepared datasets
+
+Training and inference can save the processed dataset state so the raw source is not parsed or tokenized again. `--save DIRECTORY` writes to `DIRECTORY/<type>/<source> [prepared]/dataset.pkl`; `--load-prepared` accepts that prepared folder (or a save root containing exactly one prepared dataset of the requested type). When loading, `--dataset-link` is optional. Use `--prepare-only` with `--save` to prepare and save a dataset without starting a run:
+
+```bash
+python -m initium.core_training 0.0 --dataset-type text --dataset-link ./corpus.txt --save ./prepared --prepare-only
+python -m initium.core_training 0.0 --dataset-type text --load-prepared "./prepared/text/corpus [prepared]"
+initium-infer checkpoint.pt --dataset-type text --load-prepared "./prepared/text/corpus [prepared]"
+initium-infer --dataset-type text --dataset-link ./corpus.txt --save ./prepared --prepare-only
+```
+
+Prepared artifacts retain the resolved train/test pools or graph mappings, including the split used when they were created. They are Python pickle files and should only be loaded from sources you trust.
 
 ## High-level flow
 

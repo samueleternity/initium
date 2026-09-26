@@ -32,8 +32,11 @@ def get_dataset(
     dataset_type: str = "graph",
     dataset_link: str | None = None,
     test_dataset_link: str | None = None,
+    prepared_dataset=None,
     **kwargs,
 ):
+    if prepared_dataset is not None:
+        return prepared_dataset
     t = (dataset_type or "graph").lower()
     if t in GRAPH_ALIASES:
         from initium.data.graph_traversal.graph_traversal import GraphTraversalDataset

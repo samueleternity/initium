@@ -45,7 +45,8 @@ class GraphTraversalTask(BaseInferenceTask):
     output_dim = TRIPLE_DIM
 
     def __init__(
-        self, dataset_link=None, path_length_range=None, shared_context=False, num_contexts=1
+        self, dataset_link=None, path_length_range=None, shared_context=False, num_contexts=1,
+        prepared_dataset=None,
     ):
         if path_length_range is not None:
             lo, hi = path_length_range
@@ -61,7 +62,15 @@ class GraphTraversalTask(BaseInferenceTask):
             raise ValueError("num_contexts > 1 requires shared_context=True")
         self.shared_context, self.num_contexts = bool(shared_context), int(num_contexts)
 
-        if dataset_link in BUILTIN_LINKS:
+        if prepared_dataset is not None:
+            graph = prepared_dataset._custom_test_graph or prepared_dataset._custom_graph
+            if graph is None:
+                self.edges, self.node_labels, self.adjacency = build_london_underground_eval()
+                self.source_desc = "London Underground (built-in prepared dataset)"
+            else:
+                self.edges, self.node_labels, self.adjacency = graph
+                self.source_desc = "saved prepared graph"
+        elif dataset_link in BUILTIN_LINKS:
             self.edges, self.node_labels, self.adjacency = build_london_underground_eval()
             self.source_desc = "London Underground (built-in)"
         else:

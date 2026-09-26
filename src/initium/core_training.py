@@ -130,6 +130,7 @@ from initium.config.train_config import (
     WARMUP_STEPS,
 )
 from initium.data.dataset_registry import get_dataset
+from initium.data.prepared_dataset import load_prepared_dataset, save_prepared_dataset
 from initium.mamba_controller.mamba_controller import MambaDNC
 from initium.mamba_controller.split_graph_dnc import SplitGraphDNC
 from initium.memory_manipulation.dynamic_memory_resize import resize_memory
@@ -460,6 +461,7 @@ def run(
     dataset_type: str = DATASET_TYPE,
     dataset_link: str | None = DATASET_LINK,
     test_dataset_link: str | None = None,
+    prepared_dataset=None,
 ):
     # Deliberately does NOT touch LR_DECAY_STEPS - that's a separate
     # module-level constant, fixed at import time from the *original*
@@ -467,7 +469,12 @@ def run(
     # name, not through this parameter. A pilot run still anneals LR on
     # the full 120000-step schedule and simply stops early partway
     # through it, exactly as the --total-steps help text promises.
-    dataset = get_dataset(dataset_type, dataset_link, test_dataset_link=test_dataset_link)
+    dataset = get_dataset(
+        dataset_type,
+        dataset_link,
+        test_dataset_link=test_dataset_link,
+        prepared_dataset=prepared_dataset,
+    )
     INPUT_DIM, TRIPLE_DIM = dataset.input_dim, dataset.output_dim
     beta_ctrl_acc_target = (
         BETA_CTRL_ACC_TARGET if BETA_CTRL_ACC_TARGET is not None else dataset.advance_threshold
@@ -2068,7 +2075,48 @@ if __name__ == "__main__":
         "disjoint-key held-out slice of --dataset-link (or the fully synthetic "
         "seeded table if --dataset-link is also omitted).",
     )
+    parser.add_argument(
+        "--save",
+        type=str,
+        default=None,
+        metavar="DIRECTORY",
+        help="save the prepared dataset under DIRECTORY/<type>/<name> [prepared].",
+    )
+    parser.add_argument(
+        "--load-prepared",
+        type=str,
+        default=None,
+        metavar="DIRECTORY",
+        help="load an already prepared dataset directory; --dataset-link is not needed.",
+    )
+    parser.add_argument(
+        "--prepare-only",
+        action="store_true",
+        help="prepare and optionally save the dataset, then exit without training.",
+    )
     args = parser.parse_args()
+
+    if args.prepare_only and args.load_prepared:
+        parser.error("--prepare-only cannot be combined with --load-prepared")
+    if args.prepare_only and not args.save:
+        parser.error("--prepare-only requires --save DIRECTORY")
+    if args.save and args.load_prepared:
+        parser.error("--save and --load-prepared cannot be combined")
+    if args.load_prepared and args.dataset_type == "multimodal":
+        parser.error("--load-prepared currently supports graph, text, audio, and video datasets")
+    prepared_dataset = None
+    if args.load_prepared:
+        prepared_dataset = load_prepared_dataset(args.load_prepared, args.dataset_type)
+    elif args.save or args.prepare_only:
+        if args.dataset_type == "multimodal":
+            parser.error("prepared dataset saving currently supports graph, text, audio, and video")
+        prepared_dataset = get_dataset(
+            args.dataset_type, args.dataset_link, test_dataset_link=args.test_dataset_link
+        )
+        if args.save:
+            save_prepared_dataset(prepared_dataset, args.save, args.dataset_type, args.dataset_link)
+        if args.prepare_only:
+            raise SystemExit(0)
 
     if args.resume is not None and args.beta is None:
         raise SystemExit(
@@ -2161,6 +2209,7 @@ if __name__ == "__main__":
             dataset_type=args.dataset_type,
             dataset_link=args.dataset_link,
             test_dataset_link=args.test_dataset_link,
+            prepared_dataset=prepared_dataset,
         )
         all_summaries.append(summary)
 

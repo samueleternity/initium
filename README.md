@@ -42,6 +42,19 @@ python -m initium.core_training 0.0 --split-graph --split-graph-variant mamba1 .
 
 For any inference you need a checkpoint first, the built in inferencing tool will analyze the checkpoint and if any of the parameters are not supported you will NOT be able to launch the checkpoint (in case you made some custom changes to the training code).
 
+### Reusing prepared datasets
+
+Training and inference can save the processed dataset state so the raw source is not parsed or tokenized again. `--save DIRECTORY` writes to `DIRECTORY/<type>/<source> [prepared]/dataset.pkl`; `--load-prepared` accepts that prepared folder (or a save root containing exactly one prepared dataset of the requested type). When loading, `--dataset-link` is optional. Use `--prepare-only` with `--save` to prepare and save a dataset without starting a run:
+
+```bash
+python -m initium.core_training 0.0 --dataset-type text --dataset-link ./corpus.txt --save ./prepared --prepare-only
+python -m initium.core_training 0.0 --dataset-type text --load-prepared "./prepared/text/corpus [prepared]"
+initium-infer checkpoint.pt --dataset-type text --load-prepared "./prepared/text/corpus [prepared]"
+initium-infer --dataset-type text --dataset-link ./corpus.txt --save ./prepared --prepare-only
+```
+
+Prepared artifacts retain the resolved train/test pools or graph mappings, including the split used when they were created. They are Python pickle files and should only be loaded from sources you trust.
+
 ## High-level flow
 
 ```text

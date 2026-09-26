@@ -57,7 +57,9 @@ from initium.inference.inference_config import (
     PROGRESS_EVERY,
 )
 from initium.inference.model_loader import load_model
-from initium.inference.tasks.task_registry import get_task
+from initium.inference.tasks.task_registry import canonical_type, get_task
+from initium.data.dataset_registry import get_dataset
+from initium.data.prepared_dataset import load_prepared_dataset, save_prepared_dataset
 from initium.memory_manipulation.nvrtc_compat import patch_prod_jiterator
 
 patch_prod_jiterator()  # environment workaround - see that module's docstring
@@ -72,7 +74,8 @@ def parse_args(argv=None):
         "type is not supported by the checkpoint."
     )
     p.add_argument(
-        "checkpoint", type=str, help="path to a core_training checkpoint (.pt), periodic or final"
+        "checkpoint", nargs="?", default=None, type=str,
+        help="path to a core_training checkpoint (.pt), periodic or final; omitted with --prepare-only"
     )
     p.add_argument(
         "--dataset-type",
@@ -87,6 +90,12 @@ def parse_args(argv=None):
         help="test data location. Omit for the built-in London Underground graph; "
         "for graph, a .csv/.tsv/.txt/.json edge file (src,dst,line).",
     )
+    p.add_argument("--save", type=str, default=None, metavar="DIRECTORY",
+                   help="save prepared data under DIRECTORY/<type>/<name> [prepared].")
+    p.add_argument("--load-prepared", type=str, default=None, metavar="DIRECTORY",
+                   help="use an existing prepared dataset; --dataset-link is not needed.")
+    p.add_argument("--prepare-only", action="store_true",
+                   help="prepare and optionally save the dataset, then exit without inference.")
     p.add_argument(
         "--reset-experience",
         action=argparse.BooleanOptionalAction,
@@ -255,6 +264,16 @@ def parse_args(argv=None):
             p.error(f"--{name.replace('_', '-')} must be >= 1")
     if args.num_contexts > 1 and not args.shared_context:
         p.error("--num-contexts requires --shared-context")
+    if args.prepare_only and args.load_prepared:
+        p.error("--prepare-only cannot be combined with --load-prepared")
+    if args.prepare_only and not args.save:
+        p.error("--prepare-only requires --save DIRECTORY")
+    if args.save and args.load_prepared:
+        p.error("--save and --load-prepared cannot be combined")
+    if not args.prepare_only and not args.checkpoint:
+        p.error("checkpoint is required unless --prepare-only is used")
+    if (args.load_prepared or args.save) and args.dataset_type == "multimodal":
+        p.error("prepared dataset options currently support graph, text, audio, and video")
     try:
         parse_cache_spec(args.cache)
     except ValueError as e:
@@ -270,6 +289,15 @@ def parse_args(argv=None):
 
 def main(argv=None) -> int:
     args = parse_args(argv)
+    if args.prepare_only:
+        if args.dataset_type == "multimodal":
+            raise SystemExit("prepared dataset options currently support graph, text, audio, and video")
+        try:
+            dataset = get_dataset(args.dataset_type, args.dataset_link)
+            save_prepared_dataset(dataset, args.save, args.dataset_type, args.dataset_link)
+        except (ValueError, FileNotFoundError, ImportError) as e:
+            raise SystemExit(f"[inference] ABORT: {e}") from e
+        return 0
     device = torch.device(args.device or ("cuda:0" if torch.cuda.is_available() else "cpu"))
     print(f"[inference] device: {device}")
 
@@ -280,15 +308,28 @@ def main(argv=None) -> int:
     if args.inspect:
         return 0
 
+    prepared_dataset = None
+    if args.load_prepared:
+        try:
+            prepared_dataset = load_prepared_dataset(
+                args.load_prepared, canonical_type(args.dataset_type)
+            )
+        except (FileNotFoundError, ValueError) as e:
+            raise SystemExit(f"[inference] ABORT: {e}") from e
+
     # ---- compatibility gates (cheap, BEFORE building anything) --------------
     try:
         canon = require_type_supported(caps, args.dataset_type, args.checkpoint)
+        if args.save:
+            prepared_dataset = get_dataset(canon, args.dataset_link)
+            save_prepared_dataset(prepared_dataset, args.save, canon, args.dataset_link)
         task = get_task(
             canon,
             args.dataset_link,
             path_length_range=args.path_length,
             shared_context=args.shared_context,
             num_contexts=args.num_contexts,
+            prepared_dataset=prepared_dataset,
         )
         require_dims_match(caps, task, args.checkpoint)
     except (IncompatibleModelError, NotImplementedError, ValueError, FileNotFoundError) as e:

@@ -33,8 +33,15 @@ import math
 import os
 import random
 import shutil
+import sys
 import time
 from typing import Any
+
+# Support both ``python -m initium.core_training`` and direct execution of
+# ``src/initium/core_training.py`` from a source checkout.
+_SRC_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _SRC_ROOT not in sys.path:
+    sys.path.insert(0, _SRC_ROOT)
 
 import numpy as np
 import torch

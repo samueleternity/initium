@@ -17,7 +17,15 @@ TEXT_ALIASES = ("text",)
 AUDIO_ALIASES = ("audio",)
 VIDEO_ALIASES = ("video",)
 MULTIMODAL_ALIASES = ("multimodal", "multi-modal", "multi_modal")
-IMPLEMENTED_TYPES = ("graph", "text", "audio", "video", "text-classic", "audio-classic", "video-classic")
+IMPLEMENTED_TYPES = (
+    "graph",
+    "text",
+    "audio",
+    "video",
+    "text-classic",
+    "audio-classic",
+    "video-classic",
+)
 
 
 def canonical_type(dataset_type: str) -> str:
@@ -70,7 +78,13 @@ def get_task(dataset_type: str = "graph", dataset_link: str | None = None, **kwa
     t = canonical_type(dataset_type)
     cls = get_task_class(t)
     if t not in ("text-classic", "audio-classic", "video-classic", "multimodal-classic"):
-        for key in ("test_dataset_link", "classic_modalities", "classic_window", "probe_distances", "probe_gamma"):
+        for key in (
+            "test_dataset_link",
+            "classic_modalities",
+            "classic_window",
+            "probe_distances",
+            "probe_gamma",
+        ):
             kwargs.pop(key, None)
     if t == "multimodal":
         kwargs.pop("prepared_dataset", None)

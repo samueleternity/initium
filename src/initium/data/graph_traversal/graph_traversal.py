@@ -687,9 +687,7 @@ class GraphTraversalDataset(BaseDataset):
         )
 
     def evaluate_ood_ablated(self, model, device, num_episodes, rng):
-        return self.evaluate_ood(
-            model, device, num_episodes, rng, ablate_memory=True
-        )[:2]
+        return self.evaluate_ood(model, device, num_episodes, rng, ablate_memory=True)[:2]
 
     def _lesson_eval_graph_kwargs(self, curriculum, lesson_idx):
         """-> kwargs for evaluate_traversal() covering the 'which graph(s)'

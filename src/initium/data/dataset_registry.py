@@ -40,9 +40,9 @@ def get_dataset(
     t = (dataset_type or "graph").lower()
     if t in {"text-classic", "audio-classic", "video-classic", "multimodal-classic"}:
         from initium.config.classic_config import (
+            CLASSIC_OOD_EVAL_EPISODES,
             CLASSIC_PROBE_DISTANCES,
             CLASSIC_PROBE_GAMMA,
-            CLASSIC_OOD_EVAL_EPISODES,
             CLASSIC_WINDOW_SIZE,
         )
         from initium.data.common.classic_task import ClassicDataset

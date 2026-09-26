@@ -34,11 +34,16 @@ def _read_window(path, step_start, step_end, columns):
         for row in csv.DictReader(f):
             step = int(float(row["step"]))
             if step_start <= step <= step_end:
-                rows.append({name: float(row[name]) for name in columns if row.get(name) not in (None, "")})
+                rows.append(
+                    {name: float(row[name]) for name in columns if row.get(name) not in (None, "")}
+                )
     if not rows:
         raise ValueError(f"{path}: no rows in preregistered step window {step_start}..{step_end}")
-    return {name: sum(row[name] for row in rows if name in row) / sum(name in row for row in rows)
-            for name in columns if any(name in row for row in rows)}
+    return {
+        name: sum(row[name] for row in rows if name in row) / sum(name in row for row in rows)
+        for name in columns
+        if any(name in row for row in rows)
+    }
 
 
 def _mean(values):
@@ -46,7 +51,11 @@ def _mean(values):
 
 
 def _sd(values):
-    return math.sqrt(sum((x - _mean(values)) ** 2 for x in values) / (len(values) - 1)) if len(values) > 1 else 0.0
+    return (
+        math.sqrt(sum((x - _mean(values)) ** 2 for x in values) / (len(values) - 1))
+        if len(values) > 1
+        else 0.0
+    )
 
 
 def _betacf(a, b, x):
@@ -81,8 +90,9 @@ def _ibeta(a, b, x):
         return 0.0
     if x >= 1:
         return 1.0
-    factor = math.exp(math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
-                      + a * math.log(x) + b * math.log1p(-x))
+    factor = math.exp(
+        math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b) + a * math.log(x) + b * math.log1p(-x)
+    )
     if x < (a + 1.0) / (a + b + 2.0):
         return factor * _betacf(a, b, x) / a
     return 1.0 - factor * _betacf(b, a, 1.0 - x) / b
@@ -126,8 +136,12 @@ def _paired_report(deltas):
     p_value = 2.0 * (1.0 - _t_cdf(abs(t_value), n - 1)) if n > 1 else float("nan")
     margin = _t_critical(n - 1) * se if n > 1 else float("nan")
     return {
-        "n": n, "mean_delta": mean, "sd_delta": sd, "paired_t": t_value,
-        "p_two_sided": p_value, "ci95": [mean - margin, mean + margin],
+        "n": n,
+        "mean_delta": mean,
+        "sd_delta": sd,
+        "paired_t": t_value,
+        "p_two_sided": p_value,
+        "ci95": [mean - margin, mean + margin],
         "cohens_dz": mean / sd if sd else float("nan"),
     }
 
@@ -146,7 +160,9 @@ def _training_diagnostics(pair, step_start, step_end):
     if "beta0_train" in result and "beta_train" in result:
         a = result["beta0_train"].get("task_loss")
         b = result["beta_train"].get("task_loss")
-        result["task_loss_delta_beta_minus_zero"] = b - a if a is not None and b is not None else None
+        result["task_loss_delta_beta_minus_zero"] = (
+            b - a if a is not None and b is not None else None
+        )
         result["relative_task_loss_increase"] = (
             (b - a) / max(abs(a), 1e-12) if a is not None and b is not None else None
         )
@@ -161,11 +177,13 @@ def build_report(manifest, step_start, step_end):
                 "comparison": comparison.get("label", "unlabeled comparison"),
                 "pairs": comparison["pairs"],
             }
-            reports.append({
-                "task_family": comparison.get("task_family"),
-                "architecture": comparison.get("architecture"),
-                **build_report(submanifest, step_start, step_end),
-            })
+            reports.append(
+                {
+                    "task_family": comparison.get("task_family"),
+                    "architecture": comparison.get("architecture"),
+                    **build_report(submanifest, step_start, step_end),
+                }
+            )
         directions = [
             math.copysign(1, item["aggregate"]["ogs"]["mean_delta"])
             for item in reports
@@ -175,7 +193,8 @@ def build_report(manifest, step_start, step_end):
             "preregistered_step_window": [step_start, step_end],
             "comparisons": reports,
             "two_by_two_consistency": {
-                "ogs_effect_direction_consistent": len(directions) == len(reports) and len(set(directions)) <= 1,
+                "ogs_effect_direction_consistent": len(directions) == len(reports)
+                and len(set(directions)) <= 1,
                 "criterion": "KL OGS effect sign should agree between lesson/classic task families and baseline/flagship architectures.",
             },
         }
@@ -205,11 +224,13 @@ def build_report(manifest, step_start, step_end):
                 row[metric] = treatment[metric] - anchor[metric]
         rows.append(row)
         diagnostics.append(_training_diagnostics(pair, step_start, step_end))
-    stats = {metric: _paired_report([r[metric] for r in rows if metric in r])
-             for metric in columns if any(metric in r for r in rows)}
+    stats = {
+        metric: _paired_report([r[metric] for r in rows if metric in r])
+        for metric in columns
+        if any(metric in r for r in rows)
+    }
     anchor_ogs = [
-        _read_window(pair["beta0_ogs"], step_start, step_end, ("ogs",))["ogs"]
-        for pair in pairs
+        _read_window(pair["beta0_ogs"], step_start, step_end, ("ogs",))["ogs"] for pair in pairs
     ]
     delta_ogs = [r.get("ogs", float("nan")) for r in rows]
     mean_anchor = _mean(anchor_ogs)
@@ -228,9 +249,13 @@ def build_report(manifest, step_start, step_end):
         },
         "training_diagnostics": diagnostics,
         "no_collapse_and_no_cost_redistribution": {
-            "all_beta_runs_noncollapsed": all(not d.get("kl_collapse_flag", False) for d in diagnostics),
+            "all_beta_runs_noncollapsed": all(
+                not d.get("kl_collapse_flag", False) for d in diagnostics
+            ),
             "task_loss_deltas": [d.get("task_loss_delta_beta_minus_zero") for d in diagnostics],
-            "relative_task_loss_increases": [d.get("relative_task_loss_increase") for d in diagnostics],
+            "relative_task_loss_increases": [
+                d.get("relative_task_loss_increase") for d in diagnostics
+            ],
             "possible_cost_redistribution": any(
                 d.get("relative_task_loss_increase") is not None
                 and d["relative_task_loss_increase"] >= 0.05
@@ -244,10 +269,12 @@ def build_report(manifest, step_start, step_end):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("manifest", type=Path)
-    parser.add_argument("--step-start", type=int, required=True,
-                        help="inclusive preregistered lower step bound")
-    parser.add_argument("--step-end", type=int, required=True,
-                        help="inclusive preregistered upper step bound")
+    parser.add_argument(
+        "--step-start", type=int, required=True, help="inclusive preregistered lower step bound"
+    )
+    parser.add_argument(
+        "--step-end", type=int, required=True, help="inclusive preregistered upper step bound"
+    )
     parser.add_argument("--output", type=Path, default=None)
     args = parser.parse_args(argv)
     if args.step_end < args.step_start:

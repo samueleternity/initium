@@ -36,6 +36,8 @@ from initium.config.classic_config import (
     CLASSIC_PROBE_GAMMA,
     CLASSIC_WINDOW_SIZE,
 )
+from initium.data.dataset_registry import get_dataset
+from initium.data.prepared_dataset import load_prepared_dataset, save_prepared_dataset
 from initium.inference.cache.cache_config import (
     DEFAULT_CACHE,
     DEFAULT_CACHE_DISK_MB,
@@ -51,6 +53,7 @@ from initium.inference.capabilities import (
     require_type_supported,
 )
 from initium.inference.checkpoint_io import describe_checkpoint, load_checkpoint
+from initium.inference.generate import generate
 from initium.inference.inference_config import (
     DEFAULT_DATASET_LINK,
     DEFAULT_DATASET_TYPE,
@@ -62,10 +65,7 @@ from initium.inference.inference_config import (
     PROGRESS_EVERY,
 )
 from initium.inference.model_loader import load_model
-from initium.inference.generate import generate
 from initium.inference.tasks.task_registry import canonical_type, get_task
-from initium.data.dataset_registry import get_dataset
-from initium.data.prepared_dataset import load_prepared_dataset, save_prepared_dataset
 from initium.memory_manipulation.nvrtc_compat import patch_prod_jiterator
 
 patch_prod_jiterator()  # environment workaround - see that module's docstring
@@ -80,14 +80,27 @@ def parse_args(argv=None):
         "type is not supported by the checkpoint."
     )
     p.add_argument(
-        "checkpoint", nargs="?", default=None, type=str,
-        help="path to a core_training checkpoint (.pt), periodic or final; omitted with --prepare-only"
+        "checkpoint",
+        nargs="?",
+        default=None,
+        type=str,
+        help="path to a core_training checkpoint (.pt), periodic or final; omitted with --prepare-only",
     )
     p.add_argument(
         "--dataset-type",
         type=str,
         default=DEFAULT_DATASET_TYPE,
-        choices=["graph", "text", "audio", "video", "multimodal", "text-classic", "audio-classic", "video-classic", "multimodal-classic"],
+        choices=[
+            "graph",
+            "text",
+            "audio",
+            "video",
+            "multimodal",
+            "text-classic",
+            "audio-classic",
+            "video-classic",
+            "multimodal-classic",
+        ],
         help="task type to run. '-classic' types select long-window prediction and recall probes.",
     )
     p.add_argument(
@@ -97,24 +110,48 @@ def parse_args(argv=None):
         help="test data location. Omit for the built-in London Underground graph; "
         "for graph, a .csv/.tsv/.txt/.json edge file (src,dst,line).",
     )
-    p.add_argument("--test-dataset-link", type=str, default=None,
-                   help="held-out source for classic tasks; otherwise the supplied source is split.")
+    p.add_argument(
+        "--test-dataset-link",
+        type=str,
+        default=None,
+        help="held-out source for classic tasks; otherwise the supplied source is split.",
+    )
     p.add_argument("--classic-window", type=int, default=CLASSIC_WINDOW_SIZE)
     p.add_argument("--probe-distances", type=int, nargs="+", default=list(CLASSIC_PROBE_DISTANCES))
     p.add_argument("--probe-gamma", type=float, default=CLASSIC_PROBE_GAMMA)
     p.add_argument("--classic-modalities", type=str, default="text+audio")
-    p.add_argument("--generate", action="store_true",
-                   help="run autoregressive generation and memory-on/off probe attribution (classic types only).")
+    p.add_argument(
+        "--generate",
+        action="store_true",
+        help="run autoregressive generation and memory-on/off probe attribution (classic types only).",
+    )
     p.add_argument("--max-new-steps", type=int, default=32)
     p.add_argument("--temperature", type=float, default=1.0)
-    p.add_argument("--top-k", type=int, default=0,
-                   help="generation sampling top-k; 0 means unrestricted sampling.")
-    p.add_argument("--save", type=str, default=None, metavar="DIRECTORY",
-                   help="save prepared data under DIRECTORY/<type>/<name> [prepared].")
-    p.add_argument("--load-prepared", type=str, default=None, metavar="DIRECTORY",
-                   help="use an existing prepared dataset; --dataset-link is not needed.")
-    p.add_argument("--prepare-only", action="store_true",
-                   help="prepare and optionally save the dataset, then exit without inference.")
+    p.add_argument(
+        "--top-k",
+        type=int,
+        default=0,
+        help="generation sampling top-k; 0 means unrestricted sampling.",
+    )
+    p.add_argument(
+        "--save",
+        type=str,
+        default=None,
+        metavar="DIRECTORY",
+        help="save prepared data under DIRECTORY/<type>/<name> [prepared].",
+    )
+    p.add_argument(
+        "--load-prepared",
+        type=str,
+        default=None,
+        metavar="DIRECTORY",
+        help="use an existing prepared dataset; --dataset-link is not needed.",
+    )
+    p.add_argument(
+        "--prepare-only",
+        action="store_true",
+        help="prepare and optionally save the dataset, then exit without inference.",
+    )
     p.add_argument(
         "--reset-experience",
         action=argparse.BooleanOptionalAction,
@@ -320,7 +357,9 @@ def main(argv=None) -> int:
     args = parse_args(argv)
     if args.prepare_only:
         if args.dataset_type == "multimodal":
-            raise SystemExit("prepared dataset options currently support graph, text, audio, and video")
+            raise SystemExit(
+                "prepared dataset options currently support graph, text, audio, and video"
+            )
         try:
             dataset = get_dataset(
                 args.dataset_type,
@@ -403,36 +442,54 @@ def main(argv=None) -> int:
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(pair_seed)
             with_memory = generate(
-                loaded.rnn, loaded.output_proj, task, prompt, args.max_new_steps,
-                device, temperature=args.temperature, top_k=args.top_k, ablate_memory=False,
+                loaded.rnn,
+                loaded.output_proj,
+                task,
+                prompt,
+                args.max_new_steps,
+                device,
+                temperature=args.temperature,
+                top_k=args.top_k,
+                ablate_memory=False,
             )
             torch.manual_seed(pair_seed)
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(pair_seed)
             without_memory = generate(
-                loaded.rnn, loaded.output_proj, task, prompt, args.max_new_steps,
-                device, temperature=args.temperature, top_k=args.top_k, ablate_memory=True,
+                loaded.rnn,
+                loaded.output_proj,
+                task,
+                prompt,
+                args.max_new_steps,
+                device,
+                temperature=args.temperature,
+                top_k=args.top_k,
+                ablate_memory=True,
             )
             pred_on = with_memory["tokens"][0]
             pred_off = without_memory["tokens"][0]
             correct_on += int(pred_on == expected)
             correct_off += int(pred_off == expected)
-            records.append({
-                "distance": meta["distance"],
-                "modality": meta["modality"],
-                "target_token_id": expected,
-                "memory_on_token_id": pred_on,
-                "memory_off_token_id": pred_off,
-                "memory_on_continuation": with_memory["tokens"],
-                "memory_off_continuation": without_memory["tokens"],
-            })
+            records.append(
+                {
+                    "distance": meta["distance"],
+                    "modality": meta["modality"],
+                    "target_token_id": expected,
+                    "memory_on_token_id": pred_on,
+                    "memory_off_token_id": pred_off,
+                    "memory_on_continuation": with_memory["tokens"],
+                    "memory_off_continuation": without_memory["tokens"],
+                }
+            )
         summary = {
             "checkpoint": args.checkpoint,
             "dataset_type": canon,
             "prompts": count,
             "memory_on_probe_accuracy": 100.0 * correct_on / max(count, 1),
             "memory_off_probe_accuracy": 100.0 * correct_off / max(count, 1),
-            "memory_attributable_generation_probe": 100.0 * (correct_on - correct_off) / max(count, 1),
+            "memory_attributable_generation_probe": 100.0
+            * (correct_on - correct_off)
+            / max(count, 1),
             "max_new_steps": args.max_new_steps,
             "temperature": args.temperature,
             "top_k": args.top_k,
@@ -441,7 +498,9 @@ def main(argv=None) -> int:
         print(json.dumps(summary, indent=2))
         if not args.no_log:
             os.makedirs(args.log_dir, exist_ok=True)
-            path = os.path.join(args.log_dir, f"generation_{os.path.basename(args.checkpoint)}.json")
+            path = os.path.join(
+                args.log_dir, f"generation_{os.path.basename(args.checkpoint)}.json"
+            )
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(summary, f, indent=2)
             print(f"[inference] generation report: {path}")

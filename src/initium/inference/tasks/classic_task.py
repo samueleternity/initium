@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-import torch
-
-from initium.data.dataset_registry import get_dataset
 from initium.config.classic_config import (
     CLASSIC_PROBE_DISTANCES,
     CLASSIC_PROBE_GAMMA,
     CLASSIC_WINDOW_SIZE,
 )
+from initium.data.dataset_registry import get_dataset
 from initium.inference.metrics import EpisodeScore
 from initium.inference.tasks.base_task import BaseInferenceTask, Episode
 

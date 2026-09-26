@@ -7,11 +7,10 @@ training/evaluation contract remain unchanged.
 from __future__ import annotations
 
 import random
+
 import numpy as np
 import torch
 
-from initium.data.base_dataset import BaseDataset
-from initium.data.common.digit_codec import DigitCodec, digit_field_loss
 from initium.config.classic_config import (
     CLASSIC_EVAL_EPISODES,
     CLASSIC_OOD_EVAL_EPISODES,
@@ -19,6 +18,8 @@ from initium.config.classic_config import (
     CLASSIC_PROBE_GAMMA,
     CLASSIC_WINDOW_SIZE,
 )
+from initium.data.base_dataset import BaseDataset
+from initium.data.common.digit_codec import DigitCodec, digit_field_loss
 from initium.data.common.real_data import (
     audio_token_stream_chunks,
     resolve_link_paths,
@@ -82,8 +83,12 @@ class ClassicCurriculum:
     def maybe_advance(self, model, device, step=None, optimizer=None):
         self.last_eval_field_log = {}
         accuracy, perfect, _ = self.dataset.evaluate(
-            model, device, self.dataset.train_sequences, self.dataset.eval_episodes,
-            random.Random(8100 + self.lesson), field_log=self.last_eval_field_log,
+            model,
+            device,
+            self.dataset.train_sequences,
+            self.dataset.eval_episodes,
+            random.Random(8100 + self.lesson),
+            field_log=self.last_eval_field_log,
         )
         return self.lesson, accuracy, perfect
 
@@ -185,16 +190,19 @@ class ClassicDataset(BaseDataset):
     def make_curriculum(self):
         return ClassicCurriculum(self)
 
-    def configure(self, window_size=None, probe_distances=None, probe_gamma=None,
-                  ood_eval_episodes=None):
+    def configure(
+        self, window_size=None, probe_distances=None, probe_gamma=None, ood_eval_episodes=None
+    ):
         """Apply runtime settings to a loaded prepared dataset.
 
         Prepared data stores token streams; window length, probe selection,
         and loss weighting are runtime choices and should remain overridable.
         """
         window_size = self.window_size if window_size is None else int(window_size)
-        probe_distances = self.probe_distances if probe_distances is None else tuple(
-            sorted({int(d) for d in probe_distances})
+        probe_distances = (
+            self.probe_distances
+            if probe_distances is None
+            else tuple(sorted({int(d) for d in probe_distances}))
         )
         if window_size < 2 or not probe_distances or min(probe_distances) < 1:
             raise ValueError("window size must be >=2 and probe distances must be positive")
@@ -278,8 +286,18 @@ class ClassicDataset(BaseDataset):
         p, source, requested = probe
         targets[p, 1] = torch.tensor(self.codec.label_to_digit_targets(tokens[p][1]))
         masks[p, 1] = 1.0
-        return x, targets, masks, {"probe_pos": p, "source_pos": source, "distance": p - source,
-                                  "requested_distance": requested, "modality": self.modalities[tokens[p][0]]}
+        return (
+            x,
+            targets,
+            masks,
+            {
+                "probe_pos": p,
+                "source_pos": source,
+                "distance": p - source,
+                "requested_distance": requested,
+                "modality": self.modalities[tokens[p][0]],
+            },
+        )
 
     def _episode(self, sequences, rng):
         tokens, probe = self._window_tokens(sequences, rng)
@@ -292,11 +310,17 @@ class ClassicDataset(BaseDataset):
 
     def loss(self, output, target, mask):
         predict = digit_field_loss(
-            output, target[..., 0, :], mask[..., 0], num_fields=1,
+            output,
+            target[..., 0, :],
+            mask[..., 0],
+            num_fields=1,
             digit_base=self.codec.digit_base,
         )
         probe = digit_field_loss(
-            output, target[..., 1, :], mask[..., 1], num_fields=1,
+            output,
+            target[..., 1, :],
+            mask[..., 1],
+            num_fields=1,
             digit_base=self.codec.digit_base,
         )
         # Keep scalar metrics on device; the training loop transfers their
@@ -320,13 +344,31 @@ class ClassicDataset(BaseDataset):
 
     def write_field_log(self, writer, file, step, lesson, eval_type, field_log):
         for (distance, modality), (correct, count) in sorted(field_log.items()):
-            writer.writerow([step, lesson, eval_type, distance, modality,
-                             100.0 * correct / max(count, 1), count])
+            writer.writerow(
+                [
+                    step,
+                    lesson,
+                    eval_type,
+                    distance,
+                    modality,
+                    100.0 * correct / max(count, 1),
+                    count,
+                ]
+            )
         file.flush()
 
     @torch.no_grad()
-    def evaluate(self, model, device, sequences, num_episodes, rng, ablate_memory=False,
-                 field_log=None, skip_modalities=None):
+    def evaluate(
+        self,
+        model,
+        device,
+        sequences,
+        num_episodes,
+        rng,
+        ablate_memory=False,
+        field_log=None,
+        skip_modalities=None,
+    ):
         model.eval()
         total = correct = perfect = 0
         local_field_log = field_log if field_log is not None else {}
@@ -339,7 +381,9 @@ class ClassicDataset(BaseDataset):
                     index = self.modalities.index(modality)
                     x[:, index * self._channel_size : (index + 1) * self._channel_size] = 0
             output, _ = model(
-                x.unsqueeze(0).to(device), (None, None, None), reset_experience=True,
+                x.unsqueeze(0).to(device),
+                (None, None, None),
+                reset_experience=True,
                 pass_through_memory=not ablate_memory,
             )
             output = output.transpose(0, 1).contiguous()
@@ -364,8 +408,7 @@ class ClassicDataset(BaseDataset):
             aggregate[0] += field_correct
             aggregate[1] += count
         breakdown = {
-            distance: (100.0 * n_correct / max(count, 1),
-                       100.0 * n_correct / max(count, 1), count)
+            distance: (100.0 * n_correct / max(count, 1), 100.0 * n_correct / max(count, 1), count)
             for distance, (n_correct, count) in breakdown.items()
         }
         return (
@@ -374,36 +417,62 @@ class ClassicDataset(BaseDataset):
             breakdown,
         )
 
-    def evaluate_ood(self, model, device, num_episodes, rng, verbose_n=0, field_log=None,
-                     ablate_memory=False):
-        return self.evaluate(model, device, self.test_sequences, num_episodes, rng,
-                             ablate_memory, field_log)
+    def evaluate_ood(
+        self, model, device, num_episodes, rng, verbose_n=0, field_log=None, ablate_memory=False
+    ):
+        return self.evaluate(
+            model, device, self.test_sequences, num_episodes, rng, ablate_memory, field_log
+        )
 
     def evaluate_ood_ablated(self, model, device, num_episodes, rng, field_log=None):
-        return self.evaluate(model, device, self.test_sequences, num_episodes, rng,
-                             ablate_memory=True, field_log=field_log)[:2]
+        return self.evaluate(
+            model,
+            device,
+            self.test_sequences,
+            num_episodes,
+            rng,
+            ablate_memory=True,
+            field_log=field_log,
+        )[:2]
 
     def evaluate_id_ablated(self, model, device, curriculum, lesson_idx, field_log=None):
-        return self.evaluate(model, device, self.train_sequences, self.eval_episodes,
-                             random.Random(8100 + lesson_idx), ablate_memory=True,
-                             field_log=field_log)[:2]
+        return self.evaluate(
+            model,
+            device,
+            self.train_sequences,
+            self.eval_episodes,
+            random.Random(8100 + lesson_idx),
+            ablate_memory=True,
+            field_log=field_log,
+        )[:2]
 
     def evaluate_id(self, model, device, curriculum, lesson_idx):
-        return self.evaluate(model, device, self.train_sequences, self.eval_episodes,
-                             random.Random(8100 + lesson_idx))[:2]
+        return self.evaluate(
+            model,
+            device,
+            self.train_sequences,
+            self.eval_episodes,
+            random.Random(8100 + lesson_idx),
+        )[:2]
 
     def evaluate_robustness(self, model, device, curriculum, lesson_idx, perturbation, rng):
         return self.evaluate_id(model, device, curriculum, lesson_idx)
 
-    def evaluate_id_combiner_stage_ablated(self, model, device, curriculum, lesson_idx, skip_stages):
+    def evaluate_id_combiner_stage_ablated(
+        self, model, device, curriculum, lesson_idx, skip_stages
+    ):
         raise NotImplementedError("classic-track combiner-stage ablation is not implemented")
 
     def evaluate_modality_ablated(self, model, device, curriculum, lesson_idx, modality):
         if modality not in self.modalities:
             raise ValueError(f"unknown modality {modality!r}; expected one of {self.modalities}")
         return self.evaluate(
-            model, device, self.train_sequences, self.eval_episodes,
-            random.Random(8100 + lesson_idx), skip_modalities={modality},
+            model,
+            device,
+            self.train_sequences,
+            self.eval_episodes,
+            random.Random(8100 + lesson_idx),
+            skip_modalities={modality},
         )[:2]
 
     def generation_probe(self, rng=None):
@@ -436,5 +505,7 @@ class ClassicDataset(BaseDataset):
         if top_k:
             k = min(top_k, self.codec.label_range)
             threshold = torch.topk(label_log_probs, k).values[-1]
-            label_log_probs = label_log_probs.masked_fill(label_log_probs < threshold, float("-inf"))
+            label_log_probs = label_log_probs.masked_fill(
+                label_log_probs < threshold, float("-inf")
+            )
         return int(torch.multinomial(torch.softmax(label_log_probs, dim=-1), 1).item())

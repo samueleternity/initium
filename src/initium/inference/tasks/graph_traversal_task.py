@@ -45,7 +45,11 @@ class GraphTraversalTask(BaseInferenceTask):
     output_dim = TRIPLE_DIM
 
     def __init__(
-        self, dataset_link=None, path_length_range=None, shared_context=False, num_contexts=1,
+        self,
+        dataset_link=None,
+        path_length_range=None,
+        shared_context=False,
+        num_contexts=1,
         prepared_dataset=None,
     ):
         if path_length_range is not None:

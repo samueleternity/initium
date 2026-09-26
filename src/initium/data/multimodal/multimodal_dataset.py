@@ -356,9 +356,7 @@ class MultimodalDataset(BaseDataset):
         )
 
     def evaluate_ood_ablated(self, model, device, num_episodes, rng):
-        return self.evaluate_ood(
-            model, device, num_episodes, rng, ablate_memory=True
-        )[:2]
+        return self.evaluate_ood(model, device, num_episodes, rng, ablate_memory=True)[:2]
 
     def evaluate_id_ablated(self, model, device, curriculum, lesson_idx):
         nf, nq = curriculum.table[lesson_idx]

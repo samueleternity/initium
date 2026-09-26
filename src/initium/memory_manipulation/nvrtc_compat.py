@@ -89,7 +89,9 @@ def _patched_prod(input, dim=None, keepdim=False, *, dtype=None):
         if not input.dtype.is_floating_point:
             return _orig_prod(input, dim, keepdim=keepdim, dtype=dtype)
         if _STRICT_NEGATIVE_CHECK and bool((input < 0).any()):
-            return _orig_prod(input.detach().cpu(), dim, keepdim=keepdim, dtype=dtype).to(input.device)
+            return _orig_prod(input.detach().cpu(), dim, keepdim=keepdim, dtype=dtype).to(
+                input.device
+            )
         result = _log_space(input, dim, keepdim, cumulative=False)
         return result.to(dtype) if dtype is not None else result
     if dim is None:

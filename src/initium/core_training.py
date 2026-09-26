@@ -28,13 +28,13 @@ Version notes (core-level):
 """
 
 import csv
-from contextlib import contextmanager
 import math
 import os
 import random
 import shutil
 import sys
 import time
+from contextlib import contextmanager
 from typing import Any
 
 # Support both ``python -m initium.core_training`` and direct execution of
@@ -51,6 +51,14 @@ from initium.memory_manipulation.nvrtc_compat import patch_prod_jiterator
 
 patch_prod_jiterator()  # environment workaround -- see module docstring
 
+from initium.config.classic_config import (
+    CLASSIC_BATCH_SIZE,
+    CLASSIC_OOD_EVAL_EPISODES,
+    CLASSIC_PROBE_DISTANCES,
+    CLASSIC_PROBE_GAMMA,
+    CLASSIC_WINDOW_SIZE,
+    OGS_WEIGHTS,
+)
 from initium.config.controller_config import (
     CFC_ACTIVATION,
     CFC_BACKBONE_DROPOUT,
@@ -99,14 +107,6 @@ from initium.config.controller_config import (
     SPLIT_GRAPH_MAMBA_HEADDIM,
     SPLIT_GRAPH_MAMBA_VARIANT,
     SPLIT_GRAPH_NUM_BLOCKS,
-)
-from initium.config.classic_config import (
-    CLASSIC_BATCH_SIZE,
-    CLASSIC_OOD_EVAL_EPISODES,
-    CLASSIC_PROBE_DISTANCES,
-    CLASSIC_PROBE_GAMMA,
-    CLASSIC_WINDOW_SIZE,
-    OGS_WEIGHTS,
 )
 from initium.config.train_config import (
     AMP_INIT_SCALE,
@@ -203,8 +203,7 @@ def _ogs_components(id_acc, ood_acc, ood_perfect, ood_memory_off, lesson, probe_
     components = {
         "offset_normalized": offset_normalized,
         "memory_attributable_ood": (
-            (float(ood_acc) - float(ood_memory_off)) / 100.0
-            if ood_memory_off is not None else None
+            (float(ood_acc) - float(ood_memory_off)) / 100.0 if ood_memory_off is not None else None
         ),
         "ood_perfect_frac": float(ood_perfect) / 100.0,
         "probe_ood_delta": (
@@ -219,18 +218,29 @@ def _ogs_score(components, weights):
     return sum(value * weight for value, weight in active) / max(sum(w for _, w in active), 1e-12)
 
 
-def _write_ogs_row(writer, step, lesson, id_acc, ood_acc, ood_perfect, ood_memory_off,
-                   weights, classic_track=False):
-    probe_delta = (ood_acc - ood_memory_off) if classic_track and ood_memory_off is not None else None
-    components = _ogs_components(
-        id_acc, ood_acc, ood_perfect, ood_memory_off, lesson, probe_delta
+def _write_ogs_row(
+    writer, step, lesson, id_acc, ood_acc, ood_perfect, ood_memory_off, weights, classic_track=False
+):
+    probe_delta = (
+        (ood_acc - ood_memory_off) if classic_track and ood_memory_off is not None else None
     )
-    writer.writerow([
-        step, lesson, id_acc, ood_acc, components["offset_normalized"],
-        components["ood_perfect_frac"], ood_acc, ood_memory_off,
-        components["memory_attributable_ood"], components["probe_ood_delta"],
-        *weights, _ogs_score(components, weights),
-    ])
+    components = _ogs_components(id_acc, ood_acc, ood_perfect, ood_memory_off, lesson, probe_delta)
+    writer.writerow(
+        [
+            step,
+            lesson,
+            id_acc,
+            ood_acc,
+            components["offset_normalized"],
+            components["ood_perfect_frac"],
+            ood_acc,
+            ood_memory_off,
+            components["memory_attributable_ood"],
+            components["probe_ood_delta"],
+            *weights,
+            _ogs_score(components, weights),
+        ]
+    )
 
 
 def _write_classic_probe_pairs(writer, file, step, evaluation, on_log, off_log):
@@ -240,10 +250,18 @@ def _write_classic_probe_pairs(writer, file, step, evaluation, on_log, off_log):
         off_correct, off_count = off_log.get((distance, modality), (0, 0))
         on_acc = 100.0 * on_correct / max(on_count, 1)
         off_acc = 100.0 * off_correct / max(off_count, 1)
-        writer.writerow([
-            step, evaluation, distance, modality, on_acc, off_acc,
-            on_acc - off_acc, min(on_count, off_count),
-        ])
+        writer.writerow(
+            [
+                step,
+                evaluation,
+                distance,
+                modality,
+                on_acc,
+                off_acc,
+                on_acc - off_acc,
+                min(on_count, off_count),
+            ]
+        )
     file.flush()
 
 
@@ -586,12 +604,12 @@ def run(
         CLASSIC_BATCH_SIZE if getattr(dataset, "classic_track", False) else BATCH_SIZE
     )
     periodic_ood_episodes = (
-        dataset.ood_eval_episodes if getattr(dataset, "classic_track", False)
+        dataset.ood_eval_episodes
+        if getattr(dataset, "classic_track", False)
         else OOD_EVAL_EPISODES_PERIODIC
     )
     final_ood_episodes = (
-        dataset.ood_eval_episodes if getattr(dataset, "classic_track", False)
-        else OOD_EVAL_EPISODES
+        dataset.ood_eval_episodes if getattr(dataset, "classic_track", False) else OOD_EVAL_EPISODES
     )
     INPUT_DIM, TRIPLE_DIM = dataset.input_dim, dataset.output_dim
     if getattr(dataset, "classic_track", False):
@@ -664,10 +682,21 @@ def run(
     if not resuming:
         ogs_log_writer.writerow(
             [
-                "step", "lesson", "id_acc", "ood_acc", "offset_normalized",
-                "ood_perfect_frac", "ood_memory_on_acc", "ood_memory_off_acc",
-                "memory_attributable_ood", "classic_probe_ood_delta",
-                "weight_offset", "weight_memory", "weight_perfect", "weight_probe", "ogs",
+                "step",
+                "lesson",
+                "id_acc",
+                "ood_acc",
+                "offset_normalized",
+                "ood_perfect_frac",
+                "ood_memory_on_acc",
+                "ood_memory_off_acc",
+                "memory_attributable_ood",
+                "classic_probe_ood_delta",
+                "weight_offset",
+                "weight_memory",
+                "weight_perfect",
+                "weight_probe",
+                "ogs",
             ]
         )
 
@@ -689,10 +718,18 @@ def run(
         )
         classic_probe_writer = csv.writer(classic_probe_file)
         if not resuming:
-            classic_probe_writer.writerow([
-                "step", "evaluation", "distance", "modality", "memory_on_acc",
-                "memory_off_acc", "memory_dependency", "matched_n",
-            ])
+            classic_probe_writer.writerow(
+                [
+                    "step",
+                    "evaluation",
+                    "distance",
+                    "modality",
+                    "memory_on_acc",
+                    "memory_off_acc",
+                    "memory_dependency",
+                    "matched_n",
+                ]
+            )
 
     # Functional-usage check (LB-9/Concept 6): same-cadence, same-distribution
     # companion to the ID/OOD log above, but with the model's own memory
@@ -1385,7 +1422,9 @@ def run(
     t_run_start = time.time()
 
     while step < total_steps:
-        input_seq, target_digits, answer_mask = dataset.sample_batch(curriculum, effective_batch_size)
+        input_seq, target_digits, answer_mask = dataset.sample_batch(
+            curriculum, effective_batch_size
+        )
 
         input_seq = input_seq.to(device, non_blocking=True)
         target_digits = target_digits.to(device, non_blocking=True)
@@ -1528,7 +1567,9 @@ def run(
             t0 = time.time()
             total_elapsed = time.time() - t_run_start  # log addition #5
             avg_task = (
-                running_task_loss.item() if torch.is_tensor(running_task_loss) else running_task_loss
+                running_task_loss.item()
+                if torch.is_tensor(running_task_loss)
+                else running_task_loss
             ) / LOG_EVERY
             avg_kl = (
                 running_kl_loss.item() if torch.is_tensor(running_kl_loss) else running_kl_loss
@@ -1539,14 +1580,24 @@ def run(
                 beta_eff * avg_kl
             )  # actual beta*L_KL added to total loss, vs. avg_kl (pre-beta, raw clamped sum)
             if classic_loss_writer is not None:
-                classic_loss_writer.writerow([
-                    step,
-                    (running_predict_loss.item() if torch.is_tensor(running_predict_loss)
-                     else running_predict_loss) / LOG_EVERY,
-                    (running_probe_loss.item() if torch.is_tensor(running_probe_loss)
-                     else running_probe_loss) / LOG_EVERY,
-                    dataset.probe_gamma,
-                ])
+                classic_loss_writer.writerow(
+                    [
+                        step,
+                        (
+                            running_predict_loss.item()
+                            if torch.is_tensor(running_predict_loss)
+                            else running_predict_loss
+                        )
+                        / LOG_EVERY,
+                        (
+                            running_probe_loss.item()
+                            if torch.is_tensor(running_probe_loss)
+                            else running_probe_loss
+                        )
+                        / LOG_EVERY,
+                        dataset.probe_gamma,
+                    ]
+                )
                 classic_loss_file.flush()
             gpu_mem_peak_mb = (
                 torch.cuda.max_memory_allocated(device) / 1e6 if torch.cuda.is_available() else 0.0
@@ -1750,12 +1801,19 @@ def run(
                     ood_ablated_field_log = {}
                     with _replay_torch_rng(ood_torch_rng):
                         ood_ablated_acc, _ood_ablated_perfect = dataset.evaluate_ood_ablated(
-                            rnn, device, periodic_ood_episodes, ood_ablated_rng,
+                            rnn,
+                            device,
+                            periodic_ood_episodes,
+                            ood_ablated_rng,
                             field_log=ood_ablated_field_log,
                         )
                     _write_classic_probe_pairs(
-                        classic_probe_writer, classic_probe_file, step, "ood",
-                        ood_field_log, ood_ablated_field_log,
+                        classic_probe_writer,
+                        classic_probe_file,
+                        step,
+                        "ood",
+                        ood_field_log,
+                        ood_ablated_field_log,
                     )
                 else:
                     with _replay_torch_rng(ood_torch_rng):
@@ -1807,12 +1865,19 @@ def run(
                 id_ablated_field_log = {}
                 with _replay_torch_rng(id_eval_torch_rng):
                     ablated_triple_acc, ablated_perfect_frac = dataset.evaluate_id_ablated(
-                        rnn, device, curriculum, pre_advance_lesson,
+                        rnn,
+                        device,
+                        curriculum,
+                        pre_advance_lesson,
                         field_log=id_ablated_field_log,
                     )
                 _write_classic_probe_pairs(
-                    classic_probe_writer, classic_probe_file, step, "id",
-                    curriculum.last_eval_field_log, id_ablated_field_log,
+                    classic_probe_writer,
+                    classic_probe_file,
+                    step,
+                    "id",
+                    curriculum.last_eval_field_log,
+                    id_ablated_field_log,
                 )
             else:
                 ablated_triple_acc, ablated_perfect_frac = dataset.evaluate_id_ablated(
@@ -1974,12 +2039,19 @@ def run(
             final_ood_ablated_field_log = {}
             with _replay_torch_rng(final_ood_torch_rng):
                 final_ood_ablated_acc, _final_ood_ablated_perfect = dataset.evaluate_ood_ablated(
-                    rnn, device, final_ood_episodes, final_ood_ablated_rng,
+                    rnn,
+                    device,
+                    final_ood_episodes,
+                    final_ood_ablated_rng,
                     field_log=final_ood_ablated_field_log,
                 )
             _write_classic_probe_pairs(
-                classic_probe_writer, classic_probe_file, step, "final_ood",
-                final_ood_field_log, final_ood_ablated_field_log,
+                classic_probe_writer,
+                classic_probe_file,
+                step,
+                "final_ood",
+                final_ood_field_log,
+                final_ood_ablated_field_log,
             )
         else:
             with _replay_torch_rng(final_ood_torch_rng):
@@ -2323,7 +2395,17 @@ if __name__ == "__main__":
         "--dataset-type",
         type=str,
         default=DATASET_TYPE,
-        choices=["graph", "text", "audio", "video", "multimodal", "text-classic", "audio-classic", "video-classic", "multimodal-classic"],
+        choices=[
+            "graph",
+            "text",
+            "audio",
+            "video",
+            "multimodal",
+            "text-classic",
+            "audio-classic",
+            "video-classic",
+            "multimodal-classic",
+        ],
         help="Dataset plugged into the core loop. The '-classic' types select long-window "
         "prediction plus retrieval-probe tasks; existing names keep the KV-chain track.",
     )
@@ -2348,22 +2430,51 @@ if __name__ == "__main__":
         "disjoint-key held-out slice of --dataset-link (or the fully synthetic "
         "seeded table if --dataset-link is also omitted).",
     )
-    parser.add_argument("--classic-window", type=int, default=CLASSIC_WINDOW_SIZE,
-                        help="classic track window length in tokens/frames (default: 1024).")
-    parser.add_argument("--batch-size", type=int, default=None,
-                        help="microbatch size; classic tasks default to 1 to bound full-window DNC activations, other tasks retain the configured default.")
-    parser.add_argument("--probe-distances", type=int, nargs="+", default=list(CLASSIC_PROBE_DISTANCES),
-                        help="classic retrieval distances to sample; pilot sweep default: 8 32 128 512.")
-    parser.add_argument("--probe-gamma", type=float, default=CLASSIC_PROBE_GAMMA,
-                        help="classic-track weight gamma in L_predict + gamma*L_probe.")
-    parser.add_argument("--classic-ood-eval-episodes", type=int,
-                        default=CLASSIC_OOD_EVAL_EPISODES,
-                        help="classic held-out probe episodes per OOD evaluation.")
-    parser.add_argument("--classic-modalities", type=str, default="text+audio",
-                        help="modalities for multimodal-classic, e.g. text+audio or text+video.")
-    parser.add_argument("--ogs-weights", type=float, nargs=4, default=list(OGS_WEIGHTS),
-                        metavar=("OFFSET", "MEMORY", "PERFECT", "PROBE"),
-                        help="nonnegative OGS component weights in the order shown.")
+    parser.add_argument(
+        "--classic-window",
+        type=int,
+        default=CLASSIC_WINDOW_SIZE,
+        help="classic track window length in tokens/frames (default: 1024).",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="microbatch size; classic tasks default to 1 to bound full-window DNC activations, other tasks retain the configured default.",
+    )
+    parser.add_argument(
+        "--probe-distances",
+        type=int,
+        nargs="+",
+        default=list(CLASSIC_PROBE_DISTANCES),
+        help="classic retrieval distances to sample; pilot sweep default: 8 32 128 512.",
+    )
+    parser.add_argument(
+        "--probe-gamma",
+        type=float,
+        default=CLASSIC_PROBE_GAMMA,
+        help="classic-track weight gamma in L_predict + gamma*L_probe.",
+    )
+    parser.add_argument(
+        "--classic-ood-eval-episodes",
+        type=int,
+        default=CLASSIC_OOD_EVAL_EPISODES,
+        help="classic held-out probe episodes per OOD evaluation.",
+    )
+    parser.add_argument(
+        "--classic-modalities",
+        type=str,
+        default="text+audio",
+        help="modalities for multimodal-classic, e.g. text+audio or text+video.",
+    )
+    parser.add_argument(
+        "--ogs-weights",
+        type=float,
+        nargs=4,
+        default=list(OGS_WEIGHTS),
+        metavar=("OFFSET", "MEMORY", "PERFECT", "PROBE"),
+        help="nonnegative OGS component weights in the order shown.",
+    )
     parser.add_argument(
         "--save",
         type=str,

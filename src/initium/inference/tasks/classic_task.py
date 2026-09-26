@@ -43,6 +43,12 @@ class ClassicInferenceTask(BaseInferenceTask):
             probe_distances=probe_distances,
             probe_gamma=probe_gamma,
         )
+        if prepared_dataset is not None:
+            self._ds.configure(
+                window_size=classic_window,
+                probe_distances=probe_distances,
+                probe_gamma=probe_gamma,
+            )
         self.name = self._ds.name
         self.input_dim, self.output_dim = self._ds.input_dim, self._ds.output_dim
 

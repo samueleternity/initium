@@ -1,6 +1,7 @@
 """Defaults for the additive classic long-window task family."""
 
 CLASSIC_WINDOW_SIZE = 1024
+CLASSIC_BATCH_SIZE = 1
 CLASSIC_PROBE_DISTANCES = (8, 32, 128, 512)
 CLASSIC_PROBE_GAMMA = 1.0
 CLASSIC_EVAL_EPISODES = 32

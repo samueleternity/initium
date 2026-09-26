@@ -101,6 +101,7 @@ from initium.config.controller_config import (
     SPLIT_GRAPH_NUM_BLOCKS,
 )
 from initium.config.classic_config import (
+    CLASSIC_BATCH_SIZE,
     CLASSIC_OOD_EVAL_EPISODES,
     CLASSIC_PROBE_DISTANCES,
     CLASSIC_PROBE_GAMMA,
@@ -555,6 +556,7 @@ def run(
     classic_modalities: tuple[str, ...] = ("text", "audio"),
     classic_ood_eval_episodes: int = CLASSIC_OOD_EVAL_EPISODES,
     ogs_weights: tuple[float, float, float, float] = OGS_WEIGHTS,
+    batch_size: int | None = None,
 ):
     # Deliberately does NOT touch LR_DECAY_STEPS - that's a separate
     # module-level constant, fixed at import time from the *original*
@@ -572,6 +574,16 @@ def run(
         probe_gamma=probe_gamma,
         modalities=list(classic_modalities),
         ood_eval_episodes=classic_ood_eval_episodes,
+    )
+    if getattr(dataset, "classic_track", False):
+        dataset.configure(
+            window_size=classic_window,
+            probe_distances=probe_distances,
+            probe_gamma=probe_gamma,
+            ood_eval_episodes=classic_ood_eval_episodes,
+        )
+    effective_batch_size = batch_size or (
+        CLASSIC_BATCH_SIZE if getattr(dataset, "classic_track", False) else BATCH_SIZE
     )
     periodic_ood_episodes = (
         dataset.ood_eval_episodes if getattr(dataset, "classic_track", False)
@@ -1368,7 +1380,7 @@ def run(
     t_run_start = time.time()
 
     while step < total_steps:
-        input_seq, target_digits, answer_mask = dataset.sample_batch(curriculum, BATCH_SIZE)
+        input_seq, target_digits, answer_mask = dataset.sample_batch(curriculum, effective_batch_size)
 
         input_seq = input_seq.to(device, non_blocking=True)
         target_digits = target_digits.to(device, non_blocking=True)
@@ -1380,7 +1392,7 @@ def run(
         with torch.amp.autocast("cuda", enabled=amp_enabled):
             output, hidden = rnn(input_seq, hidden, reset_experience=True)
             _first_nonfinite_report(output, "rnn_output", step)
-            output = output.transpose(0, 1).contiguous()  # (B, T, 92)
+            output = output.transpose(0, 1)  # (B, T, 92); Linear accepts non-contiguous input.
             output = output_proj(output)  # (B, T, 90)
             task_loss = dataset.loss(output, target_digits, answer_mask)
 
@@ -2320,6 +2332,8 @@ if __name__ == "__main__":
     )
     parser.add_argument("--classic-window", type=int, default=CLASSIC_WINDOW_SIZE,
                         help="classic track window length in tokens/frames (default: 1024).")
+    parser.add_argument("--batch-size", type=int, default=None,
+                        help="microbatch size; classic tasks default to 1 to bound full-window DNC activations, other tasks retain the configured default.")
     parser.add_argument("--probe-distances", type=int, nargs="+", default=list(CLASSIC_PROBE_DISTANCES),
                         help="classic retrieval distances to sample; pilot sweep default: 8 32 128 512.")
     parser.add_argument("--probe-gamma", type=float, default=CLASSIC_PROBE_GAMMA,
@@ -2365,6 +2379,8 @@ if __name__ == "__main__":
         parser.error("every --probe-distances value must be smaller than --classic-window")
     if args.probe_gamma < 0:
         parser.error("--probe-gamma must be >= 0")
+    if args.batch_size is not None and args.batch_size < 1:
+        parser.error("--batch-size must be >= 1")
     if args.classic_ood_eval_episodes < 1:
         parser.error("--classic-ood-eval-episodes must be >= 1")
     if any(weight < 0 for weight in args.ogs_weights) or sum(args.ogs_weights) <= 0:
@@ -2374,6 +2390,13 @@ if __name__ == "__main__":
     prepared_dataset = None
     if args.load_prepared:
         prepared_dataset = load_prepared_dataset(args.load_prepared, args.dataset_type)
+        if getattr(prepared_dataset, "classic_track", False):
+            prepared_dataset.configure(
+                window_size=args.classic_window,
+                probe_distances=tuple(args.probe_distances),
+                probe_gamma=args.probe_gamma,
+                ood_eval_episodes=args.classic_ood_eval_episodes,
+            )
     elif args.save or args.prepare_only:
         if args.dataset_type == "multimodal":
             parser.error("prepared dataset saving currently supports graph, text, audio, and video")
@@ -2446,6 +2469,8 @@ if __name__ == "__main__":
                 run_id = f"{run_id}_combctrl{args.split_graph_combiner_variant.replace('+', '')}"
         if args.dataset_type != "graph":
             run_id = f"{run_id}_ds{args.dataset_type}"
+        if args.dataset_type.endswith("-classic"):
+            run_id = f"{run_id}_bs{args.batch_size or CLASSIC_BATCH_SIZE}"
         if args.run_id_suffix:
             run_id = f"{run_id}_{args.run_id_suffix}"
         summary = run(
@@ -2491,6 +2516,7 @@ if __name__ == "__main__":
             classic_modalities=tuple(args.classic_modalities.split("+")),
             classic_ood_eval_episodes=args.classic_ood_eval_episodes,
             ogs_weights=tuple(args.ogs_weights),
+            batch_size=args.batch_size,
         )
         all_summaries.append(summary)
 

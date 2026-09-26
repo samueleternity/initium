@@ -171,6 +171,28 @@ class ClassicDataset(BaseDataset):
     def make_curriculum(self):
         return ClassicCurriculum(self)
 
+    def configure(self, window_size=None, probe_distances=None, probe_gamma=None,
+                  ood_eval_episodes=None):
+        """Apply runtime settings to a loaded prepared dataset.
+
+        Prepared data stores token streams; window length, probe selection,
+        and loss weighting are runtime choices and should remain overridable.
+        """
+        window_size = self.window_size if window_size is None else int(window_size)
+        probe_distances = self.probe_distances if probe_distances is None else tuple(
+            sorted({int(d) for d in probe_distances})
+        )
+        if window_size < 2 or not probe_distances or min(probe_distances) < 1:
+            raise ValueError("window size must be >=2 and probe distances must be positive")
+        if max(probe_distances) >= window_size:
+            raise ValueError("each probe distance must be smaller than the classic window size")
+        self.window_size = window_size
+        self.probe_distances = probe_distances
+        if probe_gamma is not None:
+            self.probe_gamma = float(probe_gamma)
+        if ood_eval_episodes is not None:
+            self.ood_eval_episodes = int(ood_eval_episodes)
+
     def set_output_proj(self, proj):
         self._output_proj = proj
 

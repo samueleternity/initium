@@ -338,7 +338,9 @@ class MultimodalDataset(BaseDataset):
             return combined_acc, perfect_frac, breakdown
         return combined_acc, perfect_frac
 
-    def evaluate_ood(self, model, device, num_episodes, rng, verbose_n=0, field_log=None):
+    def evaluate_ood(
+        self, model, device, num_episodes, rng, verbose_n=0, field_log=None, ablate_memory=False
+    ):
         return self.evaluate_chain(
             model,
             device,
@@ -346,11 +348,15 @@ class MultimodalDataset(BaseDataset):
             num_facts_range=(15, 20),
             num_queries_range=self.primary.ood_query_range,
             rng=rng,
+            ablate_memory=ablate_memory,
             step_breakdown=True,
             use_test_pool=True,
             verbose_n=verbose_n,
             field_log=field_log,
         )
+
+    def evaluate_ood_ablated(self, model, device, num_episodes, rng):
+        return self.evaluate_ood(model, device, num_episodes, rng, ablate_memory=True)[:2]
 
     def evaluate_id_ablated(self, model, device, curriculum, lesson_idx):
         nf, nq = curriculum.table[lesson_idx]

@@ -64,5 +64,6 @@ def get_task(dataset_type: str = "graph", dataset_link: str | None = None, **kwa
     t = canonical_type(dataset_type)
     cls = get_task_class(t)
     if t == "multimodal":
+        kwargs.pop("prepared_dataset", None)
         return cls((dataset_link or "text+audio").split("+"), **kwargs)
     return cls(dataset_link, **kwargs)

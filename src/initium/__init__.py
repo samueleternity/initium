@@ -60,22 +60,34 @@ _EXPORTS = {
 }
 
 if TYPE_CHECKING:
-    from initium.LNN_controller.cfc_controller import CfCControllerWrapper as CfCControllerWrapper
-    from initium.LNN_controller.chained_controller import ChainedControllerWrapper as ChainedControllerWrapper
-    from initium.LNN_controller.hybrid_controller import build_hybrid_controller as build_hybrid_controller
-    from initium.MoE.moe_layer import MoEBlock as MoEBlock
-    from initium.MoE.moe_layer import SwitchMoE as SwitchMoE
     from initium.inference.checkpoint_io import describe_checkpoint as describe_checkpoint
     from initium.inference.checkpoint_io import load_checkpoint as load_checkpoint
     from initium.inference.model_loader import LoadedModel as LoadedModel
     from initium.inference.model_loader import load_model as load_model
-    from initium.mamba_controller.mamba2_controller import Mamba2ControllerWrapper as Mamba2ControllerWrapper
-    from initium.mamba_controller.mamba3_controller import Mamba3ControllerWrapper as Mamba3ControllerWrapper
-    from initium.mamba_controller.mamba_controller import MambaControllerWrapper as MambaControllerWrapper
+    from initium.LNN_controller.cfc_controller import CfCControllerWrapper as CfCControllerWrapper
+    from initium.LNN_controller.chained_controller import (
+        ChainedControllerWrapper as ChainedControllerWrapper,
+    )
+    from initium.LNN_controller.hybrid_controller import (
+        build_hybrid_controller as build_hybrid_controller,
+    )
+    from initium.mamba_controller.mamba2_controller import (
+        Mamba2ControllerWrapper as Mamba2ControllerWrapper,
+    )
+    from initium.mamba_controller.mamba3_controller import (
+        Mamba3ControllerWrapper as Mamba3ControllerWrapper,
+    )
+    from initium.mamba_controller.mamba_controller import (
+        MambaControllerWrapper as MambaControllerWrapper,
+    )
     from initium.mamba_controller.mamba_controller import MambaDNC as MambaDNC
     from initium.mamba_controller.split_graph_dnc import SplitGraphDNC as SplitGraphDNC
     from initium.memory_manipulation.dynamic_memory_resize import resize_memory as resize_memory
-    from initium.memory_manipulation.stochastic_write_head_v2 import StochasticWriteHead as StochasticWriteHead
+    from initium.memory_manipulation.stochastic_write_head_v2 import (
+        StochasticWriteHead as StochasticWriteHead,
+    )
+    from initium.MoE.moe_layer import MoEBlock as MoEBlock
+    from initium.MoE.moe_layer import SwitchMoE as SwitchMoE
 
 
 def __getattr__(name: str) -> Any:

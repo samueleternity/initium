@@ -24,7 +24,6 @@ METRICS = (
     "offset_normalized",
     "memory_attributable_ood",
     "ood_perfect_frac",
-    "classic_probe_ood_delta",
 )
 
 
@@ -195,7 +194,7 @@ def build_report(manifest, step_start, step_end):
             "two_by_two_consistency": {
                 "ogs_effect_direction_consistent": len(directions) == len(reports)
                 and len(set(directions)) <= 1,
-                "criterion": "KL OGS effect sign should agree between lesson/classic task families and baseline/flagship architectures.",
+                "criterion": "KL OGS effect sign should agree across the compared architectures and task families.",
             },
         }
     pairs = manifest["pairs"]

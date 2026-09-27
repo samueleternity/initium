@@ -1887,7 +1887,7 @@ def run(
 
     final_ood_rng_state = ood_rng.getstate()
     final_ood_torch_rng = _capture_torch_rng()
-    final_ood_field_log = {}
+    final_ood_field_log: dict[tuple[int, int], list[int]] = {}
     ood_triple_acc, ood_perfect_frac, ood_hop_breakdown = dataset.evaluate_ood(
         rnn,
         device,

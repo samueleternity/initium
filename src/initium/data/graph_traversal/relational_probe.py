@@ -38,8 +38,11 @@ def build_relational_probe(
     """
     if cases < 2:
         raise ValueError("cases must be at least 2 to reserve held-out compositions")
-    if cell_size < 12:
-        raise ValueError("cell_size must be at least 12")
+    # Three role channels are sufficient. Tiny smoke configurations use
+    # cell_size=8; requiring four dimensions per channel made the probe abort
+    # those runs before training, even though the fixture fits in fewer.
+    if cell_size < 6:
+        raise ValueError("cell_size must be at least 6")
 
     generator = torch.Generator(device="cpu").manual_seed(seed)
     width = cell_size // 3

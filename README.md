@@ -87,6 +87,25 @@ The training core delegates task construction and task-specific behavior to a da
 
 The DNC supplies a memory matrix and differentiable read/write interface. The memory can retain information beyond a controller's immediate hidden state. Content-based addressing, read heads, and temporal-link structures are part of the underlying DNC implementation. The temporal link matrix has quadratic cost in the number of memory cells, which motivates the project's link-matrix ablations and memory-size investigations.
 
+### Read/write mechanism roadmap
+
+The split-graph memory exposes independent read and write variants while retaining the DNC usage, allocation, write addressing, read modes, and temporal-link machinery:
+
+- `--dnc-read-variant cosine` is the DNC baseline. `relational-mlp` learns a score for each `(query, memory row)` pair; write content addressing remains cosine-based.
+- `--dnc-write-variant learned` is the DNC baseline. `kanerva-closed-form` turns the existing write-value projection into an observation and applies a per-row online isotropic Gaussian posterior update. It does not import the Kanerva Machine's exchangeable episode objective or claim to reproduce its full generative model.
+- The variants compose, so the four baseline / Track A / Track B / combined cells are expressible through the same training and checkpoint pipeline. The closed-form writer uses a deterministic observation projection; the stochastic write head is not installed for that variant.
+- The graph curriculum emits ID, OOD, and OOD-offset metrics as before. Graph runs also write `run_<id>_relational_probe.csv`, with cosine top-1, selected read-head top-1, and held-out-composition accuracy. `data/graph_traversal/order_probe.py` supplies paired prefix-permutation helpers for the Q99 order-sensitivity evaluation.
+- Split-graph graph runs also write `run_<id>_track_a.csv` and `run_<id>_track_b.csv`. Track A records ID/OOD accuracy, relational stress and held-out-composition accuracy, plus ordinary-input read-score/cosine correlation. Track B records the Q99 order-sensitivity gate, ID/OOD posterior variance and write-update diagnostics, and training-window loss, gradient norm, AMP scale, and learning rate. These are experiment logs; no training or evaluation results are checked in.
+
+Use the selected split-graph baseline with either supported controller combiner:
+
+```bash
+python -m initium.core_training 0.0 --split-graph --split-graph-variant mamba1 --split-graph-combiner-mode controller --split-graph-combiner-variant cfc
+python -m initium.core_training 0.0 --split-graph --split-graph-variant mamba1 --split-graph-combiner-mode controller --split-graph-combiner-variant mamba+cfc
+```
+
+Add `--dnc-read-variant relational-mlp` for Track A or `--dnc-write-variant kanerva-closed-form` for Track B. Add both only for the combined cell after each track is characterized. Dense temporal links remain the default. The short-run baseline reproduction gate and the Q99 paired-order evaluation are deliberate user-run experiment steps; no run results are assumed by this repository change.
+
 ### Controllers
 
 The training core exposes controller choices through its command-line interface and configuration:

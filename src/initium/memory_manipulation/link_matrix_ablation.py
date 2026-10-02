@@ -123,7 +123,17 @@ def patch_link_matrix(model, mode: str, topk: int | None = None, layer: int | No
 
     targets = model.memories if layer is None else [model.memories[layer]]
     for memory in targets:
-        memory.__class__ = AblatableSparseLinkMemory
+        if not isinstance(memory, AblatableSparseLinkMemory):
+            # Preserve mechanism-specific overrides (for example relational
+            # read scoring and Bayesian writes) while layering this isolated
+            # link-matrix override on top of the memory's existing class.
+            original_class = memory.__class__
+            combined_class = type(
+                f"Ablatable{original_class.__name__}",
+                (AblatableSparseLinkMemory, original_class),
+                {},
+            )
+            memory.__class__ = combined_class
         memory.link_matrix_mode = mode
         if topk is not None:
             memory.link_matrix_topk = topk

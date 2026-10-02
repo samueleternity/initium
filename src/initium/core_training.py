@@ -69,6 +69,9 @@ from initium.config.controller_config import (
     DYNAMIC_N_MODE,
     DYNAMIC_N_TRIGGER_FRAC,
     DYNAMIC_N_USAGE_HIGH,
+    DNC_READ_VARIANT,
+    DNC_WRITE_OBSERVATION_VARIANCE,
+    DNC_WRITE_VARIANT,
     HYBRID_CFC_NUM_BLOCKS,
     ISOLATE_LINK_ABLATION,
     LINK_MATRIX_MODE,
@@ -139,6 +142,15 @@ from initium.config.train_config import (
     WARMUP_STEPS,
 )
 from initium.data.dataset_registry import get_dataset
+from initium.data.graph_traversal.relational_probe import (
+    build_relational_probe,
+    cosine_top1_accuracy,
+    score_probe_cases,
+)
+from initium.data.graph_traversal.order_probe import (
+    build_q99_probe_batch,
+    evaluate_q99_order_sensitivity,
+)
 from initium.data.prepared_dataset import load_prepared_dataset, save_prepared_dataset
 from initium.mamba_controller.mamba_controller import MambaDNC
 from initium.mamba_controller.split_graph_dnc import SplitGraphDNC
@@ -566,6 +578,9 @@ def run(
     split_graph_combiner_mode: str = SPLIT_GRAPH_COMBINER_MODE,
     split_graph_combiner_variant: str = SPLIT_GRAPH_COMBINER_VARIANT,
     split_graph_combiner_num_blocks: int = SPLIT_GRAPH_COMBINER_NUM_BLOCKS,
+    dnc_read_variant: str = DNC_READ_VARIANT,
+    dnc_write_variant: str = DNC_WRITE_VARIANT,
+    dnc_write_observation_variance: float = DNC_WRITE_OBSERVATION_VARIANCE,
     dataset_type: str = DATASET_TYPE,
     dataset_link: str | None = DATASET_LINK,
     test_dataset_link: str | None = None,
@@ -645,6 +660,108 @@ def run(
                 "ood_offset_perfect",
             ]
         )
+
+    relational_probe_cases = (
+        build_relational_probe(cell_size=MODEL_CELL_SIZE)
+        if dataset_type == "graph"
+        else None
+    )
+    relational_probe_file = None
+    relational_probe_writer = None
+    if relational_probe_cases is not None:
+        relational_probe_file = open(
+            os.path.join(LOG_DIR, f"run_{run_id}_relational_probe.csv"),
+            "a" if resuming else "w",
+            newline="",
+        )
+        relational_probe_writer = csv.writer(relational_probe_file)
+        if not resuming:
+            relational_probe_writer.writerow(
+                [
+                    "step",
+                    "lesson",
+                    "cosine_top1_accuracy",
+                    "selected_read_top1_accuracy",
+                    "selected_read_held_out_accuracy",
+                    "cases",
+                ]
+            )
+
+    track_a_file = None
+    track_a_writer = None
+    track_b_file = None
+    track_b_writer = None
+    if split_graph_enabled and dataset_type == "graph":
+        track_a_file = open(
+            os.path.join(LOG_DIR, f"run_{run_id}_track_a.csv"),
+            "a" if resuming else "w",
+            newline="",
+        )
+        track_a_writer = csv.writer(track_a_file)
+        if not resuming:
+            track_a_writer.writerow(
+                [
+                    "step",
+                    "lesson",
+                    "read_variant",
+                    "id_triple_acc",
+                    "ood_triple_acc",
+                    "ood_offset_triple",
+                    "stress_cosine_top1_acc",
+                    "stress_selected_read_top1_acc",
+                    "stress_held_out_acc",
+                    "ordinary_read_score_cosine_rho_mean",
+                    "ordinary_read_diagnostic_count",
+                ]
+            )
+        track_b_file = open(
+            os.path.join(LOG_DIR, f"run_{run_id}_track_b.csv"),
+            "a" if resuming else "w",
+            newline="",
+        )
+        track_b_writer = csv.writer(track_b_file)
+        if not resuming:
+            track_b_writer.writerow(
+                [
+                    "event",
+                    "step",
+                    "lesson",
+                    "write_variant",
+                    "id_triple_acc",
+                    "ood_triple_acc",
+                    "ood_offset_triple",
+                    "q99_gate",
+                    "q99_tested_episodes",
+                    "q99_outputs_change_with_memory",
+                    "q99_outputs_change_without_memory",
+                    "q99_max_abs_output_delta",
+                    "q99_mean_abs_output_delta",
+                    "q99_prediction_flip_rate",
+                    "q99_memory_incremental_order_effect",
+                    "id_posterior_mean_variance",
+                    "id_posterior_variance_min",
+                    "id_posterior_variance_max",
+                    "id_posterior_variance_reduction",
+                    "id_posterior_mean_update_abs",
+                    "id_active_write_cell_fraction",
+                    "id_write_weight_mass",
+                    "id_diagnostic_steps",
+                    "ood_posterior_mean_variance",
+                    "ood_posterior_variance_min",
+                    "ood_posterior_variance_max",
+                    "ood_posterior_variance_reduction",
+                    "ood_posterior_mean_update_abs",
+                    "ood_active_write_cell_fraction",
+                    "ood_write_weight_mass",
+                    "ood_diagnostic_steps",
+                    "train_task_loss",
+                    "train_kl_loss",
+                    "train_total_loss",
+                    "train_grad_norm",
+                    "amp_scale",
+                    "learning_rate",
+                ]
+            )
 
     ogs_log_path = os.path.join(LOG_DIR, f"run_{run_id}_ogs.csv")
     ogs_log_file = open(ogs_log_path, "a" if resuming else "w", newline="")
@@ -1015,6 +1132,9 @@ def run(
             moe_capacity_factor=moe_capacity_factor,
             moe_load_balance_alpha=moe_load_balance_alpha,
             moe_cfc_multi_source=split_graph_combiner_cfc_multi_source_moe,
+            dnc_read_variant=dnc_read_variant,
+            dnc_write_variant=dnc_write_variant,
+            dnc_write_observation_variance=dnc_write_observation_variance,
             device=device,
         ).to(device)
     else:
@@ -1076,6 +1196,9 @@ def run(
             else None
         ),
         "split_graph_combiner_cfc_multi_source_moe": split_graph_combiner_cfc_multi_source_moe,
+        "dnc_read_variant": dnc_read_variant,
+        "dnc_write_variant": dnc_write_variant,
+        "dnc_write_observation_variance": dnc_write_observation_variance,
     }
 
     if link_matrix_mode != "dense":
@@ -1096,9 +1219,15 @@ def run(
     # step 0 the sampled mean exactly matches Phase 0's write vector.
     # sample=True for all beta in BETAS_TO_SWEEP now that beta=0 is dropped
     # from the sweep (see header note) -- beta_target is always > 0.0 here.
-    stochastic_heads = install_stochastic_write_heads(
-        rnn, device=device, sample=(beta_target > 0.0)
-    )
+    if split_graph_enabled and dnc_write_variant == "kanerva-closed-form":
+        # The Bayesian update consumes a deterministic observation from the
+        # DNC write-value projection. Sampling a stochastic write head here
+        # would make uncertainty sampling a second, confounded write change.
+        stochastic_heads = []
+    else:
+        stochastic_heads = install_stochastic_write_heads(
+            rnn, device=device, sample=(beta_target > 0.0)
+        )
 
     optimizer = torch.optim.Adam(list(rnn.parameters()) + list(output_proj.parameters()), lr=LR)
     # Option 3 (Concept 24/LB-17): multi-axis efficiency accounting.
@@ -1110,7 +1239,7 @@ def run(
         p.numel() for p in output_proj.parameters()
     )
     amp_enabled = USE_AMP and device.type == "cuda"
-    kl_on = stochastic_heads[0].sample  # False when beta==0 -> no KL/prior terms in console
+    kl_on = bool(stochastic_heads) and stochastic_heads[0].sample
     print(
         f"[{run_id}] params {param_count} | kl_terms={'on' if kl_on else 'off'} | amp={'on' if amp_enabled else 'off'}"
     )
@@ -1326,6 +1455,58 @@ def run(
                 f"[{run_id}] Checkpoint step {step} already >= total_steps "
                 f"{total_steps} -- nothing to do. Raise --total-steps if you "
                 f"want to extend further."
+            )
+
+    q99_metrics = None
+    if split_graph_enabled and dnc_write_variant == "kanerva-closed-form":
+        python_rng_state = random.getstate()
+        numpy_rng_state = np.random.get_state()
+        torch_rng_state = _capture_torch_rng()
+        try:
+            with _replay_torch_rng(torch_rng_state):
+                q99_inputs, _, q99_answer_mask = build_q99_probe_batch()
+                q99_metrics = evaluate_q99_order_sensitivity(
+                    rnn, output_proj, q99_inputs, q99_answer_mask
+                )
+        finally:
+            random.setstate(python_rng_state)
+            np.random.set_state(numpy_rng_state)
+
+        print(
+            f"[{run_id}] [Track B / Q99] gate={q99_metrics['gate']} | "
+            f"episodes={q99_metrics['tested_episodes']} | "
+            f"output_delta={q99_metrics.get('mean_abs_output_delta', 0.0):.6g} | "
+            f"prediction_flip={q99_metrics.get('prediction_flip_rate', 0.0):.4f} | "
+            f"memory_order_effect="
+            f"{q99_metrics.get('memory_incremental_order_effect', 0.0):.6g}"
+        )
+        if track_b_writer is not None:
+            track_b_writer.writerow(
+                [
+                    "q99_gate",
+                    step,
+                    curriculum.lesson + 1,
+                    dnc_write_variant,
+                    None,
+                    None,
+                    None,
+                    q99_metrics["gate"],
+                    q99_metrics["tested_episodes"],
+                    q99_metrics["outputs_change_with_memory"],
+                    q99_metrics["outputs_change_without_memory"],
+                    q99_metrics.get("max_abs_output_delta"),
+                    q99_metrics.get("mean_abs_output_delta"),
+                    q99_metrics.get("prediction_flip_rate"),
+                    q99_metrics.get("memory_incremental_order_effect"),
+                    *([None] * 16),
+                    *([None] * 6),
+                ]
+            )
+            track_b_file.flush()
+        if q99_metrics["gate"] != "pass":
+            raise RuntimeError(
+                "Track B Q99 order-sensitivity gate failed before training; "
+                "see the run's _track_b.csv q99_gate row."
             )
 
     print(
@@ -1551,6 +1732,34 @@ def run(
                 parts.append(dyn_n_str.strip(" |"))
             print(" | ".join(parts))
 
+            if track_b_writer is not None and dnc_write_variant == "kanerva-closed-form":
+                train_total_loss = avg_task + kl_contrib
+                track_b_writer.writerow(
+                    [
+                        "training_window",
+                        step,
+                        curriculum.lesson + 1,
+                        dnc_write_variant,
+                        None,
+                        None,
+                        None,
+                        *([None] * 24),
+                        avg_task,
+                        avg_kl,
+                        train_total_loss,
+                        avg_grad_norm,
+                        amp_scale,
+                        current_lr,
+                    ]
+                )
+                track_b_file.flush()
+                print(
+                    f"[{run_id}] [Track B / train] task/total loss="
+                    f"{avg_task:.5f}/{train_total_loss:.5f} | "
+                    f"grad_norm={avg_grad_norm:.4f} | amp_scale={amp_scale:.1f} | "
+                    f"lr={current_lr:.6g}"
+                )
+
             log_writer.writerow(
                 [
                     step,
@@ -1629,9 +1838,30 @@ def run(
 
         if step % EVAL_EVERY == 0:
             pre_advance_lesson = curriculum.lesson  # capture before maybe_advance can bump it
+            id_stage_memory = rnn.memories[0]
+            if hasattr(id_stage_memory, "begin_stage_diagnostics"):
+                id_stage_memory.begin_stage_diagnostics()
             _, id_triple_acc, id_perfect_frac = curriculum.maybe_advance(
                 rnn, device, step=step, optimizer=optimizer
             )
+            id_stage_diagnostics = (
+                id_stage_memory.finish_stage_diagnostics()
+                if hasattr(id_stage_memory, "finish_stage_diagnostics")
+                else {}
+            )
+            if relational_probe_writer is not None:
+                probe_metrics = score_probe_cases(rnn.memories[0], relational_probe_cases)
+                relational_probe_writer.writerow(
+                    [
+                        step,
+                        curriculum.lesson + 1,
+                        cosine_top1_accuracy(relational_probe_cases),
+                        probe_metrics["accuracy"],
+                        probe_metrics["held_out_accuracy"],
+                        int(probe_metrics["cases"]),
+                    ]
+                )
+                relational_probe_file.flush()
 
             if curriculum.lesson != pre_advance_lesson:
                 lesson_dip_start_step = step
@@ -1693,12 +1923,20 @@ def run(
             ood_field_log: dict[tuple[int, int], list[int]] = {}
             ood_rng_state = ood_rng.getstate()
             ood_torch_rng = _capture_torch_rng()
+            ood_stage_memory = rnn.memories[0]
+            if hasattr(ood_stage_memory, "begin_stage_diagnostics"):
+                ood_stage_memory.begin_stage_diagnostics()
             ood_triple_acc, ood_perfect_frac, ood_hop_breakdown = dataset.evaluate_ood(
                 rnn,
                 device,
                 num_episodes=periodic_ood_episodes,
                 rng=ood_rng,
                 field_log=ood_field_log,
+            )
+            ood_stage_diagnostics = (
+                ood_stage_memory.finish_stage_diagnostics()
+                if hasattr(ood_stage_memory, "finish_stage_diagnostics")
+                else {}
             )
             ood_ablated_acc = None
             if hasattr(dataset, "evaluate_ood_ablated"):
@@ -1722,6 +1960,91 @@ def run(
                 ]
             )
             ood_log_file.flush()
+            if track_a_writer is not None:
+                rho_key = "ordinary_read_score_cosine_correlation_mean"
+                rho = id_stage_diagnostics.get(
+                    rho_key,
+                    1.0 if dnc_read_variant == "cosine" else None,
+                )
+                rho_count = id_stage_diagnostics.get("diagnostic_steps", 0.0)
+                stress_metrics = score_probe_cases(rnn.memories[0], relational_probe_cases)
+                track_a_writer.writerow(
+                    [
+                        step,
+                        pre_advance_lesson + 1,
+                        dnc_read_variant,
+                        id_triple_acc,
+                        ood_triple_acc,
+                        id_triple_acc - ood_triple_acc,
+                        cosine_top1_accuracy(relational_probe_cases),
+                        stress_metrics["accuracy"],
+                        stress_metrics["held_out_accuracy"],
+                        rho,
+                        rho_count,
+                    ]
+                )
+                track_a_file.flush()
+                print(
+                    f"[{run_id}] [Track A] read={dnc_read_variant} | "
+                    f"ID/OOD/offset={id_triple_acc:.2f}/{ood_triple_acc:.2f}/"
+                    f"{id_triple_acc - ood_triple_acc:.2f} | "
+                    f"stress cosine/read/held-out="
+                    f"{cosine_top1_accuracy(relational_probe_cases):.3f}/"
+                    f"{stress_metrics['accuracy']:.3f}/"
+                    f"{stress_metrics['held_out_accuracy']:.3f} | "
+                    f"ordinary MLP-cosine rho="
+                    f"{rho if rho is not None else float('nan'):.4f}"
+                )
+            if track_b_writer is not None:
+                id_write_values = [
+                    id_stage_diagnostics.get("posterior_variance_mean"),
+                    id_stage_diagnostics.get("posterior_variance_min"),
+                    id_stage_diagnostics.get("posterior_variance_max"),
+                    id_stage_diagnostics.get("posterior_variance_reduction_mean"),
+                    id_stage_diagnostics.get("posterior_mean_update_abs_mean"),
+                    id_stage_diagnostics.get("active_write_cell_fraction_mean"),
+                    id_stage_diagnostics.get("write_weight_mass_mean"),
+                    id_stage_diagnostics.get("diagnostic_steps"),
+                ]
+                ood_write_values = [
+                    ood_stage_diagnostics.get("posterior_variance_mean"),
+                    ood_stage_diagnostics.get("posterior_variance_min"),
+                    ood_stage_diagnostics.get("posterior_variance_max"),
+                    ood_stage_diagnostics.get("posterior_variance_reduction_mean"),
+                    ood_stage_diagnostics.get("posterior_mean_update_abs_mean"),
+                    ood_stage_diagnostics.get("active_write_cell_fraction_mean"),
+                    ood_stage_diagnostics.get("write_weight_mass_mean"),
+                    ood_stage_diagnostics.get("diagnostic_steps"),
+                ]
+                track_b_writer.writerow(
+                    [
+                        "evaluation",
+                        step,
+                        pre_advance_lesson + 1,
+                        dnc_write_variant,
+                        id_triple_acc,
+                        ood_triple_acc,
+                        id_triple_acc - ood_triple_acc,
+                        *([None] * 8),
+                        *id_write_values,
+                        *ood_write_values,
+                        *([None] * 6),
+                    ]
+                )
+                track_b_file.flush()
+                if dnc_write_variant == "kanerva-closed-form":
+                    print(
+                        f"[{run_id}] [Track B] write={dnc_write_variant} | "
+                        f"posterior variance ID/OOD="
+                        f"{id_stage_diagnostics.get('posterior_variance_mean', float('nan')):.5f}/"
+                        f"{ood_stage_diagnostics.get('posterior_variance_mean', float('nan')):.5f} | "
+                        f"mean update ID/OOD="
+                        f"{id_stage_diagnostics.get('posterior_mean_update_abs_mean', float('nan')):.6g}/"
+                        f"{ood_stage_diagnostics.get('posterior_mean_update_abs_mean', float('nan')):.6g} | "
+                        f"active cells ID/OOD="
+                        f"{id_stage_diagnostics.get('active_write_cell_fraction_mean', float('nan')):.4f}/"
+                        f"{ood_stage_diagnostics.get('active_write_cell_fraction_mean', float('nan')):.4f}"
+                    )
             _write_ogs_row(
                 ogs_log_writer,
                 step,
@@ -1879,15 +2202,39 @@ def run(
             shutil.copyfile(ckpt_path, latest_path)
 
     print(f"\n[{run_id}] Training complete. Final evaluation on training-distribution lesson:")
+    final_id_stage_memory = rnn.memories[0]
+    if hasattr(final_id_stage_memory, "begin_stage_diagnostics"):
+        final_id_stage_memory.begin_stage_diagnostics()
     _, id_triple_acc, id_perfect_frac = curriculum.maybe_advance(
         rnn, device, step=step, optimizer=optimizer
     )
+    final_id_stage_diagnostics = (
+        final_id_stage_memory.finish_stage_diagnostics()
+        if hasattr(final_id_stage_memory, "finish_stage_diagnostics")
+        else {}
+    )
+    if relational_probe_writer is not None:
+        probe_metrics = score_probe_cases(rnn.memories[0], relational_probe_cases)
+        relational_probe_writer.writerow(
+            [
+                step,
+                curriculum.lesson + 1,
+                cosine_top1_accuracy(relational_probe_cases),
+                probe_metrics["accuracy"],
+                probe_metrics["held_out_accuracy"],
+                int(probe_metrics["cases"]),
+            ]
+        )
+        relational_probe_file.flush()
 
     print(f"\n[{run_id}] Generalization test:")
 
     final_ood_rng_state = ood_rng.getstate()
     final_ood_torch_rng = _capture_torch_rng()
     final_ood_field_log: dict[tuple[int, int], list[int]] = {}
+    final_ood_stage_memory = rnn.memories[0]
+    if hasattr(final_ood_stage_memory, "begin_stage_diagnostics"):
+        final_ood_stage_memory.begin_stage_diagnostics()
     ood_triple_acc, ood_perfect_frac, ood_hop_breakdown = dataset.evaluate_ood(
         rnn,
         device,
@@ -1896,9 +2243,83 @@ def run(
         verbose_n=10,
         field_log=final_ood_field_log,
     )
+    final_ood_stage_diagnostics = (
+        final_ood_stage_memory.finish_stage_diagnostics()
+        if hasattr(final_ood_stage_memory, "finish_stage_diagnostics")
+        else {}
+    )
 
     ood_offset_triple = id_triple_acc - ood_triple_acc
     ood_offset_perfect = id_perfect_frac - ood_perfect_frac
+
+    if track_a_writer is not None:
+        final_stress_metrics = score_probe_cases(rnn.memories[0], relational_probe_cases)
+        rho = final_id_stage_diagnostics.get(
+            "ordinary_read_score_cosine_correlation_mean",
+            1.0 if dnc_read_variant == "cosine" else None,
+        )
+        track_a_writer.writerow(
+            [
+                step,
+                curriculum.lesson + 1,
+                dnc_read_variant,
+                id_triple_acc,
+                ood_triple_acc,
+                ood_offset_triple,
+                cosine_top1_accuracy(relational_probe_cases),
+                final_stress_metrics["accuracy"],
+                final_stress_metrics["held_out_accuracy"],
+                rho,
+                final_id_stage_diagnostics.get("diagnostic_steps", 0.0),
+            ]
+        )
+        track_a_file.flush()
+        print(
+            f"[{run_id}] [Track A / final] stress cosine/read/held-out="
+            f"{cosine_top1_accuracy(relational_probe_cases):.3f}/"
+            f"{final_stress_metrics['accuracy']:.3f}/"
+            f"{final_stress_metrics['held_out_accuracy']:.3f} | "
+            f"ordinary MLP-cosine rho="
+            f"{rho if rho is not None else float('nan'):.4f}"
+        )
+    if track_b_writer is not None:
+        def _write_diagnostic_values(diagnostics):
+            return [
+                diagnostics.get("posterior_variance_mean"),
+                diagnostics.get("posterior_variance_min"),
+                diagnostics.get("posterior_variance_max"),
+                diagnostics.get("posterior_variance_reduction_mean"),
+                diagnostics.get("posterior_mean_update_abs_mean"),
+                diagnostics.get("active_write_cell_fraction_mean"),
+                diagnostics.get("write_weight_mass_mean"),
+                diagnostics.get("diagnostic_steps"),
+            ]
+
+        track_b_writer.writerow(
+            [
+                "final_evaluation",
+                step,
+                curriculum.lesson + 1,
+                dnc_write_variant,
+                id_triple_acc,
+                ood_triple_acc,
+                ood_offset_triple,
+                *([None] * 8),
+                *_write_diagnostic_values(final_id_stage_diagnostics),
+                *_write_diagnostic_values(final_ood_stage_diagnostics),
+                *([None] * 6),
+            ]
+        )
+        track_b_file.flush()
+        if dnc_write_variant == "kanerva-closed-form":
+            print(
+                f"[{run_id}] [Track B / final] posterior variance ID/OOD="
+                f"{final_id_stage_diagnostics.get('posterior_variance_mean', float('nan')):.5f}/"
+                f"{final_ood_stage_diagnostics.get('posterior_variance_mean', float('nan')):.5f} | "
+                f"mean update ID/OOD="
+                f"{final_id_stage_diagnostics.get('posterior_mean_update_abs_mean', float('nan')):.6g}/"
+                f"{final_ood_stage_diagnostics.get('posterior_mean_update_abs_mean', float('nan')):.6g}"
+            )
 
     ood_log_writer.writerow(
         [
@@ -1969,6 +2390,12 @@ def run(
     log_writer.writerow([""] + list(summary.values()))
     log_file.close()
     ood_log_file.close()
+    if relational_probe_file is not None:
+        relational_probe_file.close()
+    if track_a_file is not None:
+        track_a_file.close()
+    if track_b_file is not None:
+        track_b_file.close()
     ogs_log_file.close()
     lesson_log_file.close()
     prior_log_file.close()
@@ -2264,6 +2691,26 @@ if __name__ == "__main__":
         "by default -- this step is meant to stay cheap.",
     )
     parser.add_argument(
+        "--dnc-read-variant",
+        choices=["cosine", "relational-mlp"],
+        default=DNC_READ_VARIANT,
+        help="Read content score for --split-graph. relational-mlp replaces "
+        "only read similarity; DNC write addressing and temporal links remain intact.",
+    )
+    parser.add_argument(
+        "--dnc-write-variant",
+        choices=["learned", "kanerva-closed-form"],
+        default=DNC_WRITE_VARIANT,
+        help="Write update for --split-graph. kanerva-closed-form performs an "
+        "online Gaussian posterior update at each timestep.",
+    )
+    parser.add_argument(
+        "--dnc-write-observation-variance",
+        type=float,
+        default=DNC_WRITE_OBSERVATION_VARIANCE,
+        help="Fixed positive observation variance for the Kanerva-style write.",
+    )
+    parser.add_argument(
         "--dataset-type",
         type=str,
         default=DATASET_TYPE,
@@ -2328,6 +2775,12 @@ if __name__ == "__main__":
 
     if args.prepare_only and args.load_prepared:
         parser.error("--prepare-only cannot be combined with --load-prepared")
+    if args.dnc_write_observation_variance <= 0:
+        parser.error("--dnc-write-observation-variance must be positive")
+    if not args.split_graph and (
+        args.dnc_read_variant != "cosine" or args.dnc_write_variant != "learned"
+    ):
+        parser.error("--dnc-read/write-variant require --split-graph")
     if args.prepare_only and not args.save:
         parser.error("--prepare-only requires --save DIRECTORY")
     if args.save and args.load_prepared:
@@ -2402,6 +2855,10 @@ if __name__ == "__main__":
             run_id = f"{run_id}_moe{args.moe_num_experts}e"
         if args.split_graph:
             run_id = f"{run_id}_splitgraph_{args.split_graph_variant.replace('+', '')}"
+            if args.dnc_read_variant != "cosine" or args.dnc_write_variant != "learned":
+                run_id += f"_read-{args.dnc_read_variant}_write-{args.dnc_write_variant}"
+            if args.dnc_write_variant == "kanerva-closed-form":
+                run_id += f"_obsvar{args.dnc_write_observation_variance:g}"
             if args.split_graph_combiner_mode == "controller":
                 run_id = f"{run_id}_combctrl{args.split_graph_combiner_variant.replace('+', '')}"
         if args.dataset_type != "graph":
@@ -2441,6 +2898,9 @@ if __name__ == "__main__":
             split_graph_combiner_mode=args.split_graph_combiner_mode,
             split_graph_combiner_variant=args.split_graph_combiner_variant,
             split_graph_combiner_num_blocks=args.split_graph_combiner_num_blocks,
+            dnc_read_variant=args.dnc_read_variant,
+            dnc_write_variant=args.dnc_write_variant,
+            dnc_write_observation_variance=args.dnc_write_observation_variance,
             dataset_type=args.dataset_type,
             dataset_link=args.dataset_link,
             test_dataset_link=args.test_dataset_link,

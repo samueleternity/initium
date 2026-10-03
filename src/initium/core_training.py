@@ -2734,8 +2734,8 @@ if __name__ == "__main__":
         type=float,
         default=DNC_READ_RESIDUAL_SCALE,
         help="Multiplier on the learned pairwise correction for relational-residual; "
-        "ignored by other read variants. Default 2.0 strengthens relation evidence "
-        "while preserving the cosine baseline at initialization.",
+        "ignored by other read variants. Default 1.0 preserves the tested scale; "
+        "the cosine baseline is exact at initialization.",
     )
     parser.add_argument(
         "--dnc-write-variant",

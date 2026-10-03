@@ -25,7 +25,7 @@ class MechanismMemory(Memory):
         *args,
         read_variant: str = "cosine",
         write_variant: str = "learned",
-        read_residual_scale: float = 2.0,
+        read_residual_scale: float = 1.0,
         relational_hidden_size: int | None = None,
         observation_variance: float = 1.0,
         **kwargs,
@@ -335,7 +335,7 @@ def build_memory(
     independent_linears: bool = True,
     read_variant: str = "cosine",
     write_variant: str = "learned",
-    read_residual_scale: float = 2.0,
+    read_residual_scale: float = 1.0,
     observation_variance: float = 1.0,
 ):
     """Construct a stock-compatible memory for the selected mechanism pair."""

@@ -196,7 +196,7 @@ class SplitGraphDNC(nn.Module):
         # input, for direct A/B comparison.
         moe_cfc_multi_source: bool = True,
         dnc_read_variant: str = "cosine",
-        dnc_read_residual_scale: float = 2.0,
+        dnc_read_residual_scale: float = 1.0,
         dnc_write_variant: str = "learned",
         dnc_write_observation_variance: float = 1.0,
     ):

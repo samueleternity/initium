@@ -91,7 +91,7 @@ The DNC supplies a memory matrix and differentiable read/write interface. The me
 
 The split-graph memory exposes independent read and write variants while retaining the DNC usage, allocation, write addressing, read modes, and temporal-link machinery:
 
-- `--dnc-read-variant cosine` is the DNC baseline. `relational-mlp` replaces cosine similarity with a learned score for each `(query, memory row)` pair. `relational-residual` adds a learned pairwise score to cosine and zero-initializes its final layer, so it starts exactly at the DNC baseline. Write content addressing remains cosine-based for both learned readers.
+- `--dnc-read-variant cosine` is the DNC baseline. `relational-mlp` replaces cosine similarity with a learned score for each `(query, memory row)` pair. `relational-residual` adds a scaled learned pairwise score to cosine and zero-initializes its final layer, so it starts exactly at the DNC baseline. `--dnc-read-residual-scale` controls that correction's strength (default `2.0`). Track A logs the correction-to-cosine RMS ratio to show whether it contributes meaningfully. Write content addressing remains cosine-based for both learned readers.
 - `--dnc-write-variant learned` is the DNC baseline. `kanerva-closed-form` turns the existing write-value projection into an observation and applies a per-row online isotropic Gaussian posterior update. It does not import the Kanerva Machine's exchangeable episode objective or claim to reproduce its full generative model.
 - The variants compose, so the four baseline / Track A / Track B / combined cells are expressible through the same training and checkpoint pipeline. The closed-form writer uses a deterministic observation projection; the stochastic write head is not installed for that variant.
 - The graph curriculum emits ID, OOD, and OOD-offset metrics as before. Graph runs also write `run_<id>_relational_probe.csv`, with cosine top-1, selected read-head top-1, and held-out-composition accuracy. `data/graph_traversal/order_probe.py` supplies paired prefix-permutation helpers for the Q99 order-sensitivity evaluation.
@@ -104,7 +104,7 @@ python -m initium.core_training 0.0 --split-graph --split-graph-variant mamba1 -
 python -m initium.core_training 0.0 --split-graph --split-graph-variant mamba1 --split-graph-combiner-mode controller --split-graph-combiner-variant mamba+cfc
 ```
 
-Add `--dnc-read-variant relational-mlp` to reproduce the original Track A reader, or `--dnc-read-variant relational-residual` to evaluate the cosine-anchored Track A reader. Use `--dnc-write-variant kanerva-closed-form` for Track B. Add a reader and writer variant together only for the combined cell after each track is characterized. Dense temporal links remain the default. The short-run baseline reproduction gate and the Q99 paired-order evaluation are deliberate user-run experiment steps; no run results are assumed by this repository change.
+Add `--dnc-read-variant relational-mlp` to reproduce the original Track A reader, or `--dnc-read-variant relational-residual --dnc-read-residual-scale 2.0` to evaluate the strengthened cosine-anchored Track A reader. Use `--dnc-write-variant kanerva-closed-form` for Track B. Add a reader and writer variant together only for the combined cell after each track is characterized. Dense temporal links remain the default. The short-run baseline reproduction gate and the Q99 paired-order evaluation are deliberate user-run experiment steps; no run results are assumed by this repository change.
 
 ### Controllers
 

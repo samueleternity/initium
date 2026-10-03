@@ -70,6 +70,7 @@ from initium.config.controller_config import (
     DYNAMIC_N_TRIGGER_FRAC,
     DYNAMIC_N_USAGE_HIGH,
     DNC_READ_VARIANT,
+    DNC_READ_RESIDUAL_SCALE,
     DNC_WRITE_OBSERVATION_VARIANCE,
     DNC_WRITE_VARIANT,
     HYBRID_CFC_NUM_BLOCKS,
@@ -579,6 +580,7 @@ def run(
     split_graph_combiner_variant: str = SPLIT_GRAPH_COMBINER_VARIANT,
     split_graph_combiner_num_blocks: int = SPLIT_GRAPH_COMBINER_NUM_BLOCKS,
     dnc_read_variant: str = DNC_READ_VARIANT,
+    dnc_read_residual_scale: float = DNC_READ_RESIDUAL_SCALE,
     dnc_write_variant: str = DNC_WRITE_VARIANT,
     dnc_write_observation_variance: float = DNC_WRITE_OBSERVATION_VARIANCE,
     dataset_type: str = DATASET_TYPE,
@@ -714,6 +716,8 @@ def run(
                     "ordinary_read_diagnostic_count",
                     "read_content_entropy_mean",
                     "read_content_max_weight_mean",
+                    "relational_read_residual_rms_mean",
+                    "relational_read_residual_to_cosine_rms_mean",
                 ]
             )
         track_b_file = open(
@@ -1135,6 +1139,7 @@ def run(
             moe_load_balance_alpha=moe_load_balance_alpha,
             moe_cfc_multi_source=split_graph_combiner_cfc_multi_source_moe,
             dnc_read_variant=dnc_read_variant,
+            dnc_read_residual_scale=dnc_read_residual_scale,
             dnc_write_variant=dnc_write_variant,
             dnc_write_observation_variance=dnc_write_observation_variance,
             device=device,
@@ -1199,6 +1204,7 @@ def run(
         ),
         "split_graph_combiner_cfc_multi_source_moe": split_graph_combiner_cfc_multi_source_moe,
         "dnc_read_variant": dnc_read_variant,
+        "dnc_read_residual_scale": dnc_read_residual_scale,
         "dnc_write_variant": dnc_write_variant,
         "dnc_write_observation_variance": dnc_write_observation_variance,
     }
@@ -1985,6 +1991,10 @@ def run(
                         rho_count,
                         id_stage_diagnostics.get("read_content_entropy_mean"),
                         id_stage_diagnostics.get("read_content_max_weight_mean"),
+                        id_stage_diagnostics.get("relational_read_residual_rms_mean"),
+                        id_stage_diagnostics.get(
+                            "relational_read_residual_to_cosine_rms_mean"
+                        ),
                     ]
                 )
                 track_a_file.flush()
@@ -2000,7 +2010,9 @@ def run(
                     f"{rho if rho is not None else float('nan'):.4f} | "
                     f"read entropy/max="
                     f"{id_stage_diagnostics.get('read_content_entropy_mean', float('nan')):.3f}/"
-                    f"{id_stage_diagnostics.get('read_content_max_weight_mean', float('nan')):.3f}"
+                    f"{id_stage_diagnostics.get('read_content_max_weight_mean', float('nan')):.3f} | "
+                    f"residual/cosine rms="
+                    f"{id_stage_diagnostics.get('relational_read_residual_to_cosine_rms_mean', float('nan')):.3f}"
                 )
             if track_b_writer is not None:
                 id_write_values = [
@@ -2280,6 +2292,10 @@ def run(
                 final_id_stage_diagnostics.get("diagnostic_steps", 0.0),
                 final_id_stage_diagnostics.get("read_content_entropy_mean"),
                 final_id_stage_diagnostics.get("read_content_max_weight_mean"),
+                final_id_stage_diagnostics.get("relational_read_residual_rms_mean"),
+                final_id_stage_diagnostics.get(
+                    "relational_read_residual_to_cosine_rms_mean"
+                ),
             ]
         )
         track_a_file.flush()
@@ -2292,7 +2308,9 @@ def run(
             f"{rho if rho is not None else float('nan'):.4f} | "
             f"read entropy/max="
             f"{final_id_stage_diagnostics.get('read_content_entropy_mean', float('nan')):.3f}/"
-            f"{final_id_stage_diagnostics.get('read_content_max_weight_mean', float('nan')):.3f}"
+            f"{final_id_stage_diagnostics.get('read_content_max_weight_mean', float('nan')):.3f} | "
+            f"residual/cosine rms="
+            f"{final_id_stage_diagnostics.get('relational_read_residual_to_cosine_rms_mean', float('nan')):.3f}"
         )
     if track_b_writer is not None:
         def _write_diagnostic_values(diagnostics):
@@ -2712,6 +2730,14 @@ if __name__ == "__main__":
         "and temporal links remain intact.",
     )
     parser.add_argument(
+        "--dnc-read-residual-scale",
+        type=float,
+        default=DNC_READ_RESIDUAL_SCALE,
+        help="Multiplier on the learned pairwise correction for relational-residual; "
+        "ignored by other read variants. Default 2.0 strengthens relation evidence "
+        "while preserving the cosine baseline at initialization.",
+    )
+    parser.add_argument(
         "--dnc-write-variant",
         choices=["learned", "kanerva-closed-form"],
         default=DNC_WRITE_VARIANT,
@@ -2871,6 +2897,8 @@ if __name__ == "__main__":
             run_id = f"{run_id}_splitgraph_{args.split_graph_variant.replace('+', '')}"
             if args.dnc_read_variant != "cosine" or args.dnc_write_variant != "learned":
                 run_id += f"_read-{args.dnc_read_variant}_write-{args.dnc_write_variant}"
+            if args.dnc_read_variant == "relational-residual":
+                run_id += f"_rscale{args.dnc_read_residual_scale:g}"
             if args.dnc_write_variant == "kanerva-closed-form":
                 run_id += f"_obsvar{args.dnc_write_observation_variance:g}"
             if args.split_graph_combiner_mode == "controller":
@@ -2913,6 +2941,7 @@ if __name__ == "__main__":
             split_graph_combiner_variant=args.split_graph_combiner_variant,
             split_graph_combiner_num_blocks=args.split_graph_combiner_num_blocks,
             dnc_read_variant=args.dnc_read_variant,
+            dnc_read_residual_scale=args.dnc_read_residual_scale,
             dnc_write_variant=args.dnc_write_variant,
             dnc_write_observation_variance=args.dnc_write_observation_variance,
             dataset_type=args.dataset_type,

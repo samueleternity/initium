@@ -68,7 +68,7 @@ SPLIT_GRAPH_COMBINER_VARIANT = "mamba1"
 SPLIT_GRAPH_COMBINER_NUM_BLOCKS = 1
 
 # DNC memory mechanism variants (only applied by the split-graph assembly).
-DNC_READ_VARIANT = "cosine"  # "cosine" | "relational-mlp"
+DNC_READ_VARIANT = "cosine"  # "cosine" | "relational-mlp" | "relational-residual"
 DNC_WRITE_VARIANT = "learned"  # "learned" | "kanerva-closed-form"
 DNC_WRITE_OBSERVATION_VARIANCE = 1.0  # fixed isotropic likelihood variance
 

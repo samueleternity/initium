@@ -13,7 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from dnc.memory import Memory
 
-READ_VARIANTS = ("cosine", "relational-mlp")
+READ_VARIANTS = ("cosine", "relational-mlp", "relational-residual")
 WRITE_VARIANTS = ("learned", "kanerva-closed-form")
 
 
@@ -45,13 +45,19 @@ class MechanismMemory(Memory):
         self._stage_diagnostic_min: dict[str, torch.Tensor] = {}
         self._stage_diagnostic_max: dict[str, torch.Tensor] = {}
         self.relational_score: nn.Module | None = None
-        if read_variant == "relational-mlp":
+        if read_variant in {"relational-mlp", "relational-residual"}:
             hidden = relational_hidden_size or max(32, self.cell_size)
             self.relational_score = nn.Sequential(
                 nn.Linear(2 * self.cell_size, hidden),
                 nn.GELU(),
                 nn.Linear(hidden, 1),
             )
+            if read_variant == "relational-residual":
+                # Preserve the DNC content-addressing behavior at step zero;
+                # the learned relation function starts as a zero residual
+                # and is then optimized from task feedback.
+                nn.init.zeros_(self.relational_score[-1].weight)
+                nn.init.zeros_(self.relational_score[-1].bias)
             if self.device is not None:
                 self.relational_score.to(self.device)
 
@@ -124,46 +130,87 @@ class MechanismMemory(Memory):
             hidden["write_posterior_variance"].fill_(1.0)
         return hidden
 
-    def read_content_weightings(self, memory, keys, strengths):
-        """Score candidate rows for reads; writes continue using DNC cosine."""
+    def _read_similarity_scores(self, memory, keys):
+        """Return one unscaled read score for every query and memory row."""
         if self.read_variant == "cosine":
-            return self.content_weightings(memory, keys, strengths)
+            return self._dnc_cosine_scores(memory, keys)
         batch, rows, width = memory.shape
         heads = keys.size(1)
         candidates = memory[:, None, :, :].expand(batch, heads, rows, width)
         queries = keys[:, :, None, :].expand(batch, heads, rows, width)
         pair = torch.cat((queries, candidates), dim=-1)
-        logits = self.relational_score(pair).squeeze(-1)
-        return F.softmax(logits * strengths.unsqueeze(-1), dim=-1)
+        relational_scores = self.relational_score(pair).squeeze(-1)
+        if self.read_variant == "relational-residual":
+            cosine_scores = self._dnc_cosine_scores(memory, keys)
+            return cosine_scores + relational_scores
+        return relational_scores
+
+    @staticmethod
+    def _dnc_cosine_scores(memory, keys):
+        """Match pytorch-dnc's cosine denominator, including its 1e-6 delta."""
+        queries = keys.unsqueeze(2)
+        candidates = memory.unsqueeze(1)
+        dot = (queries * candidates).sum(dim=-1)
+        query_norm = torch.linalg.vector_norm(queries, dim=-1)
+        memory_norm = torch.linalg.vector_norm(candidates, dim=-1)
+        return dot / (query_norm * memory_norm + 1e-6)
+
+    def read_content_weightings(self, memory, keys, strengths):
+        """Score rows, retaining DNC's key-strength softmax normalization."""
+        scores = self._read_similarity_scores(memory, keys)
+        return F.softmax(scores * strengths.unsqueeze(-1), dim=-1)
 
     def read(self, read_keys, read_strengths, read_modes, hidden):
         if self.read_variant == "cosine":
+            if self._collect_stage_diagnostics:
+                # Use the upstream content-weighting implementation so the
+                # baseline diagnostics match the actual DNC read path exactly.
+                with torch.no_grad():
+                    content_weights = self.content_weightings(
+                        hidden["memory"], read_keys, read_strengths
+                    )
+                    entropy = -(
+                        content_weights.clamp_min(1e-12)
+                        * content_weights.clamp_min(1e-12).log()
+                    ).sum(dim=-1)
+                    self._record_stage_value("read_content_entropy", entropy)
+                    self._record_stage_value(
+                        "read_content_max_weight", content_weights.max(dim=-1).values
+                    )
+                    self._record_stage_value(
+                        "ordinary_read_score_cosine_correlation",
+                        torch.ones_like(read_strengths),
+                    )
             return super().read(read_keys, read_strengths, read_modes, hidden)
         if self._collect_stage_diagnostics:
             with torch.no_grad():
-                batch, rows, width = hidden["memory"].shape
-                heads = read_keys.size(1)
-                candidates = hidden["memory"][:, None, :, :].expand(
-                    batch, heads, rows, width
-                )
-                queries = read_keys[:, :, None, :].expand(batch, heads, rows, width)
-                cosine = F.cosine_similarity(queries, candidates, dim=-1)
-                relational = self.relational_score(
-                    torch.cat((queries, candidates), dim=-1)
-                ).squeeze(-1)
+                memory = hidden["memory"]
+                cosine = self._dnc_cosine_scores(memory, read_keys)
+                scores = self._read_similarity_scores(memory, read_keys)
                 cosine_centered = cosine - cosine.mean(dim=-1, keepdim=True)
-                relational_centered = relational - relational.mean(dim=-1, keepdim=True)
-                numerator = (cosine_centered * relational_centered).sum(dim=-1)
+                scores_centered = scores - scores.mean(dim=-1, keepdim=True)
+                numerator = (cosine_centered * scores_centered).sum(dim=-1)
                 denominator = torch.sqrt(
                     cosine_centered.square().sum(dim=-1)
-                    * relational_centered.square().sum(dim=-1)
+                    * scores_centered.square().sum(dim=-1)
                 ).clamp_min(1e-12)
                 self._record_stage_value(
-                    "ordinary_read_score_cosine_correlation", numerator / denominator
+                    "ordinary_read_score_cosine_correlation",
+                    numerator / denominator,
                 )
         content_weights = self.read_content_weightings(
             hidden["memory"], read_keys, read_strengths
         )
+        if self._collect_stage_diagnostics:
+            with torch.no_grad():
+                entropy = -(
+                    content_weights.clamp_min(1e-12)
+                    * content_weights.clamp_min(1e-12).log()
+                ).sum(dim=-1)
+                self._record_stage_value("read_content_entropy", entropy)
+                self._record_stage_value(
+                    "read_content_max_weight", content_weights.max(dim=-1).values
+                )
         hidden["read_weights"] = self.read_weightings(
             hidden["memory"],
             content_weights,

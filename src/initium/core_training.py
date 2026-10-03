@@ -712,6 +712,8 @@ def run(
                     "stress_held_out_acc",
                     "ordinary_read_score_cosine_rho_mean",
                     "ordinary_read_diagnostic_count",
+                    "read_content_entropy_mean",
+                    "read_content_max_weight_mean",
                 ]
             )
         track_b_file = open(
@@ -1981,6 +1983,8 @@ def run(
                         stress_metrics["held_out_accuracy"],
                         rho,
                         rho_count,
+                        id_stage_diagnostics.get("read_content_entropy_mean"),
+                        id_stage_diagnostics.get("read_content_max_weight_mean"),
                     ]
                 )
                 track_a_file.flush()
@@ -1993,7 +1997,10 @@ def run(
                     f"{stress_metrics['accuracy']:.3f}/"
                     f"{stress_metrics['held_out_accuracy']:.3f} | "
                     f"ordinary MLP-cosine rho="
-                    f"{rho if rho is not None else float('nan'):.4f}"
+                    f"{rho if rho is not None else float('nan'):.4f} | "
+                    f"read entropy/max="
+                    f"{id_stage_diagnostics.get('read_content_entropy_mean', float('nan')):.3f}/"
+                    f"{id_stage_diagnostics.get('read_content_max_weight_mean', float('nan')):.3f}"
                 )
             if track_b_writer is not None:
                 id_write_values = [
@@ -2271,6 +2278,8 @@ def run(
                 final_stress_metrics["held_out_accuracy"],
                 rho,
                 final_id_stage_diagnostics.get("diagnostic_steps", 0.0),
+                final_id_stage_diagnostics.get("read_content_entropy_mean"),
+                final_id_stage_diagnostics.get("read_content_max_weight_mean"),
             ]
         )
         track_a_file.flush()
@@ -2280,7 +2289,10 @@ def run(
             f"{final_stress_metrics['accuracy']:.3f}/"
             f"{final_stress_metrics['held_out_accuracy']:.3f} | "
             f"ordinary MLP-cosine rho="
-            f"{rho if rho is not None else float('nan'):.4f}"
+            f"{rho if rho is not None else float('nan'):.4f} | "
+            f"read entropy/max="
+            f"{final_id_stage_diagnostics.get('read_content_entropy_mean', float('nan')):.3f}/"
+            f"{final_id_stage_diagnostics.get('read_content_max_weight_mean', float('nan')):.3f}"
         )
     if track_b_writer is not None:
         def _write_diagnostic_values(diagnostics):
@@ -2692,10 +2704,12 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--dnc-read-variant",
-        choices=["cosine", "relational-mlp"],
+        choices=["cosine", "relational-mlp", "relational-residual"],
         default=DNC_READ_VARIANT,
         help="Read content score for --split-graph. relational-mlp replaces "
-        "only read similarity; DNC write addressing and temporal links remain intact.",
+        "cosine similarity; relational-residual adds a learned pairwise score "
+        "to cosine and starts exactly at the DNC baseline. DNC write addressing "
+        "and temporal links remain intact.",
     )
     parser.add_argument(
         "--dnc-write-variant",

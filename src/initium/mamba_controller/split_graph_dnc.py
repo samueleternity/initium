@@ -114,7 +114,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from dnc.memory import Memory
+from initium.memory_manipulation.dnc_mechanisms import build_memory
 
 from initium.LNN_controller.cfc_backbone_parallel import (
     build_parallel_backbone,
@@ -195,6 +195,10 @@ class SplitGraphDNC(nn.Module):
         # False to fall back to plain per-block MoE on the pre-concatenated
         # input, for direct A/B comparison.
         moe_cfc_multi_source: bool = True,
+        dnc_read_variant: str = "cosine",
+        dnc_read_residual_scale: float = 1.0,
+        dnc_write_variant: str = "learned",
+        dnc_write_observation_variance: float = 1.0,
     ):
         super().__init__()
         if not independent_linears:
@@ -218,6 +222,10 @@ class SplitGraphDNC(nn.Module):
         self.device = device
         self.mamba_variant = mamba_variant
         self.combine_reads = combine_reads
+        self.dnc_read_variant = dnc_read_variant
+        self.dnc_read_residual_scale = dnc_read_residual_scale
+        self.dnc_write_variant = dnc_write_variant
+        self.dnc_write_observation_variance = dnc_write_observation_variance
 
         # Mamba bookkeeping, for checkpoint self-description -- same
         # rationale/convention as MambaDNC (mamba_controller.py).
@@ -437,13 +445,17 @@ class SplitGraphDNC(nn.Module):
 
         self.memories = []
         self.memories.append(
-            Memory(
+            build_memory(
                 input_size=self.output_size,
                 nr_cells=self.nr_cells,
                 cell_size=self.w,
                 read_heads=self.r,
                 device=self.device,
                 independent_linears=independent_linears,
+                read_variant=dnc_read_variant,
+                write_variant=dnc_write_variant,
+                read_residual_scale=dnc_read_residual_scale,
+                observation_variance=dnc_write_observation_variance,
             )
         )
         # See module docstring's API-compatibility section for why this

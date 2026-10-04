@@ -26,6 +26,7 @@ class MechanismMemory(Memory):
         read_variant: str = "cosine",
         write_variant: str = "learned",
         read_residual_scale: float = 1.0,
+        read_residual_max_ratio: float = 0.5,
         relational_hidden_size: int | None = None,
         observation_variance: float = 1.0,
         **kwargs,
@@ -36,12 +37,15 @@ class MechanismMemory(Memory):
             raise ValueError(f"Unknown DNC write variant: {write_variant!r}")
         if read_residual_scale < 0:
             raise ValueError("read_residual_scale must be non-negative")
+        if read_residual_max_ratio < 0:
+            raise ValueError("read_residual_max_ratio must be non-negative")
         if observation_variance <= 0:
             raise ValueError("observation_variance must be positive")
         super().__init__(*args, **kwargs)
         self.read_variant = read_variant
         self.write_variant = write_variant
         self.read_residual_scale = float(read_residual_scale)
+        self.read_residual_max_ratio = float(read_residual_max_ratio)
         self.observation_variance = float(observation_variance)
         self._collect_stage_diagnostics = False
         self._stage_diagnostic_sums: dict[str, torch.Tensor] = {}
@@ -153,7 +157,20 @@ class MechanismMemory(Memory):
         """Return one unscaled read score for every query and memory row."""
         base_scores, residual_scores = self._read_score_components(memory, keys)
         if residual_scores is not None:
-            return base_scores + self.read_residual_scale * residual_scores
+            residual_scores = residual_scores - residual_scores.mean(
+                dim=-1, keepdim=True
+            )
+            residual_rms = residual_scores.square().mean(
+                dim=-1, keepdim=True
+            ).sqrt()
+            normalized_residual = residual_scores / residual_rms.clamp_min(1e-6)
+            cosine_rms = base_scores.square().mean(dim=-1, keepdim=True).sqrt()
+            bounded_residual = (
+                self.read_residual_max_ratio
+                * cosine_rms
+                * torch.tanh(self.read_residual_scale * normalized_residual)
+            )
+            return base_scores + bounded_residual
         return base_scores
 
     @staticmethod
@@ -210,8 +227,9 @@ class MechanismMemory(Memory):
                     numerator / denominator,
                 )
                 if residual is not None:
+                    effective_residual = scores - cosine
                     cosine_rms = cosine.square().mean(dim=-1).sqrt().clamp_min(1e-12)
-                    residual_rms = residual.square().mean(dim=-1).sqrt()
+                    residual_rms = effective_residual.square().mean(dim=-1).sqrt()
                     self._record_stage_value(
                         "relational_read_residual_rms", residual_rms
                     )
@@ -336,6 +354,7 @@ def build_memory(
     read_variant: str = "cosine",
     write_variant: str = "learned",
     read_residual_scale: float = 1.0,
+    read_residual_max_ratio: float = 0.5,
     observation_variance: float = 1.0,
 ):
     """Construct a stock-compatible memory for the selected mechanism pair."""
@@ -349,5 +368,6 @@ def build_memory(
         read_variant=read_variant,
         write_variant=write_variant,
         read_residual_scale=read_residual_scale,
+        read_residual_max_ratio=read_residual_max_ratio,
         observation_variance=observation_variance,
     )

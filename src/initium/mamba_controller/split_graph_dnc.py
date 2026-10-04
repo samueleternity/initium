@@ -197,6 +197,7 @@ class SplitGraphDNC(nn.Module):
         moe_cfc_multi_source: bool = True,
         dnc_read_variant: str = "cosine",
         dnc_read_residual_scale: float = 1.0,
+        dnc_read_residual_max_ratio: float = 0.5,
         dnc_write_variant: str = "learned",
         dnc_write_observation_variance: float = 1.0,
     ):
@@ -224,6 +225,7 @@ class SplitGraphDNC(nn.Module):
         self.combine_reads = combine_reads
         self.dnc_read_variant = dnc_read_variant
         self.dnc_read_residual_scale = dnc_read_residual_scale
+        self.dnc_read_residual_max_ratio = dnc_read_residual_max_ratio
         self.dnc_write_variant = dnc_write_variant
         self.dnc_write_observation_variance = dnc_write_observation_variance
 
@@ -455,6 +457,7 @@ class SplitGraphDNC(nn.Module):
                 read_variant=dnc_read_variant,
                 write_variant=dnc_write_variant,
                 read_residual_scale=dnc_read_residual_scale,
+                read_residual_max_ratio=dnc_read_residual_max_ratio,
                 observation_variance=dnc_write_observation_variance,
             )
         )

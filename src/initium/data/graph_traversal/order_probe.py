@@ -1,116 +1,122 @@
-"""Utilities for the Q99 online-write order-sensitivity check."""
+"""Semantic ordering probes for online memory writes (Q99)."""
 
 from __future__ import annotations
 
+import random
+
+import numpy as np
 import torch
 
 
-def build_q99_probe_batch(batch_size: int = 8):
-    """Build graph episodes with at least two path writes for Q99 pairing."""
+Q99_PROBE_EPISODES = 128
+Q99_MIN_ORDERED_QUERY_ACCURACY = 50.0
+Q99_MAX_FACT_PERMUTATION_DROP = 5.0
+Q99_MIN_QUERY_ORDER_DROP = 1.0
+
+
+def build_q99_probe_batch(batch_size: int = Q99_PROBE_EPISODES, seed: int = 991):
+    """Build a reproducible paired batch without advancing training RNG state."""
     from initium.data.graph_traversal.graph_traversal import (
         build_traversal_episode,
         collate_fn,
     )
 
-    episodes = []
-    while len(episodes) < batch_size:
-        episode = build_traversal_episode(10, (2, 4), (2, 4))
-        if episode is not None:
-            episodes.append(episode)
-    return collate_fn(episodes)
+    python_state = random.getstate()
+    numpy_state = np.random.get_state()
+    try:
+        random.seed(seed)
+        np.random.seed(seed)
+        episodes = []
+        while len(episodes) < batch_size:
+            episode = build_traversal_episode(10, (2, 4), (2, 4))
+            if episode is not None:
+                episodes.append(episode)
+        return collate_fn(episodes)
+    finally:
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
 
 
-def permute_early_writes(
-    inputs: torch.Tensor,
-    *,
-    prefix_length: int,
-    permutation: tuple[int, ...],
-) -> torch.Tensor:
-    """Return a copy with only the first ``prefix_length`` events reordered.
+def _fact_row_indices(episode: torch.Tensor, label_dim: int) -> torch.Tensor:
+    destination = episode[:, 2 * label_dim : 3 * label_dim].abs().sum(dim=-1) > 0
+    prediction_required = episode[:, -1] > 0.5
+    return torch.nonzero(destination & ~prediction_required, as_tuple=False).flatten()
 
-    Inputs use the dataset's batch-first ``(batch, time, features)`` layout.
-    Queries and later sequence steps remain in their original positions.
-    ``permutation`` contains indices relative to the prefix and must be a
-    bijection, so callers can provide a deterministic paired episode.
-    """
-    if inputs.ndim != 3:
-        raise ValueError("inputs must have shape (batch, time, features)")
-    if not 0 < prefix_length <= inputs.size(1):
-        raise ValueError("prefix_length must be within the input sequence")
-    if len(permutation) != prefix_length or sorted(permutation) != list(range(prefix_length)):
-        raise ValueError("permutation must be a bijection over the write prefix")
+
+def _path_query_indices(episode: torch.Tensor, label_dim: int) -> torch.Tensor:
+    source = episode[:, :label_dim].abs().sum(dim=-1) > 0
+    edge = episode[:, label_dim : 2 * label_dim].abs().sum(dim=-1) > 0
+    destination = episode[:, 2 * label_dim : 3 * label_dim].abs().sum(dim=-1) > 0
+    prediction_required = episode[:, -1] > 0.5
+    return torch.nonzero(
+        ~destination & ~prediction_required & (source | edge), as_tuple=False
+    ).flatten()
+
+
+def permute_graph_fact_writes(
+    inputs: torch.Tensor, *, label_dim: int = 30, seed: int = 992
+) -> tuple[torch.Tensor, int]:
+    """Shuffle graph facts as a set, preserving the fact/query phase marker."""
+    if inputs.ndim != 3 or inputs.size(-1) < 3 * label_dim + 2:
+        raise ValueError("expected graph inputs shaped (batch, time, 3*label_dim + 2)")
     result = inputs.clone()
-    indices = torch.tensor(permutation, device=inputs.device)
-    result[:, :prefix_length] = inputs[:, :prefix_length].index_select(1, indices)
-    return result
+    rng = random.Random(seed)
+    tested = 0
+    for batch_index in range(inputs.size(0)):
+        indices = _fact_row_indices(inputs[batch_index], label_dim)
+        if indices.numel() < 2:
+            continue
+        order = list(range(indices.numel()))
+        rng.shuffle(order)
+        # Avoid treating an unchanged draw as a successful permutation.
+        if order == list(range(len(order))):
+            order = order[1:] + order[:1]
+        source_rows = indices[torch.tensor(order, device=indices.device)]
+        result[batch_index, indices] = inputs[batch_index, source_rows]
+        # The first-row marker denotes entry to the fact phase, not a property
+        # of an individual fact, so it stays at the first fact after shuffling.
+        result[batch_index, indices, -2] = 0.0
+        result[batch_index, indices[0], -2] = 1.0
+        tested += 1
+    return result, tested
 
 
-def permute_early_graph_query_writes(
+def swap_first_two_path_query_writes(
     inputs: torch.Tensor, *, label_dim: int = 30
 ) -> tuple[torch.Tensor, int]:
-    """Swap the first two path-query writes in each graph episode.
-
-    Graph facts have a populated destination field; path-query writes have a
-    source and/or edge field, no destination, and prediction_required=0. The
-    answer prompts and graph-fact write order are left untouched.
-    """
+    """Make an intentionally invalid order control for the dependent path queries."""
     if inputs.ndim != 3 or inputs.size(-1) < 3 * label_dim + 2:
         raise ValueError("expected graph inputs shaped (batch, time, 3*label_dim + 2)")
     result = inputs.clone()
     tested = 0
     for batch_index in range(inputs.size(0)):
-        episode = inputs[batch_index]
-        source_present = episode[:, :label_dim].abs().sum(dim=-1) > 0
-        edge_present = episode[:, label_dim : 2 * label_dim].abs().sum(dim=-1) > 0
-        destination_present = episode[:, 2 * label_dim : 3 * label_dim].abs().sum(dim=-1) > 0
-        prediction_required = episode[:, -1] > 0.5
-        query_rows = torch.nonzero(
-            ~destination_present
-            & ~prediction_required
-            & (source_present | edge_present),
-            as_tuple=False,
-        ).flatten()
-        if query_rows.numel() < 2:
+        indices = _path_query_indices(inputs[batch_index], label_dim)
+        if indices.numel() < 2:
             continue
-        first, second = query_rows[:2]
+        first, second = indices[:2]
         result[batch_index, first] = inputs[batch_index, second]
         result[batch_index, second] = inputs[batch_index, first]
         tested += 1
     return result, tested
 
 
-def order_sensitivity_metrics(
-    ordered_output: torch.Tensor,
-    permuted_output: torch.Tensor,
-    *,
-    atol: float = 1e-6,
-    mask: torch.Tensor | None = None,
-) -> dict[str, float | bool]:
-    """Summarize whether task outputs respond to a prefix-order change."""
-    if ordered_output.shape != permuted_output.shape:
-        raise ValueError("paired outputs must have identical shapes")
-    if mask is not None:
-        if mask.shape != ordered_output.shape[: mask.ndim]:
-            raise ValueError("mask dimensions must match leading output dimensions")
-        selected = mask.to(device=ordered_output.device, dtype=torch.bool)
-        ordered_output = ordered_output[selected]
-        permuted_output = permuted_output[selected]
-        if ordered_output.numel() == 0:
-            raise ValueError("mask selects no output positions")
-    difference = (ordered_output - permuted_output).abs()
-    if ordered_output.ndim >= 2:
-        changed = ordered_output.argmax(dim=-1) != permuted_output.argmax(dim=-1)
-        prediction_flip_rate = changed.float().mean().item()
-    else:
-        prediction_flip_rate = float(
-            (ordered_output.round() != permuted_output.round()).float().mean().item()
-        )
-    return {
-        "outputs_change": bool((difference > atol).any().item()),
-        "max_absolute_difference": float(difference.max().item()),
-        "mean_absolute_difference": float(difference.mean().item()),
-        "prediction_flip_rate": prediction_flip_rate,
-    }
+def _triple_accuracy(logits: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor) -> float:
+    predicted = logits.argmax(dim=-1)
+    correct_triples = predicted.eq(targets).all(dim=-1)
+    selected = mask.to(device=logits.device, dtype=torch.bool)
+    if not selected.any():
+        return 0.0
+    return float(correct_triples[selected].float().mean().item() * 100.0)
+
+
+def _answer_prediction_retention(
+    first: torch.Tensor, second: torch.Tensor, mask: torch.Tensor
+) -> float:
+    selected = mask.to(device=first.device, dtype=torch.bool)
+    if not selected.any():
+        return 0.0
+    same = first.argmax(dim=-1).eq(second.argmax(dim=-1)).all(dim=-1)
+    return float(same[selected].float().mean().item() * 100.0)
 
 
 @torch.no_grad()
@@ -118,20 +124,34 @@ def evaluate_q99_order_sensitivity(
     model,
     output_projection,
     inputs: torch.Tensor,
+    target_digits: torch.Tensor,
     answer_mask: torch.Tensor,
     *,
     atol: float = 1e-6,
 ) -> dict[str, float | bool | int | str]:
-    """Compare paired-order task outputs with and without external memory."""
-    permuted, tested_episodes = permute_early_graph_query_writes(inputs)
-    if tested_episodes == 0:
+    """Check fact-order invariance and ordered-query correctness separately.
+
+    Graph facts are a set: shuffling them must preserve answer accuracy.
+    Path queries form a dependent sequence: swapping the first two query writes
+    is an intentionally invalid control and should reduce correctness. The
+    latter is compared with memory ablated to isolate memory's incremental role.
+    """
+    fact_permuted, fact_episodes = permute_graph_fact_writes(inputs)
+    query_swapped, query_episodes = swap_first_two_path_query_writes(inputs)
+    if fact_episodes == 0 or query_episodes == 0:
         return {
             "gate": "not_applicable",
-            "tested_episodes": 0,
-            "outputs_change_with_memory": False,
-            "outputs_change_without_memory": False,
-            "memory_incremental_order_effect": 0.0,
-            "prediction_flip_rate": 0.0,
+            "tested_episodes": int(inputs.size(0)),
+            "tested_fact_episodes": fact_episodes,
+            "tested_query_episodes": query_episodes,
+            "ordered_query_accuracy": 0.0,
+            "fact_permuted_accuracy": 0.0,
+            "fact_accuracy_delta": 0.0,
+            "fact_prediction_retention": 0.0,
+            "swapped_query_accuracy": 0.0,
+            "query_order_accuracy_drop": 0.0,
+            "query_prediction_flip_rate": 0.0,
+            "query_memory_incremental_order_effect": 0.0,
         }
 
     was_training = model.training
@@ -151,35 +171,55 @@ def evaluate_q99_order_sensitivity(
         )
 
     try:
-        inputs = inputs.to(next(model.parameters()).device)
-        permuted = permuted.to(inputs.device)
-        answer_mask = answer_mask.to(device=inputs.device, dtype=torch.bool)
+        device = next(model.parameters()).device
+        inputs = inputs.to(device)
+        fact_permuted = fact_permuted.to(device)
+        query_swapped = query_swapped.to(device)
+        target_digits = target_digits.to(device=device, dtype=torch.long)
+        answer_mask = answer_mask.to(device=device, dtype=torch.bool)
+
         ordered_full = forward(inputs, True)
-        permuted_full = forward(permuted, True)
+        fact_permuted_full = forward(fact_permuted, True)
+        query_swapped_full = forward(query_swapped, True)
         ordered_ablate = forward(inputs, False)
-        permuted_ablate = forward(permuted, False)
+        query_swapped_ablate = forward(query_swapped, False)
     finally:
         model.train(was_training)
         output_projection.train(projection_was_training)
 
-    full_metrics = order_sensitivity_metrics(
-        ordered_full, permuted_full, atol=atol, mask=answer_mask
+    ordered_accuracy = _triple_accuracy(ordered_full, target_digits, answer_mask)
+    fact_accuracy = _triple_accuracy(fact_permuted_full, target_digits, answer_mask)
+    swapped_accuracy = _triple_accuracy(query_swapped_full, target_digits, answer_mask)
+    query_drop = ordered_accuracy - swapped_accuracy
+    query_flip = _answer_prediction_retention(
+        ordered_full, query_swapped_full, answer_mask
     )
-    ablated_metrics = order_sensitivity_metrics(
-        ordered_ablate, permuted_ablate, atol=atol, mask=answer_mask
-    )
-    delta_difference = (
-        (ordered_full - permuted_full) - (ordered_ablate - permuted_ablate)
+    memory_delta = (
+        (ordered_full - query_swapped_full)
+        - (ordered_ablate - query_swapped_ablate)
     ).abs()[answer_mask]
-    memory_effect = float(delta_difference.mean().item()) if delta_difference.numel() else 0.0
-    gate_pass = bool(full_metrics["outputs_change"]) and memory_effect > atol
+    memory_effect = float(memory_delta.mean().item()) if memory_delta.numel() else 0.0
+    fact_delta = fact_accuracy - ordered_accuracy
+
+    fact_order_ok = fact_delta >= -Q99_MAX_FACT_PERMUTATION_DROP
+    ordered_queries_ok = ordered_accuracy >= Q99_MIN_ORDERED_QUERY_ACCURACY
+    query_order_ok = (
+        query_drop >= Q99_MIN_QUERY_ORDER_DROP and memory_effect > atol
+    )
+    gate_pass = fact_order_ok and ordered_queries_ok and query_order_ok
     return {
         "gate": "pass" if gate_pass else "fail",
-        "tested_episodes": tested_episodes,
-        "outputs_change_with_memory": bool(full_metrics["outputs_change"]),
-        "outputs_change_without_memory": bool(ablated_metrics["outputs_change"]),
-        "max_abs_output_delta": float(full_metrics["max_absolute_difference"]),
-        "mean_abs_output_delta": float(full_metrics["mean_absolute_difference"]),
-        "prediction_flip_rate": float(full_metrics["prediction_flip_rate"]),
-        "memory_incremental_order_effect": memory_effect,
+        "tested_episodes": int(inputs.size(0)),
+        "tested_fact_episodes": fact_episodes,
+        "tested_query_episodes": query_episodes,
+        "ordered_query_accuracy": ordered_accuracy,
+        "fact_permuted_accuracy": fact_accuracy,
+        "fact_accuracy_delta": fact_delta,
+        "fact_prediction_retention": _answer_prediction_retention(
+            ordered_full, fact_permuted_full, answer_mask
+        ),
+        "swapped_query_accuracy": swapped_accuracy,
+        "query_order_accuracy_drop": query_drop,
+        "query_prediction_flip_rate": 100.0 - query_flip,
+        "query_memory_incremental_order_effect": memory_effect,
     }

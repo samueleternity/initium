@@ -110,6 +110,7 @@ def resize_memory(model, new_nr_cells: int, device=None, layer: int = 0, optimiz
             read_variant=old_memory.read_variant,
             write_variant=old_memory.write_variant,
             read_residual_scale=old_memory.read_residual_scale,
+            read_residual_max_ratio=old_memory.read_residual_max_ratio,
             observation_variance=old_memory.observation_variance,
         ).to(device)
     else:

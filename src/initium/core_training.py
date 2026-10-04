@@ -71,6 +71,7 @@ from initium.config.controller_config import (
     DYNAMIC_N_USAGE_HIGH,
     DNC_READ_VARIANT,
     DNC_READ_RESIDUAL_SCALE,
+    DNC_READ_RESIDUAL_MAX_RATIO,
     DNC_WRITE_OBSERVATION_VARIANCE,
     DNC_WRITE_VARIANT,
     HYBRID_CFC_NUM_BLOCKS,
@@ -581,6 +582,7 @@ def run(
     split_graph_combiner_num_blocks: int = SPLIT_GRAPH_COMBINER_NUM_BLOCKS,
     dnc_read_variant: str = DNC_READ_VARIANT,
     dnc_read_residual_scale: float = DNC_READ_RESIDUAL_SCALE,
+    dnc_read_residual_max_ratio: float = DNC_READ_RESIDUAL_MAX_RATIO,
     dnc_write_variant: str = DNC_WRITE_VARIANT,
     dnc_write_observation_variance: float = DNC_WRITE_OBSERVATION_VARIANCE,
     dataset_type: str = DATASET_TYPE,
@@ -738,12 +740,16 @@ def run(
                     "ood_offset_triple",
                     "q99_gate",
                     "q99_tested_episodes",
-                    "q99_outputs_change_with_memory",
-                    "q99_outputs_change_without_memory",
-                    "q99_max_abs_output_delta",
-                    "q99_mean_abs_output_delta",
-                    "q99_prediction_flip_rate",
-                    "q99_memory_incremental_order_effect",
+                    "q99_tested_fact_episodes",
+                    "q99_tested_query_episodes",
+                    "q99_ordered_query_accuracy",
+                    "q99_fact_permuted_accuracy",
+                    "q99_fact_accuracy_delta",
+                    "q99_fact_prediction_retention",
+                    "q99_swapped_query_accuracy",
+                    "q99_query_order_accuracy_drop",
+                    "q99_query_prediction_flip_rate",
+                    "q99_query_memory_incremental_order_effect",
                     "id_posterior_mean_variance",
                     "id_posterior_variance_min",
                     "id_posterior_variance_max",
@@ -1140,6 +1146,7 @@ def run(
             moe_cfc_multi_source=split_graph_combiner_cfc_multi_source_moe,
             dnc_read_variant=dnc_read_variant,
             dnc_read_residual_scale=dnc_read_residual_scale,
+            dnc_read_residual_max_ratio=dnc_read_residual_max_ratio,
             dnc_write_variant=dnc_write_variant,
             dnc_write_observation_variance=dnc_write_observation_variance,
             device=device,
@@ -1205,6 +1212,7 @@ def run(
         "split_graph_combiner_cfc_multi_source_moe": split_graph_combiner_cfc_multi_source_moe,
         "dnc_read_variant": dnc_read_variant,
         "dnc_read_residual_scale": dnc_read_residual_scale,
+        "dnc_read_residual_max_ratio": dnc_read_residual_max_ratio,
         "dnc_write_variant": dnc_write_variant,
         "dnc_write_observation_variance": dnc_write_observation_variance,
     }
@@ -1465,58 +1473,6 @@ def run(
                 f"want to extend further."
             )
 
-    q99_metrics = None
-    if split_graph_enabled and dnc_write_variant == "kanerva-closed-form":
-        python_rng_state = random.getstate()
-        numpy_rng_state = np.random.get_state()
-        torch_rng_state = _capture_torch_rng()
-        try:
-            with _replay_torch_rng(torch_rng_state):
-                q99_inputs, _, q99_answer_mask = build_q99_probe_batch()
-                q99_metrics = evaluate_q99_order_sensitivity(
-                    rnn, output_proj, q99_inputs, q99_answer_mask
-                )
-        finally:
-            random.setstate(python_rng_state)
-            np.random.set_state(numpy_rng_state)
-
-        print(
-            f"[{run_id}] [Track B / Q99] gate={q99_metrics['gate']} | "
-            f"episodes={q99_metrics['tested_episodes']} | "
-            f"output_delta={q99_metrics.get('mean_abs_output_delta', 0.0):.6g} | "
-            f"prediction_flip={q99_metrics.get('prediction_flip_rate', 0.0):.4f} | "
-            f"memory_order_effect="
-            f"{q99_metrics.get('memory_incremental_order_effect', 0.0):.6g}"
-        )
-        if track_b_writer is not None:
-            track_b_writer.writerow(
-                [
-                    "q99_gate",
-                    step,
-                    curriculum.lesson + 1,
-                    dnc_write_variant,
-                    None,
-                    None,
-                    None,
-                    q99_metrics["gate"],
-                    q99_metrics["tested_episodes"],
-                    q99_metrics["outputs_change_with_memory"],
-                    q99_metrics["outputs_change_without_memory"],
-                    q99_metrics.get("max_abs_output_delta"),
-                    q99_metrics.get("mean_abs_output_delta"),
-                    q99_metrics.get("prediction_flip_rate"),
-                    q99_metrics.get("memory_incremental_order_effect"),
-                    *([None] * 16),
-                    *([None] * 6),
-                ]
-            )
-            track_b_file.flush()
-        if q99_metrics["gate"] != "pass":
-            raise RuntimeError(
-                "Track B Q99 order-sensitivity gate failed before training; "
-                "see the run's _track_b.csv q99_gate row."
-            )
-
     print(
         f"\n=== [{run_id}] Training (beta_target={beta_target}, beta_mode={beta_mode}) "
         f"{'[resumed]' if resuming else ''} ==="
@@ -1751,7 +1707,7 @@ def run(
                         None,
                         None,
                         None,
-                        *([None] * 24),
+                        *([None] * 28),
                         avg_task,
                         avg_kl,
                         train_total_loss,
@@ -2044,7 +2000,7 @@ def run(
                         id_triple_acc,
                         ood_triple_acc,
                         id_triple_acc - ood_triple_acc,
-                        *([None] * 8),
+                        *([None] * 12),
                         *id_write_values,
                         *ood_write_values,
                         *([None] * 6),
@@ -2334,7 +2290,7 @@ def run(
                 id_triple_acc,
                 ood_triple_acc,
                 ood_offset_triple,
-                *([None] * 8),
+                *([None] * 12),
                 *_write_diagnostic_values(final_id_stage_diagnostics),
                 *_write_diagnostic_values(final_ood_stage_diagnostics),
                 *([None] * 6),
@@ -2372,6 +2328,58 @@ def run(
             final_ood_ablated_acc, _final_ood_ablated_perfect = dataset.evaluate_ood_ablated(
                 rnn, device, final_ood_episodes, final_ood_ablated_rng
             )
+
+    q99_metrics = None
+    if split_graph_enabled and dnc_write_variant == "kanerva-closed-form":
+        q99_inputs, q99_targets, q99_answer_mask = build_q99_probe_batch()
+        q99_metrics = evaluate_q99_order_sensitivity(
+            rnn,
+            output_proj,
+            q99_inputs,
+            q99_targets,
+            q99_answer_mask,
+        )
+        print(
+            f"[{run_id}] [Track B / Q99] post-training gate={q99_metrics['gate']} | "
+            f"episodes={q99_metrics['tested_episodes']} | "
+            f"ordered/fact-permuted accuracy="
+            f"{q99_metrics['ordered_query_accuracy']:.2f}/"
+            f"{q99_metrics['fact_permuted_accuracy']:.2f}% "
+            f"(delta {q99_metrics['fact_accuracy_delta']:+.2f} pp) | "
+            f"ordered/swapped query accuracy="
+            f"{q99_metrics['ordered_query_accuracy']:.2f}/"
+            f"{q99_metrics['swapped_query_accuracy']:.2f}% "
+            f"(drop {q99_metrics['query_order_accuracy_drop']:+.2f} pp) | "
+            f"query memory effect="
+            f"{q99_metrics['query_memory_incremental_order_effect']:.6g}"
+        )
+        if track_b_writer is not None:
+            track_b_writer.writerow(
+                [
+                    "q99_semantic_order_check",
+                    step,
+                    curriculum.lesson + 1,
+                    dnc_write_variant,
+                    id_triple_acc,
+                    ood_triple_acc,
+                    ood_offset_triple,
+                    q99_metrics["gate"],
+                    q99_metrics["tested_episodes"],
+                    q99_metrics["tested_fact_episodes"],
+                    q99_metrics["tested_query_episodes"],
+                    q99_metrics["ordered_query_accuracy"],
+                    q99_metrics["fact_permuted_accuracy"],
+                    q99_metrics["fact_accuracy_delta"],
+                    q99_metrics["fact_prediction_retention"],
+                    q99_metrics["swapped_query_accuracy"],
+                    q99_metrics["query_order_accuracy_drop"],
+                    q99_metrics["query_prediction_flip_rate"],
+                    q99_metrics["query_memory_incremental_order_effect"],
+                    *([None] * 16),
+                    *([None] * 6),
+                ]
+            )
+            track_b_file.flush()
     _write_ogs_row(
         ogs_log_writer,
         step,
@@ -2413,6 +2421,14 @@ def run(
         "ood_offset_perfect": ood_offset_perfect,
         "total_elapsed_sec": time.time() - t_run_start,
     }
+    if q99_metrics is not None:
+        summary["q99_gate"] = q99_metrics["gate"]
+        summary["q99_fact_permuted_accuracy"] = q99_metrics[
+            "fact_permuted_accuracy"
+        ]
+        summary["q99_query_order_accuracy_drop"] = q99_metrics[
+            "query_order_accuracy_drop"
+        ]
     print(f"\n[{run_id}] SUMMARY: {summary}")
 
     log_writer.writerow([])
@@ -2733,9 +2749,15 @@ if __name__ == "__main__":
         "--dnc-read-residual-scale",
         type=float,
         default=DNC_READ_RESIDUAL_SCALE,
-        help="Multiplier on the learned pairwise correction for relational-residual; "
-        "ignored by other read variants. Default 1.0 preserves the tested scale; "
-        "the cosine baseline is exact at initialization.",
+        help="Gain applied before tanh to the normalized, centered relational correction; "
+        "ignored by other read variants. The correction is still bounded by the max-ratio.",
+    )
+    parser.add_argument(
+        "--dnc-read-residual-max-ratio",
+        type=float,
+        default=DNC_READ_RESIDUAL_MAX_RATIO,
+        help="Maximum absolute relational correction as a fraction of per-query cosine RMS; "
+        "ignored by other read variants.",
     )
     parser.add_argument(
         "--dnc-write-variant",
@@ -2817,6 +2839,10 @@ if __name__ == "__main__":
         parser.error("--prepare-only cannot be combined with --load-prepared")
     if args.dnc_write_observation_variance <= 0:
         parser.error("--dnc-write-observation-variance must be positive")
+    if args.dnc_read_residual_scale < 0:
+        parser.error("--dnc-read-residual-scale must be non-negative")
+    if args.dnc_read_residual_max_ratio < 0:
+        parser.error("--dnc-read-residual-max-ratio must be non-negative")
     if not args.split_graph and (
         args.dnc_read_variant != "cosine" or args.dnc_write_variant != "learned"
     ):
@@ -2899,6 +2925,7 @@ if __name__ == "__main__":
                 run_id += f"_read-{args.dnc_read_variant}_write-{args.dnc_write_variant}"
             if args.dnc_read_variant == "relational-residual":
                 run_id += f"_rscale{args.dnc_read_residual_scale:g}"
+                run_id += f"_rmax{args.dnc_read_residual_max_ratio:g}"
             if args.dnc_write_variant == "kanerva-closed-form":
                 run_id += f"_obsvar{args.dnc_write_observation_variance:g}"
             if args.split_graph_combiner_mode == "controller":
@@ -2942,6 +2969,7 @@ if __name__ == "__main__":
             split_graph_combiner_num_blocks=args.split_graph_combiner_num_blocks,
             dnc_read_variant=args.dnc_read_variant,
             dnc_read_residual_scale=args.dnc_read_residual_scale,
+            dnc_read_residual_max_ratio=args.dnc_read_residual_max_ratio,
             dnc_write_variant=args.dnc_write_variant,
             dnc_write_observation_variance=args.dnc_write_observation_variance,
             dataset_type=args.dataset_type,

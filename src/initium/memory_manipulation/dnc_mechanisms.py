@@ -160,11 +160,16 @@ class MechanismMemory(Memory):
             residual_scores = residual_scores - residual_scores.mean(
                 dim=-1, keepdim=True
             )
-            residual_rms = residual_scores.square().mean(
-                dim=-1, keepdim=True
+            # Add epsilon before sqrt: the residual scorer is zero-initialized,
+            # so RMS can be exactly zero on the first forward pass. Clamping
+            # after sqrt leaves an infinite sqrt derivative in the graph.
+            residual_rms = (
+                residual_scores.square().mean(dim=-1, keepdim=True) + 1e-12
             ).sqrt()
-            normalized_residual = residual_scores / residual_rms.clamp_min(1e-6)
-            cosine_rms = base_scores.square().mean(dim=-1, keepdim=True).sqrt()
+            normalized_residual = residual_scores / residual_rms
+            cosine_rms = (
+                base_scores.square().mean(dim=-1, keepdim=True) + 1e-12
+            ).sqrt()
             bounded_residual = (
                 self.read_residual_max_ratio
                 * cosine_rms

@@ -50,6 +50,7 @@ import torch
 import torch.nn as nn
 from dnc.memory import Memory
 
+from initium.memory_manipulation.dnc_mechanisms import MechanismMemory, build_memory
 from initium.memory_manipulation.link_matrix_ablation import AblatableSparseLinkMemory
 
 
@@ -95,14 +96,25 @@ def resize_memory(model, new_nr_cells: int, device=None, layer: int = 0, optimiz
     # used by the optimizer resync at the very end of this function.
     old_named_params = dict(old_memory.named_parameters())
 
-    new_memory = Memory(
+    memory_args = dict(
         input_size=old_memory.input_size,
-        nr_cells=new_nr_cells,  # VERIFY kwarg name
+        nr_cells=new_nr_cells,
         cell_size=old_memory.cell_size,
         read_heads=old_memory.read_heads,
         independent_linears=True,
-        device=device,  # VERIFY kwarg name -- see note below
-    ).to(device)
+        device=device,
+    )
+    if isinstance(old_memory, MechanismMemory):
+        new_memory = build_memory(
+            **memory_args,
+            read_variant=old_memory.read_variant,
+            write_variant=old_memory.write_variant,
+            read_residual_scale=old_memory.read_residual_scale,
+            read_residual_max_ratio=old_memory.read_residual_max_ratio,
+            observation_variance=old_memory.observation_variance,
+        ).to(device)
+    else:
+        new_memory = Memory(**memory_args).to(device)
 
     # Transplant every N-independent learned sublayer except
     # write_vector_transform (that one is a StochasticWriteHead, not a
@@ -125,7 +137,13 @@ def resize_memory(model, new_nr_cells: int, device=None, layer: int = 0, optimiz
     # event (Option 2) can never silently undo an active link-matrix
     # ablation/sparsification (Option 1) mid-run.
     if isinstance(old_memory, AblatableSparseLinkMemory):
-        new_memory.__class__ = AblatableSparseLinkMemory
+        if not isinstance(new_memory, AblatableSparseLinkMemory):
+            original_class = new_memory.__class__
+            new_memory.__class__ = type(
+                f"Ablatable{original_class.__name__}",
+                (AblatableSparseLinkMemory, original_class),
+                {},
+            )
         new_memory.link_matrix_mode = old_memory.link_matrix_mode
         if hasattr(old_memory, "link_matrix_topk"):
             new_memory.link_matrix_topk = old_memory.link_matrix_topk

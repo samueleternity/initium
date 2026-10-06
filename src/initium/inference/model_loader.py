@@ -176,6 +176,17 @@ def _build_split_graph(c: _Cfg, input_dim, hidden, nr_cells, cell_size, read_hea
         combiner_num_blocks=c.get(
             "split_graph_combiner_num_blocks", cc.SPLIT_GRAPH_COMBINER_NUM_BLOCKS
         ),
+        dnc_read_variant=c.get("dnc_read_variant", cc.DNC_READ_VARIANT),
+        dnc_read_residual_scale=c.get(
+            # Older relational-residual checkpoints used gain 1.
+            "dnc_read_residual_scale",
+            1.0,
+        ),
+        dnc_read_residual_max_ratio=c.get("dnc_read_residual_max_ratio", 0.5),
+        dnc_write_variant=c.get("dnc_write_variant", cc.DNC_WRITE_VARIANT),
+        dnc_write_observation_variance=c.get(
+            "dnc_write_observation_variance", cc.DNC_WRITE_OBSERVATION_VARIANCE
+        ),
         independent_linears=True,
         moe_enabled=_moe["moe_enabled"],
         moe_num_experts=_moe["moe_num_experts"],

@@ -219,3 +219,5 @@ __marimo__/
 
 # Experimental documents for context, not to be committed
 documents/*
+dnc-context/*
+tmp/*

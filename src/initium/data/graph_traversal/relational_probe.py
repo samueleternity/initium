@@ -89,9 +89,7 @@ def cosine_top1_accuracy(cases: list[RelationalProbeCase]) -> float:
         return 0.0
     correct = 0
     for case in cases:
-        scores = torch.nn.functional.cosine_similarity(
-            case.memory, case.query.unsqueeze(0), dim=-1
-        )
+        scores = torch.nn.functional.cosine_similarity(case.memory, case.query.unsqueeze(0), dim=-1)
         correct += int(scores.argmax().item() == case.target_index)
     return correct / len(cases)
 

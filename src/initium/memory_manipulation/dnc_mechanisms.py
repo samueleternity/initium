@@ -64,8 +64,12 @@ class MechanismMemory(Memory):
                 # Preserve the DNC content-addressing behavior at step zero;
                 # the learned relation function starts as a zero residual
                 # and is then optimized from task feedback.
-                nn.init.zeros_(self.relational_score[-1].weight)
-                nn.init.zeros_(self.relational_score[-1].bias)
+                output_layer = self.relational_score[-1]
+                if not isinstance(output_layer, nn.Linear):
+                    raise TypeError("relational score output layer must be linear")
+                nn.init.zeros_(output_layer.weight)
+                if output_layer.bias is not None:
+                    nn.init.zeros_(output_layer.bias)
             if self.device is not None:
                 self.relational_score.to(self.device)
 
@@ -102,14 +106,10 @@ class MechanismMemory(Memory):
         self._collect_stage_diagnostics = False
         result: dict[str, float] = {}
         for name, total in self._stage_diagnostic_sums.items():
-            result[f"{name}_mean"] = float(
-                (total / self._stage_diagnostic_counts[name]).item()
-            )
+            result[f"{name}_mean"] = float((total / self._stage_diagnostic_counts[name]).item())
             result[f"{name}_min"] = float(self._stage_diagnostic_min[name].item())
             result[f"{name}_max"] = float(self._stage_diagnostic_max[name].item())
-        result["diagnostic_steps"] = float(
-            max(self._stage_diagnostic_counts.values(), default=0)
-        )
+        result["diagnostic_steps"] = float(max(self._stage_diagnostic_counts.values(), default=0))
         return result
 
     def new(self, batch_size: int = 1):
@@ -118,7 +118,9 @@ class MechanismMemory(Memory):
             # Isotropic Gaussian covariance per row, represented by its scalar
             # variance. This is episode state, not a learned model parameter.
             hidden["write_posterior_variance"] = torch.ones(
-                batch_size, self.nr_cells, 1,
+                batch_size,
+                self.nr_cells,
+                1,
                 device=hidden["memory"].device,
                 dtype=hidden["memory"].dtype,
             )
@@ -127,9 +129,7 @@ class MechanismMemory(Memory):
     def clone(self, hidden):
         cloned = super().clone(hidden)
         if self.write_variant == "kanerva-closed-form":
-            cloned["write_posterior_variance"] = hidden[
-                "write_posterior_variance"
-            ].clone()
+            cloned["write_posterior_variance"] = hidden["write_posterior_variance"].clone()
         return cloned
 
     def erase(self, hidden):
@@ -157,19 +157,13 @@ class MechanismMemory(Memory):
         """Return one unscaled read score for every query and memory row."""
         base_scores, residual_scores = self._read_score_components(memory, keys)
         if residual_scores is not None:
-            residual_scores = residual_scores - residual_scores.mean(
-                dim=-1, keepdim=True
-            )
+            residual_scores = residual_scores - residual_scores.mean(dim=-1, keepdim=True)
             # Add epsilon before sqrt: the residual scorer is zero-initialized,
             # so RMS can be exactly zero on the first forward pass. Clamping
             # after sqrt leaves an infinite sqrt derivative in the graph.
-            residual_rms = (
-                residual_scores.square().mean(dim=-1, keepdim=True) + 1e-12
-            ).sqrt()
+            residual_rms = (residual_scores.square().mean(dim=-1, keepdim=True) + 1e-12).sqrt()
             normalized_residual = residual_scores / residual_rms
-            cosine_rms = (
-                base_scores.square().mean(dim=-1, keepdim=True) + 1e-12
-            ).sqrt()
+            cosine_rms = (base_scores.square().mean(dim=-1, keepdim=True) + 1e-12).sqrt()
             bounded_residual = (
                 self.read_residual_max_ratio
                 * cosine_rms
@@ -203,8 +197,7 @@ class MechanismMemory(Memory):
                         hidden["memory"], read_keys, read_strengths
                     )
                     entropy = -(
-                        content_weights.clamp_min(1e-12)
-                        * content_weights.clamp_min(1e-12).log()
+                        content_weights.clamp_min(1e-12) * content_weights.clamp_min(1e-12).log()
                     ).sum(dim=-1)
                     self._record_stage_value("read_content_entropy", entropy)
                     self._record_stage_value(
@@ -224,8 +217,7 @@ class MechanismMemory(Memory):
                 scores_centered = scores - scores.mean(dim=-1, keepdim=True)
                 numerator = (cosine_centered * scores_centered).sum(dim=-1)
                 denominator = torch.sqrt(
-                    cosine_centered.square().sum(dim=-1)
-                    * scores_centered.square().sum(dim=-1)
+                    cosine_centered.square().sum(dim=-1) * scores_centered.square().sum(dim=-1)
                 ).clamp_min(1e-12)
                 self._record_stage_value(
                     "ordinary_read_score_cosine_correlation",
@@ -235,21 +227,16 @@ class MechanismMemory(Memory):
                     effective_residual = scores - cosine
                     cosine_rms = cosine.square().mean(dim=-1).sqrt().clamp_min(1e-12)
                     residual_rms = effective_residual.square().mean(dim=-1).sqrt()
-                    self._record_stage_value(
-                        "relational_read_residual_rms", residual_rms
-                    )
+                    self._record_stage_value("relational_read_residual_rms", residual_rms)
                     self._record_stage_value(
                         "relational_read_residual_to_cosine_rms",
                         self.read_residual_scale * residual_rms / cosine_rms,
                     )
-        content_weights = self.read_content_weightings(
-            hidden["memory"], read_keys, read_strengths
-        )
+        content_weights = self.read_content_weightings(hidden["memory"], read_keys, read_strengths)
         if self._collect_stage_diagnostics:
             with torch.no_grad():
                 entropy = -(
-                    content_weights.clamp_min(1e-12)
-                    * content_weights.clamp_min(1e-12).log()
+                    content_weights.clamp_min(1e-12) * content_weights.clamp_min(1e-12).log()
                 ).sum(dim=-1)
                 self._record_stage_value("read_content_entropy", entropy)
                 self._record_stage_value(
@@ -297,12 +284,8 @@ class MechanismMemory(Memory):
             hidden["read_weights"],
             hidden["write_weights"],
         )
-        write_content_weights = self.content_weightings(
-            hidden["memory"], write_key, write_strength
-        )
-        allocation, _ = self.allocate(
-            hidden["usage_vector"], allocation_gate * write_gate
-        )
+        write_content_weights = self.content_weightings(hidden["memory"], write_key, write_strength)
+        allocation, _ = self.allocate(hidden["usage_vector"], allocation_gate * write_gate)
         hidden["write_weights"] = self.write_weighting(
             hidden["memory"],
             write_content_weights,
@@ -322,13 +305,9 @@ class MechanismMemory(Memory):
         gain = (weight * variance) / (noise + weight * variance)
         observation = write_vector.expand_as(hidden["memory"])
         old_memory = hidden["memory"]
-        posterior_memory = old_memory + gain * (
-            observation - hidden["memory"]
-        )
+        posterior_memory = old_memory + gain * (observation - hidden["memory"])
         hidden["memory"] = posterior_memory
-        hidden["write_posterior_variance"] = variance * noise / (
-            noise + weight * variance
-        )
+        hidden["write_posterior_variance"] = variance * noise / (noise + weight * variance)
         if self._collect_stage_diagnostics:
             posterior_variance = hidden["write_posterior_variance"]
             self._record_stage_value(
@@ -342,9 +321,7 @@ class MechanismMemory(Memory):
         hidden["link_matrix"] = self.get_link_matrix(
             hidden["link_matrix"], hidden["write_weights"], hidden["precedence"]
         )
-        hidden["precedence"] = self.update_precedence(
-            hidden["precedence"], hidden["write_weights"]
-        )
+        hidden["precedence"] = self.update_precedence(hidden["precedence"], hidden["write_weights"])
         return hidden
 
 

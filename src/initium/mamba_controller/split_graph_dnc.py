@@ -114,7 +114,6 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from initium.memory_manipulation.dnc_mechanisms import build_memory
 
 from initium.LNN_controller.cfc_backbone_parallel import (
     build_parallel_backbone,
@@ -128,6 +127,7 @@ from initium.LNN_controller.hybrid_controller import (  # v15: hybrid combiner
 from initium.mamba_controller.mamba2_controller import Mamba2ControllerWrapper
 from initium.mamba_controller.mamba3_controller import Mamba3ControllerWrapper
 from initium.mamba_controller.mamba_controller import MambaControllerWrapper
+from initium.memory_manipulation.dnc_mechanisms import build_memory
 
 
 class SplitGraphDNC(nn.Module):

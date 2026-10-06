@@ -61,6 +61,11 @@ from initium.config.controller_config import (
     CFC_MODE,
     CFC_RESIDUAL,
     CONTROLLER_TYPE,
+    DNC_READ_RESIDUAL_MAX_RATIO,
+    DNC_READ_RESIDUAL_SCALE,
+    DNC_READ_VARIANT,
+    DNC_WRITE_OBSERVATION_VARIANCE,
+    DNC_WRITE_VARIANT,
     DYNAMIC_N_CEILING,
     DYNAMIC_N_COOLDOWN_STEPS,
     DYNAMIC_N_EMA_DECAY,
@@ -69,11 +74,6 @@ from initium.config.controller_config import (
     DYNAMIC_N_MODE,
     DYNAMIC_N_TRIGGER_FRAC,
     DYNAMIC_N_USAGE_HIGH,
-    DNC_READ_VARIANT,
-    DNC_READ_RESIDUAL_SCALE,
-    DNC_READ_RESIDUAL_MAX_RATIO,
-    DNC_WRITE_OBSERVATION_VARIANCE,
-    DNC_WRITE_VARIANT,
     HYBRID_CFC_NUM_BLOCKS,
     ISOLATE_LINK_ABLATION,
     LINK_MATRIX_MODE,
@@ -144,14 +144,14 @@ from initium.config.train_config import (
     WARMUP_STEPS,
 )
 from initium.data.dataset_registry import get_dataset
+from initium.data.graph_traversal.order_probe import (
+    build_q99_probe_batch,
+    evaluate_q99_order_sensitivity,
+)
 from initium.data.graph_traversal.relational_probe import (
     build_relational_probe,
     cosine_top1_accuracy,
     score_probe_cases,
-)
-from initium.data.graph_traversal.order_probe import (
-    build_q99_probe_batch,
-    evaluate_q99_order_sensitivity,
 )
 from initium.data.prepared_dataset import load_prepared_dataset, save_prepared_dataset
 from initium.mamba_controller.mamba_controller import MambaDNC
@@ -666,9 +666,7 @@ def run(
         )
 
     relational_probe_cases = (
-        build_relational_probe(cell_size=MODEL_CELL_SIZE)
-        if dataset_type == "graph"
-        else None
+        build_relational_probe(cell_size=MODEL_CELL_SIZE) if dataset_type == "graph" else None
     )
     relational_probe_file = None
     relational_probe_writer = None
@@ -1696,7 +1694,11 @@ def run(
                 parts.append(dyn_n_str.strip(" |"))
             print(" | ".join(parts))
 
-            if track_b_writer is not None and dnc_write_variant == "kanerva-closed-form":
+            if (
+                track_b_writer is not None
+                and track_b_file is not None
+                and dnc_write_variant == "kanerva-closed-form"
+            ):
                 train_total_loss = avg_task + kl_contrib
                 track_b_writer.writerow(
                     [
@@ -1813,7 +1815,11 @@ def run(
                 if hasattr(id_stage_memory, "finish_stage_diagnostics")
                 else {}
             )
-            if relational_probe_writer is not None:
+            if (
+                relational_probe_writer is not None
+                and relational_probe_file is not None
+                and relational_probe_cases is not None
+            ):
                 probe_metrics = score_probe_cases(rnn.memories[0], relational_probe_cases)
                 relational_probe_writer.writerow(
                     [
@@ -1924,7 +1930,11 @@ def run(
                 ]
             )
             ood_log_file.flush()
-            if track_a_writer is not None:
+            if (
+                track_a_writer is not None
+                and track_a_file is not None
+                and relational_probe_cases is not None
+            ):
                 rho_key = "ordinary_read_score_cosine_correlation_mean"
                 rho = id_stage_diagnostics.get(
                     rho_key,
@@ -1948,9 +1958,7 @@ def run(
                         id_stage_diagnostics.get("read_content_entropy_mean"),
                         id_stage_diagnostics.get("read_content_max_weight_mean"),
                         id_stage_diagnostics.get("relational_read_residual_rms_mean"),
-                        id_stage_diagnostics.get(
-                            "relational_read_residual_to_cosine_rms_mean"
-                        ),
+                        id_stage_diagnostics.get("relational_read_residual_to_cosine_rms_mean"),
                     ]
                 )
                 track_a_file.flush()
@@ -1970,7 +1978,7 @@ def run(
                     f"residual/cosine rms="
                     f"{id_stage_diagnostics.get('relational_read_residual_to_cosine_rms_mean', float('nan')):.3f}"
                 )
-            if track_b_writer is not None:
+            if track_b_writer is not None and track_b_file is not None:
                 id_write_values = [
                     id_stage_diagnostics.get("posterior_variance_mean"),
                     id_stage_diagnostics.get("posterior_variance_min"),
@@ -2188,7 +2196,11 @@ def run(
         if hasattr(final_id_stage_memory, "finish_stage_diagnostics")
         else {}
     )
-    if relational_probe_writer is not None:
+    if (
+        relational_probe_writer is not None
+        and relational_probe_file is not None
+        and relational_probe_cases is not None
+    ):
         probe_metrics = score_probe_cases(rnn.memories[0], relational_probe_cases)
         relational_probe_writer.writerow(
             [
@@ -2227,7 +2239,11 @@ def run(
     ood_offset_triple = id_triple_acc - ood_triple_acc
     ood_offset_perfect = id_perfect_frac - ood_perfect_frac
 
-    if track_a_writer is not None:
+    if (
+        track_a_writer is not None
+        and track_a_file is not None
+        and relational_probe_cases is not None
+    ):
         final_stress_metrics = score_probe_cases(rnn.memories[0], relational_probe_cases)
         rho = final_id_stage_diagnostics.get(
             "ordinary_read_score_cosine_correlation_mean",
@@ -2249,9 +2265,7 @@ def run(
                 final_id_stage_diagnostics.get("read_content_entropy_mean"),
                 final_id_stage_diagnostics.get("read_content_max_weight_mean"),
                 final_id_stage_diagnostics.get("relational_read_residual_rms_mean"),
-                final_id_stage_diagnostics.get(
-                    "relational_read_residual_to_cosine_rms_mean"
-                ),
+                final_id_stage_diagnostics.get("relational_read_residual_to_cosine_rms_mean"),
             ]
         )
         track_a_file.flush()
@@ -2268,7 +2282,8 @@ def run(
             f"residual/cosine rms="
             f"{final_id_stage_diagnostics.get('relational_read_residual_to_cosine_rms_mean', float('nan')):.3f}"
         )
-    if track_b_writer is not None:
+    if track_b_writer is not None and track_b_file is not None:
+
         def _write_diagnostic_values(diagnostics):
             return [
                 diagnostics.get("posterior_variance_mean"),
@@ -2353,7 +2368,7 @@ def run(
             f"query memory effect="
             f"{q99_metrics['query_memory_incremental_order_effect']:.6g}"
         )
-        if track_b_writer is not None:
+        if track_b_writer is not None and track_b_file is not None:
             track_b_writer.writerow(
                 [
                     "q99_semantic_order_check",
@@ -2423,12 +2438,8 @@ def run(
     }
     if q99_metrics is not None:
         summary["q99_gate"] = q99_metrics["gate"]
-        summary["q99_fact_permuted_accuracy"] = q99_metrics[
-            "fact_permuted_accuracy"
-        ]
-        summary["q99_query_order_accuracy_drop"] = q99_metrics[
-            "query_order_accuracy_drop"
-        ]
+        summary["q99_fact_permuted_accuracy"] = q99_metrics["fact_permuted_accuracy"]
+        summary["q99_query_order_accuracy_drop"] = q99_metrics["query_order_accuracy_drop"]
     print(f"\n[{run_id}] SUMMARY: {summary}")
 
     log_writer.writerow([])
@@ -2696,7 +2707,7 @@ if __name__ == "__main__":
         type=str,
         default=SPLIT_GRAPH_COMBINER_MODE,
         choices=["linear", "controller"],
-        help="v11: 'linear' (default) is the original, already-efficient "
+        help="'linear' (default) is the original, already-efficient "
         "stateless combiner. 'controller' drives the sequential "
         "addressing step with a real interleaved Mamba controller "
         "cell instead (see --split-graph-combiner-variant).",

@@ -7,7 +7,6 @@ import random
 import numpy as np
 import torch
 
-
 Q99_PROBE_EPISODES = 128
 Q99_MIN_ORDERED_QUERY_ACCURACY = 50.0
 Q99_MAX_FACT_PERMUTATION_DROP = 5.0
@@ -26,7 +25,7 @@ def build_q99_probe_batch(batch_size: int = Q99_PROBE_EPISODES, seed: int = 991)
     try:
         random.seed(seed)
         np.random.seed(seed)
-        episodes = []
+        episodes: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
         while len(episodes) < batch_size:
             episode = build_traversal_episode(10, (2, 4), (2, 4))
             if episode is not None:
@@ -191,21 +190,16 @@ def evaluate_q99_order_sensitivity(
     fact_accuracy = _triple_accuracy(fact_permuted_full, target_digits, answer_mask)
     swapped_accuracy = _triple_accuracy(query_swapped_full, target_digits, answer_mask)
     query_drop = ordered_accuracy - swapped_accuracy
-    query_flip = _answer_prediction_retention(
-        ordered_full, query_swapped_full, answer_mask
-    )
+    query_flip = _answer_prediction_retention(ordered_full, query_swapped_full, answer_mask)
     memory_delta = (
-        (ordered_full - query_swapped_full)
-        - (ordered_ablate - query_swapped_ablate)
+        (ordered_full - query_swapped_full) - (ordered_ablate - query_swapped_ablate)
     ).abs()[answer_mask]
     memory_effect = float(memory_delta.mean().item()) if memory_delta.numel() else 0.0
     fact_delta = fact_accuracy - ordered_accuracy
 
     fact_order_ok = fact_delta >= -Q99_MAX_FACT_PERMUTATION_DROP
     ordered_queries_ok = ordered_accuracy >= Q99_MIN_ORDERED_QUERY_ACCURACY
-    query_order_ok = (
-        query_drop >= Q99_MIN_QUERY_ORDER_DROP and memory_effect > atol
-    )
+    query_order_ok = query_drop >= Q99_MIN_QUERY_ORDER_DROP and memory_effect > atol
     gate_pass = fact_order_ok and ordered_queries_ok and query_order_ok
     return {
         "gate": "pass" if gate_pass else "fail",

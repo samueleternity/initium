@@ -105,6 +105,11 @@ from initium.config.controller_config import (
     SPLIT_GRAPH_MAMBA_HEADDIM,
     SPLIT_GRAPH_MAMBA_VARIANT,
     SPLIT_GRAPH_NUM_BLOCKS,
+    WORKSPACE_ENABLED,
+    WORKSPACE_NO_SELECTION,
+    WORKSPACE_NUM_SLOTS,
+    WORKSPACE_RESET_EACH_STEP,
+    WORKSPACE_TRAIN_MODE,
 )
 from initium.config.train_config import (
     AMP_INIT_SCALE,
@@ -154,6 +159,7 @@ from initium.data.graph_traversal.relational_probe import (
     score_probe_cases,
 )
 from initium.data.prepared_dataset import load_prepared_dataset, save_prepared_dataset
+from initium.diagnostics.segment_logging import SegmentDiagnostics
 from initium.mamba_controller.mamba_controller import MambaDNC
 from initium.mamba_controller.split_graph_dnc import SplitGraphDNC
 from initium.memory_manipulation.dynamic_memory_resize import resize_memory
@@ -202,6 +208,73 @@ def _first_nonfinite_report(tensor, name, step):
             f"[NaN-TRACE] step {step}: non-finite in '{name}' ({bad_frac * 100:.2f}% of elements)"
         )
     return ok
+
+
+def _capture_rng_state():
+    """Capture all RNG streams used by task generation and model evaluation.
+
+    Periodic dependency evaluations replay this state so the memory-on and
+    memory-off scores use the same episodes, then restore the stream so the
+    paired check does not perturb subsequent evaluation/training randomness.
+    """
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch_cpu": torch.random.get_rng_state(),
+        "torch_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+
+
+def _restore_rng_state(state):
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.random.set_rng_state(state["torch_cpu"])
+    if state["torch_cuda"] is not None:
+        torch.cuda.set_rng_state_all(state["torch_cuda"])
+
+
+def _report_first_nonfinite_gradient(named_parameters, step):
+    """Identify the first parameter whose unscaled gradient is non-finite."""
+    for name, parameter in named_parameters:
+        grad = parameter.grad
+        if grad is not None and not torch.isfinite(grad).all():
+            bad_fraction = (~torch.isfinite(grad)).float().mean().item()
+            print(
+                f"[NaN-TRACE] step {step}: first non-finite gradient in "
+                f"'{name}' ({bad_fraction * 100:.2f}% of elements)"
+            )
+            return name
+    print(f"[NaN-TRACE] step {step}: gradient norm is non-finite but no bad gradient tensor was found")
+    return None
+
+
+def _format_moe_layer_reports(diagnostics: dict) -> list[str]:
+    """Format per-bank routing/activation summaries for console output."""
+    reports = []
+    for layer_diag in diagnostics.get("moe_layers", []):
+        load = ",".join(f"{value:.2f}" for value in layer_diag.get("expert_load_frac", []))
+        importance = ",".join(
+            f"{value:.2f}" for value in layer_diag.get("router_importance_frac", [])
+        )
+        reports.append(
+            f"moe-bank[{layer_diag['name']} "
+            f"load=[{load}] importance=[{importance}] "
+            f"entropy={layer_diag.get('router_entropy', 0.0):.2f} "
+            f"pmax={layer_diag.get('router_max_prob', 0.0):.2f} "
+            f"cv_load={layer_diag.get('cv_load', 0.0):.2f} "
+            f"cv_imp={layer_diag.get('cv_importance', 0.0):.2f} "
+            f"max_load={layer_diag.get('max_load_frac', 0.0):.2f} "
+            f"topk_gate={layer_diag.get('topk_gate_mean', 0.0):.2f} "
+            f"in_rms={layer_diag.get('input_rms', 0.0):.3g} "
+            f"in_max={layer_diag.get('input_absmax', 0.0):.3g} "
+            f"expert_rms/max={layer_diag.get('expert_output_rms', 0.0):.3g}/"
+            f"{layer_diag.get('expert_output_absmax', 0.0):.3g} "
+            f"moe_delta_rms/max={layer_diag.get('routed_output_rms', 0.0):.3g}/"
+            f"{layer_diag.get('routed_output_absmax', 0.0):.3g} "
+            f"drop={layer_diag.get('capacity_drop_frac', 0.0):.1%} "
+            f"gate_mass={layer_diag.get('accepted_gate_mass', 0.0):.2f}]"
+        )
+    return reports
 
 
 def _ogs_components(id_acc, ood_acc, ood_perfect, ood_memory_off, lesson):
@@ -580,6 +653,11 @@ def run(
     split_graph_combiner_mode: str = SPLIT_GRAPH_COMBINER_MODE,
     split_graph_combiner_variant: str = SPLIT_GRAPH_COMBINER_VARIANT,
     split_graph_combiner_num_blocks: int = SPLIT_GRAPH_COMBINER_NUM_BLOCKS,
+    workspace_enabled: bool = WORKSPACE_ENABLED,
+    workspace_num_slots: int = WORKSPACE_NUM_SLOTS,
+    workspace_no_selection: bool = WORKSPACE_NO_SELECTION,
+    workspace_reset_each_step: bool = WORKSPACE_RESET_EACH_STEP,
+    workspace_train_mode: str = WORKSPACE_TRAIN_MODE,
     dnc_read_variant: str = DNC_READ_VARIANT,
     dnc_read_residual_scale: float = DNC_READ_RESIDUAL_SCALE,
     dnc_read_residual_max_ratio: float = DNC_READ_RESIDUAL_MAX_RATIO,
@@ -645,6 +723,7 @@ def run(
                 "moe_cv_importance",
                 "moe_cv_load",
                 "moe_max_load_frac",
+                "moe_capacity_drop_frac",
             ]
         )
 
@@ -1147,6 +1226,11 @@ def run(
             dnc_read_residual_max_ratio=dnc_read_residual_max_ratio,
             dnc_write_variant=dnc_write_variant,
             dnc_write_observation_variance=dnc_write_observation_variance,
+            workspace_enabled=workspace_enabled,
+            workspace_num_slots=workspace_num_slots,
+            workspace_no_selection=workspace_no_selection,
+            workspace_reset_each_step=workspace_reset_each_step,
+            workspace_train_mode=workspace_train_mode,
             device=device,
         ).to(device)
     else:
@@ -1171,6 +1255,23 @@ def run(
             # dnc.memory.Memory identically regardless of rnn_type.
             **mamba_kwargs,
         ).to(device)
+
+    if split_graph_enabled:
+        if workspace_enabled:
+            workspace_active = isinstance(rnn, SplitGraphDNC) and rnn.workspace is not None
+            write_mode = "random-control" if workspace_no_selection else "MoE-top-k"
+            persistence = "off (reset each timestep)" if workspace_reset_each_step else "on"
+            print(
+                f"[{run_id}] WORKSPACE {'active' if workspace_active else 'bypassed'} | "
+                f"slots={workspace_num_slots} | write_selection={write_mode} | "
+                f"persistence={persistence} | train_mode={workspace_train_mode} | "
+                "scope=final-backbone-MoE-bank; each specialist reads shared slots"
+            )
+        else:
+            print(
+                f"[{run_id}] WORKSPACE disabled | Selection-only split-graph run; "
+                "no shared-slot writes or broadcast readback"
+            )
 
     combiner_stage_kinds = getattr(
         getattr(rnn, "combiner_wrapper", None), "stage_kinds", None
@@ -1213,6 +1314,11 @@ def run(
         "dnc_read_residual_max_ratio": dnc_read_residual_max_ratio,
         "dnc_write_variant": dnc_write_variant,
         "dnc_write_observation_variance": dnc_write_observation_variance,
+        "workspace_enabled": workspace_enabled,
+        "workspace_num_slots": workspace_num_slots,
+        "workspace_no_selection": workspace_no_selection,
+        "workspace_reset_each_step": workspace_reset_each_step,
+        "workspace_train_mode": workspace_train_mode,
     }
 
     if link_matrix_mode != "dense":
@@ -1225,6 +1331,22 @@ def run(
 
     output_proj = nn.Linear(INPUT_DIM, TRIPLE_DIM).to(device)
     dataset.set_output_proj(output_proj)
+    segment_diagnostics = SegmentDiagnostics(rnn)
+    segment_diagnostics.add_module(output_proj, "task_output")
+    moe_layer_ids = {id(layer) for layer in getattr(rnn, "moe_layers", [])}
+    for module_name, module in rnn.named_modules():
+        if id(module) in moe_layer_ids:
+            module.diagnostic_name = module_name or type(module).__name__
+
+    def emit_failure_diagnostics(channel: str, *, include_gradients: bool = False) -> None:
+        segment_diagnostics.emit(channel, include_gradients=include_gradients)
+        if moe_enabled:
+            _, failure_moe_diag = pop_total_moe_aux_loss(
+                rnn.moe_layers, include_diagnostics=True
+            )
+            reports = _format_moe_layer_reports(failure_moe_diag)
+            if reports:
+                print(f"[moe-diag:{channel}] " + " | ".join(reports))
 
     # Install the stochastic write head(s) BEFORE building the
     # optimizer, so their parameters (mu_transform, logvar_transform) are
@@ -1243,7 +1365,22 @@ def run(
             rnn, device=device, sample=(beta_target > 0.0)
         )
 
-    optimizer = torch.optim.Adam(list(rnn.parameters()) + list(output_proj.parameters()), lr=LR)
+    if workspace_enabled and workspace_train_mode == "frozen":
+        for parameter in rnn.parameters():
+            parameter.requires_grad_(False)
+        assert isinstance(rnn, SplitGraphDNC) and rnn.workspace is not None
+        for parameter in rnn.workspace.parameters():
+            parameter.requires_grad_(True)
+        for parameter in output_proj.parameters():
+            parameter.requires_grad_(False)
+    trainable_parameters = [
+        parameter
+        for parameter in list(rnn.parameters()) + list(output_proj.parameters())
+        if parameter.requires_grad
+    ]
+    if not trainable_parameters:
+        raise ValueError("training configuration has no trainable parameters")
+    optimizer = torch.optim.Adam(trainable_parameters, lr=LR)
     # Option 3 (Concept 24/LB-17): multi-axis efficiency accounting.
     # param_count is fixed for the life of this run -- static Option 2's
     # nr_cells resize never changes it (every Memory sublayer is sized by
@@ -1481,6 +1618,8 @@ def run(
     # whatever LR was saved inside optimizer_state_dict at checkpoint time
     # (potentially still reflecting the old buggy drifted value).
     running_task_loss, running_kl_loss, running_div, running_grad_norm = 0.0, 0.0, 0, 0.0
+    running_finite_grad_steps = 0
+    running_nonfinite_grad_steps = 0
 
     # Dynamic-beta controller state (no-op / unused when beta_mode == "static").
     # Initialized post-resume so a resumed dynamic run starts its health check
@@ -1488,6 +1627,7 @@ def run(
     beta_constraint_ema = 0.0
     scale_at_last_eval = scaler.get_scale()
     grad_was_finite_since_eval = True
+    consecutive_nonfinite_grad_steps = 0
 
     t0 = time.time()
 
@@ -1508,36 +1648,82 @@ def run(
         answer_mask = answer_mask.to(device, non_blocking=True)
         check_finite_this_step = True
         if check_finite_this_step:
-            _first_nonfinite_report(input_seq, "input_seq", step)
+            if not _first_nonfinite_report(input_seq, "input_seq", step):
+                emit_failure_diagnostics("train")
+                raise FloatingPointError(
+                    f"[{run_id}] non-finite training input at step {step}; stopping."
+                )
         hidden = (None, None, None)
         optimizer.zero_grad(set_to_none=True)
 
+        segment_diagnostics.set_channel("train")
         with torch.amp.autocast("cuda", enabled=amp_enabled):
             output, hidden = rnn(input_seq, hidden, reset_experience=True)
-            if check_finite_this_step:
-                _first_nonfinite_report(output, "rnn_output", step)
+            if check_finite_this_step and not _first_nonfinite_report(
+                output, "rnn_output", step
+            ):
+                emit_failure_diagnostics("train")
+                raise FloatingPointError(
+                    f"[{run_id}] non-finite recurrent output at step {step}; "
+                    "stopping before backward/optimizer update to protect the checkpoint."
+                )
             output = output.transpose(0, 1)  # (B, T, 92); Linear accepts non-contiguous input.
             output = output_proj(output)  # (B, T, 90)
+            if check_finite_this_step and not _first_nonfinite_report(
+                output, "output_logits", step
+            ):
+                emit_failure_diagnostics("train")
+                raise FloatingPointError(
+                    f"[{run_id}] non-finite output logits at step {step}; "
+                    "stopping before backward/optimizer update to protect the checkpoint."
+                )
             task_loss = dataset.loss(output, target_digits, answer_mask)
 
-        if check_finite_this_step:
-            _first_nonfinite_report(task_loss, "task_loss", step)
+        if check_finite_this_step and not _first_nonfinite_report(
+            task_loss, "task_loss", step
+        ):
+            emit_failure_diagnostics("train")
+            raise FloatingPointError(
+                f"[{run_id}] non-finite task loss at step {step}; "
+                "stopping before backward/optimizer update to protect the checkpoint."
+            )
         kl_loss, kl_diag = pop_total_kl(stochastic_heads, free_bits=FREE_BITS)  # Phase 1
-        if check_finite_this_step:
-            _first_nonfinite_report(kl_loss, "kl_loss", step)
+        if check_finite_this_step and not _first_nonfinite_report(
+            kl_loss, "kl_loss", step
+        ):
+            emit_failure_diagnostics("train")
+            raise FloatingPointError(
+                f"[{run_id}] non-finite KL loss at step {step}; stopping before backward."
+            )
         moe_aux_loss, moe_diag = (
-            pop_total_moe_aux_loss(rnn.moe_layers)
+            pop_total_moe_aux_loss(
+                rnn.moe_layers,
+                include_diagnostics=(step + 1) % LOG_EVERY == 0,
+            )
             if moe_enabled
             else (torch.zeros((), device=device), {})
         )  # v8 (Option 4): Switch-style load-balancing loss, already scaled
         # by moe_load_balance_alpha inside SwitchMoE.pop_aux_loss() -- no
         # extra weighting applied here, unlike beta_eff*kl_loss below.
+        if check_finite_this_step and not _first_nonfinite_report(
+            moe_aux_loss, "moe_aux_loss", step
+        ):
+            emit_failure_diagnostics("train")
+            raise FloatingPointError(
+                f"[{run_id}] non-finite MoE auxiliary loss at step {step}; "
+                "stopping before backward."
+            )
         global_ramp = min(1.0, (step - anneal_start_step) / max(1, KL_ANNEAL_STEPS))
         lesson_dip_ramp = min(1.0, (step - lesson_dip_start_step) / max(1, LESSON_KL_DIP_STEPS))
         beta_eff = beta_target * global_ramp * lesson_dip_ramp
         loss = (
             task_loss + beta_eff * kl_loss + moe_aux_loss
         )  # Phase 1 + Option 4: L = L_task + beta*L_KL + L_moe_aux
+        if check_finite_this_step and not _first_nonfinite_report(loss, "total_loss", step):
+            emit_failure_diagnostics("train")
+            raise FloatingPointError(
+                f"[{run_id}] non-finite total loss at step {step}; stopping before backward."
+            )
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
         # Log addition #2: capture the pre-clip gradient norm instead of
@@ -1545,21 +1731,48 @@ def run(
         # gradient-scale trajectory to compare a future β>0 switch-in
         # against, useful for telling a genuine instability apart from the
         # expected one-off "shock" when sampling noise is switched on.
-        grad_norm = torch.nn.utils.clip_grad_norm_(rnn.parameters(), max_norm=10.0)
+        # Clip every parameter in this optimizer, including output_proj.
+        # Clipping only rnn.parameters() left the trainable prediction head
+        # unbounded while its gradients were still being applied by Adam.
+        try:
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                trainable_parameters, max_norm=10.0, error_if_nonfinite=True
+            )
+        except RuntimeError as error:
+            if "non-finite" not in str(error):
+                raise
+            # error_if_nonfinite raises before applying the clip coefficient,
+            # preserving the original bad gradients for the diagnostic below.
+            grad_norm = torch.tensor(float("nan"), device=device)
         if not math.isfinite(float(grad_norm)):
             grad_was_finite_since_eval = False
-            # clip_grad_norm_ computes clip_coef = max_norm/(total_norm+eps)
-            # and multiplies EVERY gradient by it. A NaN total_norm therefore
-            # NaNs out every gradient in the model, including ones that were
-            # finite. GradScaler's found_inf was recorded during unscale_,
-            # BEFORE this clip, so it can be clean while the post-clip grads
-            # are all NaN -- scaler.step() then applies them and the weights
-            # are permanently poisoned, which is exactly the one-way collapse
-            # at step 23700. Zero the grads and skip the step instead: this
-            # costs one wasted batch and is fully recoverable.
+            consecutive_nonfinite_grad_steps += 1
+            running_nonfinite_grad_steps += 1
+            _report_first_nonfinite_gradient(
+                [
+                    (f"rnn.{name}", parameter)
+                    for name, parameter in rnn.named_parameters()
+                ]
+                + [
+                    (f"output_proj.{name}", parameter)
+                    for name, parameter in output_proj.named_parameters()
+                ],
+                step,
+            )
+            emit_failure_diagnostics("train", include_gradients=True)
+            # Skip this optimizer update. GradScaler's found_inf scan happens
+            # during unscale_; the explicit finite-norm check also covers
+            # non-finite gradients that arise after that scan.
             optimizer.zero_grad(set_to_none=True)
             scaler.update()
+            if consecutive_nonfinite_grad_steps >= 8:
+                raise FloatingPointError(
+                    f"[{run_id}] {consecutive_nonfinite_grad_steps} consecutive optimizer "
+                    f"steps had non-finite gradients (AMP scale={scaler.get_scale():.4g}); "
+                    "stopping rather than silently training without parameter updates."
+                )
         else:
+            consecutive_nonfinite_grad_steps = 0
             scaler.step(optimizer)
             scaler.update()
         # Log addition #3: AMP loss-scale value. A collapsing/repeatedly
@@ -1571,7 +1784,9 @@ def run(
         running_task_loss += task_loss.detach()
         running_kl_loss += kl_loss.detach()
         running_div += dataset.diversity(output.detach(), target_digits, answer_mask)
-        running_grad_norm += float(grad_norm)
+        if math.isfinite(float(grad_norm)):
+            running_grad_norm += float(grad_norm)
+            running_finite_grad_steps += 1
         step += 1
         current_lr = set_lr(step)  # Phase 1 FIX: clamped manual LR, replaces scheduler.step()
 
@@ -1647,7 +1862,7 @@ def run(
                 running_kl_loss.item() if torch.is_tensor(running_kl_loss) else running_kl_loss
             ) / LOG_EVERY
             avg_div = running_div / LOG_EVERY
-            avg_grad_norm = running_grad_norm / LOG_EVERY
+            avg_grad_norm = running_grad_norm / max(running_finite_grad_steps, 1)
             kl_contrib = (
                 beta_eff * avg_kl
             )  # actual beta*L_KL added to total loss, vs. avg_kl (pre-beta, raw clamped sum)
@@ -1680,6 +1895,7 @@ def run(
                 f"{LOG_EVERY / elapsed:.2f} steps/s",
                 f"LR {current_lr:.6f}",
                 f"grad_norm {avg_grad_norm:.4f}",
+                f"nonfinite_grad_steps {running_nonfinite_grad_steps}",
             ]
             if amp_enabled:
                 parts.append(f"amp_scale {amp_scale:.1f}")
@@ -1689,10 +1905,28 @@ def run(
                     f"moe_aux {float(moe_aux_loss.detach()):.4f}",
                     f"moe_cv_load {moe_diag.get('moe_cv_load', 0.0):.4f}",
                     f"moe_max_load_frac {moe_diag.get('moe_max_load_frac', 0.0):.4f}",
+                    f"moe_capacity_drop {moe_diag.get('moe_capacity_drop_frac', 0.0):.1%}",
                 ]
+                parts.extend(_format_moe_layer_reports(moe_diag))
+            if workspace_enabled and isinstance(rnn, SplitGraphDNC):
+                if rnn.workspace is None:
+                    parts.append("workspace[bypassed: slots=0]")
+                else:
+                    workspace_diag = rnn.workspace.last_diagnostics()
+                    if workspace_diag:
+                        parts.append(
+                            "workspace["
+                            f"write_mass {workspace_diag['write_mass'].item():.3f} "
+                            f"active_writes {workspace_diag['active_write_frac'].item():.1%} "
+                            f"write_gate {workspace_diag['write_gate_mean'].item():.3f} "
+                            f"slot_rms {workspace_diag['slot_rms'].item():.3f} "
+                            f"broadcast/specialist {workspace_diag['broadcast_to_specialist_ratio'].item():.3f} "
+                            f"read_gate {workspace_diag['read_gate'].item():.3f}]"
+                        )
             if dyn_n_str:
                 parts.append(dyn_n_str.strip(" |"))
             print(" | ".join(parts))
+            segment_diagnostics.emit("train", include_gradients=True)
 
             if (
                 track_b_writer is not None
@@ -1752,12 +1986,15 @@ def run(
                     moe_diag.get("moe_cv_importance", 0.0),
                     moe_diag.get("moe_cv_load", 0.0),
                     moe_diag.get("moe_max_load_frac", 0.0),
+                    moe_diag.get("moe_capacity_drop_frac", 0.0),
                 ]
             )
             if torch.cuda.is_available():
                 torch.cuda.reset_peak_memory_stats(device)  # so next window's peak isn't cumulative
             log_file.flush()
             running_task_loss, running_kl_loss, running_div, running_grad_norm = 0.0, 0.0, 0, 0.0
+            running_finite_grad_steps = 0
+            running_nonfinite_grad_steps = 0
 
         if kl_on and step % PRIOR_SNAPSHOT_EVERY == 0:
             # v5 (Phase 2): refit (mu_g, Sigma_g) from the writes
@@ -1807,9 +2044,12 @@ def run(
             id_stage_memory = rnn.memories[0]
             if hasattr(id_stage_memory, "begin_stage_diagnostics"):
                 id_stage_memory.begin_stage_diagnostics()
+            id_eval_rng_state = _capture_rng_state()
+            segment_diagnostics.set_channel("eval-id")
             _, id_triple_acc, id_perfect_frac = curriculum.maybe_advance(
                 rnn, device, step=step, optimizer=optimizer
             )
+            segment_diagnostics.emit("eval-id")
             id_stage_diagnostics = (
                 id_stage_memory.finish_stage_diagnostics()
                 if hasattr(id_stage_memory, "finish_stage_diagnostics")
@@ -1896,6 +2136,7 @@ def run(
             ood_stage_memory = rnn.memories[0]
             if hasattr(ood_stage_memory, "begin_stage_diagnostics"):
                 ood_stage_memory.begin_stage_diagnostics()
+            segment_diagnostics.set_channel("eval-ood")
             ood_triple_acc, ood_perfect_frac, ood_hop_breakdown = dataset.evaluate_ood(
                 rnn,
                 device,
@@ -1903,6 +2144,7 @@ def run(
                 rng=ood_rng,
                 field_log=ood_field_log,
             )
+            segment_diagnostics.emit("eval-ood")
             ood_stage_diagnostics = (
                 ood_stage_memory.finish_stage_diagnostics()
                 if hasattr(ood_stage_memory, "finish_stage_diagnostics")
@@ -1912,10 +2154,12 @@ def run(
             if hasattr(dataset, "evaluate_ood_ablated"):
                 ood_ablated_rng = random.Random()
                 ood_ablated_rng.setstate(ood_rng_state)
+                segment_diagnostics.set_channel("eval-ood-memory-off")
                 with _replay_torch_rng(ood_torch_rng):
                     ood_ablated_acc, _ood_ablated_perfect = dataset.evaluate_ood_ablated(
                         rnn, device, periodic_ood_episodes, ood_ablated_rng
                     )
+                segment_diagnostics.emit("eval-ood-memory-off")
 
             ood_log_writer.writerow(
                 [
@@ -2068,9 +2312,22 @@ def run(
             # Functional-usage check: same lesson distribution the ID eval
             # above just used (pre_advance_lesson, not curriculum.lesson --
             # this call may have just advanced it).
-            ablated_triple_acc, ablated_perfect_frac = dataset.evaluate_id_ablated(
-                rnn, device, curriculum, pre_advance_lesson
-            )
+            # Replay the exact ID evaluation episodes with memory bypassed.
+            # Comparing two independently sampled episode sets made this
+            # purported causal dependency metric too noisy to diagnose
+            # whether the model actually used memory. Restore the post-ID
+            # stream afterward so the paired evaluation consumes no extra
+            # randomness from the run.
+            rng_state_after_other_evaluations = _capture_rng_state()
+            _restore_rng_state(id_eval_rng_state)
+            segment_diagnostics.set_channel("eval-id-memory-off")
+            try:
+                ablated_triple_acc, ablated_perfect_frac = dataset.evaluate_id_ablated(
+                    rnn, device, curriculum, pre_advance_lesson
+                )
+            finally:
+                _restore_rng_state(rng_state_after_other_evaluations)
+            segment_diagnostics.emit("eval-id-memory-off")
 
             mem_check_writer.writerow(
                 [
@@ -2098,11 +2355,13 @@ def run(
                 # contribution to accuracy is measured directly instead of
                 # inferred from loss curves / plateau shape.
                 for stage_idx, stage_kind in enumerate(combiner_stage_kinds):
+                    segment_diagnostics.set_channel(f"eval-combiner-{stage_idx}")
                     stage_triple_acc, stage_perfect_frac = (
                         dataset.evaluate_id_combiner_stage_ablated(
                             rnn, device, curriculum, pre_advance_lesson, skip_stages={stage_idx}
                         )
                     )
+                    segment_diagnostics.emit(f"eval-combiner-{stage_idx}")
                     combiner_stage_log_writer.writerow(
                         [
                             step,
@@ -2188,9 +2447,11 @@ def run(
     final_id_stage_memory = rnn.memories[0]
     if hasattr(final_id_stage_memory, "begin_stage_diagnostics"):
         final_id_stage_memory.begin_stage_diagnostics()
+    segment_diagnostics.set_channel("eval-final-id")
     _, id_triple_acc, id_perfect_frac = curriculum.maybe_advance(
         rnn, device, step=step, optimizer=optimizer
     )
+    segment_diagnostics.emit("eval-final-id")
     final_id_stage_diagnostics = (
         final_id_stage_memory.finish_stage_diagnostics()
         if hasattr(final_id_stage_memory, "finish_stage_diagnostics")
@@ -2222,6 +2483,7 @@ def run(
     final_ood_stage_memory = rnn.memories[0]
     if hasattr(final_ood_stage_memory, "begin_stage_diagnostics"):
         final_ood_stage_memory.begin_stage_diagnostics()
+    segment_diagnostics.set_channel("eval-final-ood")
     ood_triple_acc, ood_perfect_frac, ood_hop_breakdown = dataset.evaluate_ood(
         rnn,
         device,
@@ -2230,6 +2492,7 @@ def run(
         verbose_n=10,
         field_log=final_ood_field_log,
     )
+    segment_diagnostics.emit("eval-final-ood")
     final_ood_stage_diagnostics = (
         final_ood_stage_memory.finish_stage_diagnostics()
         if hasattr(final_ood_stage_memory, "finish_stage_diagnostics")
@@ -2339,10 +2602,12 @@ def run(
     if hasattr(dataset, "evaluate_ood_ablated"):
         final_ood_ablated_rng = random.Random()
         final_ood_ablated_rng.setstate(final_ood_rng_state)
+        segment_diagnostics.set_channel("eval-final-ood-memory-off")
         with _replay_torch_rng(final_ood_torch_rng):
             final_ood_ablated_acc, _final_ood_ablated_perfect = dataset.evaluate_ood_ablated(
                 rnn, device, final_ood_episodes, final_ood_ablated_rng
             )
+        segment_diagnostics.emit("eval-final-ood-memory-off")
 
     q99_metrics = None
     if split_graph_enabled and dnc_write_variant == "kanerva-closed-form":
@@ -2462,6 +2727,7 @@ def run(
     if dynamic_n_ctrl is not None:
         dynamic_n_log_file.close()
 
+    segment_diagnostics.close()
     return summary
 
 
@@ -2638,6 +2904,19 @@ if __name__ == "__main__":
         "SwitchMoE blocks between Mamba controller blocks (mamba_controller.py "
         "/ moe_layer.py).",
     )
+    parser.add_argument(
+        "--workspace", action="store_true",
+        help="Phase 0 shared workspace: competitively write selected MoE expert outputs to persistent slots, then broadcast slots back to every specialist. Requires --split-graph and --moe.",
+    )
+    parser.add_argument("--workspace-num-slots", type=int, default=WORKSPACE_NUM_SLOTS,
+                        help="Persistent workspace slot count (0 is the plumbing/bypass control).")
+    parser.add_argument("--workspace-no-selection", action="store_true",
+                        help="Control: use random, unweighted specialist writes instead of MoE-selected writes.")
+    parser.add_argument("--workspace-reset-each-step", action="store_true",
+                        help="Persistence ablation: reset workspace before each timestep's write/read cycle.")
+    parser.add_argument("--workspace-train-mode", choices=["coadapted", "frozen"],
+                        default=WORKSPACE_TRAIN_MODE,
+                        help="coadapted trains the full model; frozen trains workspace parameters and freezes substrate/task-head parameters.")
     parser.add_argument(
         "--moe-num-experts",
         type=int,
@@ -2891,6 +3170,12 @@ if __name__ == "__main__":
 
     if args.link_matrix_mode == "sparse_topk" and args.link_matrix_topk is None:
         raise SystemExit("--link-matrix-mode=sparse_topk requires --link-matrix-topk")
+    if args.workspace and not args.split_graph:
+        parser.error("--workspace requires --split-graph")
+    if args.workspace and not args.moe:
+        parser.error("--workspace requires --moe")
+    if args.workspace_num_slots < 0:
+        parser.error("--workspace-num-slots must be >= 0")
 
     if args.beta is not None:
         betas_to_run = [args.beta]
@@ -2930,6 +3215,12 @@ if __name__ == "__main__":
             run_id = f"{run_id}_dynN"
         if args.moe:
             run_id = f"{run_id}_moe{args.moe_num_experts}e"
+        if args.workspace:
+            run_id += f"_workspace{args.workspace_num_slots}s_{args.workspace_train_mode}"
+            if args.workspace_no_selection:
+                run_id += "_randomwrite"
+            if args.workspace_reset_each_step:
+                run_id += "_resetstep"
         if args.split_graph:
             run_id = f"{run_id}_splitgraph_{args.split_graph_variant.replace('+', '')}"
             if args.dnc_read_variant != "cosine" or args.dnc_write_variant != "learned":
@@ -2978,6 +3269,11 @@ if __name__ == "__main__":
             split_graph_combiner_mode=args.split_graph_combiner_mode,
             split_graph_combiner_variant=args.split_graph_combiner_variant,
             split_graph_combiner_num_blocks=args.split_graph_combiner_num_blocks,
+            workspace_enabled=args.workspace,
+            workspace_num_slots=args.workspace_num_slots,
+            workspace_no_selection=args.workspace_no_selection,
+            workspace_reset_each_step=args.workspace_reset_each_step,
+            workspace_train_mode=args.workspace_train_mode,
             dnc_read_variant=args.dnc_read_variant,
             dnc_read_residual_scale=args.dnc_read_residual_scale,
             dnc_read_residual_max_ratio=args.dnc_read_residual_max_ratio,

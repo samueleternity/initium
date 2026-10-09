@@ -67,6 +67,13 @@ SPLIT_GRAPH_COMBINER_MODE = "linear"  # "linear" (default) | "controller"
 SPLIT_GRAPH_COMBINER_VARIANT = "mamba1"
 SPLIT_GRAPH_COMBINER_NUM_BLOCKS = 1
 
+# Phase 0 shared global workspace (requires split-graph + MoE).
+WORKSPACE_ENABLED = False
+WORKSPACE_NUM_SLOTS = 5
+WORKSPACE_NO_SELECTION = False  # random/unweighted write control
+WORKSPACE_RESET_EACH_STEP = False  # persistence ablation
+WORKSPACE_TRAIN_MODE = "coadapted"  # "coadapted" | "frozen"
+
 # DNC memory mechanism variants (only applied by the split-graph assembly).
 DNC_READ_VARIANT = "cosine"  # "cosine" | "relational-mlp" | "relational-residual"
 DNC_READ_RESIDUAL_SCALE = 1.0  # Gain applied before tanh for relational-residual.

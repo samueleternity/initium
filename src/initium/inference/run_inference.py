@@ -558,9 +558,10 @@ def main(argv=None) -> int:
                     " (multi-source combiner)" if hasattr(layer, "last_source_diagnostics") else ""
                 )
                 print(
-                    f"  [{i}]{tag} cv_load={diag['cv_load']:.4f} "
-                    f"cv_importance={diag['cv_importance']:.4f} "
-                    f"max_load_frac={diag['max_load_frac']:.4f}"
+                    f"  [{i}]{tag} cv_load={float(diag['cv_load']):.4f} "
+                    f"cv_importance={float(diag['cv_importance']):.4f} "
+                    f"max_load_frac={float(diag['max_load_frac']):.4f} "
+                    f"capacity_drop_frac={float(diag.get('capacity_drop_frac', 0.0)):.4f}"
                 )
                 src_diag = (
                     layer.last_source_diagnostics()

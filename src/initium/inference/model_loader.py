@@ -198,6 +198,15 @@ def _build_split_graph(c: _Cfg, input_dim, hidden, nr_cells, cell_size, read_hea
             "split_graph_combiner_cfc_multi_source_moe",
             cc.SPLIT_GRAPH_COMBINER_CFC_MULTI_SOURCE_MOE,
         ),
+        workspace_enabled=c.get("workspace_enabled", cc.WORKSPACE_ENABLED),
+        workspace_num_slots=c.get("workspace_num_slots", cc.WORKSPACE_NUM_SLOTS),
+        workspace_no_selection=c.get(
+            "workspace_no_selection", cc.WORKSPACE_NO_SELECTION
+        ),
+        workspace_reset_each_step=c.get(
+            "workspace_reset_each_step", cc.WORKSPACE_RESET_EACH_STEP
+        ),
+        workspace_train_mode=c.get("workspace_train_mode", cc.WORKSPACE_TRAIN_MODE),
         device=device,
     ).to(device)
 

@@ -289,3 +289,23 @@ class MambaBackboneParallel(nn.Module):
                 assert self.moe_blocks is not None
                 h = self.moe_blocks[i](h)
         return h
+
+    def forward_with_specialists(self, x: torch.Tensor):
+        """Return final MoE candidates and sparse routes for workspace use.
+
+        Earlier backbone/MoE blocks remain unchanged. The final MoE block
+        exposes expert deltas before routing so the workspace can broadcast
+        context to every specialist, then reuse the original sparse route.
+        """
+        if not self.moe_enabled or self.moe_blocks is None:
+            raise RuntimeError("workspace broadcast requires an enabled MoE expert pool")
+        h = self.in_adapter(x)
+        final_index = len(self.blocks) - 1
+        for i, block in enumerate(self.blocks):
+            h = block(h)
+            if i == final_index:
+                base = h
+                _, experts, indices, weights = self.moe_blocks[i](h, return_details=True)
+                return base, experts, indices, weights
+            h = self.moe_blocks[i](h)
+        raise RuntimeError("parallel backbone has no blocks")

@@ -100,6 +100,14 @@ class Expert(nn.Module):
         super().__init__()
         self.w_in = nn.Linear(d_model, expert_dim)
         self.w_out = nn.Linear(expert_dim, d_model)
+        # Make inserting an MoE residual a no-op at initialization.  The
+        # output projections still receive task gradients on the first
+        # update; their hidden projections begin learning as soon as those
+        # output weights move away from zero.  This avoids a randomly
+        # initialized expert bank changing the controller's signal scale
+        # before routing/expert specialization has learned anything.
+        nn.init.zeros_(self.w_out.weight)
+        nn.init.zeros_(self.w_out.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.w_out(F.relu(self.w_in(x)))
@@ -153,6 +161,7 @@ class SwitchMoE(nn.Module):
         self._last_topk_idx: torch.Tensor | None = (
             None  # (T, k), detached -- for per-source breakdowns
         )
+        self._last_accepted: torch.Tensor | None = None  # (T, k), detached
 
     def forward(self, x: torch.Tensor, *, return_details: bool = False):
         orig_shape = x.shape
@@ -186,9 +195,9 @@ class SwitchMoE(nn.Module):
         probs = torch.softmax(logits32, dim=-1)  # (num_tokens, num_experts)
 
         # Top-K routing (Shazeer et al. 2017 / GShard), generalizing Switch's
-        # own k=1 special case: each token selects its top_k highest-prob
-        # experts, gate weights renormalized to sum to 1 across just those
-        # k slots -- top_k=1 reduces to the original Switch gate exactly.
+        # own k=1 special case: top-1 retains its selected probability from
+        # the full expert softmax (so the task objective can train the
+        # router); top-k>1 normalizes among the selected experts.
         # Normal training dispatches selected, capacity-accepted routes into
         # bounded per-expert buffers. The optional all-expert result is
         # reserved for the workspace specialist path, which explicitly needs
@@ -196,7 +205,15 @@ class SwitchMoE(nn.Module):
         # compute and avoids expanding expert weights per route.
         top_k = self.top_k
         topk_prob, topk_idx = probs.topk(top_k, dim=-1)  # (T, k) each
-        gate_weights = topk_prob / topk_prob.sum(dim=-1, keepdim=True).clamp(min=1e-9)
+        if top_k == 1:
+            # Switch's top-1 gate multiplies the expert output by its
+            # probability in the full expert softmax. Renormalizing a
+            # one-element selected set would make every gate exactly 1 and
+            # cancel the softmax derivative, leaving the task loss unable
+            # to train the router at all.
+            gate_weights = topk_prob
+        else:
+            gate_weights = topk_prob / topk_prob.sum(dim=-1, keepdim=True).clamp(min=1e-9)
 
         # f_i/P_i are cheap to compute regardless of mode; only the aux LOSS
         # accumulation (needed for backward()) is training-gated below.
@@ -219,18 +236,30 @@ class SwitchMoE(nn.Module):
         # per-expert buffer).
         capacity = max(1, int((num_tokens * top_k / self.num_experts) * self.capacity_factor))
 
-        # Capacity mask: keep only the first `capacity` (token,slot) pairs,
-        # in original order, routed to each expert -- same drop semantics
-        # as the prior top-1 implementation, generalized over the
-        # flattened (T*k) slot order.
+        # Capacity is assigned by router confidence, not flattened token
+        # order.  In recurrent multi-source calls the source batches are
+        # concatenated (backbone first, memory read second); first-come
+        # capacity therefore silently favored the first source whenever an
+        # expert overflowed.  Confidence-priority acceptance is independent
+        # of source ordering and preserves the strongest routes.
         flat_idx = topk_idx.reshape(-1)
-        one_hot_flat = F.one_hot(flat_idx, num_classes=self.num_experts)
-        rank_in_expert = one_hot_flat.cumsum(dim=0).gather(1, flat_idx.unsqueeze(1)).squeeze(1) - 1
+        flat_priority = topk_prob.reshape(-1)
+        priority_order = torch.argsort(flat_priority, descending=True, stable=True)
+        expert_in_priority_order = flat_idx.index_select(0, priority_order)
+        one_hot_priority = F.one_hot(
+            expert_in_priority_order, num_classes=self.num_experts
+        )
+        ranks_in_priority_order = one_hot_priority.cumsum(dim=0).gather(
+            1, expert_in_priority_order.unsqueeze(1)
+        ).squeeze(1) - 1
+        rank_in_expert = torch.empty_like(ranks_in_priority_order)
+        rank_in_expert.scatter_(0, priority_order, ranks_in_priority_order)
         keep = (rank_in_expert < capacity).reshape(num_tokens, top_k)
         accepted_gates = gate_weights * keep.to(gate_weights.dtype)
-        accepted_gates = accepted_gates / accepted_gates.sum(
-            dim=-1, keepdim=True
-        ).clamp_min(1e-9)
+        if top_k > 1:
+            accepted_gates = accepted_gates / accepted_gates.sum(
+                dim=-1, keepdim=True
+            ).clamp_min(1e-9)
 
         with torch.autocast(device_type=x.device.type, enabled=False):
             # Dispatch activations into fixed-capacity expert buffers. The
@@ -314,6 +343,7 @@ class SwitchMoE(nn.Module):
         output = output32.to(output_dtype)
 
         with torch.no_grad():
+            self._last_accepted = keep.detach()
             self._last_diag = {
                 "cv_importance": (P_i.std() / P_i.mean().clamp(min=1e-8)).detach(),
                 "cv_load": (f_i.std() / f_i.mean().clamp(min=1e-8)).detach(),
@@ -398,6 +428,11 @@ class SwitchMoE(nn.Module):
         per-slice routing breakdowns that this pooled-over-all-tokens
         class has no notion of on its own."""
         return self._last_topk_idx
+
+    def last_accepted_routing(self) -> torch.Tensor | None:
+        """Capacity acceptance mask ``(num_tokens, top_k)`` for the most
+        recent call, or ``None`` before the first call."""
+        return self._last_accepted
 
 
 class MoEBlock(nn.Module):
@@ -499,6 +534,8 @@ class MultiSourceMoEBlock(nn.Module):
     """
 
     _cumulative_source_counts: list[torch.Tensor] | None
+    _cumulative_source_accepted: list[torch.Tensor] | None
+    _cumulative_source_routes: list[torch.Tensor] | None
 
     def __init__(
         self,
@@ -529,6 +566,8 @@ class MultiSourceMoEBlock(nn.Module):
             load_balance_alpha=load_balance_alpha,
         )
         self._cumulative_source_counts = None
+        self._cumulative_source_accepted = None
+        self._cumulative_source_routes = None
         if device is not None and getattr(device, "type", None) == "cuda":
             self.to(device)
 
@@ -552,20 +591,37 @@ class MultiSourceMoEBlock(nn.Module):
         # concentrates on experts {2,5}, source 1 (read vector) on {1,7}"
         # -- rather than every source routing near-identically by chance.
         topk_idx = self.moe.last_routing()  # (sum(batch_sizes), top_k) or None
-        if topk_idx is not None:
+        accepted = self.moe.last_accepted_routing()
+        if topk_idx is not None and accepted is not None:
             num_experts = self.moe.num_experts
             if self._cumulative_source_counts is None:
                 self._cumulative_source_counts = [
                     torch.zeros(num_experts, device=topk_idx.device) for _ in batch_sizes
                 ]
+                self._cumulative_source_accepted = [
+                    torch.zeros(num_experts, device=topk_idx.device) for _ in batch_sizes
+                ]
+                self._cumulative_source_routes = [
+                    torch.zeros((), device=topk_idx.device) for _ in batch_sizes
+                ]
             offset = 0
             for i, b in enumerate(batch_sizes):
                 idx_slice = topk_idx[offset : offset + b].reshape(-1)
                 counts = torch.bincount(idx_slice, minlength=num_experts).float()
+                accepted_slice = accepted[offset : offset + b].reshape(-1)
+                accepted_counts = torch.bincount(
+                    idx_slice,
+                    weights=accepted_slice.to(dtype=torch.float32),
+                    minlength=num_experts,
+                )
                 # Keep routing counters on device and defer CPU synchronization
                 # until inference explicitly requests a report. This block runs
                 # once per CfC timestep during training.
                 self._cumulative_source_counts[i] += counts
+                assert self._cumulative_source_accepted is not None
+                assert self._cumulative_source_routes is not None
+                self._cumulative_source_accepted[i] += accepted_counts
+                self._cumulative_source_routes[i] += accepted_slice.sum()
                 offset += b
 
         outs, offset = [], 0
@@ -594,19 +650,57 @@ class MultiSourceMoEBlock(nn.Module):
         if self._cumulative_source_counts is None:
             return None
         source_diag = []
-        for counts in self._cumulative_source_counts:
+        assert self._cumulative_source_accepted is not None
+        assert self._cumulative_source_routes is not None
+        for counts, accepted_counts, accepted_routes in zip(
+            self._cumulative_source_counts,
+            self._cumulative_source_accepted,
+            self._cumulative_source_routes,
+        ):
             counts_cpu = counts.detach().float().cpu()
+            accepted_cpu = accepted_counts.detach().float().cpu()
             fractions = counts_cpu / counts_cpu.sum().clamp_min(1.0)
             top_expert = int(counts_cpu.argmax().item())
+            total_routes = float(counts_cpu.sum().item())
+            accepted_total = float(accepted_cpu.sum().item())
             source_diag.append(
                 {
                     "expert_frac": fractions.tolist(),
                     "top_expert": top_expert,
                     "top_expert_frac": float(fractions[top_expert]),
-                    "n_calls_accumulated": int(counts_cpu.sum().item()),
+                    "accepted_expert_frac": (
+                        accepted_cpu / accepted_cpu.sum().clamp_min(1.0)
+                    ).tolist(),
+                    "accepted_route_frac": accepted_total / max(total_routes, 1.0),
+                    "capacity_drop_frac": 1.0 - accepted_total / max(total_routes, 1.0),
+                    "n_routes_accumulated": int(total_routes),
+                    "n_accepted_accumulated": int(accepted_routes.detach().item()),
                 }
             )
         return source_diag
+
+    def pop_source_diagnostics(self) -> list[dict] | None:
+        """Return and reset per-source routing/capacity counters.
+
+        This is intended for periodic training logs, where source-level
+        overflow must be compared over the same window as the pooled MoE
+        diagnostics. ``last_source_diagnostics`` remains cumulative for
+        inference callers.
+        """
+        report = self.last_source_diagnostics()
+        if report is not None:
+            assert self._cumulative_source_counts is not None
+            assert self._cumulative_source_accepted is not None
+            assert self._cumulative_source_routes is not None
+            for counts, accepted, routes in zip(
+                self._cumulative_source_counts,
+                self._cumulative_source_accepted,
+                self._cumulative_source_routes,
+            ):
+                counts.zero_()
+                accepted.zero_()
+                routes.zero_()
+        return report
 
 
 class MoERNNWrapper(nn.Module):
@@ -678,6 +772,11 @@ def pop_total_moe_aux_loss(moe_layers: list, *, include_diagnostics: bool = True
         else:
             diag = {}
         if diag:
+            source_report = None
+            if include_diagnostics:
+                pop_source_diagnostics = getattr(layer, "pop_source_diagnostics", None)
+                if pop_source_diagnostics is not None:
+                    source_report = pop_source_diagnostics()
             cv_imp.append(float(diag["cv_importance"]))
             cv_load.append(float(diag["cv_load"]))
             max_load.append(float(diag["max_load_frac"]))
@@ -710,6 +809,7 @@ def pop_total_moe_aux_loss(moe_layers: list, *, include_diagnostics: bool = True
                         for key in ("expert_load_frac", "router_importance_frac")
                         if key in diag
                     },
+                    **({"source_routes": source_report} if source_report is not None else {}),
                 }
             )
     if total is None:

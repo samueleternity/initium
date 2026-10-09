@@ -181,6 +181,7 @@ class SplitGraphDNC(nn.Module):
         independent_linears: bool = True,
         device: torch.device | None = None,
         moe_enabled: bool = False,
+        moe_placement: str = "all",
         moe_num_experts: int = 8,
         moe_expert_dim: int | None = None,
         moe_top_k: int = 1,
@@ -234,8 +235,14 @@ class SplitGraphDNC(nn.Module):
         self.dnc_read_residual_max_ratio = dnc_read_residual_max_ratio
         self.dnc_write_variant = dnc_write_variant
         self.dnc_write_observation_variance = dnc_write_observation_variance
-        if workspace_enabled and not moe_enabled:
-            raise ValueError("--workspace requires --moe so it can broadcast to MoE specialists")
+        if moe_placement not in ("all", "backbone", "combiner"):
+            raise ValueError("moe_placement must be 'all', 'backbone', or 'combiner'")
+        backbone_moe_enabled = moe_enabled and moe_placement in ("all", "backbone")
+        combiner_moe_enabled = moe_enabled and moe_placement in ("all", "combiner")
+        if workspace_enabled and not backbone_moe_enabled:
+            raise ValueError(
+                "--workspace requires backbone MoE because it broadcasts to backbone specialists"
+            )
         if workspace_train_mode not in ("coadapted", "frozen"):
             raise ValueError("workspace_train_mode must be 'coadapted' or 'frozen'")
         if workspace_enabled and workspace_train_mode == "frozen" and workspace_num_slots == 0:
@@ -263,7 +270,7 @@ class SplitGraphDNC(nn.Module):
             expand=mamba_expand,
             headdim=mamba_headdim,
             cfc_kwargs=cfc_kwargs,
-            moe_enabled=moe_enabled,
+            moe_enabled=backbone_moe_enabled,
             moe_num_experts=moe_num_experts,
             moe_expert_dim=moe_expert_dim,
             moe_top_k=moe_top_k,
@@ -335,7 +342,7 @@ class SplitGraphDNC(nn.Module):
                     expand=combiner_expand,
                     headdim=combiner_headdim,
                     ngroups=combiner_ngroups,
-                    moe_enabled=moe_enabled,
+                    moe_enabled=combiner_moe_enabled,
                     moe_num_experts=moe_num_experts,
                     moe_expert_dim=moe_expert_dim,
                     moe_top_k=moe_top_k,
@@ -351,7 +358,7 @@ class SplitGraphDNC(nn.Module):
                     d_state=_d_state,
                     expand=combiner_expand,
                     headdim=combiner_headdim,
-                    moe_enabled=moe_enabled,
+                    moe_enabled=combiner_moe_enabled,
                     moe_num_experts=moe_num_experts,
                     moe_expert_dim=moe_expert_dim,
                     moe_top_k=moe_top_k,
@@ -374,7 +381,7 @@ class SplitGraphDNC(nn.Module):
                             d_state=16,
                             d_conv=combiner_d_conv,
                             expand=combiner_expand,
-                            moe_enabled=moe_enabled,
+                            moe_enabled=combiner_moe_enabled,
                             moe_num_experts=moe_num_experts,
                             moe_expert_dim=moe_expert_dim,
                             moe_top_k=moe_top_k,
@@ -387,7 +394,7 @@ class SplitGraphDNC(nn.Module):
                             expand=combiner_expand,
                             headdim=combiner_headdim,
                             ngroups=combiner_ngroups,
-                            moe_enabled=moe_enabled,
+                            moe_enabled=combiner_moe_enabled,
                             moe_num_experts=moe_num_experts,
                             moe_expert_dim=moe_expert_dim,
                             moe_top_k=moe_top_k,
@@ -398,7 +405,7 @@ class SplitGraphDNC(nn.Module):
                             d_state=64,
                             expand=combiner_expand,
                             headdim=combiner_headdim,
-                            moe_enabled=moe_enabled,
+                            moe_enabled=combiner_moe_enabled,
                             moe_num_experts=moe_num_experts,
                             moe_expert_dim=moe_expert_dim,
                             moe_top_k=moe_top_k,
@@ -414,7 +421,7 @@ class SplitGraphDNC(nn.Module):
                     in_dim=combiner_in_dim,
                     d_model=hidden_size,
                     num_blocks=combiner_num_blocks,
-                    moe_enabled=moe_enabled,
+                    moe_enabled=combiner_moe_enabled,
                     moe_num_experts=moe_num_experts,
                     moe_expert_dim=moe_expert_dim,
                     moe_top_k=moe_top_k,
@@ -428,7 +435,7 @@ class SplitGraphDNC(nn.Module):
                     # concat -- see moe_layer.MultiSourceMoEBlock.
                     moe_source_dims=(
                         [hidden_size, self.read_vectors_size]
-                        if (moe_enabled and moe_cfc_multi_source)
+                        if (combiner_moe_enabled and moe_cfc_multi_source)
                         else None
                     ),
                     device=device,
@@ -441,7 +448,7 @@ class SplitGraphDNC(nn.Module):
                     d_state=_d_state,
                     d_conv=combiner_d_conv,
                     expand=combiner_expand,
-                    moe_enabled=moe_enabled,
+                    moe_enabled=combiner_moe_enabled,
                     moe_num_experts=moe_num_experts,
                     moe_expert_dim=moe_expert_dim,
                     moe_top_k=moe_top_k,
@@ -504,7 +511,8 @@ class SplitGraphDNC(nn.Module):
 
         # Keep a flat list of every active MoE block so the training loop can
         # collect auxiliary losses and routing diagnostics uniformly.
-        self.moe_enabled = moe_enabled
+        self.moe_enabled = backbone_moe_enabled or combiner_moe_enabled
+        self.moe_placement = moe_placement
         self.moe_cfc_multi_source = moe_cfc_multi_source
         # Flat list every pop_total_moe_aux_loss() call sums over: the
         # backbone's own per-block MoE sublayers, PLUS the combiner's (a

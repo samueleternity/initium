@@ -256,6 +256,12 @@ def _format_moe_layer_reports(diagnostics: dict) -> list[str]:
         importance = ",".join(
             f"{value:.2f}" for value in layer_diag.get("router_importance_frac", [])
         )
+        source_routes = layer_diag.get("source_routes") or []
+        source_summary = " ".join(
+            f"src{i}:accepted={source.get('accepted_route_frac', 0.0):.1%},"
+            f"drop={source.get('capacity_drop_frac', 0.0):.1%}"
+            for i, source in enumerate(source_routes)
+        )
         reports.append(
             f"moe-bank[{layer_diag['name']} "
             f"load=[{load}] importance=[{importance}] "
@@ -272,7 +278,8 @@ def _format_moe_layer_reports(diagnostics: dict) -> list[str]:
             f"moe_delta_rms/max={layer_diag.get('routed_output_rms', 0.0):.3g}/"
             f"{layer_diag.get('routed_output_absmax', 0.0):.3g} "
             f"drop={layer_diag.get('capacity_drop_frac', 0.0):.1%} "
-            f"gate_mass={layer_diag.get('accepted_gate_mass', 0.0):.2f}]"
+            f"gate_mass={layer_diag.get('accepted_gate_mass', 0.0):.2f}"
+            f"{(' ' + source_summary) if source_summary else ''}]"
         )
     return reports
 
@@ -639,6 +646,7 @@ def run(
     dynamic_n_trigger_frac: float = DYNAMIC_N_TRIGGER_FRAC,
     dynamic_n_cooldown_steps: int = DYNAMIC_N_COOLDOWN_STEPS,
     moe_enabled: bool = MOE_ENABLED,
+    split_graph_moe_placement: str = "all",
     moe_num_experts: int = MOE_NUM_EXPERTS,
     moe_expert_dim: int | None = MOE_EXPERT_DIM,
     moe_capacity_factor: float = MOE_CAPACITY_FACTOR,
@@ -706,12 +714,14 @@ def run(
                 "beta_effective",
                 "task_loss",
                 "kl_loss",
+                "kl_contrib",
                 "total_loss",
                 "digit_diversity",
                 "kl_mean",
                 "kl_max",
                 "kl_min",
                 "kl_std",
+                "clamp_frac",
                 "lr",
                 "grad_norm",
                 "amp_scale",
@@ -1168,12 +1178,13 @@ def run(
     if split_graph_enabled:
         if moe_enabled:
             print(
-                f"[{run_id}] moe_enabled=True with split_graph_enabled=True: MoE is now "
-                f"wired into both the parallel backbone and the sequential combiner (see "
-                f"split_graph_dnc.py). A combiner_variant='cfc' additionally routes its two "
+                f"[{run_id}] split-graph MoE placement={split_graph_moe_placement}: "
+                f"backbone={'on' if split_graph_moe_placement in ('all', 'backbone') else 'off'}, "
+                f"combiner={'on' if split_graph_moe_placement in ('all', 'combiner') else 'off'} "
+                f"(see split_graph_dnc.py). A combiner_variant='cfc' additionally routes its two "
                 f"natural input sources (backbone output, previous read vector) through "
-                f"per-source specialized experts when "
-                f"split_graph_combiner_cfc_multi_source_moe={split_graph_combiner_cfc_multi_source_moe} "
+                f"per-source specialized experts when active="
+                f"{split_graph_moe_placement in ('all', 'combiner') and split_graph_combiner_cfc_multi_source_moe} "
                 f"(see moe_layer.MultiSourceMoEBlock)."
             )
 
@@ -1215,6 +1226,7 @@ def run(
             combiner_num_blocks=split_graph_combiner_num_blocks,
             independent_linears=True,
             moe_enabled=moe_enabled,
+            moe_placement=split_graph_moe_placement,
             moe_num_experts=moe_num_experts,
             moe_expert_dim=moe_expert_dim,
             moe_top_k=moe_top_k,
@@ -1309,6 +1321,7 @@ def run(
             else None
         ),
         "split_graph_combiner_cfc_multi_source_moe": split_graph_combiner_cfc_multi_source_moe,
+        "split_graph_moe_placement": split_graph_moe_placement,
         "dnc_read_variant": dnc_read_variant,
         "dnc_read_residual_scale": dnc_read_residual_scale,
         "dnc_read_residual_max_ratio": dnc_read_residual_max_ratio,
@@ -2905,6 +2918,13 @@ if __name__ == "__main__":
         "/ moe_layer.py).",
     )
     parser.add_argument(
+        "--moe-placement",
+        choices=("all", "backbone", "combiner"),
+        default="all",
+        help="For split-graph MoE, enable experts in both components (all), "
+        "only the parallel backbone, or only the sequential combiner. Default: all.",
+    )
+    parser.add_argument(
         "--workspace", action="store_true",
         help="Phase 0 shared workspace: competitively write selected MoE expert outputs to persistent slots, then broadcast slots back to every specialist. Requires --split-graph and --moe.",
     )
@@ -3174,6 +3194,14 @@ if __name__ == "__main__":
         parser.error("--workspace requires --split-graph")
     if args.workspace and not args.moe:
         parser.error("--workspace requires --moe")
+    if args.moe_placement != "all" and not args.moe:
+        parser.error("--moe-placement backbone/combiner requires --moe")
+    if args.moe_placement != "all" and not args.split_graph:
+        parser.error("--moe-placement backbone/combiner requires --split-graph")
+    if args.moe_placement == "combiner" and args.split_graph_combiner_mode != "controller":
+        parser.error("--moe-placement combiner requires --split-graph-combiner-mode controller")
+    if args.workspace and args.moe_placement == "combiner":
+        parser.error("--workspace requires backbone MoE; use --moe-placement backbone or all")
     if args.workspace_num_slots < 0:
         parser.error("--workspace-num-slots must be >= 0")
 
@@ -3215,6 +3243,8 @@ if __name__ == "__main__":
             run_id = f"{run_id}_dynN"
         if args.moe:
             run_id = f"{run_id}_moe{args.moe_num_experts}e"
+            if args.split_graph and args.moe_placement != "all":
+                run_id += f"_{args.moe_placement}only"
         if args.workspace:
             run_id += f"_workspace{args.workspace_num_slots}s_{args.workspace_train_mode}"
             if args.workspace_no_selection:
@@ -3256,6 +3286,7 @@ if __name__ == "__main__":
             dynamic_n_trigger_frac=args.dynamic_n_trigger_frac,
             dynamic_n_cooldown_steps=args.dynamic_n_cooldown_steps,
             moe_enabled=args.moe,
+            split_graph_moe_placement=args.moe_placement,
             moe_num_experts=args.moe_num_experts,
             moe_expert_dim=args.moe_expert_dim,
             moe_capacity_factor=args.moe_capacity_factor,

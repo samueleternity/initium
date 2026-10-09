@@ -283,9 +283,21 @@ class CfCControllerWrapper(nn.Module):
         if self.moe_source_dims is None:
             raise RuntimeError("forward_multi_source requires moe_source_dims to have been set")
         assert self.source_in_adapters is not None and self.moe_blocks is not None
+        # Preserve the stock CfC input-fusion path exactly: the baseline
+        # receives one affine projection of concat([backbone, previous
+        # read]). The source-aware MoE is an additive residual around that
+        # fused representation. This keeps the memory signal and controller
+        # initialization intact while still allowing the experts to learn
+        # source-specific corrections.
+        concatenated = torch.cat(sources, dim=-1)
+        x = self.in_adapter(concatenated)
         projected = [adapter(s) for adapter, s in zip(self.source_in_adapters, sources)]
-        fused_per_source = self.moe_blocks[0](projected)  # list[Tensor], one per source
-        x = torch.stack(fused_per_source, dim=0).sum(dim=0)  # combine into one fused input
+        fused_per_source = self.moe_blocks[0](projected)  # source + routed delta
+        moe_delta = torch.stack(
+            [fused - source for fused, source in zip(fused_per_source, projected)],
+            dim=0,
+        ).sum(dim=0)
+        x = x + moe_delta
         if hx is None:
             hx = self.init_state(x.size(0), device=x.device)
         new_hx = []

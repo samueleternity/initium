@@ -575,7 +575,9 @@ def main(argv=None) -> int:
                         )
                         print(
                             f"      source {s_idx}: top_expert={s['top_expert']} "
-                            f"({s['top_expert_frac']:.2f}) | dist [{frac_str}]"
+                            f"({s['top_expert_frac']:.2f}) | dist [{frac_str}] "
+                            f"accepted={s.get('accepted_route_frac', 0.0):.1%} "
+                            f"drop={s.get('capacity_drop_frac', 0.0):.1%}"
                         )
 
     rl.print_summary(summary)

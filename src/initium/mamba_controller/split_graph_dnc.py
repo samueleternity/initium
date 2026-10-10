@@ -251,11 +251,6 @@ class SplitGraphDNC(nn.Module):
             raise ValueError(
                 "--workspace requires backbone MoE because it broadcasts to backbone specialists"
             )
-        if workspace_enabled and moe_backbone_residual_scale != 1.0:
-            raise ValueError(
-                "workspace specialist broadcasts do not use the backbone MoE residual; "
-                "moe_backbone_residual_scale must remain 1.0 with workspace_enabled"
-            )
         if workspace_train_mode not in ("coadapted", "frozen"):
             raise ValueError("workspace_train_mode must be 'coadapted' or 'frozen'")
         if workspace_enabled and workspace_train_mode == "frozen" and workspace_num_slots == 0:
@@ -636,7 +631,13 @@ class SplitGraphDNC(nn.Module):
                 reset_each_step=self.workspace_reset_each_step,
             )
             H = base.clone()
-            H[:, start_step:] = base[:, start_step:] + broadcast_delta
+            # The workspace returns the selected, broadcast-enriched MoE
+            # delta. Apply the same residual scale as the ordinary final MoE
+            # block to the complete delta so workspace and selection-only
+            # runs share a matched backbone residual setting.
+            H[:, start_step:] = base[:, start_step:] + (
+                self.moe_backbone_residual_scale * broadcast_delta
+            )
         else:
             backbone_stages = (
                 list(self.backbone)

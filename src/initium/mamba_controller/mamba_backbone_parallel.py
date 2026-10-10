@@ -312,6 +312,8 @@ class MambaBackboneParallel(nn.Module):
         Earlier backbone/MoE blocks remain unchanged. The final MoE block
         exposes expert deltas before routing so the workspace can broadcast
         context to every specialist, then reuse the original sparse route.
+        The split-graph caller applies this block's configured residual scale
+        to the combined routed and broadcast delta.
         """
         if not self.moe_enabled or self.moe_blocks is None:
             raise RuntimeError("workspace broadcast requires an enabled MoE expert pool")

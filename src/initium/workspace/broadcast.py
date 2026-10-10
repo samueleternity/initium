@@ -54,6 +54,47 @@ class WorkspaceBroadcast(nn.Module):
         no_selection: bool = False,
         reset_each_step: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Keep the zero-slot/closed-gate bypass identical to the selection-only
+        # MoE path. Active workspace attention and recurrent slot updates use
+        # fp32 even when the surrounding controller is under CUDA autocast.
+        if self.num_slots == 0 or self.write_gate_closed:
+            return self._forward_step(
+                specialist_deltas,
+                route_indices,
+                route_weights,
+                state,
+                no_selection=no_selection,
+                reset_each_step=reset_each_step,
+            )
+        if specialist_deltas.is_cuda:
+            with torch.autocast(device_type="cuda", enabled=False):
+                return self._forward_step(
+                    specialist_deltas.float(),
+                    route_indices,
+                    route_weights.float(),
+                    state.float(),
+                    no_selection=no_selection,
+                    reset_each_step=reset_each_step,
+                )
+        return self._forward_step(
+            specialist_deltas.float(),
+            route_indices,
+            route_weights.float(),
+            state.float(),
+            no_selection=no_selection,
+            reset_each_step=reset_each_step,
+        )
+
+    def _forward_step(
+        self,
+        specialist_deltas: torch.Tensor,
+        route_indices: torch.Tensor,
+        route_weights: torch.Tensor,
+        state: torch.Tensor,
+        *,
+        no_selection: bool = False,
+        reset_each_step: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.num_slots == 0 or self.write_gate_closed:
             selected = specialist_deltas.gather(
                 1, route_indices.unsqueeze(-1).expand(-1, -1, self.d_model)

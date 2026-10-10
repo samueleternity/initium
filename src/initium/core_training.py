@@ -1232,8 +1232,9 @@ def run(
                 print(
                     f"[{run_id}] backbone MoE residual scale="
                     f"{split_graph_moe_backbone_residual_scale:g} | "
-                    "MoE delta is scaled before its residual addition; router, "
-                    "experts, and auxiliary routing loss remain active."
+                    "applies to each backbone MoE residual, including the "
+                    "broadcast-enriched final bank when workspace is active; "
+                    "router, experts, and auxiliary routing loss remain active."
                 )
 
         # v10: variant-matched hyperparameter defaults instead of always
@@ -1338,6 +1339,7 @@ def run(
                 f"[{run_id}] WORKSPACE {'active' if workspace_active else 'bypassed'} | "
                 f"slots={workspace_num_slots} | write_selection={write_mode} | "
                 f"persistence={persistence} | train_mode={workspace_train_mode} | "
+                f"compute_precision={'fp32' if workspace_active else 'bypass'} | "
                 "scope=final-backbone-MoE-bank; each specialist reads shared slots"
             )
         else:
@@ -3040,6 +3042,7 @@ if __name__ == "__main__":
         metavar="SCALE",
         help="Multiply each active split-graph backbone MoE delta by SCALE "
         "before adding it to the backbone residual (default: 1.0, unchanged). "
+        "With --workspace, this also scales the final-bank broadcast contribution. "
         "Use with --moe-placement backbone or all; with all, combiner MoE "
         "residuals remain unscaled. In an isolation run, only the selected "
         "block's MoE residual is scaled.",
@@ -3352,8 +3355,6 @@ if __name__ == "__main__":
             parser.error(
                 "--moe-backbone-residual-scale requires --moe-placement backbone or all"
             )
-        if args.workspace:
-            parser.error("--moe-backbone-residual-scale cannot be combined with --workspace")
     if args.workspace and args.moe_placement == "combiner":
         parser.error("--workspace requires backbone MoE; use --moe-placement backbone or all")
     if args.workspace_num_slots < 0:

@@ -700,6 +700,7 @@ def run(
     dnc_read_residual_max_ratio: float = DNC_READ_RESIDUAL_MAX_RATIO,
     dnc_write_variant: str = DNC_WRITE_VARIANT,
     dnc_write_observation_variance: float = DNC_WRITE_OBSERVATION_VARIANCE,
+    dnc_backward_trace: bool = False,
     dataset_type: str = DATASET_TYPE,
     dataset_link: str | None = DATASET_LINK,
     test_dataset_link: str | None = None,
@@ -1294,6 +1295,17 @@ def run(
             workspace_train_mode=workspace_train_mode,
             device=device,
         ).to(device)
+        if dnc_backward_trace:
+            rnn.memories[0].set_backward_trace(True)
+            print(
+                f"[{run_id}] DNC backward trace enabled | watches usage, allocation, "
+                "patched prod/cumprod, write/read addressing, temporal links, "
+                "precedence, memory state and read vectors | forward equations unchanged"
+            )
+        print(
+            f"[{run_id}] DNC compute precision=fp32 | memory interface, addressing, "
+            "and recurrent state updates run outside CUDA autocast"
+        )
     else:
         rnn = MambaDNC(
             input_size=INPUT_DIM,
@@ -1378,6 +1390,8 @@ def run(
         "dnc_read_residual_max_ratio": dnc_read_residual_max_ratio,
         "dnc_write_variant": dnc_write_variant,
         "dnc_write_observation_variance": dnc_write_observation_variance,
+        "dnc_compute_precision": "fp32",
+        "dnc_backward_trace": dnc_backward_trace,
         "workspace_enabled": workspace_enabled,
         "workspace_num_slots": workspace_num_slots,
         "workspace_no_selection": workspace_no_selection,
@@ -1404,6 +1418,13 @@ def run(
 
     def emit_failure_diagnostics(channel: str, *, include_gradients: bool = False) -> None:
         segment_diagnostics.emit(channel, include_gradients=include_gradients)
+        if dnc_backward_trace and split_graph_enabled:
+            memory_diag = rnn.memories[0].pop_numerical_diagnostics()
+            if memory_diag:
+                print(
+                    f"[dnc-numerics:{channel}] "
+                    + " ".join(f"{name}={value:.4g}" for name, value in memory_diag.items())
+                )
         if moe_enabled:
             _, failure_moe_diag = pop_total_moe_aux_loss(
                 rnn.moe_layers, include_diagnostics=True
@@ -1721,6 +1742,8 @@ def run(
         optimizer.zero_grad(set_to_none=True)
 
         segment_diagnostics.set_channel("train")
+        if dnc_backward_trace and split_graph_enabled:
+            rnn.memories[0].set_backward_trace(True, step=step)
         with torch.amp.autocast("cuda", enabled=amp_enabled):
             if split_graph_enabled:
                 # Graph episodes are variable length and collate_fn pads them
@@ -2007,6 +2030,15 @@ def run(
                 parts.append(dyn_n_str.strip(" |"))
             print(" | ".join(parts))
             segment_diagnostics.emit("train", include_gradients=True)
+            if dnc_backward_trace and split_graph_enabled:
+                memory_diag = rnn.memories[0].pop_numerical_diagnostics()
+                if memory_diag:
+                    print(
+                        f"[dnc-numerics:train] step={step} "
+                        + " ".join(
+                            f"{name}={value:.4g}" for name, value in memory_diag.items()
+                        )
+                    )
 
             if (
                 track_b_writer is not None
@@ -3171,6 +3203,12 @@ if __name__ == "__main__":
         help="Fixed positive observation variance for the Kanerva-style write.",
     )
     parser.add_argument(
+        "--dnc-backward-trace",
+        action="store_true",
+        help="Trace the first non-finite gradient through DNC internals and report "
+        "windowed memory/read/link magnitudes. Diagnostic only; adds synchronization.",
+    )
+    parser.add_argument(
         "--dataset-type",
         type=str,
         default=DATASET_TYPE,
@@ -3237,6 +3275,8 @@ if __name__ == "__main__":
         parser.error("--prepare-only cannot be combined with --load-prepared")
     if args.dnc_write_observation_variance <= 0:
         parser.error("--dnc-write-observation-variance must be positive")
+    if args.dnc_backward_trace and not args.split_graph:
+        parser.error("--dnc-backward-trace requires --split-graph")
     if args.dnc_read_residual_scale < 0:
         parser.error("--dnc-read-residual-scale must be non-negative")
     if args.dnc_read_residual_max_ratio < 0:
@@ -3371,6 +3411,8 @@ if __name__ == "__main__":
                 run_id += "_resetstep"
         if args.split_graph:
             run_id = f"{run_id}_splitgraph_{args.split_graph_variant.replace('+', '')}"
+            if args.dnc_backward_trace:
+                run_id += "_dncbacktrace"
             if args.dnc_read_variant != "cosine" or args.dnc_write_variant != "learned":
                 run_id += f"_read-{args.dnc_read_variant}_write-{args.dnc_write_variant}"
             if args.dnc_read_variant == "relational-residual":
@@ -3430,6 +3472,7 @@ if __name__ == "__main__":
             dnc_read_residual_max_ratio=args.dnc_read_residual_max_ratio,
             dnc_write_variant=args.dnc_write_variant,
             dnc_write_observation_variance=args.dnc_write_observation_variance,
+            dnc_backward_trace=args.dnc_backward_trace,
             dataset_type=args.dataset_type,
             dataset_link=args.dataset_link,
             test_dataset_link=args.test_dataset_link,

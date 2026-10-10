@@ -675,6 +675,7 @@ def run(
     moe_enabled: bool = MOE_ENABLED,
     split_graph_moe_placement: str = "all",
     split_graph_moe_backbone_block_isolation: int | None = None,
+    split_graph_moe_backbone_residual_scale: float = 1.0,
     moe_num_experts: int = MOE_NUM_EXPERTS,
     moe_expert_dim: int | None = MOE_EXPERT_DIM,
     moe_capacity_factor: float = MOE_CAPACITY_FACTOR,
@@ -1226,6 +1227,13 @@ def run(
                     f"(zero-based per backbone stage; all other backbone blocks run without MoE). "
                     f"{routing_note}"
                 )
+            if split_graph_moe_backbone_residual_scale != 1.0:
+                print(
+                    f"[{run_id}] backbone MoE residual scale="
+                    f"{split_graph_moe_backbone_residual_scale:g} | "
+                    "MoE delta is scaled before its residual addition; router, "
+                    "experts, and auxiliary routing loss remain active."
+                )
 
         # v10: variant-matched hyperparameter defaults instead of always
         # reusing the Mamba-1 constants here -- harmless previously (any
@@ -1272,6 +1280,7 @@ def run(
             moe_top_k=moe_top_k,
             moe_capacity_factor=moe_capacity_factor,
             moe_load_balance_alpha=moe_load_balance_alpha,
+            moe_backbone_residual_scale=split_graph_moe_backbone_residual_scale,
             moe_cfc_multi_source=split_graph_combiner_cfc_multi_source_moe,
             dnc_read_variant=dnc_read_variant,
             dnc_read_residual_scale=dnc_read_residual_scale,
@@ -1363,6 +1372,7 @@ def run(
         "split_graph_combiner_cfc_multi_source_moe": split_graph_combiner_cfc_multi_source_moe,
         "split_graph_moe_placement": split_graph_moe_placement,
         "split_graph_moe_backbone_block_isolation": split_graph_moe_backbone_block_isolation,
+        "split_graph_moe_backbone_residual_scale": split_graph_moe_backbone_residual_scale,
         "dnc_read_variant": dnc_read_variant,
         "dnc_read_residual_scale": dnc_read_residual_scale,
         "dnc_read_residual_max_ratio": dnc_read_residual_max_ratio,
@@ -2992,6 +3002,17 @@ if __name__ == "__main__":
         "--moe-placement backbone).",
     )
     parser.add_argument(
+        "--moe-backbone-residual-scale",
+        type=float,
+        default=1.0,
+        metavar="SCALE",
+        help="Multiply each active split-graph backbone MoE delta by SCALE "
+        "before adding it to the backbone residual (default: 1.0, unchanged). "
+        "Use with --moe-placement backbone or all; with all, combiner MoE "
+        "residuals remain unscaled. In an isolation run, only the selected "
+        "block's MoE residual is scaled.",
+    )
+    parser.add_argument(
         "--workspace", action="store_true",
         help="Phase 0 shared workspace: competitively write selected MoE expert outputs to persistent slots, then broadcast slots back to every specialist. Requires --split-graph and --moe.",
     )
@@ -3282,6 +3303,17 @@ if __name__ == "__main__":
                 "--moe-backbone-block-isolation must be in [0, "
                 f"{args.split_graph_num_blocks - 1}] for the configured number of blocks"
             )
+    if not math.isfinite(args.moe_backbone_residual_scale) or args.moe_backbone_residual_scale < 0.0:
+        parser.error("--moe-backbone-residual-scale must be finite and >= 0")
+    if args.moe_backbone_residual_scale != 1.0:
+        if not args.moe or not args.split_graph:
+            parser.error("--moe-backbone-residual-scale requires --moe and --split-graph")
+        if args.moe_placement not in ("backbone", "all"):
+            parser.error(
+                "--moe-backbone-residual-scale requires --moe-placement backbone or all"
+            )
+        if args.workspace:
+            parser.error("--moe-backbone-residual-scale cannot be combined with --workspace")
     if args.workspace and args.moe_placement == "combiner":
         parser.error("--workspace requires backbone MoE; use --moe-placement backbone or all")
     if args.workspace_num_slots < 0:
@@ -3329,6 +3361,8 @@ if __name__ == "__main__":
                 run_id += f"_{args.moe_placement}only"
             if args.moe_backbone_block_isolation is not None:
                 run_id += f"_backboneblock{args.moe_backbone_block_isolation}only"
+            if args.moe_backbone_residual_scale != 1.0:
+                run_id += f"_backbonerscale{args.moe_backbone_residual_scale:g}"
         if args.workspace:
             run_id += f"_workspace{args.workspace_num_slots}s_{args.workspace_train_mode}"
             if args.workspace_no_selection:
@@ -3372,6 +3406,7 @@ if __name__ == "__main__":
             moe_enabled=args.moe,
             split_graph_moe_placement=args.moe_placement,
             split_graph_moe_backbone_block_isolation=args.moe_backbone_block_isolation,
+            split_graph_moe_backbone_residual_scale=args.moe_backbone_residual_scale,
             moe_num_experts=args.moe_num_experts,
             moe_expert_dim=args.moe_expert_dim,
             moe_capacity_factor=args.moe_capacity_factor,

@@ -188,6 +188,7 @@ class SplitGraphDNC(nn.Module):
         moe_top_k: int = 1,
         moe_capacity_factor: float = 1.5,
         moe_load_balance_alpha: float = 0.01,
+        moe_backbone_residual_scale: float = 1.0,
         # When combiner_variant == "cfc" (standalone, not part of a hybrid
         # combiner chain) and moe_enabled, route the combiner's two natural
         # inputs -- backbone output h_t and the previous read vector --
@@ -236,6 +237,7 @@ class SplitGraphDNC(nn.Module):
         self.dnc_read_residual_max_ratio = dnc_read_residual_max_ratio
         self.dnc_write_variant = dnc_write_variant
         self.dnc_write_observation_variance = dnc_write_observation_variance
+        self.moe_backbone_residual_scale = moe_backbone_residual_scale
         if moe_placement not in ("all", "backbone", "combiner"):
             raise ValueError("moe_placement must be 'all', 'backbone', or 'combiner'")
         backbone_moe_enabled = moe_enabled and moe_placement in ("all", "backbone")
@@ -248,6 +250,11 @@ class SplitGraphDNC(nn.Module):
         if workspace_enabled and not backbone_moe_enabled:
             raise ValueError(
                 "--workspace requires backbone MoE because it broadcasts to backbone specialists"
+            )
+        if workspace_enabled and moe_backbone_residual_scale != 1.0:
+            raise ValueError(
+                "workspace specialist broadcasts do not use the backbone MoE residual; "
+                "moe_backbone_residual_scale must remain 1.0 with workspace_enabled"
             )
         if workspace_train_mode not in ("coadapted", "frozen"):
             raise ValueError("workspace_train_mode must be 'coadapted' or 'frozen'")
@@ -282,6 +289,7 @@ class SplitGraphDNC(nn.Module):
             moe_top_k=moe_top_k,
             moe_capacity_factor=moe_capacity_factor,
             moe_load_balance_alpha=moe_load_balance_alpha,
+            moe_residual_scale=moe_backbone_residual_scale,
             moe_block_isolation=moe_backbone_block_isolation,
             device=device,
         )

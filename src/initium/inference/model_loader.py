@@ -193,6 +193,9 @@ def _build_split_graph(c: _Cfg, input_dim, hidden, nr_cells, cell_size, read_hea
         moe_backbone_block_isolation=c.get(
             "split_graph_moe_backbone_block_isolation", None
         ),
+        moe_backbone_residual_scale=c.get(
+            "split_graph_moe_backbone_residual_scale", 1.0
+        ),
         moe_num_experts=_moe["moe_num_experts"],
         moe_expert_dim=_moe["moe_expert_dim"],
         moe_top_k=_moe["moe_top_k"],

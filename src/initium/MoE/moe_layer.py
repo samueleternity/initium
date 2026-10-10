@@ -81,6 +81,8 @@ itself check (see Experiment-Roadmap.md, "Option 4" failure-mode table):
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -504,10 +506,16 @@ class MoEBlock(nn.Module):
         router_noise_eps: float = 1e-2,
         load_balance_alpha: float = 0.01,
         top_k: int = 1,
+        residual_scale: float = 1.0,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
     ):
         super().__init__()
+        if not math.isfinite(residual_scale) or residual_scale < 0.0:
+            raise ValueError(
+                f"MoEBlock residual_scale must be finite and >= 0, got {residual_scale!r}"
+            )
+        self.residual_scale = float(residual_scale)
         self.norm = nn.LayerNorm(d_model, device=device, dtype=dtype)
         self.moe = SwitchMoE(
             d_model,
@@ -532,11 +540,12 @@ class MoEBlock(nn.Module):
         token_mask: torch.Tensor | None = None,
     ):
         if not return_details:
-            return x + self.moe(self.norm(x), token_mask=token_mask)
+            routed = self.moe(self.norm(x), token_mask=token_mask)
+            return x + self.residual_scale * routed
         routed, experts, indices, weights = self.moe(
             self.norm(x), return_details=True, token_mask=token_mask
         )
-        return x + routed, experts, indices, weights
+        return x + self.residual_scale * routed, experts, indices, weights
 
     def pop_aux_loss(self) -> torch.Tensor:
         return self.moe.pop_aux_loss()

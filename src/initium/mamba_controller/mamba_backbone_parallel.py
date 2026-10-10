@@ -224,6 +224,7 @@ class MambaBackboneParallel(nn.Module):
         moe_top_k: int = 1,
         moe_capacity_factor: float = 1.5,
         moe_load_balance_alpha: float = 0.01,
+        moe_residual_scale: float = 1.0,
         moe_block_isolation: int | None = None,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
@@ -277,6 +278,7 @@ class MambaBackboneParallel(nn.Module):
                             top_k=moe_top_k,
                             capacity_factor=moe_capacity_factor,
                             load_balance_alpha=moe_load_balance_alpha,
+                            residual_scale=moe_residual_scale,
                             device=device,
                             dtype=dtype,
                         )

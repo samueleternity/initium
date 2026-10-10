@@ -100,6 +100,7 @@ class CfCBackboneParallel(nn.Module):
         moe_top_k: int = 1,
         moe_capacity_factor: float = 1.5,
         moe_load_balance_alpha: float = 0.01,
+        moe_residual_scale: float = 1.0,
         moe_block_isolation: int | None = None,
         device=None,
         dtype=None,
@@ -151,6 +152,7 @@ class CfCBackboneParallel(nn.Module):
                             top_k=moe_top_k,
                             capacity_factor=moe_capacity_factor,
                             load_balance_alpha=moe_load_balance_alpha,
+                            residual_scale=moe_residual_scale,
                             device=device,
                             dtype=dtype,
                         )
@@ -213,6 +215,7 @@ def build_parallel_backbone(
     moe_top_k: int = 1,
     moe_capacity_factor: float = 1.5,
     moe_load_balance_alpha: float = 0.01,
+    moe_residual_scale: float = 1.0,
     moe_block_isolation: int | None = None,
     device=None,
     dtype=None,
@@ -241,6 +244,7 @@ def build_parallel_backbone(
                     moe_top_k=moe_top_k,
                     moe_capacity_factor=moe_capacity_factor,
                     moe_load_balance_alpha=moe_load_balance_alpha,
+                    moe_residual_scale=moe_residual_scale,
                     moe_block_isolation=moe_block_isolation,
                     **(cfc_kwargs or {}),
                 )
@@ -264,6 +268,7 @@ def build_parallel_backbone(
                     moe_top_k=moe_top_k,
                     moe_capacity_factor=moe_capacity_factor,
                     moe_load_balance_alpha=moe_load_balance_alpha,
+                    moe_residual_scale=moe_residual_scale,
                     moe_block_isolation=moe_block_isolation,
                 )
             )

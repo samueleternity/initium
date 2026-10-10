@@ -189,6 +189,13 @@ def _build_split_graph(c: _Cfg, input_dim, hidden, nr_cells, cell_size, read_hea
         ),
         independent_linears=True,
         moe_enabled=_moe["moe_enabled"],
+        moe_placement=c.get("split_graph_moe_placement", "all"),
+        moe_backbone_block_isolation=c.get(
+            "split_graph_moe_backbone_block_isolation", None
+        ),
+        moe_backbone_residual_scale=c.get(
+            "split_graph_moe_backbone_residual_scale", 1.0
+        ),
         moe_num_experts=_moe["moe_num_experts"],
         moe_expert_dim=_moe["moe_expert_dim"],
         moe_top_k=_moe["moe_top_k"],
@@ -198,6 +205,15 @@ def _build_split_graph(c: _Cfg, input_dim, hidden, nr_cells, cell_size, read_hea
             "split_graph_combiner_cfc_multi_source_moe",
             cc.SPLIT_GRAPH_COMBINER_CFC_MULTI_SOURCE_MOE,
         ),
+        workspace_enabled=c.get("workspace_enabled", cc.WORKSPACE_ENABLED),
+        workspace_num_slots=c.get("workspace_num_slots", cc.WORKSPACE_NUM_SLOTS),
+        workspace_no_selection=c.get(
+            "workspace_no_selection", cc.WORKSPACE_NO_SELECTION
+        ),
+        workspace_reset_each_step=c.get(
+            "workspace_reset_each_step", cc.WORKSPACE_RESET_EACH_STEP
+        ),
+        workspace_train_mode=c.get("workspace_train_mode", cc.WORKSPACE_TRAIN_MODE),
         device=device,
     ).to(device)
 

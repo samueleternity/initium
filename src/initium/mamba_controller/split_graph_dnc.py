@@ -42,10 +42,10 @@ the backbone's parallel output as an input stream":
       this project has built, so this doesn't add a new bottleneck, it
       just stops making the (much more expensive) backbone share it.
 
-Requirement from the roadmap's own methodological note on this option: "do
-not layer them all at once... Concept 16 / Suspected Pattern SP-10". This
-module therefore deliberately does NOT wire in Option 4's MoE (moe_enabled
-raises if set) -- Option 5 must be run and ablated on its own first.
+The split graph can compose with the existing external MoE blocks. The
+optional shared workspace is a separate Phase 0 feature and requires those
+MoE specialists; it operates on the final parallel-backbone MoE bank while
+leaving earlier MoE blocks unchanged.
 
 --- Built-in ablation for the roadmap's own required verification --------
 "Verify [the design] preserves the exact 'read now, decide next hop
@@ -128,6 +128,7 @@ from initium.mamba_controller.mamba2_controller import Mamba2ControllerWrapper
 from initium.mamba_controller.mamba3_controller import Mamba3ControllerWrapper
 from initium.mamba_controller.mamba_controller import MambaControllerWrapper
 from initium.memory_manipulation.dnc_mechanisms import build_memory
+from initium.workspace.broadcast import WorkspaceBroadcast
 
 
 class SplitGraphDNC(nn.Module):
@@ -180,11 +181,14 @@ class SplitGraphDNC(nn.Module):
         independent_linears: bool = True,
         device: torch.device | None = None,
         moe_enabled: bool = False,
+        moe_placement: str = "all",
+        moe_backbone_block_isolation: int | None = None,
         moe_num_experts: int = 8,
         moe_expert_dim: int | None = None,
         moe_top_k: int = 1,
         moe_capacity_factor: float = 1.5,
         moe_load_balance_alpha: float = 0.01,
+        moe_backbone_residual_scale: float = 1.0,
         # When combiner_variant == "cfc" (standalone, not part of a hybrid
         # combiner chain) and moe_enabled, route the combiner's two natural
         # inputs -- backbone output h_t and the previous read vector --
@@ -200,6 +204,11 @@ class SplitGraphDNC(nn.Module):
         dnc_read_residual_max_ratio: float = 0.5,
         dnc_write_variant: str = "learned",
         dnc_write_observation_variance: float = 1.0,
+        workspace_enabled: bool = False,
+        workspace_num_slots: int = 5,
+        workspace_no_selection: bool = False,
+        workspace_reset_each_step: bool = False,
+        workspace_train_mode: str = "coadapted",
     ):
         super().__init__()
         if not independent_linears:
@@ -228,6 +237,29 @@ class SplitGraphDNC(nn.Module):
         self.dnc_read_residual_max_ratio = dnc_read_residual_max_ratio
         self.dnc_write_variant = dnc_write_variant
         self.dnc_write_observation_variance = dnc_write_observation_variance
+        self.moe_backbone_residual_scale = moe_backbone_residual_scale
+        if moe_placement not in ("all", "backbone", "combiner"):
+            raise ValueError("moe_placement must be 'all', 'backbone', or 'combiner'")
+        backbone_moe_enabled = moe_enabled and moe_placement in ("all", "backbone")
+        combiner_moe_enabled = moe_enabled and moe_placement in ("all", "combiner")
+        if moe_backbone_block_isolation is not None and not backbone_moe_enabled:
+            raise ValueError(
+                "moe_backbone_block_isolation requires active backbone MoE "
+                "(moe_enabled=True and moe_placement='backbone')"
+            )
+        if workspace_enabled and not backbone_moe_enabled:
+            raise ValueError(
+                "--workspace requires backbone MoE because it broadcasts to backbone specialists"
+            )
+        if workspace_train_mode not in ("coadapted", "frozen"):
+            raise ValueError("workspace_train_mode must be 'coadapted' or 'frozen'")
+        if workspace_enabled and workspace_train_mode == "frozen" and workspace_num_slots == 0:
+            raise ValueError("frozen workspace training requires workspace_num_slots > 0")
+        self.workspace_enabled = workspace_enabled
+        self.workspace_num_slots = workspace_num_slots
+        self.workspace_no_selection = workspace_no_selection
+        self.workspace_reset_each_step = workspace_reset_each_step
+        self.workspace_train_mode = workspace_train_mode
 
         # Mamba bookkeeping, for checkpoint self-description -- same
         # rationale/convention as MambaDNC (mamba_controller.py).
@@ -246,12 +278,14 @@ class SplitGraphDNC(nn.Module):
             expand=mamba_expand,
             headdim=mamba_headdim,
             cfc_kwargs=cfc_kwargs,
-            moe_enabled=moe_enabled,
+            moe_enabled=backbone_moe_enabled,
             moe_num_experts=moe_num_experts,
             moe_expert_dim=moe_expert_dim,
             moe_top_k=moe_top_k,
             moe_capacity_factor=moe_capacity_factor,
             moe_load_balance_alpha=moe_load_balance_alpha,
+            moe_residual_scale=moe_backbone_residual_scale,
+            moe_block_isolation=moe_backbone_block_isolation,
             device=device,
         )
 
@@ -318,7 +352,7 @@ class SplitGraphDNC(nn.Module):
                     expand=combiner_expand,
                     headdim=combiner_headdim,
                     ngroups=combiner_ngroups,
-                    moe_enabled=moe_enabled,
+                    moe_enabled=combiner_moe_enabled,
                     moe_num_experts=moe_num_experts,
                     moe_expert_dim=moe_expert_dim,
                     moe_top_k=moe_top_k,
@@ -334,7 +368,7 @@ class SplitGraphDNC(nn.Module):
                     d_state=_d_state,
                     expand=combiner_expand,
                     headdim=combiner_headdim,
-                    moe_enabled=moe_enabled,
+                    moe_enabled=combiner_moe_enabled,
                     moe_num_experts=moe_num_experts,
                     moe_expert_dim=moe_expert_dim,
                     moe_top_k=moe_top_k,
@@ -357,7 +391,7 @@ class SplitGraphDNC(nn.Module):
                             d_state=16,
                             d_conv=combiner_d_conv,
                             expand=combiner_expand,
-                            moe_enabled=moe_enabled,
+                            moe_enabled=combiner_moe_enabled,
                             moe_num_experts=moe_num_experts,
                             moe_expert_dim=moe_expert_dim,
                             moe_top_k=moe_top_k,
@@ -370,7 +404,7 @@ class SplitGraphDNC(nn.Module):
                             expand=combiner_expand,
                             headdim=combiner_headdim,
                             ngroups=combiner_ngroups,
-                            moe_enabled=moe_enabled,
+                            moe_enabled=combiner_moe_enabled,
                             moe_num_experts=moe_num_experts,
                             moe_expert_dim=moe_expert_dim,
                             moe_top_k=moe_top_k,
@@ -381,7 +415,7 @@ class SplitGraphDNC(nn.Module):
                             d_state=64,
                             expand=combiner_expand,
                             headdim=combiner_headdim,
-                            moe_enabled=moe_enabled,
+                            moe_enabled=combiner_moe_enabled,
                             moe_num_experts=moe_num_experts,
                             moe_expert_dim=moe_expert_dim,
                             moe_top_k=moe_top_k,
@@ -397,7 +431,7 @@ class SplitGraphDNC(nn.Module):
                     in_dim=combiner_in_dim,
                     d_model=hidden_size,
                     num_blocks=combiner_num_blocks,
-                    moe_enabled=moe_enabled,
+                    moe_enabled=combiner_moe_enabled,
                     moe_num_experts=moe_num_experts,
                     moe_expert_dim=moe_expert_dim,
                     moe_top_k=moe_top_k,
@@ -411,7 +445,7 @@ class SplitGraphDNC(nn.Module):
                     # concat -- see moe_layer.MultiSourceMoEBlock.
                     moe_source_dims=(
                         [hidden_size, self.read_vectors_size]
-                        if (moe_enabled and moe_cfc_multi_source)
+                        if (combiner_moe_enabled and moe_cfc_multi_source)
                         else None
                     ),
                     device=device,
@@ -424,7 +458,7 @@ class SplitGraphDNC(nn.Module):
                     d_state=_d_state,
                     d_conv=combiner_d_conv,
                     expand=combiner_expand,
-                    moe_enabled=moe_enabled,
+                    moe_enabled=combiner_moe_enabled,
                     moe_num_experts=moe_num_experts,
                     moe_expert_dim=moe_expert_dim,
                     moe_top_k=moe_top_k,
@@ -467,16 +501,28 @@ class SplitGraphDNC(nn.Module):
 
         self.output = nn.Linear(self.nn_output_size, self.input_size, device=device)
         torch.nn.init.kaiming_uniform_(self.output.weight)
+        if workspace_num_slots < 0:
+            raise ValueError("workspace_num_slots must be >= 0")
+        # Build the optional module last so enabling it leaves the existing
+        # backbone, combiner, DNC, and output-projection initializations and
+        # subsequent global RNG stream intact for matched-seed controls.
+        rng_state = (
+            torch.random.get_rng_state()
+            if workspace_enabled and workspace_num_slots > 0
+            else None
+        )
+        self.workspace = (
+            WorkspaceBroadcast(hidden_size, moe_num_experts, workspace_num_slots)
+            if workspace_enabled and workspace_num_slots > 0
+            else None
+        )
+        if rng_state is not None:
+            torch.random.set_rng_state(rng_state)
 
-        # Option 4 (MoE) interoperability: kept OFF and deliberately NOT
-        # wired into the backbone blocks here (unlike mamba_controller.py's
-        # MambaControllerWrapper) -- Concept 16/SP-10 (non-additive
-        # combination) is why Option 5 is being built and ablated on its
-        # own first. moe_layers stays an empty list so
-        # pop_total_moe_aux_loss(...) (moe_layer.py) is still safe to call
-        # unconditionally from the training script regardless of which
-        # controller is active this run.
-        self.moe_enabled = moe_enabled
+        # Keep a flat list of every active MoE block so the training loop can
+        # collect auxiliary losses and routing diagnostics uniformly.
+        self.moe_enabled = backbone_moe_enabled or combiner_moe_enabled
+        self.moe_placement = moe_placement
         self.moe_cfc_multi_source = moe_cfc_multi_source
         # Flat list every pop_total_moe_aux_loss() call sums over: the
         # backbone's own per-block MoE sublayers, PLUS the combiner's (a
@@ -501,6 +547,7 @@ class SplitGraphDNC(nn.Module):
         pass_through_memory: bool = True,
         combiner_skip_stages=None,
         start_step: int = 0,  # v20: resume the sequential loop mid-sequence (inference caching)
+        sequence_valid_mask: torch.Tensor | None = None,
     ):
         """
         input: (B, T, input_size) -- batch-first, the whole padded episode
@@ -518,6 +565,9 @@ class SplitGraphDNC(nn.Module):
             the functional-usage ablation check
             (evaluate_traversal(..., ablate_memory=True)) already wired
             into this project's training loop; see module docstring.
+        sequence_valid_mask: optional (B, T) mask forwarded to backbone MoE
+            banks for valid-versus-padding routing diagnostics. It does not
+            mask backbone computation, MoE dispatch, or memory execution.
 
         Returns (output, (chx, mhx, last_read)) with output shaped
         (T, B, input_size) -- see module docstring for why this shape,
@@ -525,6 +575,20 @@ class SplitGraphDNC(nn.Module):
         """
         chx, mhx, last_read = hx
         B, T, _ = input.shape
+        combiner_hx_in = chx
+        workspace_state = None
+        if self.workspace is not None:
+            if isinstance(chx, dict) and "_initium_workspace_state" in chx:
+                workspace_state = chx["_initium_workspace_state"]
+                combiner_hx_in = chx.get("_initium_combiner_state")
+            if start_step > 0 and workspace_state is None:
+                raise ValueError(
+                    "workspace-enabled start_step>0 requires workspace state in hx[0]"
+                )
+            if workspace_state is None or reset_experience:
+                workspace_state = self.workspace.init_state(
+                    B, device=input.device, dtype=input.dtype
+                )
         if start_step:
             # Backbone still runs over the FULL input (cheap, parallel, stateless across
             # calls); only the sequential memory loop is skipped for t < start_step.
@@ -539,7 +603,50 @@ class SplitGraphDNC(nn.Module):
         # Single call, whole sequence, zero dependency on memory state.
         # This is the entire "removed from the sequential critical path"
         # half of Option 5.
-        H = self.backbone(input)  # (B, T, hidden_size)
+        if self.workspace is not None:
+            backbone_stages = (
+                list(self.backbone)
+                if isinstance(self.backbone, nn.Sequential)
+                else [self.backbone]
+            )
+            stage_input = input
+            for stage in backbone_stages[:-1]:
+                stage_input = stage(stage_input, token_mask=sequence_valid_mask)
+            final_stage = backbone_stages[-1]
+            if not hasattr(final_stage, "forward_with_specialists"):
+                raise RuntimeError(
+                    "workspace requires the final parallel-backbone stage to expose its MoE specialists"
+                )
+            base, specialists, route_indices, route_weights = (
+                final_stage.forward_with_specialists(
+                    stage_input, token_mask=sequence_valid_mask
+                )
+            )
+            broadcast_delta, workspace_state = self.workspace(
+                specialists[:, start_step:],
+                route_indices[:, start_step:],
+                route_weights[:, start_step:],
+                workspace_state,
+                no_selection=self.workspace_no_selection,
+                reset_each_step=self.workspace_reset_each_step,
+            )
+            H = base.clone()
+            # The workspace returns the selected, broadcast-enriched MoE
+            # delta. Apply the same residual scale as the ordinary final MoE
+            # block to the complete delta so workspace and selection-only
+            # runs share a matched backbone residual setting.
+            H[:, start_step:] = base[:, start_step:] + (
+                self.moe_backbone_residual_scale * broadcast_delta
+            )
+        else:
+            backbone_stages = (
+                list(self.backbone)
+                if isinstance(self.backbone, nn.Sequential)
+                else [self.backbone]
+            )
+            H = input
+            for stage in backbone_stages:
+                H = stage(H, token_mask=sequence_valid_mask)
 
         # ---- memory hidden-state init (byte-identical convention to
         # dnc.DNC._init_hidden / MambaDNC._init_hidden's memory branch) ---
@@ -576,8 +683,8 @@ class SplitGraphDNC(nn.Module):
         if self.combiner_mode == "controller":
             assert self.combiner_wrapper is not None
             combiner_hx = (
-                chx
-                if chx is not None
+                combiner_hx_in
+                if combiner_hx_in is not None
                 else self.combiner_wrapper.init_state(B, device=device, dtype=H.dtype)
             )
 
@@ -631,6 +738,16 @@ class SplitGraphDNC(nn.Module):
         if self.combiner_mode == "controller":
             chx = combiner_hx  # v11: expose the controller combiner's final state, same
             # convention as mem_state -> mhx just above
+
+        if self.workspace is not None:
+            chx = {
+                "_initium_workspace_state": workspace_state,
+                "_initium_combiner_state": (
+                    combiner_hx
+                    if self.combiner_mode == "controller"
+                    else combiner_hx_in
+                ),
+            }
 
         mhx = [mem_state]
         output = torch.stack(outputs, dim=0)  # (T, B, input_size)

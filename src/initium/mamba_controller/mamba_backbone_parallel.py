@@ -224,6 +224,8 @@ class MambaBackboneParallel(nn.Module):
         moe_top_k: int = 1,
         moe_capacity_factor: float = 1.5,
         moe_load_balance_alpha: float = 0.01,
+        moe_residual_scale: float = 1.0,
+        moe_block_isolation: int | None = None,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
     ):
@@ -233,6 +235,11 @@ class MambaBackboneParallel(nn.Module):
         self.d_model = d_model
         self.moe_enabled = moe_enabled
         self.moe_blocks: nn.ModuleList | None = None
+        if moe_block_isolation is not None and not 0 <= moe_block_isolation < num_blocks:
+            raise ValueError(
+                f"moe_block_isolation={moe_block_isolation} is outside "
+                f"the configured backbone block range [0, {num_blocks - 1}]"
+            )
 
         # Same role as MambaControllerWrapper's in_adapter: DNC's raw
         # per-timestep input (input_size) generally differs from
@@ -263,21 +270,28 @@ class MambaBackboneParallel(nn.Module):
         if moe_enabled:
             self.moe_blocks = nn.ModuleList(
                 [
-                    MoEBlock(
-                        d_model,
-                        num_experts=moe_num_experts,
-                        expert_dim=moe_expert_dim,
-                        top_k=moe_top_k,
-                        capacity_factor=moe_capacity_factor,
-                        load_balance_alpha=moe_load_balance_alpha,
-                        device=device,
-                        dtype=dtype,
+                    (
+                        MoEBlock(
+                            d_model,
+                            num_experts=moe_num_experts,
+                            expert_dim=moe_expert_dim,
+                            top_k=moe_top_k,
+                            capacity_factor=moe_capacity_factor,
+                            load_balance_alpha=moe_load_balance_alpha,
+                            residual_scale=moe_residual_scale,
+                            device=device,
+                            dtype=dtype,
+                        )
+                        if moe_block_isolation is None or i == moe_block_isolation
+                        else nn.Identity()
                     )
-                    for _ in range(num_blocks)
+                    for i in range(num_blocks)
                 ]
             )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, *, token_mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
         # x: (B, L, in_dim) -> (B, L, d_model). Called EXACTLY ONCE per
         # training step (not once per DNC timestep, unlike
         # MambaControllerWrapper) -- this single call is the entire
@@ -285,7 +299,38 @@ class MambaBackboneParallel(nn.Module):
         h = self.in_adapter(x)
         for i, block in enumerate(self.blocks):
             h = block(h)
-            if self.moe_enabled:
+            if self.moe_enabled and isinstance(self.moe_blocks[i], MoEBlock):
                 assert self.moe_blocks is not None
-                h = self.moe_blocks[i](h)
+                h = self.moe_blocks[i](h, token_mask=token_mask)
         return h
+
+    def forward_with_specialists(
+        self, x: torch.Tensor, *, token_mask: torch.Tensor | None = None
+    ):
+        """Return final MoE candidates and sparse routes for workspace use.
+
+        Earlier backbone/MoE blocks remain unchanged. The final MoE block
+        exposes expert deltas before routing so the workspace can broadcast
+        context to every specialist, then reuse the original sparse route.
+        The split-graph caller applies this block's configured residual scale
+        to the combined routed and broadcast delta.
+        """
+        if not self.moe_enabled or self.moe_blocks is None:
+            raise RuntimeError("workspace broadcast requires an enabled MoE expert pool")
+        h = self.in_adapter(x)
+        final_index = len(self.blocks) - 1
+        if not isinstance(self.moe_blocks[final_index], MoEBlock):
+            raise RuntimeError(
+                "workspace broadcast requires the final backbone block to have an active MoE bank"
+            )
+        for i, block in enumerate(self.blocks):
+            h = block(h)
+            if i == final_index:
+                base = h
+                _, experts, indices, weights = self.moe_blocks[i](
+                    h, return_details=True, token_mask=token_mask
+                )
+                return base, experts, indices, weights
+            if isinstance(self.moe_blocks[i], MoEBlock):
+                h = self.moe_blocks[i](h, token_mask=token_mask)
+        raise RuntimeError("parallel backbone has no blocks")

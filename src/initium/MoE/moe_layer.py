@@ -81,7 +81,7 @@ itself check (see Experiment-Roadmap.md, "Option 4" failure-mode table):
 
 from __future__ import annotations
 
-from typing import cast
+import math
 
 import torch
 import torch.nn as nn
@@ -102,13 +102,21 @@ class Expert(nn.Module):
         super().__init__()
         self.w_in = nn.Linear(d_model, expert_dim)
         self.w_out = nn.Linear(expert_dim, d_model)
+        # Make inserting an MoE residual a no-op at initialization.  The
+        # output projections still receive task gradients on the first
+        # update; their hidden projections begin learning as soon as those
+        # output weights move away from zero.  This avoids a randomly
+        # initialized expert bank changing the controller's signal scale
+        # before routing/expert specialization has learned anything.
+        nn.init.zeros_(self.w_out.weight)
+        nn.init.zeros_(self.w_out.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.w_out(F.relu(self.w_in(x)))
 
 
 class SwitchMoE(nn.Module):
-    """Switch-style (top-1) sparsely-gated MoE feed-forward sublayer.
+    """Switch-style top-k sparsely-gated MoE feed-forward sublayer.
     Controller-agnostic: operates on the last dimension of whatever shape
     is passed in (..., d_model), and returns the same shape -- it does NOT
     apply its own residual connection (see MoEBlock below for that), so it
@@ -150,11 +158,20 @@ class SwitchMoE(nn.Module):
 
         self._aux_losses: list[torch.Tensor] = []
         self._last_diag: dict = {}
+        self._diag_accum: dict[str, torch.Tensor] = {}
+        self._diag_calls = 0
         self._last_topk_idx: torch.Tensor | None = (
             None  # (T, k), detached -- for per-source breakdowns
         )
+        self._last_accepted: torch.Tensor | None = None  # (T, k), detached
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        return_details: bool = False,
+        token_mask: torch.Tensor | None = None,
+    ):
         orig_shape = x.shape
         d_model = orig_shape[-1]
         assert d_model == self.d_model, (
@@ -162,10 +179,27 @@ class SwitchMoE(nn.Module):
         )
         flat = x.reshape(-1, d_model)  # (num_tokens, d_model)
         num_tokens = flat.shape[0]
+        if token_mask is not None:
+            if tuple(token_mask.shape) != tuple(orig_shape[:-1]):
+                raise ValueError(
+                    "SwitchMoE: token_mask must match the leading input dimensions "
+                    f"{tuple(orig_shape[:-1])}, got {tuple(token_mask.shape)}"
+                )
+            token_mask_flat = token_mask.reshape(-1).to(device=x.device, dtype=torch.bool)
+        else:
+            token_mask_flat = None
 
-        logits32 = self.router(
-            flat
-        ).float()  # router kept in fp32 (Switch's own selective-precision fix)
+        # ``.float()`` after Linear is too late under autocast: CUDA AMP may
+        # execute the router matmul in fp16 and only cast its already-rounded
+        # result back to fp32.  Switch's selective-precision rule requires the
+        # projection itself to run in fp32.
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            flat32 = flat.float()
+            logits32 = F.linear(
+                flat32,
+                self.router.weight.float(),
+                None if self.router.bias is None else self.router.bias.float(),
+            )
         if self.training and self.router_noise_eps > 0:
             # Switch's own exploration mechanism (Appendix C): multiplicative
             # jitter noise. We apply it directly to the router logits here
@@ -178,18 +212,25 @@ class SwitchMoE(nn.Module):
         probs = torch.softmax(logits32, dim=-1)  # (num_tokens, num_experts)
 
         # Top-K routing (Shazeer et al. 2017 / GShard), generalizing Switch's
-        # own k=1 special case: each token selects its top_k highest-prob
-        # experts, gate weights renormalized to sum to 1 across just those
-        # k slots -- top_k=1 reduces to the original Switch gate exactly.
-        # Every expert is computed ONCE for the WHOLE token batch (dense,
-        # single pair of batched einsums below) regardless of top_k, so the
-        # k selected experts for a given token are genuinely active
-        # SIMULTANEOUSLY (one fused kernel launch covers all E experts x
-        # all T tokens), not run as k sequential passes -- this is what
-        # "multiple experts active at once" means at this project's scale.
+        # own k=1 special case: top-1 retains its selected probability from
+        # the full expert softmax (so the task objective can train the
+        # router); top-k>1 normalizes among the selected experts.
+        # Normal training dispatches selected, capacity-accepted routes into
+        # bounded per-expert buffers. The optional all-expert result is
+        # reserved for the workspace specialist path, which explicitly needs
+        # every specialist candidate. This keeps top-k routing sparse in
+        # compute and avoids expanding expert weights per route.
         top_k = self.top_k
         topk_prob, topk_idx = probs.topk(top_k, dim=-1)  # (T, k) each
-        gate_weights = topk_prob / topk_prob.sum(dim=-1, keepdim=True).clamp(min=1e-9)
+        if top_k == 1:
+            # Switch's top-1 gate multiplies the expert output by its
+            # probability in the full expert softmax. Renormalizing a
+            # one-element selected set would make every gate exactly 1 and
+            # cancel the softmax derivative, leaving the task loss unable
+            # to train the router at all.
+            gate_weights = topk_prob
+        else:
+            gate_weights = topk_prob / topk_prob.sum(dim=-1, keepdim=True).clamp(min=1e-9)
 
         # f_i/P_i are cheap to compute regardless of mode; only the aux LOSS
         # accumulation (needed for backward()) is training-gated below.
@@ -206,50 +247,194 @@ class SwitchMoE(nn.Module):
             self._aux_losses.append(aux_loss)
 
         with torch.no_grad():
-            self._last_diag = {
-                "cv_importance": (P_i.std() / P_i.mean().clamp(min=1e-8)).item(),
-                "cv_load": (f_i.std() / f_i.mean().clamp(min=1e-8)).item(),
-                "max_load_frac": f_i.max().item(),
-            }
             self._last_topk_idx = topk_idx.detach()
 
         # Expert capacity, scaled by top_k (each slot competes for the same
         # per-expert buffer).
         capacity = max(1, int((num_tokens * top_k / self.num_experts) * self.capacity_factor))
 
-        w_in = torch.stack(
-            [cast(nn.Linear, e.w_in).weight for e in self.experts], dim=0
-        )  # (E, expert_dim, d_model)
-        b_in = torch.stack([cast(nn.Linear, e.w_in).bias for e in self.experts], dim=0)
-        w_out = torch.stack(
-            [cast(nn.Linear, e.w_out).weight for e in self.experts], dim=0
-        )  # (E, d_model, expert_dim)
-        b_out = torch.stack([cast(nn.Linear, e.w_out).bias for e in self.experts], dim=0)
-
-        # Dense pass over EVERY expert for EVERY token -- the single fused
-        # computation that makes the top-k selected experts per token
-        # simultaneous rather than sequential.
-        hidden = torch.einsum("td,exd->tex", flat, w_in) + b_in  # (T, E, expert_dim)
-        hidden = F.relu(hidden)
-        expert_out_all = torch.einsum("tex,edx->ted", hidden, w_out) + b_out  # (T, E, d_model)
-
-        gathered = torch.gather(
-            expert_out_all, 1, topk_idx.unsqueeze(-1).expand(-1, -1, d_model)
-        )  # (T, k, d_model)
-
-        # Capacity mask: keep only the first `capacity` (token,slot) pairs,
-        # in original order, routed to each expert -- same drop semantics
-        # as the prior top-1 implementation, generalized over the
-        # flattened (T*k) slot order.
+        # Capacity is assigned by router confidence, not flattened token
+        # order.  In recurrent multi-source calls the source batches are
+        # concatenated (backbone first, memory read second); first-come
+        # capacity therefore silently favored the first source whenever an
+        # expert overflowed.  Confidence-priority acceptance is independent
+        # of source ordering and preserves the strongest routes.
         flat_idx = topk_idx.reshape(-1)
-        one_hot_flat = F.one_hot(flat_idx, num_classes=self.num_experts)
-        rank_in_expert = one_hot_flat.cumsum(dim=0).gather(1, flat_idx.unsqueeze(1)).squeeze(1) - 1
+        flat_priority = topk_prob.reshape(-1)
+        priority_order = torch.argsort(flat_priority, descending=True, stable=True)
+        expert_in_priority_order = flat_idx.index_select(0, priority_order)
+        one_hot_priority = F.one_hot(
+            expert_in_priority_order, num_classes=self.num_experts
+        )
+        ranks_in_priority_order = one_hot_priority.cumsum(dim=0).gather(
+            1, expert_in_priority_order.unsqueeze(1)
+        ).squeeze(1) - 1
+        rank_in_expert = torch.empty_like(ranks_in_priority_order)
+        rank_in_expert.scatter_(0, priority_order, ranks_in_priority_order)
         keep = (rank_in_expert < capacity).reshape(num_tokens, top_k)
+        accepted_gates = gate_weights * keep.to(gate_weights.dtype)
+        if top_k > 1:
+            accepted_gates = accepted_gates / accepted_gates.sum(
+                dim=-1, keepdim=True
+            ).clamp_min(1e-9)
 
-        gate = (gate_weights * keep.to(gate_weights.dtype)).unsqueeze(-1).to(gathered.dtype)
-        output = (gathered * gate).sum(dim=1).to(flat.dtype)  # (T, d_model)
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            # Dispatch activations into fixed-capacity expert buffers. The
+            # previous batched-weight implementation expanded each expert's
+            # (D, hidden) matrices once per token/route; autograd retained
+            # those copies for every recurrent call (96 MiB for just one
+            # 32-token, 512x1536 projection). Running each expert's Linear on
+            # its capacity buffer shares the original Parameter storage and
+            # limits saved activations to dispatched tokens.
+            route_slots = rank_in_expert.clamp(max=capacity - 1)
+            route_tokens = torch.arange(num_tokens, device=x.device).repeat_interleave(top_k)
+            route_keep = keep.reshape(-1)
+            route_inputs = flat32.index_select(0, route_tokens)
+            route_inputs = route_inputs * route_keep.unsqueeze(-1).to(route_inputs.dtype)
+            dispatch_indices = flat_idx * capacity + route_slots
+            dispatch = flat32.new_zeros((self.num_experts * capacity, d_model))
+            dispatch = dispatch.index_add(0, dispatch_indices, route_inputs)
+            dispatch = dispatch.reshape(self.num_experts, capacity, d_model)
 
-        return output.reshape(orig_shape)
+            expert_outputs = []
+            for expert_index, expert in enumerate(self.experts):
+                expert_input = dispatch[expert_index]
+                expert_hidden = F.linear(
+                    expert_input, expert.w_in.weight.float(), expert.w_in.bias.float()
+                ).relu()
+                expert_outputs.append(
+                    F.linear(
+                        expert_hidden,
+                        expert.w_out.weight.float(),
+                        expert.w_out.bias.float(),
+                    )
+                )
+            expert_outputs = torch.stack(expert_outputs, dim=0)
+
+            # Both advanced indices must have identical (T, top_k) shapes.
+            # Leaving flat_idx flat (T*top_k,) makes PyTorch broadcast it
+            # against the (T, top_k) slot index. For top_k=1 this silently
+            # creates a (T, T, D) selection, mixing unrelated tokens and
+            # summing T expert outputs per token; the resulting oversized
+            # MoE delta caused the immediate forward-scale and NaN-gradient
+            # failure in the Phase 1 trace.
+            route_experts = flat_idx.reshape(num_tokens, top_k)
+            route_slots_2d = route_slots.reshape(num_tokens, top_k)
+            selected_outputs = expert_outputs[route_experts, route_slots_2d]
+            output32 = (selected_outputs * accepted_gates.unsqueeze(-1)).sum(dim=1)
+            accepted_outputs = selected_outputs * keep.unsqueeze(-1).to(selected_outputs.dtype)
+
+            expert_out_all = None
+            if return_details:
+                # Workspace broadcasting is the one caller that needs all
+                # specialist candidates, including experts not selected by
+                # the sparse route. Keep this expensive activation path
+                # explicit, while still using each expert's shared weights.
+                expert_out_all = torch.stack(
+                    [
+                        F.linear(
+                            F.relu(
+                                F.linear(
+                                    flat32,
+                                    expert.w_in.weight.float(),
+                                    expert.w_in.bias.float(),
+                                )
+                            ),
+                            expert.w_out.weight.float(),
+                            expert.w_out.bias.float(),
+                        )
+                        for expert in self.experts
+                    ],
+                    dim=1,
+                )
+
+        # Keep the result in fp32 when the input was autocast to fp16/bf16.
+        # Casting a large but finite fp32 expert result back to fp16 can
+        # create an Inf before the residual or DNC path has a chance to
+        # stabilize it. The surrounding residual naturally promotes to fp32.
+        output_dtype = (
+            torch.float32
+            if flat.dtype in (torch.float16, torch.bfloat16)
+            else flat.dtype
+        )
+        output = output32.to(output_dtype)
+
+        with torch.no_grad():
+            self._last_accepted = keep.detach()
+            self._last_diag = {
+                "cv_importance": (P_i.std() / P_i.mean().clamp(min=1e-8)).detach(),
+                "cv_load": (f_i.std() / f_i.mean().clamp(min=1e-8)).detach(),
+                "max_load_frac": f_i.max().detach(),
+                "expert_load_frac": f_i.detach(),
+                "router_importance_frac": P_i.detach(),
+                "router_entropy": (
+                    -(probs * probs.clamp_min(1e-9).log()).sum(dim=-1).mean()
+                ).detach(),
+                "router_max_prob": probs.max(dim=-1).values.mean().detach(),
+                "topk_gate_mean": topk_prob.mean().detach(),
+                "input_rms": flat32.square().mean().sqrt().detach(),
+                "input_absmax": flat32.abs().amax().detach(),
+                "expert_output_rms": accepted_outputs.square().mean().sqrt().detach(),
+                "expert_output_absmax": accepted_outputs.abs().amax().detach(),
+                "routed_output_rms": output32.square().mean().sqrt().detach(),
+                "routed_output_absmax": output32.abs().amax().detach(),
+                "capacity_drop_frac": (1.0 - keep.float().mean()).detach(),
+                "accepted_gate_mass": accepted_gates.sum(dim=-1).mean().detach(),
+            }
+            if token_mask_flat is not None:
+                valid = token_mask_flat
+                padded = ~valid
+                per_token_entropy = -(
+                    probs * probs.clamp_min(1e-9).log()
+                ).sum(dim=-1)
+                per_token_max_prob = probs.max(dim=-1).values
+                per_token_drop = 1.0 - keep.float().mean(dim=-1)
+
+                def subset_routing_stats(subset: torch.Tensor, prefix: str) -> None:
+                    subset_weight = subset.to(probs.dtype)
+                    count = subset_weight.sum()
+                    denom = count.clamp_min(1.0)
+                    subset_load = (
+                        one_hot_k
+                        * subset_weight[:, None, None]
+                    ).sum(dim=(0, 1)) / (denom * top_k)
+                    subset_importance = (
+                        probs * subset_weight[:, None]
+                    ).sum(dim=0) / denom
+                    entropy = (per_token_entropy * subset_weight).sum() / denom
+                    max_prob = (per_token_max_prob * subset_weight).sum() / denom
+                    drop_frac = (per_token_drop * subset_weight).sum() / denom
+                    self._last_diag[f"{prefix}_token_count"] = count.detach()
+                    self._last_diag[f"{prefix}_expert_load_frac"] = subset_load.detach()
+                    self._last_diag[f"{prefix}_router_importance_frac"] = (
+                        subset_importance.detach()
+                    )
+                    self._last_diag[f"{prefix}_router_entropy"] = entropy.detach()
+                    self._last_diag[f"{prefix}_router_max_prob"] = max_prob.detach()
+                    self._last_diag[f"{prefix}_capacity_drop_frac"] = drop_frac.detach()
+
+                subset_routing_stats(valid, "valid")
+                subset_routing_stats(padded, "padded")
+            if self.training:
+                for key, value in self._last_diag.items():
+                    self._diag_accum[key] = (
+                        self._diag_accum[key] + value
+                        if key in self._diag_accum
+                        else value.clone()
+                    )
+                self._diag_calls += 1
+
+        output = output.reshape(orig_shape)
+        if return_details:
+            expert_shape = (*orig_shape[:-1], self.num_experts, d_model)
+            route_shape = (*orig_shape[:-1], top_k)
+            return (
+                output,
+                expert_out_all.to(output_dtype).reshape(expert_shape),
+                topk_idx.reshape(route_shape),
+                accepted_gates.reshape(route_shape),
+            )
+        return output
 
     def pop_aux_loss(self) -> torch.Tensor:
         """Consume and clear the accumulated load-balancing loss (mirrors
@@ -259,7 +444,11 @@ class SwitchMoE(nn.Module):
         across both mechanisms)."""
         if not self._aux_losses:
             return torch.zeros((), device=self.router.weight.device)
-        total = torch.stack(self._aux_losses).sum()
+        # A recurrent controller invokes this layer once per timestep.  The
+        # Switch objective is per routing batch, so sum() would silently
+        # multiply its strength by episode length.  Average calls within this
+        # layer; pop_total_moe_aux_loss still sums distinct model layers.
+        total = torch.stack(self._aux_losses).mean()
         self._aux_losses = []
         return total
 
@@ -273,6 +462,15 @@ class SwitchMoE(nn.Module):
         not a routing-internal metric."""
         return dict(self._last_diag)
 
+    def pop_diagnostics(self) -> dict:
+        """Consume mean training diagnostics accumulated since the last pop."""
+        if not self._diag_calls:
+            return {}
+        result = {key: value / self._diag_calls for key, value in self._diag_accum.items()}
+        self._diag_accum = {}
+        self._diag_calls = 0
+        return result
+
     def last_routing(self) -> torch.Tensor | None:
         """(num_tokens, top_k) expert indices chosen on the most recent
         forward() call, or None before any call. Callers that know the
@@ -281,6 +479,11 @@ class SwitchMoE(nn.Module):
         per-slice routing breakdowns that this pooled-over-all-tokens
         class has no notion of on its own."""
         return self._last_topk_idx
+
+    def last_accepted_routing(self) -> torch.Tensor | None:
+        """Capacity acceptance mask ``(num_tokens, top_k)`` for the most
+        recent call, or ``None`` before the first call."""
+        return self._last_accepted
 
 
 class MoEBlock(nn.Module):
@@ -303,10 +506,16 @@ class MoEBlock(nn.Module):
         router_noise_eps: float = 1e-2,
         load_balance_alpha: float = 0.01,
         top_k: int = 1,
+        residual_scale: float = 1.0,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
     ):
         super().__init__()
+        if not math.isfinite(residual_scale) or residual_scale < 0.0:
+            raise ValueError(
+                f"MoEBlock residual_scale must be finite and >= 0, got {residual_scale!r}"
+            )
+        self.residual_scale = float(residual_scale)
         self.norm = nn.LayerNorm(d_model, device=device, dtype=dtype)
         self.moe = SwitchMoE(
             d_model,
@@ -323,14 +532,29 @@ class MoEBlock(nn.Module):
         if device is not None and getattr(device, "type", None) == "cuda":
             self.to(device)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.moe(self.norm(x))
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        return_details: bool = False,
+        token_mask: torch.Tensor | None = None,
+    ):
+        if not return_details:
+            routed = self.moe(self.norm(x), token_mask=token_mask)
+            return x + self.residual_scale * routed
+        routed, experts, indices, weights = self.moe(
+            self.norm(x), return_details=True, token_mask=token_mask
+        )
+        return x + self.residual_scale * routed, experts, indices, weights
 
     def pop_aux_loss(self) -> torch.Tensor:
         return self.moe.pop_aux_loss()
 
     def last_diagnostics(self) -> dict:
         return self.moe.last_diagnostics()
+
+    def pop_diagnostics(self) -> dict:
+        return self.moe.pop_diagnostics()
 
 
 class SourceEmbedding(nn.Module):
@@ -358,8 +582,8 @@ class MultiSourceMoEBlock(nn.Module):
     """CfC-oriented MoE sublayer: accepts a VARIABLE-length list of
     per-source token tensors -- each (B, d_model) -- and returns the same
     number of outputs, one per source, each individually routed and gated
-    through ONE shared bank of Top-K experts (SwitchMoE.forward -- every
-    expert still runs exactly once per call, dense and simultaneous).
+    through ONE shared bank of Top-K experts (SwitchMoE.forward computes
+    only selected, capacity-accepted token/expert pairs).
 
     This is what lets a CfC controller/combiner keep its "many inputs in,
     many outputs out, with per-input specialization" property once MoE
@@ -376,6 +600,8 @@ class MultiSourceMoEBlock(nn.Module):
     """
 
     _cumulative_source_counts: list[torch.Tensor] | None
+    _cumulative_source_accepted: list[torch.Tensor] | None
+    _cumulative_source_routes: list[torch.Tensor] | None
 
     def __init__(
         self,
@@ -406,6 +632,8 @@ class MultiSourceMoEBlock(nn.Module):
             load_balance_alpha=load_balance_alpha,
         )
         self._cumulative_source_counts = None
+        self._cumulative_source_accepted = None
+        self._cumulative_source_routes = None
         if device is not None and getattr(device, "type", None) == "cuda":
             self.to(device)
 
@@ -429,28 +657,38 @@ class MultiSourceMoEBlock(nn.Module):
         # concentrates on experts {2,5}, source 1 (read vector) on {1,7}"
         # -- rather than every source routing near-identically by chance.
         topk_idx = self.moe.last_routing()  # (sum(batch_sizes), top_k) or None
-        if topk_idx is not None:
+        accepted = self.moe.last_accepted_routing()
+        if topk_idx is not None and accepted is not None:
             num_experts = self.moe.num_experts
             if self._cumulative_source_counts is None:
-                self._cumulative_source_counts = [torch.zeros(num_experts) for _ in batch_sizes]
-            source_diag, offset = [], 0
+                self._cumulative_source_counts = [
+                    torch.zeros(num_experts, device=topk_idx.device) for _ in batch_sizes
+                ]
+                self._cumulative_source_accepted = [
+                    torch.zeros(num_experts, device=topk_idx.device) for _ in batch_sizes
+                ]
+                self._cumulative_source_routes = [
+                    torch.zeros((), device=topk_idx.device) for _ in batch_sizes
+                ]
+            offset = 0
             for i, b in enumerate(batch_sizes):
-                idx_slice = topk_idx[offset : offset + b].reshape(-1).cpu()
+                idx_slice = topk_idx[offset : offset + b].reshape(-1)
                 counts = torch.bincount(idx_slice, minlength=num_experts).float()
-                self._cumulative_source_counts[i] += counts  # never reset -- spans the whole run
-                cum = self._cumulative_source_counts[i]
-                frac = (cum / cum.sum().clamp(min=1)).tolist()
-                top_expert = int(cum.argmax().item())
-                source_diag.append(
-                    {
-                        "expert_frac": frac,
-                        "top_expert": top_expert,
-                        "top_expert_frac": frac[top_expert],
-                        "n_calls_accumulated": int(cum.sum().item()),
-                    }
+                accepted_slice = accepted[offset : offset + b].reshape(-1)
+                accepted_counts = torch.bincount(
+                    idx_slice,
+                    weights=accepted_slice.to(dtype=torch.float32),
+                    minlength=num_experts,
                 )
+                # Keep routing counters on device and defer CPU synchronization
+                # until inference explicitly requests a report. This block runs
+                # once per CfC timestep during training.
+                self._cumulative_source_counts[i] += counts
+                assert self._cumulative_source_accepted is not None
+                assert self._cumulative_source_routes is not None
+                self._cumulative_source_accepted[i] += accepted_counts
+                self._cumulative_source_routes[i] += accepted_slice.sum()
                 offset += b
-            self._last_source_diag = source_diag
 
         outs, offset = [], 0
         for i, b in enumerate(batch_sizes):
@@ -464,6 +702,9 @@ class MultiSourceMoEBlock(nn.Module):
     def last_diagnostics(self) -> dict:
         return self.moe.last_diagnostics()
 
+    def pop_diagnostics(self) -> dict:
+        return self.moe.pop_diagnostics()
+
     def last_source_diagnostics(self) -> list[dict] | None:
         """Per-source expert-usage breakdown from the most recent forward()
         call: one dict per source (same order as the `sources` list passed
@@ -472,7 +713,60 @@ class MultiSourceMoEBlock(nn.Module):
         Comparing this ACROSS sources is the concrete test of whether the
         router is genuinely specializing by input identity rather than
         routing every source near-identically."""
-        return getattr(self, "_last_source_diag", None)
+        if self._cumulative_source_counts is None:
+            return None
+        source_diag = []
+        assert self._cumulative_source_accepted is not None
+        assert self._cumulative_source_routes is not None
+        for counts, accepted_counts, accepted_routes in zip(
+            self._cumulative_source_counts,
+            self._cumulative_source_accepted,
+            self._cumulative_source_routes,
+        ):
+            counts_cpu = counts.detach().float().cpu()
+            accepted_cpu = accepted_counts.detach().float().cpu()
+            fractions = counts_cpu / counts_cpu.sum().clamp_min(1.0)
+            top_expert = int(counts_cpu.argmax().item())
+            total_routes = float(counts_cpu.sum().item())
+            accepted_total = float(accepted_cpu.sum().item())
+            source_diag.append(
+                {
+                    "expert_frac": fractions.tolist(),
+                    "top_expert": top_expert,
+                    "top_expert_frac": float(fractions[top_expert]),
+                    "accepted_expert_frac": (
+                        accepted_cpu / accepted_cpu.sum().clamp_min(1.0)
+                    ).tolist(),
+                    "accepted_route_frac": accepted_total / max(total_routes, 1.0),
+                    "capacity_drop_frac": 1.0 - accepted_total / max(total_routes, 1.0),
+                    "n_routes_accumulated": int(total_routes),
+                    "n_accepted_accumulated": int(accepted_routes.detach().item()),
+                }
+            )
+        return source_diag
+
+    def pop_source_diagnostics(self) -> list[dict] | None:
+        """Return and reset per-source routing/capacity counters.
+
+        This is intended for periodic training logs, where source-level
+        overflow must be compared over the same window as the pooled MoE
+        diagnostics. ``last_source_diagnostics`` remains cumulative for
+        inference callers.
+        """
+        report = self.last_source_diagnostics()
+        if report is not None:
+            assert self._cumulative_source_counts is not None
+            assert self._cumulative_source_accepted is not None
+            assert self._cumulative_source_routes is not None
+            for counts, accepted, routes in zip(
+                self._cumulative_source_counts,
+                self._cumulative_source_accepted,
+                self._cumulative_source_routes,
+            ):
+                counts.zero_()
+                accepted.zero_()
+                routes.zero_()
+        return report
 
 
 class MoERNNWrapper(nn.Module):
@@ -526,27 +820,88 @@ class MoERNNWrapper(nn.Module):
         return out, new_hx
 
 
-def pop_total_moe_aux_loss(moe_layers: list) -> tuple:
+def pop_total_moe_aux_loss(moe_layers: list, *, include_diagnostics: bool = True) -> tuple:
     """Sum pop_aux_loss() across all installed MoEBlock/SwitchMoE layers and
     merge their diagnostics (mean across layers for CV metrics, max for the
     worst-case load fraction), mirroring stochastic_write_head_v2's
     pop_total_kl() pattern exactly, so the training loop combines this
     auxiliary loss the same way it already combines the KL loss."""
     total = None
-    cv_imp, cv_load, max_load = [], [], []
+    cv_imp, cv_load, max_load, capacity_drop = [], [], [], []
+    layer_reports = []
     for layer in moe_layers:
         loss = layer.pop_aux_loss()
         total = loss if total is None else total + loss
-        diag = layer.last_diagnostics()
+        if include_diagnostics:
+            pop_diagnostics = getattr(layer, "pop_diagnostics", None)
+            diag = pop_diagnostics() if pop_diagnostics is not None else layer.last_diagnostics()
+        else:
+            diag = {}
         if diag:
-            cv_imp.append(diag["cv_importance"])
-            cv_load.append(diag["cv_load"])
-            max_load.append(diag["max_load_frac"])
+            source_report = None
+            if include_diagnostics:
+                pop_source_diagnostics = getattr(layer, "pop_source_diagnostics", None)
+                if pop_source_diagnostics is not None:
+                    source_report = pop_source_diagnostics()
+            cv_imp.append(float(diag["cv_importance"]))
+            cv_load.append(float(diag["cv_load"]))
+            max_load.append(float(diag["max_load_frac"]))
+            capacity_drop.append(float(diag.get("capacity_drop_frac", 0.0)))
+            layer_reports.append(
+                {
+                    "name": getattr(layer, "diagnostic_name", type(layer).__name__),
+                    **{
+                        key: float(diag[key])
+                        for key in (
+                            "cv_importance",
+                            "cv_load",
+                            "max_load_frac",
+                            "router_entropy",
+                            "router_max_prob",
+                            "topk_gate_mean",
+                            "input_rms",
+                            "input_absmax",
+                            "expert_output_rms",
+                            "expert_output_absmax",
+                            "routed_output_rms",
+                            "routed_output_absmax",
+                            "capacity_drop_frac",
+                            "accepted_gate_mass",
+                            "valid_token_count",
+                            "padded_token_count",
+                            "valid_router_entropy",
+                            "valid_router_max_prob",
+                            "valid_capacity_drop_frac",
+                            "padded_router_entropy",
+                            "padded_router_max_prob",
+                            "padded_capacity_drop_frac",
+                        )
+                        if key in diag
+                    },
+                    **{
+                        key: diag[key].detach().float().cpu().tolist()
+                        for key in (
+                            "expert_load_frac",
+                            "router_importance_frac",
+                            "valid_expert_load_frac",
+                            "valid_router_importance_frac",
+                            "padded_expert_load_frac",
+                            "padded_router_importance_frac",
+                        )
+                        if key in diag
+                    },
+                    **({"source_routes": source_report} if source_report is not None else {}),
+                }
+            )
     if total is None:
         total = torch.zeros(())
     merged = {
         "moe_cv_importance": sum(cv_imp) / len(cv_imp) if cv_imp else 0.0,
         "moe_cv_load": sum(cv_load) / len(cv_load) if cv_load else 0.0,
         "moe_max_load_frac": max(max_load) if max_load else 0.0,
+        "moe_capacity_drop_frac": (
+            sum(capacity_drop) / len(capacity_drop) if capacity_drop else 0.0
+        ),
+        "moe_layers": layer_reports,
     }
     return total, merged

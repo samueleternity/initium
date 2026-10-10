@@ -189,6 +189,10 @@ def _build_split_graph(c: _Cfg, input_dim, hidden, nr_cells, cell_size, read_hea
         ),
         independent_linears=True,
         moe_enabled=_moe["moe_enabled"],
+        moe_placement=c.get("split_graph_moe_placement", "all"),
+        moe_backbone_block_isolation=c.get(
+            "split_graph_moe_backbone_block_isolation", None
+        ),
         moe_num_experts=_moe["moe_num_experts"],
         moe_expert_dim=_moe["moe_expert_dim"],
         moe_top_k=_moe["moe_top_k"],

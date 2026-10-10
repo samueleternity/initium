@@ -163,7 +163,13 @@ class SwitchMoE(nn.Module):
         )
         self._last_accepted: torch.Tensor | None = None  # (T, k), detached
 
-    def forward(self, x: torch.Tensor, *, return_details: bool = False):
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        return_details: bool = False,
+        token_mask: torch.Tensor | None = None,
+    ):
         orig_shape = x.shape
         d_model = orig_shape[-1]
         assert d_model == self.d_model, (
@@ -171,6 +177,15 @@ class SwitchMoE(nn.Module):
         )
         flat = x.reshape(-1, d_model)  # (num_tokens, d_model)
         num_tokens = flat.shape[0]
+        if token_mask is not None:
+            if tuple(token_mask.shape) != tuple(orig_shape[:-1]):
+                raise ValueError(
+                    "SwitchMoE: token_mask must match the leading input dimensions "
+                    f"{tuple(orig_shape[:-1])}, got {tuple(token_mask.shape)}"
+                )
+            token_mask_flat = token_mask.reshape(-1).to(device=x.device, dtype=torch.bool)
+        else:
+            token_mask_flat = None
 
         # ``.float()`` after Linear is too late under autocast: CUDA AMP may
         # execute the router matmul in fp16 and only cast its already-rounded
@@ -364,6 +379,40 @@ class SwitchMoE(nn.Module):
                 "capacity_drop_frac": (1.0 - keep.float().mean()).detach(),
                 "accepted_gate_mass": accepted_gates.sum(dim=-1).mean().detach(),
             }
+            if token_mask_flat is not None:
+                valid = token_mask_flat
+                padded = ~valid
+                per_token_entropy = -(
+                    probs * probs.clamp_min(1e-9).log()
+                ).sum(dim=-1)
+                per_token_max_prob = probs.max(dim=-1).values
+                per_token_drop = 1.0 - keep.float().mean(dim=-1)
+
+                def subset_routing_stats(subset: torch.Tensor, prefix: str) -> None:
+                    subset_weight = subset.to(probs.dtype)
+                    count = subset_weight.sum()
+                    denom = count.clamp_min(1.0)
+                    subset_load = (
+                        one_hot_k
+                        * subset_weight[:, None, None]
+                    ).sum(dim=(0, 1)) / (denom * top_k)
+                    subset_importance = (
+                        probs * subset_weight[:, None]
+                    ).sum(dim=0) / denom
+                    entropy = (per_token_entropy * subset_weight).sum() / denom
+                    max_prob = (per_token_max_prob * subset_weight).sum() / denom
+                    drop_frac = (per_token_drop * subset_weight).sum() / denom
+                    self._last_diag[f"{prefix}_token_count"] = count.detach()
+                    self._last_diag[f"{prefix}_expert_load_frac"] = subset_load.detach()
+                    self._last_diag[f"{prefix}_router_importance_frac"] = (
+                        subset_importance.detach()
+                    )
+                    self._last_diag[f"{prefix}_router_entropy"] = entropy.detach()
+                    self._last_diag[f"{prefix}_router_max_prob"] = max_prob.detach()
+                    self._last_diag[f"{prefix}_capacity_drop_frac"] = drop_frac.detach()
+
+                subset_routing_stats(valid, "valid")
+                subset_routing_stats(padded, "padded")
             if self.training:
                 for key, value in self._last_diag.items():
                     self._diag_accum[key] = (
@@ -475,10 +524,18 @@ class MoEBlock(nn.Module):
         if device is not None and getattr(device, "type", None) == "cuda":
             self.to(device)
 
-    def forward(self, x: torch.Tensor, *, return_details: bool = False):
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        return_details: bool = False,
+        token_mask: torch.Tensor | None = None,
+    ):
         if not return_details:
-            return x + self.moe(self.norm(x))
-        routed, experts, indices, weights = self.moe(self.norm(x), return_details=True)
+            return x + self.moe(self.norm(x), token_mask=token_mask)
+        routed, experts, indices, weights = self.moe(
+            self.norm(x), return_details=True, token_mask=token_mask
+        )
         return x + routed, experts, indices, weights
 
     def pop_aux_loss(self) -> torch.Tensor:
@@ -801,12 +858,27 @@ def pop_total_moe_aux_loss(moe_layers: list, *, include_diagnostics: bool = True
                             "routed_output_absmax",
                             "capacity_drop_frac",
                             "accepted_gate_mass",
+                            "valid_token_count",
+                            "padded_token_count",
+                            "valid_router_entropy",
+                            "valid_router_max_prob",
+                            "valid_capacity_drop_frac",
+                            "padded_router_entropy",
+                            "padded_router_max_prob",
+                            "padded_capacity_drop_frac",
                         )
                         if key in diag
                     },
                     **{
                         key: diag[key].detach().float().cpu().tolist()
-                        for key in ("expert_load_frac", "router_importance_frac")
+                        for key in (
+                            "expert_load_frac",
+                            "router_importance_frac",
+                            "valid_expert_load_frac",
+                            "valid_router_importance_frac",
+                            "padded_expert_load_frac",
+                            "padded_router_importance_frac",
+                        )
                         if key in diag
                     },
                     **({"source_routes": source_report} if source_report is not None else {}),

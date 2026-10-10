@@ -182,6 +182,7 @@ class SplitGraphDNC(nn.Module):
         device: torch.device | None = None,
         moe_enabled: bool = False,
         moe_placement: str = "all",
+        moe_backbone_block_isolation: int | None = None,
         moe_num_experts: int = 8,
         moe_expert_dim: int | None = None,
         moe_top_k: int = 1,
@@ -239,6 +240,11 @@ class SplitGraphDNC(nn.Module):
             raise ValueError("moe_placement must be 'all', 'backbone', or 'combiner'")
         backbone_moe_enabled = moe_enabled and moe_placement in ("all", "backbone")
         combiner_moe_enabled = moe_enabled and moe_placement in ("all", "combiner")
+        if moe_backbone_block_isolation is not None and not backbone_moe_enabled:
+            raise ValueError(
+                "moe_backbone_block_isolation requires active backbone MoE "
+                "(moe_enabled=True and moe_placement='backbone')"
+            )
         if workspace_enabled and not backbone_moe_enabled:
             raise ValueError(
                 "--workspace requires backbone MoE because it broadcasts to backbone specialists"
@@ -276,6 +282,7 @@ class SplitGraphDNC(nn.Module):
             moe_top_k=moe_top_k,
             moe_capacity_factor=moe_capacity_factor,
             moe_load_balance_alpha=moe_load_balance_alpha,
+            moe_block_isolation=moe_backbone_block_isolation,
             device=device,
         )
 
@@ -537,6 +544,7 @@ class SplitGraphDNC(nn.Module):
         pass_through_memory: bool = True,
         combiner_skip_stages=None,
         start_step: int = 0,  # v20: resume the sequential loop mid-sequence (inference caching)
+        sequence_valid_mask: torch.Tensor | None = None,
     ):
         """
         input: (B, T, input_size) -- batch-first, the whole padded episode
@@ -554,6 +562,9 @@ class SplitGraphDNC(nn.Module):
             the functional-usage ablation check
             (evaluate_traversal(..., ablate_memory=True)) already wired
             into this project's training loop; see module docstring.
+        sequence_valid_mask: optional (B, T) mask forwarded to backbone MoE
+            banks for valid-versus-padding routing diagnostics. It does not
+            mask backbone computation, MoE dispatch, or memory execution.
 
         Returns (output, (chx, mhx, last_read)) with output shaped
         (T, B, input_size) -- see module docstring for why this shape,
@@ -597,14 +608,16 @@ class SplitGraphDNC(nn.Module):
             )
             stage_input = input
             for stage in backbone_stages[:-1]:
-                stage_input = stage(stage_input)
+                stage_input = stage(stage_input, token_mask=sequence_valid_mask)
             final_stage = backbone_stages[-1]
             if not hasattr(final_stage, "forward_with_specialists"):
                 raise RuntimeError(
                     "workspace requires the final parallel-backbone stage to expose its MoE specialists"
                 )
             base, specialists, route_indices, route_weights = (
-                final_stage.forward_with_specialists(stage_input)
+                final_stage.forward_with_specialists(
+                    stage_input, token_mask=sequence_valid_mask
+                )
             )
             broadcast_delta, workspace_state = self.workspace(
                 specialists[:, start_step:],
@@ -617,7 +630,14 @@ class SplitGraphDNC(nn.Module):
             H = base.clone()
             H[:, start_step:] = base[:, start_step:] + broadcast_delta
         else:
-            H = self.backbone(input)  # (B, T, hidden_size)
+            backbone_stages = (
+                list(self.backbone)
+                if isinstance(self.backbone, nn.Sequential)
+                else [self.backbone]
+            )
+            H = input
+            for stage in backbone_stages:
+                H = stage(H, token_mask=sequence_valid_mask)
 
         # ---- memory hidden-state init (byte-identical convention to
         # dnc.DNC._init_hidden / MambaDNC._init_hidden's memory branch) ---

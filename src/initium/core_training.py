@@ -256,12 +256,38 @@ def _format_moe_layer_reports(diagnostics: dict) -> list[str]:
         importance = ",".join(
             f"{value:.2f}" for value in layer_diag.get("router_importance_frac", [])
         )
+        valid_load = ",".join(
+            f"{value:.2f}" for value in layer_diag.get("valid_expert_load_frac", [])
+        )
+        padded_load = ",".join(
+            f"{value:.2f}" for value in layer_diag.get("padded_expert_load_frac", [])
+        )
+        valid_importance = ",".join(
+            f"{value:.2f}" for value in layer_diag.get("valid_router_importance_frac", [])
+        )
+        padded_importance = ",".join(
+            f"{value:.2f}" for value in layer_diag.get("padded_router_importance_frac", [])
+        )
         source_routes = layer_diag.get("source_routes") or []
         source_summary = " ".join(
             f"src{i}:accepted={source.get('accepted_route_frac', 0.0):.1%},"
             f"drop={source.get('capacity_drop_frac', 0.0):.1%}"
             for i, source in enumerate(source_routes)
         )
+        split_summary = ""
+        if "valid_token_count" in layer_diag:
+            valid_count = layer_diag.get("valid_token_count", 0.0)
+            padded_count = layer_diag.get("padded_token_count", 0.0)
+            split_summary = (
+                f" valid[n={valid_count:.1f} load=[{valid_load}] imp=[{valid_importance}] "
+                f"H={layer_diag.get('valid_router_entropy', 0.0):.2f} "
+                f"pmax={layer_diag.get('valid_router_max_prob', 0.0):.2f} "
+                f"drop={layer_diag.get('valid_capacity_drop_frac', 0.0):.1%}]"
+                f" padded[n={padded_count:.1f} load=[{padded_load}] imp=[{padded_importance}] "
+                f"H={layer_diag.get('padded_router_entropy', 0.0):.2f} "
+                f"pmax={layer_diag.get('padded_router_max_prob', 0.0):.2f} "
+                f"drop={layer_diag.get('padded_capacity_drop_frac', 0.0):.1%}]"
+            )
         reports.append(
             f"moe-bank[{layer_diag['name']} "
             f"load=[{load}] importance=[{importance}] "
@@ -279,6 +305,7 @@ def _format_moe_layer_reports(diagnostics: dict) -> list[str]:
             f"{layer_diag.get('routed_output_absmax', 0.0):.3g} "
             f"drop={layer_diag.get('capacity_drop_frac', 0.0):.1%} "
             f"gate_mass={layer_diag.get('accepted_gate_mass', 0.0):.2f}"
+            f"{split_summary}"
             f"{(' ' + source_summary) if source_summary else ''}]"
         )
     return reports
@@ -647,6 +674,7 @@ def run(
     dynamic_n_cooldown_steps: int = DYNAMIC_N_COOLDOWN_STEPS,
     moe_enabled: bool = MOE_ENABLED,
     split_graph_moe_placement: str = "all",
+    split_graph_moe_backbone_block_isolation: int | None = None,
     moe_num_experts: int = MOE_NUM_EXPERTS,
     moe_expert_dim: int | None = MOE_EXPERT_DIM,
     moe_capacity_factor: float = MOE_CAPACITY_FACTOR,
@@ -1187,6 +1215,17 @@ def run(
                 f"{split_graph_moe_placement in ('all', 'combiner') and split_graph_combiner_cfc_multi_source_moe} "
                 f"(see moe_layer.MultiSourceMoEBlock)."
             )
+            if split_graph_moe_backbone_block_isolation is not None:
+                routing_note = (
+                    "Graph routing diagnostics split selected routes into valid and zero-padded timesteps."
+                    if dataset_type == "graph"
+                    else "Token-subset routing diagnostics are unavailable for this dataset."
+                )
+                print(
+                    f"[{run_id}] backbone MoE block isolation={split_graph_moe_backbone_block_isolation} "
+                    f"(zero-based per backbone stage; all other backbone blocks run without MoE). "
+                    f"{routing_note}"
+                )
 
         # v10: variant-matched hyperparameter defaults instead of always
         # reusing the Mamba-1 constants here -- harmless previously (any
@@ -1227,6 +1266,7 @@ def run(
             independent_linears=True,
             moe_enabled=moe_enabled,
             moe_placement=split_graph_moe_placement,
+            moe_backbone_block_isolation=split_graph_moe_backbone_block_isolation,
             moe_num_experts=moe_num_experts,
             moe_expert_dim=moe_expert_dim,
             moe_top_k=moe_top_k,
@@ -1322,6 +1362,7 @@ def run(
         ),
         "split_graph_combiner_cfc_multi_source_moe": split_graph_combiner_cfc_multi_source_moe,
         "split_graph_moe_placement": split_graph_moe_placement,
+        "split_graph_moe_backbone_block_isolation": split_graph_moe_backbone_block_isolation,
         "dnc_read_variant": dnc_read_variant,
         "dnc_read_residual_scale": dnc_read_residual_scale,
         "dnc_read_residual_max_ratio": dnc_read_residual_max_ratio,
@@ -1671,7 +1712,23 @@ def run(
 
         segment_diagnostics.set_channel("train")
         with torch.amp.autocast("cuda", enabled=amp_enabled):
-            output, hidden = rnn(input_seq, hidden, reset_experience=True)
+            if split_graph_enabled:
+                # Graph episodes are variable length and collate_fn pads them
+                # with all-zero feature rows. This mask is diagnostic-only for
+                # MoE routing: routing/capacity behavior remains unchanged.
+                sequence_valid_mask = (
+                    input_seq.ne(0).any(dim=-1)
+                    if moe_enabled and dataset_type == "graph"
+                    else None
+                )
+                output, hidden = rnn(
+                    input_seq,
+                    hidden,
+                    reset_experience=True,
+                    sequence_valid_mask=sequence_valid_mask,
+                )
+            else:
+                output, hidden = rnn(input_seq, hidden, reset_experience=True)
             if check_finite_this_step and not _first_nonfinite_report(
                 output, "rnn_output", step
             ):
@@ -2925,6 +2982,16 @@ if __name__ == "__main__":
         "only the parallel backbone, or only the sequential combiner. Default: all.",
     )
     parser.add_argument(
+        "--moe-backbone-block-isolation",
+        type=int,
+        default=None,
+        metavar="INDEX",
+        help="For split-graph backbone MoE, install a bank only after the selected "
+        "zero-based backbone block; other blocks run without MoE. Use one run per "
+        "block index in every backbone stage to isolate routing (requires --moe and "
+        "--moe-placement backbone).",
+    )
+    parser.add_argument(
         "--workspace", action="store_true",
         help="Phase 0 shared workspace: competitively write selected MoE expert outputs to persistent slots, then broadcast slots back to every specialist. Requires --split-graph and --moe.",
     )
@@ -3200,6 +3267,21 @@ if __name__ == "__main__":
         parser.error("--moe-placement backbone/combiner requires --split-graph")
     if args.moe_placement == "combiner" and args.split_graph_combiner_mode != "controller":
         parser.error("--moe-placement combiner requires --split-graph-combiner-mode controller")
+    if args.moe_backbone_block_isolation is not None:
+        if not args.moe or not args.split_graph:
+            parser.error("--moe-backbone-block-isolation requires --moe and --split-graph")
+        if args.moe_placement != "backbone":
+            parser.error(
+                "--moe-backbone-block-isolation requires --moe-placement backbone "
+                "to keep combiner MoE out of the isolation run"
+            )
+        if args.workspace:
+            parser.error("--moe-backbone-block-isolation cannot be combined with --workspace")
+        if not 0 <= args.moe_backbone_block_isolation < args.split_graph_num_blocks:
+            parser.error(
+                "--moe-backbone-block-isolation must be in [0, "
+                f"{args.split_graph_num_blocks - 1}] for the configured number of blocks"
+            )
     if args.workspace and args.moe_placement == "combiner":
         parser.error("--workspace requires backbone MoE; use --moe-placement backbone or all")
     if args.workspace_num_slots < 0:
@@ -3245,6 +3327,8 @@ if __name__ == "__main__":
             run_id = f"{run_id}_moe{args.moe_num_experts}e"
             if args.split_graph and args.moe_placement != "all":
                 run_id += f"_{args.moe_placement}only"
+            if args.moe_backbone_block_isolation is not None:
+                run_id += f"_backboneblock{args.moe_backbone_block_isolation}only"
         if args.workspace:
             run_id += f"_workspace{args.workspace_num_slots}s_{args.workspace_train_mode}"
             if args.workspace_no_selection:
@@ -3287,6 +3371,7 @@ if __name__ == "__main__":
             dynamic_n_cooldown_steps=args.dynamic_n_cooldown_steps,
             moe_enabled=args.moe,
             split_graph_moe_placement=args.moe_placement,
+            split_graph_moe_backbone_block_isolation=args.moe_backbone_block_isolation,
             moe_num_experts=args.moe_num_experts,
             moe_expert_dim=args.moe_expert_dim,
             moe_capacity_factor=args.moe_capacity_factor,

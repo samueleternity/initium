@@ -100,6 +100,7 @@ class CfCBackboneParallel(nn.Module):
         moe_top_k: int = 1,
         moe_capacity_factor: float = 1.5,
         moe_load_balance_alpha: float = 0.01,
+        moe_block_isolation: int | None = None,
         device=None,
         dtype=None,
     ):
@@ -134,45 +135,65 @@ class CfCBackboneParallel(nn.Module):
         # token batch, so this costs nothing extra to support here).
         self.moe_enabled = moe_enabled
         self.moe_blocks: nn.ModuleList | None = None
+        if moe_block_isolation is not None and not 0 <= moe_block_isolation < num_blocks:
+            raise ValueError(
+                f"moe_block_isolation={moe_block_isolation} is outside "
+                f"the configured backbone block range [0, {num_blocks - 1}]"
+            )
         if moe_enabled:
             self.moe_blocks = nn.ModuleList(
                 [
-                    MoEBlock(
-                        d_model,
-                        num_experts=moe_num_experts,
-                        expert_dim=moe_expert_dim,
-                        top_k=moe_top_k,
-                        capacity_factor=moe_capacity_factor,
-                        load_balance_alpha=moe_load_balance_alpha,
-                        device=device,
-                        dtype=dtype,
+                    (
+                        MoEBlock(
+                            d_model,
+                            num_experts=moe_num_experts,
+                            expert_dim=moe_expert_dim,
+                            top_k=moe_top_k,
+                            capacity_factor=moe_capacity_factor,
+                            load_balance_alpha=moe_load_balance_alpha,
+                            device=device,
+                            dtype=dtype,
+                        )
+                        if moe_block_isolation is None or i == moe_block_isolation
+                        else nn.Identity()
                     )
-                    for _ in range(num_blocks)
+                    for i in range(num_blocks)
                 ]
             )
 
-    def forward(self, x):  # (B, L, in_dim) -> (B, L, d_model), called ONCE per training step
+    def forward(
+        self, x, *, token_mask: torch.Tensor | None = None
+    ):  # (B, L, in_dim) -> (B, L, d_model), called ONCE per training step
         h = self.in_adapter(x)
         for i, block in enumerate(self.blocks):
             h = block(h)
-            if self.moe_enabled:
+            if self.moe_enabled and isinstance(self.moe_blocks[i], MoEBlock):
                 assert self.moe_blocks is not None
-                h = self.moe_blocks[i](h)
+                h = self.moe_blocks[i](h, token_mask=token_mask)
         return h
 
-    def forward_with_specialists(self, x: torch.Tensor):
+    def forward_with_specialists(
+        self, x: torch.Tensor, *, token_mask: torch.Tensor | None = None
+    ):
         """Return final MoE candidates and routes for shared-workspace use."""
         if not self.moe_enabled or self.moe_blocks is None:
             raise RuntimeError("workspace broadcast requires an enabled MoE expert pool")
         h = self.in_adapter(x)
         final_index = len(self.blocks) - 1
+        if not isinstance(self.moe_blocks[final_index], MoEBlock):
+            raise RuntimeError(
+                "workspace broadcast requires the final backbone block to have an active MoE bank"
+            )
         for i, block in enumerate(self.blocks):
             h = block(h)
             if i == final_index:
                 base = h
-                _, experts, indices, weights = self.moe_blocks[i](h, return_details=True)
+                _, experts, indices, weights = self.moe_blocks[i](
+                    h, return_details=True, token_mask=token_mask
+                )
                 return base, experts, indices, weights
-            h = self.moe_blocks[i](h)
+            if isinstance(self.moe_blocks[i], MoEBlock):
+                h = self.moe_blocks[i](h, token_mask=token_mask)
         raise RuntimeError("CfC parallel backbone has no blocks")
 
 
@@ -192,6 +213,7 @@ def build_parallel_backbone(
     moe_top_k: int = 1,
     moe_capacity_factor: float = 1.5,
     moe_load_balance_alpha: float = 0.01,
+    moe_block_isolation: int | None = None,
     device=None,
     dtype=None,
 ):
@@ -219,6 +241,7 @@ def build_parallel_backbone(
                     moe_top_k=moe_top_k,
                     moe_capacity_factor=moe_capacity_factor,
                     moe_load_balance_alpha=moe_load_balance_alpha,
+                    moe_block_isolation=moe_block_isolation,
                     **(cfc_kwargs or {}),
                 )
             )
@@ -241,6 +264,7 @@ def build_parallel_backbone(
                     moe_top_k=moe_top_k,
                     moe_capacity_factor=moe_capacity_factor,
                     moe_load_balance_alpha=moe_load_balance_alpha,
+                    moe_block_isolation=moe_block_isolation,
                 )
             )
         cur = d_model
@@ -261,7 +285,9 @@ def collect_backbone_moe_layers(backbone: nn.Module) -> list:
                 raise TypeError(
                     "MoE-enabled backbone stages must expose a ModuleList of moe_blocks"
                 )
-            moe_layers.extend(blocks)
+            moe_layers.extend(
+                block for block in blocks if callable(getattr(block, "pop_aux_loss", None))
+            )
     return moe_layers
 
 

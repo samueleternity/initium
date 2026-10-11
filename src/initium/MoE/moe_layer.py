@@ -157,6 +157,11 @@ class SwitchMoE(nn.Module):
         self.experts = nn.ModuleList([Expert(d_model, expert_dim) for _ in range(num_experts)])
 
         self._aux_losses: list[torch.Tensor] = []
+        # Routing/activation reports are useful for experiments but can be
+        # expensive in recurrent controllers, where this module may run once
+        # per timestep. Keep them independently switchable from the actual
+        # routing and load-balancing objective.
+        self.diagnostics_enabled = True
         self._last_diag: dict = {}
         self._diag_accum: dict[str, torch.Tensor] = {}
         self._diag_calls = 0
@@ -232,22 +237,29 @@ class SwitchMoE(nn.Module):
         else:
             gate_weights = topk_prob / topk_prob.sum(dim=-1, keepdim=True).clamp(min=1e-9)
 
-        # f_i/P_i are cheap to compute regardless of mode; only the aux LOSS
-        # accumulation (needed for backward()) is training-gated below.
-        # Computing diagnostics unconditionally is what lets inference
-        # (model.eval()) report routing health -- previously last_diagnostics()
-        # stayed empty forever outside training, which made it impossible to
-        # verify MoE routing on real held-out data at inference time.
-        one_hot_k = F.one_hot(topk_idx, num_classes=self.num_experts).float()  # (T, k, E)
-        f_i = one_hot_k.sum(dim=(0, 1)) / max(num_tokens * top_k, 1)
-        P_i = probs.mean(dim=0)
-
+        collect_diagnostics = self.diagnostics_enabled
+        # The auxiliary loss needs the non-differentiable assignment fraction
+        # and differentiable probability mass. Use bincount instead of a
+        # dense (tokens, top_k, experts) one-hot tensor, which is especially
+        # costly for recurrent MoE calls. The one-hot form is built only when
+        # detailed reports are enabled and token-subset statistics need it.
         if self.training:
+            f_i = torch.bincount(
+                topk_idx.reshape(-1), minlength=self.num_experts
+            ).to(dtype=probs.dtype) / max(num_tokens * top_k, 1)
+            P_i = probs.mean(dim=0)
             aux_loss = self.load_balance_alpha * self.num_experts * (f_i * P_i).sum()
             self._aux_losses.append(aux_loss)
+        elif collect_diagnostics:
+            f_i = torch.bincount(
+                topk_idx.reshape(-1), minlength=self.num_experts
+            ).to(dtype=probs.dtype) / max(num_tokens * top_k, 1)
+            P_i = probs.mean(dim=0)
 
-        with torch.no_grad():
-            self._last_topk_idx = topk_idx.detach()
+        if collect_diagnostics:
+            with torch.no_grad():
+                self._last_topk_idx = topk_idx.detach()
+
 
         # Expert capacity, scaled by top_k (each slot competes for the same
         # per-expert buffer).
@@ -322,7 +334,11 @@ class SwitchMoE(nn.Module):
             route_slots_2d = route_slots.reshape(num_tokens, top_k)
             selected_outputs = expert_outputs[route_experts, route_slots_2d]
             output32 = (selected_outputs * accepted_gates.unsqueeze(-1)).sum(dim=1)
-            accepted_outputs = selected_outputs * keep.unsqueeze(-1).to(selected_outputs.dtype)
+            accepted_outputs = (
+                selected_outputs * keep.unsqueeze(-1).to(selected_outputs.dtype)
+                if collect_diagnostics
+                else None
+            )
 
             expert_out_all = None
             if return_details:
@@ -359,70 +375,72 @@ class SwitchMoE(nn.Module):
         )
         output = output32.to(output_dtype)
 
-        with torch.no_grad():
-            self._last_accepted = keep.detach()
-            self._last_diag = {
-                "cv_importance": (P_i.std() / P_i.mean().clamp(min=1e-8)).detach(),
-                "cv_load": (f_i.std() / f_i.mean().clamp(min=1e-8)).detach(),
-                "max_load_frac": f_i.max().detach(),
-                "expert_load_frac": f_i.detach(),
-                "router_importance_frac": P_i.detach(),
-                "router_entropy": (
-                    -(probs * probs.clamp_min(1e-9).log()).sum(dim=-1).mean()
-                ).detach(),
-                "router_max_prob": probs.max(dim=-1).values.mean().detach(),
-                "topk_gate_mean": topk_prob.mean().detach(),
-                "input_rms": flat32.square().mean().sqrt().detach(),
-                "input_absmax": flat32.abs().amax().detach(),
-                "expert_output_rms": accepted_outputs.square().mean().sqrt().detach(),
-                "expert_output_absmax": accepted_outputs.abs().amax().detach(),
-                "routed_output_rms": output32.square().mean().sqrt().detach(),
-                "routed_output_absmax": output32.abs().amax().detach(),
-                "capacity_drop_frac": (1.0 - keep.float().mean()).detach(),
-                "accepted_gate_mass": accepted_gates.sum(dim=-1).mean().detach(),
-            }
-            if token_mask_flat is not None:
-                valid = token_mask_flat
-                padded = ~valid
-                per_token_entropy = -(
-                    probs * probs.clamp_min(1e-9).log()
-                ).sum(dim=-1)
-                per_token_max_prob = probs.max(dim=-1).values
-                per_token_drop = 1.0 - keep.float().mean(dim=-1)
+        if collect_diagnostics:
+            with torch.no_grad():
+                one_hot_k = F.one_hot(topk_idx, num_classes=self.num_experts).float()
+                self._last_accepted = keep.detach()
+                self._last_diag = {
+                    "cv_importance": (P_i.std() / P_i.mean().clamp(min=1e-8)).detach(),
+                    "cv_load": (f_i.std() / f_i.mean().clamp(min=1e-8)).detach(),
+                    "max_load_frac": f_i.max().detach(),
+                    "expert_load_frac": f_i.detach(),
+                    "router_importance_frac": P_i.detach(),
+                    "router_entropy": (
+                        -(probs * probs.clamp_min(1e-9).log()).sum(dim=-1).mean()
+                    ).detach(),
+                    "router_max_prob": probs.max(dim=-1).values.mean().detach(),
+                    "topk_gate_mean": topk_prob.mean().detach(),
+                    "input_rms": flat32.square().mean().sqrt().detach(),
+                    "input_absmax": flat32.abs().amax().detach(),
+                    "expert_output_rms": accepted_outputs.square().mean().sqrt().detach(),
+                    "expert_output_absmax": accepted_outputs.abs().amax().detach(),
+                    "routed_output_rms": output32.square().mean().sqrt().detach(),
+                    "routed_output_absmax": output32.abs().amax().detach(),
+                    "capacity_drop_frac": (1.0 - keep.float().mean()).detach(),
+                    "accepted_gate_mass": accepted_gates.sum(dim=-1).mean().detach(),
+                }
+                if token_mask_flat is not None:
+                    valid = token_mask_flat
+                    padded = ~valid
+                    per_token_entropy = -(
+                        probs * probs.clamp_min(1e-9).log()
+                    ).sum(dim=-1)
+                    per_token_max_prob = probs.max(dim=-1).values
+                    per_token_drop = 1.0 - keep.float().mean(dim=-1)
 
-                def subset_routing_stats(subset: torch.Tensor, prefix: str) -> None:
-                    subset_weight = subset.to(probs.dtype)
-                    count = subset_weight.sum()
-                    denom = count.clamp_min(1.0)
-                    subset_load = (
-                        one_hot_k
-                        * subset_weight[:, None, None]
-                    ).sum(dim=(0, 1)) / (denom * top_k)
-                    subset_importance = (
-                        probs * subset_weight[:, None]
-                    ).sum(dim=0) / denom
-                    entropy = (per_token_entropy * subset_weight).sum() / denom
-                    max_prob = (per_token_max_prob * subset_weight).sum() / denom
-                    drop_frac = (per_token_drop * subset_weight).sum() / denom
-                    self._last_diag[f"{prefix}_token_count"] = count.detach()
-                    self._last_diag[f"{prefix}_expert_load_frac"] = subset_load.detach()
-                    self._last_diag[f"{prefix}_router_importance_frac"] = (
-                        subset_importance.detach()
-                    )
-                    self._last_diag[f"{prefix}_router_entropy"] = entropy.detach()
-                    self._last_diag[f"{prefix}_router_max_prob"] = max_prob.detach()
-                    self._last_diag[f"{prefix}_capacity_drop_frac"] = drop_frac.detach()
+                    def subset_routing_stats(subset: torch.Tensor, prefix: str) -> None:
+                        subset_weight = subset.to(probs.dtype)
+                        count = subset_weight.sum()
+                        denom = count.clamp_min(1.0)
+                        subset_load = (
+                            one_hot_k
+                            * subset_weight[:, None, None]
+                        ).sum(dim=(0, 1)) / (denom * top_k)
+                        subset_importance = (
+                            probs * subset_weight[:, None]
+                        ).sum(dim=0) / denom
+                        entropy = (per_token_entropy * subset_weight).sum() / denom
+                        max_prob = (per_token_max_prob * subset_weight).sum() / denom
+                        drop_frac = (per_token_drop * subset_weight).sum() / denom
+                        self._last_diag[f"{prefix}_token_count"] = count.detach()
+                        self._last_diag[f"{prefix}_expert_load_frac"] = subset_load.detach()
+                        self._last_diag[f"{prefix}_router_importance_frac"] = (
+                            subset_importance.detach()
+                        )
+                        self._last_diag[f"{prefix}_router_entropy"] = entropy.detach()
+                        self._last_diag[f"{prefix}_router_max_prob"] = max_prob.detach()
+                        self._last_diag[f"{prefix}_capacity_drop_frac"] = drop_frac.detach()
 
-                subset_routing_stats(valid, "valid")
-                subset_routing_stats(padded, "padded")
-            if self.training:
-                for key, value in self._last_diag.items():
-                    self._diag_accum[key] = (
-                        self._diag_accum[key] + value
-                        if key in self._diag_accum
-                        else value.clone()
-                    )
-                self._diag_calls += 1
+                    subset_routing_stats(valid, "valid")
+                    subset_routing_stats(padded, "padded")
+                if self.training:
+                    for key, value in self._last_diag.items():
+                        self._diag_accum[key] = (
+                            self._diag_accum[key] + value
+                            if key in self._diag_accum
+                            else value.clone()
+                        )
+                    self._diag_calls += 1
 
         output = output.reshape(orig_shape)
         if return_details:
@@ -451,6 +469,19 @@ class SwitchMoE(nn.Module):
         total = torch.stack(self._aux_losses).mean()
         self._aux_losses = []
         return total
+
+    def set_diagnostics_enabled(self, enabled: bool) -> None:
+        """Enable/disable optional routing and activation diagnostics.
+
+        This does not affect expert routing, outputs, or auxiliary loss.
+        Clearing cached values also makes runtime toggles well-defined.
+        """
+        self.diagnostics_enabled = bool(enabled)
+        self._last_diag = {}
+        self._diag_accum = {}
+        self._diag_calls = 0
+        self._last_topk_idx = None
+        self._last_accepted = None
 
     def last_diagnostics(self) -> dict:
         """Read-only routing-health diagnostics from the most recent
@@ -549,6 +580,9 @@ class MoEBlock(nn.Module):
 
     def pop_aux_loss(self) -> torch.Tensor:
         return self.moe.pop_aux_loss()
+
+    def set_diagnostics_enabled(self, enabled: bool) -> None:
+        self.moe.set_diagnostics_enabled(enabled)
 
     def last_diagnostics(self) -> dict:
         return self.moe.last_diagnostics()
@@ -656,8 +690,8 @@ class MultiSourceMoEBlock(nn.Module):
         # per-source specialization -- e.g. "source 0 (backbone output)
         # concentrates on experts {2,5}, source 1 (read vector) on {1,7}"
         # -- rather than every source routing near-identically by chance.
-        topk_idx = self.moe.last_routing()  # (sum(batch_sizes), top_k) or None
-        accepted = self.moe.last_accepted_routing()
+        topk_idx = self.moe.last_routing() if self.moe.diagnostics_enabled else None
+        accepted = self.moe.last_accepted_routing() if self.moe.diagnostics_enabled else None
         if topk_idx is not None and accepted is not None:
             num_experts = self.moe.num_experts
             if self._cumulative_source_counts is None:
@@ -698,6 +732,12 @@ class MultiSourceMoEBlock(nn.Module):
 
     def pop_aux_loss(self) -> torch.Tensor:
         return self.moe.pop_aux_loss()
+
+    def set_diagnostics_enabled(self, enabled: bool) -> None:
+        self.moe.set_diagnostics_enabled(enabled)
+        self._cumulative_source_counts = None
+        self._cumulative_source_accepted = None
+        self._cumulative_source_routes = None
 
     def last_diagnostics(self) -> dict:
         return self.moe.last_diagnostics()

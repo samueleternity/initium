@@ -172,7 +172,7 @@ from initium.memory_manipulation.stochastic_write_head_v2 import (
     pop_total_kl,
     update_all_prior_snapshots,
 )
-from initium.MoE.moe_layer import pop_total_moe_aux_loss
+from initium.MoE.moe_layer import SwitchMoE, pop_total_moe_aux_loss
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
@@ -652,6 +652,118 @@ def restore_rng_state(rng_state):
         torch.cuda.set_rng_state_all(rng_state["cuda"])
 
 
+def load_frozen_workspace_warm_start(
+    rnn: nn.Module,
+    output_proj: nn.Module,
+    checkpoint: dict,
+    expected_model_config: dict,
+) -> list[str]:
+    """Load a workspace-disabled baseline into a frozen-workspace model.
+
+    Only the newly introduced workspace state may be absent. Every shared
+    tensor must match by name and shape, and the recorded architecture must
+    match outside workspace settings and the curriculum-dependent memory
+    size. Returns the target workspace keys left at their fresh initialization.
+    """
+    checkpoint_config = checkpoint.get("model_config")
+    if not isinstance(checkpoint_config, dict):
+        raise ValueError(
+            "Frozen-workspace warm start requires a checkpoint with model_config metadata."
+        )
+    if checkpoint_config.get("workspace_enabled", False) or any(
+        key.startswith("workspace.") or ".workspace." in key
+        for key in checkpoint.get("rnn_state_dict", {})
+    ):
+        raise ValueError(
+            "Frozen-workspace warm start expects a workspace-disabled baseline checkpoint."
+        )
+
+    ignored_config_keys = {
+        "nr_cells",  # resized to the checkpoint size for load, then back to lesson 1
+        "dnc_backward_trace",  # diagnostic instrumentation, not architecture
+        "workspace_enabled",
+        "workspace_num_slots",
+        "workspace_no_selection",
+        "workspace_reset_each_step",
+        "workspace_train_mode",
+    }
+    missing_config = sorted(
+        key
+        for key in expected_model_config
+        if key not in ignored_config_keys and key not in checkpoint_config
+    )
+    unexpected_config = sorted(
+        key
+        for key in checkpoint_config
+        if key not in ignored_config_keys and key not in expected_model_config
+    )
+    mismatched_config = sorted(
+        key
+        for key, expected in expected_model_config.items()
+        if key not in ignored_config_keys
+        and key in checkpoint_config
+        and checkpoint_config[key] != expected
+    )
+    if missing_config or unexpected_config or mismatched_config:
+        details = []
+        if missing_config:
+            details.append(f"missing metadata: {', '.join(missing_config)}")
+        if unexpected_config:
+            details.append(f"unrecognized metadata: {', '.join(unexpected_config)}")
+        if mismatched_config:
+            details.append(
+                "configuration differs: "
+                + ", ".join(
+                    f"{key}={checkpoint_config[key]!r} (expected "
+                    f"{expected_model_config[key]!r})"
+                    for key in mismatched_config
+                )
+            )
+        raise ValueError(
+            "Checkpoint is not a compatible frozen-workspace baseline: "
+            + "; ".join(details)
+        )
+
+    checkpoint_state = checkpoint.get("rnn_state_dict")
+    if not isinstance(checkpoint_state, dict):
+        raise ValueError("Checkpoint does not contain an rnn_state_dict.")
+    target_state = rnn.state_dict()
+    missing_keys = set(target_state) - set(checkpoint_state)
+    unexpected_keys = set(checkpoint_state) - set(target_state)
+
+    def is_workspace_key(key: str) -> bool:
+        return key == "workspace" or key.startswith("workspace.") or ".workspace." in key
+
+    missing_workspace_keys = sorted(key for key in missing_keys if is_workspace_key(key))
+    missing_non_workspace = sorted(missing_keys - set(missing_workspace_keys))
+    if missing_non_workspace or unexpected_keys:
+        raise ValueError(
+            "Checkpoint state does not match the frozen-workspace model. "
+            f"Missing non-workspace keys={missing_non_workspace[:8]}, "
+            f"unexpected keys={sorted(unexpected_keys)[:8]}"
+        )
+    shape_mismatches = [
+        f"{key}: checkpoint{tuple(checkpoint_state[key].shape)} != model{tuple(target_state[key].shape)}"
+        for key in target_state.keys() & checkpoint_state.keys()
+        if torch.is_tensor(target_state[key])
+        and torch.is_tensor(checkpoint_state[key])
+        and target_state[key].shape != checkpoint_state[key].shape
+    ]
+    if shape_mismatches:
+        raise ValueError(
+            "Checkpoint has incompatible tensor shapes: " + "; ".join(shape_mismatches[:8])
+        )
+
+    load_result = rnn.load_state_dict(checkpoint_state, strict=False)
+    if load_result.unexpected_keys or sorted(load_result.missing_keys) != missing_workspace_keys:
+        raise RuntimeError(
+            "Unexpected state mismatch while loading frozen-workspace baseline: "
+            f"missing={load_result.missing_keys}, unexpected={load_result.unexpected_keys}"
+        )
+    output_proj.load_state_dict(checkpoint["output_proj_state_dict"])
+    return missing_workspace_keys
+
+
 # ==========================================
 #              TRAINING LOOP
 # ==========================================
@@ -673,6 +785,7 @@ def run(
     dynamic_n_trigger_frac: float = DYNAMIC_N_TRIGGER_FRAC,
     dynamic_n_cooldown_steps: int = DYNAMIC_N_COOLDOWN_STEPS,
     moe_enabled: bool = MOE_ENABLED,
+    moe_diagnostics_enabled: bool = True,
     split_graph_moe_placement: str = "all",
     split_graph_moe_backbone_block_isolation: int | None = None,
     split_graph_moe_backbone_residual_scale: float = 1.0,
@@ -733,7 +846,36 @@ def run(
 
     os.makedirs(LOG_DIR, exist_ok=True)
     log_path = os.path.join(LOG_DIR, f"run_{run_id}.csv")
-    resuming = resume_from is not None
+    resume_requested = resume_from is not None
+    resume_checkpoint = (
+        load_checkpoint_for_resume(resume_from, device) if resume_requested else None
+    )
+    checkpoint_config = (
+        (resume_checkpoint.get("model_config") or {})
+        if resume_checkpoint is not None
+        else {}
+    )
+    checkpoint_state = (
+        (resume_checkpoint.get("rnn_state_dict") or {})
+        if resume_checkpoint is not None
+        else {}
+    )
+    checkpoint_has_workspace = any(
+        key.startswith("workspace.") or ".workspace." in key
+        for key in checkpoint_state
+    )
+    checkpoint_workspace_enabled = bool(
+        checkpoint_config.get("workspace_enabled", False) or checkpoint_has_workspace
+    )
+    frozen_workspace_warm_start = bool(
+        resume_requested
+        and workspace_enabled
+        and workspace_train_mode == "frozen"
+        and not checkpoint_workspace_enabled
+    )
+    # A baseline-to-frozen-workspace warm start starts a new experiment: its
+    # logs must be fresh, and it gets a fresh workspace-only optimizer.
+    resuming = resume_requested and not frozen_workspace_warm_start
     log_file = open(log_path, "a" if resuming else "w", newline="")
     log_writer = csv.writer(log_file)
     if not resuming:
@@ -1091,6 +1233,12 @@ def run(
         )
         + (f" | moe={moe_num_experts}e" if moe_enabled else "")
     )
+    if moe_enabled:
+        print(
+            f"[{run_id}] MoE routing diagnostics="
+            f"{'on' if moe_diagnostics_enabled else 'off'} | "
+            "load-balancing auxiliary loss and routing remain active"
+        )
 
     if isolate_link_ablation:
         curriculum.lesson_nr_cells = [MODEL_NR_CELLS] * len(curriculum.table)
@@ -1400,6 +1548,83 @@ def run(
         "workspace_reset_each_step": workspace_reset_each_step,
         "workspace_train_mode": workspace_train_mode,
     }
+    controller_model_config = {}
+    if controller == "mamba":
+        controller_model_config = {
+            "mamba_d_state": MAMBA_D_STATE,
+            "mamba_d_conv": MAMBA_D_CONV,
+            "mamba_expand": MAMBA_EXPAND,
+        }
+    elif controller == "mamba2":
+        controller_model_config = {
+            "mamba2_d_state": MAMBA2_D_STATE,
+            "mamba2_d_conv": MAMBA2_D_CONV,
+            "mamba2_expand": MAMBA2_EXPAND,
+            "mamba2_headdim": MAMBA2_HEADDIM,
+            "mamba2_ngroups": MAMBA2_NGROUPS,
+        }
+    elif controller == "mamba3":
+        controller_model_config = {
+            "mamba3_d_state": MAMBA3_D_STATE,
+            "mamba3_expand": MAMBA3_EXPAND,
+            "mamba3_headdim": MAMBA3_HEADDIM,
+            "mamba3_rope_fraction": MAMBA3_ROPE_FRACTION,
+        }
+    elif controller == "cfc":
+        controller_model_config = {
+            "cfc_mode": CFC_MODE,
+            "cfc_backbone_units": CFC_BACKBONE_UNITS,
+            "cfc_backbone_layers": CFC_BACKBONE_LAYERS,
+            "cfc_backbone_dropout": CFC_BACKBONE_DROPOUT,
+            "cfc_activation": CFC_ACTIVATION,
+            "cfc_mixed_memory": CFC_MIXED_MEMORY,
+            "cfc_residual": CFC_RESIDUAL,
+        }
+    elif "+" in controller:
+        controller_model_config = {
+            "mamba_d_state": MAMBA_D_STATE,
+            "mamba_d_conv": MAMBA_D_CONV,
+            "mamba_expand": MAMBA_EXPAND,
+            "mamba2_d_state": MAMBA2_D_STATE,
+            "mamba2_d_conv": MAMBA2_D_CONV,
+            "mamba2_expand": MAMBA2_EXPAND,
+            "mamba2_headdim": MAMBA2_HEADDIM,
+            "mamba2_ngroups": MAMBA2_NGROUPS,
+            "mamba3_d_state": MAMBA3_D_STATE,
+            "mamba3_expand": MAMBA3_EXPAND,
+            "mamba3_headdim": MAMBA3_HEADDIM,
+            "mamba3_rope_fraction": MAMBA3_ROPE_FRACTION,
+            "cfc_mode": CFC_MODE,
+            "cfc_backbone_units": CFC_BACKBONE_UNITS,
+            "cfc_backbone_layers": CFC_BACKBONE_LAYERS,
+            "cfc_backbone_dropout": CFC_BACKBONE_DROPOUT,
+            "cfc_activation": CFC_ACTIVATION,
+            "cfc_mixed_memory": CFC_MIXED_MEMORY,
+            "cfc_residual": CFC_RESIDUAL,
+            "hybrid_cfc_num_blocks": HYBRID_CFC_NUM_BLOCKS,
+        }
+    expected_resume_model_config = {
+        "input_size": INPUT_DIM,
+        "hidden_size": hidden_size,
+        "num_hidden_layers": getattr(rnn, "num_hidden_layers", None),
+        "nr_cells": rnn.memories[0].nr_cells,
+        "cell_size": cell_size,
+        "read_heads": read_heads,
+        "controller_type": controller,
+        "link_matrix_mode": link_matrix_mode,
+        "link_matrix_topk": link_matrix_topk,
+        "dynamic_n_mode": dynamic_n_mode,
+        "moe_enabled": moe_enabled,
+        "moe_num_experts": moe_num_experts,
+        "moe_expert_dim": moe_expert_dim,
+        "moe_capacity_factor": moe_capacity_factor,
+        "moe_load_balance_alpha": moe_load_balance_alpha,
+        "moe_top_k": moe_top_k,
+        "split_graph_enabled": split_graph_enabled,
+        "split_graph_variant": split_graph_variant,
+        **controller_model_config,
+        **extra_model_config,
+    }
 
     if link_matrix_mode != "dense":
         patch_link_matrix(rnn, mode=link_matrix_mode, topk=link_matrix_topk)
@@ -1417,6 +1642,9 @@ def run(
     for module_name, module in rnn.named_modules():
         if id(module) in moe_layer_ids:
             module.diagnostic_name = module_name or type(module).__name__
+    for module in rnn.modules():
+        if isinstance(module, SwitchMoE):
+            module.set_diagnostics_enabled(moe_diagnostics_enabled)
 
     def emit_failure_diagnostics(channel: str, *, include_gradients: bool = False) -> None:
         segment_diagnostics.emit(channel, include_gradients=include_gradients)
@@ -1427,7 +1655,7 @@ def run(
                     f"[dnc-numerics:{channel}] "
                     + " ".join(f"{name}={value:.4g}" for name, value in memory_diag.items())
                 )
-        if moe_enabled:
+        if moe_enabled and moe_diagnostics_enabled:
             _, failure_moe_diag = pop_total_moe_aux_loss(
                 rnn.moe_layers, include_diagnostics=True
             )
@@ -1568,8 +1796,10 @@ def run(
         10**9
     )  # idle at run start (so the dip ramp is already at 1.0 immediately);
     # reset to `step` on every lesson advance instead
-    if resuming:
-        ckpt = load_checkpoint_for_resume(resume_from, device)
+    if resume_requested:
+        ckpt = resume_checkpoint
+        if ckpt is None:
+            raise RuntimeError("resume_requested was set without a loaded checkpoint")
         # Static Option 2 resume fix: rnn was just constructed above at
         # LESSON_NR_CELLS[0] (curriculum.lesson doesn't exist yet at that
         # point in run()). If this checkpoint is mid-schedule, the live
@@ -1595,16 +1825,57 @@ def run(
             )
         resize_memory(rnn, ckpt_nr_cells, device=device, optimizer=optimizer)
 
-        rnn.load_state_dict(ckpt["rnn_state_dict"])
-        output_proj.load_state_dict(ckpt["output_proj_state_dict"])
-        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        if frozen_workspace_warm_start:
+            if ckpt.get("beta_target") != beta_target:
+                raise ValueError(
+                    "Frozen-workspace warm start requires the baseline checkpoint "
+                    f"beta ({ckpt.get('beta_target')}) to match this run ({beta_target})."
+                )
+            missing_workspace_keys = load_frozen_workspace_warm_start(
+                rnn,
+                output_proj,
+                ckpt,
+                expected_resume_model_config,
+            )
+            # The baseline was saved at a later curriculum lesson, where
+            # memory has more cells. Start the workspace experiment at lesson
+            # 1 with that lesson's configured memory size and a fresh schedule.
+            resize_memory(rnn, starting_nr_cells, device=device, optimizer=optimizer)
+            # Memory resize constructs a replacement module with fresh
+            # Parameter objects; reapply the frozen policy after transplant.
+            for parameter in rnn.parameters():
+                parameter.requires_grad_(False)
+            assert isinstance(rnn, SplitGraphDNC) and rnn.workspace is not None
+            for parameter in rnn.workspace.parameters():
+                parameter.requires_grad_(True)
+            # Model construction and checkpoint loading consume RNG state.
+            # Start the new workspace experiment from the requested seed.
+            random.seed(seed)
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
+            curriculum.lesson = 0
+            step = 0
+            print(
+                f"[{run_id}] Warm-started frozen workspace from {resume_from} "
+                f"(baseline step {ckpt['step']}, lesson "
+                f"{ckpt.get('curriculum_lesson', 0) + 1}); loaded matching "
+                f"backbone/combiner/MoE/DNC/task-head weights, kept "
+                f"{len(missing_workspace_keys)} workspace tensors freshly initialized, "
+                f"reset optimizer, scaler, RNG, and curriculum to step 0 / lesson 1."
+            )
+        else:
+            rnn.load_state_dict(ckpt["rnn_state_dict"])
+            output_proj.load_state_dict(ckpt["output_proj_state_dict"])
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         # v3 fix: restore GradScaler state (scale, growth tracker) instead
         # of leaving `scaler` at its freshly-constructed init_scale -- see
         # header note. `.get(...)` instead of ["..."] so a pre-v3 checkpoint
         # (saved before this key existed) still loads, just without this fix.
-        if "scaler_state_dict" in ckpt:
+        if not frozen_workspace_warm_start and "scaler_state_dict" in ckpt:
             scaler.load_state_dict(ckpt["scaler_state_dict"])
-        else:
+        elif not frozen_workspace_warm_start:
             print(
                 f"[{run_id}] WARNING: checkpoint predates GradScaler-state "
                 f"saving (v3 fix) -- scaler starting fresh at "
@@ -1618,7 +1889,8 @@ def run(
         # and also means old checkpoints' scheduler_state_dict (which may
         # already reflect the buggy drifted state) is simply ignored rather
         # than needing migration.
-        curriculum.lesson = ckpt["curriculum_lesson"]
+        if not frozen_workspace_warm_start:
+            curriculum.lesson = ckpt["curriculum_lesson"]
         # Dynamic-N (macro-scale): restore the usage-EMA/cooldown/growth
         # history, so a resumed run doesn't silently reset the trigger's
         # sustained-saturation window back to 0 (which would just delay the
@@ -1628,7 +1900,7 @@ def run(
         # saved before dynamic_n_mode existed, or a checkpoint from a
         # non-dynamic-N run, still loads -- the controller (if this run
         # even has one) just starts fresh, same as a brand-new run would.
-        if dynamic_n_ctrl is not None:
+        if dynamic_n_ctrl is not None and not frozen_workspace_warm_start:
             if ckpt.get("dynamic_n_state") is not None:
                 dynamic_n_ctrl.load_state_dict(ckpt["dynamic_n_state"])
             else:
@@ -1649,9 +1921,9 @@ def run(
         # instead of ["..."] so a pre-v5 (Phase 1) checkpoint, which has no
         # prior state to restore at all, still loads -- just starting the
         # learned prior fresh at N(0,I), same as a brand-new run would.
-        if "prior_state" in ckpt:
+        if not frozen_workspace_warm_start and "prior_state" in ckpt:
             load_prior_state(stochastic_heads, ckpt["prior_state"])
-        else:
+        elif not frozen_workspace_warm_start:
             print(
                 f"[{run_id}] WARNING: checkpoint predates the learned-prior "
                 f"snapshot (v5/Phase 2) - prior starting fresh at N(0,I) "
@@ -1664,18 +1936,19 @@ def run(
         # docstring). `.get(...)` so a pre-v6 checkpoint still loads --
         # ood_rng just starts fresh in that case, identical to today's
         # behavior before this fix.
-        if "ood_rng_state" in ckpt:
+        if not frozen_workspace_warm_start and "ood_rng_state" in ckpt:
             ood_rng.setstate(ckpt["ood_rng_state"])
-        else:
+        elif not frozen_workspace_warm_start:
             print(
                 f"[{run_id}] WARNING: checkpoint predates ood_rng-state "
                 f"saving (v6 fix) -- OOD sampling restarting from its "
                 f"fresh, seed-derived state instead of continuing the "
                 f"pre-resume leg's exact walk sequence."
             )
-        restore_rng_state(ckpt["rng_state"])
-        step = ckpt["step"]
-        if ckpt["beta_target"] != beta_target:
+        if not frozen_workspace_warm_start:
+            restore_rng_state(ckpt["rng_state"])
+            step = ckpt["step"]
+        if not frozen_workspace_warm_start and ckpt["beta_target"] != beta_target:
             anneal_start_step = step  # Phase 1: restart the ramp here
             print(
                 f"[{run_id}] beta_target changed on resume "
@@ -1683,11 +1956,12 @@ def run(
                 f"restarted from step {anneal_start_step}, ramping over "
                 f"the next {KL_ANNEAL_STEPS} steps."
             )
-        print(
-            f"[{run_id}] Resumed from {resume_from} at step {step} "
-            f"(lesson {curriculum.lesson + 1}/{len(curriculum.table)}); "
-            f"continuing to total_steps={total_steps}"
-        )
+        if not frozen_workspace_warm_start:
+            print(
+                f"[{run_id}] Resumed from {resume_from} at step {step} "
+                f"(lesson {curriculum.lesson + 1}/{len(curriculum.table)}); "
+                f"continuing to total_steps={total_steps}"
+            )
         if step >= total_steps:
             print(
                 f"[{run_id}] Checkpoint step {step} already >= total_steps "
@@ -1697,7 +1971,7 @@ def run(
 
     print(
         f"\n=== [{run_id}] Training (beta_target={beta_target}, beta_mode={beta_mode}) "
-        f"{'[resumed]' if resuming else ''} ==="
+        f"{'[warm-started]' if frozen_workspace_warm_start else '[resumed]' if resuming else ''} ==="
     )
     rnn.train()
     set_lr(step)  # Phase 1 FIX: ensure correct clamped LR from the very first
@@ -1803,7 +2077,9 @@ def run(
         moe_aux_loss, moe_diag = (
             pop_total_moe_aux_loss(
                 rnn.moe_layers,
-                include_diagnostics=(step + 1) % LOG_EVERY == 0,
+                include_diagnostics=(
+                    moe_diagnostics_enabled and (step + 1) % LOG_EVERY == 0
+                ),
             )
             if moe_enabled
             else (torch.zeros((), device=device), {})
@@ -2005,9 +2281,9 @@ def run(
             if amp_enabled:
                 parts.append(f"amp_scale {amp_scale:.1f}")
             parts.append(f"gpu_mem_peak_mb {gpu_mem_peak_mb:.1f}")
-            if moe_enabled:
+            if moe_enabled and moe_diagnostics_enabled:
+                parts.append(f"moe_aux {float(moe_aux_loss.detach()):.4f}")
                 parts += [
-                    f"moe_aux {float(moe_aux_loss.detach()):.4f}",
                     f"moe_cv_load {moe_diag.get('moe_cv_load', 0.0):.4f}",
                     f"moe_max_load_frac {moe_diag.get('moe_max_load_frac', 0.0):.4f}",
                     f"moe_capacity_drop {moe_diag.get('moe_capacity_drop_frac', 0.0):.1%}",
@@ -2868,9 +3144,10 @@ if __name__ == "__main__":
         "--resume",
         type=str,
         default=None,
-        help="path to a checkpoint .pt to resume from (requires --beta / positional beta "
-        "to also be given, so run_id/beta_target can be matched against the checkpoint). "
-        "Training continues from the checkpoint's step up to TOTAL_STEPS.",
+        help="path to a checkpoint .pt (requires --beta / positional beta). Normally "
+        "restores model, optimizer, RNG, curriculum, and step. With --workspace "
+        "--workspace-train-mode=frozen, a compatible workspace-disabled baseline "
+        "instead warm-starts matching weights and begins a fresh workspace training run.",
     )
     parser.add_argument(
         "--run-id-suffix",
@@ -3017,6 +3294,14 @@ if __name__ == "__main__":
         help="Alternative Phase 3, Step 2, Option 4: interleave external "
         "SwitchMoE blocks between Mamba controller blocks (mamba_controller.py "
         "/ moe_layer.py).",
+    )
+    parser.add_argument(
+        "--moe-diagnostics",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Collect and print detailed MoE routing/activation diagnostics "
+        "(enabled by default; use --no-moe-diagnostics to reduce diagnostic "
+        "overhead). Expert routing and the load-balancing auxiliary loss stay active.",
     )
     parser.add_argument(
         "--moe-placement",
@@ -3398,6 +3683,8 @@ if __name__ == "__main__":
             run_id = f"{run_id}_dynN"
         if args.moe:
             run_id = f"{run_id}_moe{args.moe_num_experts}e"
+            if not args.moe_diagnostics:
+                run_id += "_moediagoff"
             if args.split_graph and args.moe_placement != "all":
                 run_id += f"_{args.moe_placement}only"
             if args.moe_backbone_block_isolation is not None:
@@ -3447,6 +3734,7 @@ if __name__ == "__main__":
             dynamic_n_trigger_frac=args.dynamic_n_trigger_frac,
             dynamic_n_cooldown_steps=args.dynamic_n_cooldown_steps,
             moe_enabled=args.moe,
+            moe_diagnostics_enabled=args.moe_diagnostics,
             split_graph_moe_placement=args.moe_placement,
             split_graph_moe_backbone_block_isolation=args.moe_backbone_block_isolation,
             split_graph_moe_backbone_residual_scale=args.moe_backbone_residual_scale,

@@ -786,6 +786,7 @@ def run(
     dynamic_n_cooldown_steps: int = DYNAMIC_N_COOLDOWN_STEPS,
     moe_enabled: bool = MOE_ENABLED,
     moe_diagnostics_enabled: bool = True,
+    segment_diagnostics_enabled: bool = True,
     split_graph_moe_placement: str = "all",
     split_graph_moe_backbone_block_isolation: int | None = None,
     split_graph_moe_backbone_residual_scale: float = 1.0,
@@ -1233,6 +1234,10 @@ def run(
         )
         + (f" | moe={moe_num_experts}e" if moe_enabled else "")
     )
+    print(
+        f"[{run_id}] diagnostics: moe={'on' if moe_diagnostics_enabled else 'off'} "
+        f"segment={'on' if segment_diagnostics_enabled else 'off'}"
+    )
     if moe_enabled:
         print(
             f"[{run_id}] MoE routing diagnostics="
@@ -1636,7 +1641,9 @@ def run(
 
     output_proj = nn.Linear(INPUT_DIM, TRIPLE_DIM).to(device)
     dataset.set_output_proj(output_proj)
-    segment_diagnostics = SegmentDiagnostics(rnn)
+    segment_diagnostics = SegmentDiagnostics(
+        rnn, enabled=segment_diagnostics_enabled
+    )
     segment_diagnostics.add_module(output_proj, "task_output")
     moe_layer_ids = {id(layer) for layer in getattr(rnn, "moe_layers", [])}
     for module_name, module in rnn.named_modules():
@@ -1645,6 +1652,8 @@ def run(
     for module in rnn.modules():
         if isinstance(module, SwitchMoE):
             module.set_diagnostics_enabled(moe_diagnostics_enabled)
+    if isinstance(rnn, SplitGraphDNC) and rnn.workspace is not None:
+        rnn.workspace.set_diagnostics_enabled(moe_diagnostics_enabled)
 
     def emit_failure_diagnostics(channel: str, *, include_gradients: bool = False) -> None:
         segment_diagnostics.emit(channel, include_gradients=include_gradients)
@@ -3301,7 +3310,15 @@ if __name__ == "__main__":
         default=True,
         help="Collect and print detailed MoE routing/activation diagnostics "
         "(enabled by default; use --no-moe-diagnostics to reduce diagnostic "
-        "overhead). Expert routing and the load-balancing auxiliary loss stay active.",
+        "overhead, including workspace activity summaries). Expert routing, "
+        "workspace computation, and the load-balancing auxiliary loss stay active.",
+    )
+    parser.add_argument(
+        "--segment-diagnostics",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Collect activation/gradient summaries for model segments (enabled by default; "
+        "use --no-segment-diagnostics to avoid per-module hooks in long recurrent sequences).",
     )
     parser.add_argument(
         "--moe-placement",
@@ -3735,6 +3752,7 @@ if __name__ == "__main__":
             dynamic_n_cooldown_steps=args.dynamic_n_cooldown_steps,
             moe_enabled=args.moe,
             moe_diagnostics_enabled=args.moe_diagnostics,
+            segment_diagnostics_enabled=args.segment_diagnostics,
             split_graph_moe_placement=args.moe_placement,
             split_graph_moe_backbone_block_isolation=args.moe_backbone_block_isolation,
             split_graph_moe_backbone_residual_scale=args.moe_backbone_residual_scale,

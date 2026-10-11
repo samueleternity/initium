@@ -80,13 +80,16 @@ class SegmentDiagnostics:
     boundary or when a numerical failure needs an immediate trace.
     """
 
-    def __init__(self, model: nn.Module):
+    def __init__(self, model: nn.Module, *, enabled: bool = True):
         self.model = model
+        self.enabled = bool(enabled)
         self.channel: str | None = "train"
         self._records: dict[str, OrderedDict[str, dict[str, Any]]] = {}
         self._segments: list[tuple[str, str]] = []
         self._external_modules: list[tuple[str, nn.Module]] = []
         self._handles = []
+        if not self.enabled:
+            return
         for path, module in model.named_modules():
             label = _segment_label(path, module)
             if label is not None:
@@ -140,6 +143,8 @@ class SegmentDiagnostics:
 
     def add_module(self, module: nn.Module, label: str) -> None:
         """Add a caller-named module such as the task output projection."""
+        if not self.enabled:
+            return
         self._register(module, label, label)
         self._external_modules.append((label, module))
 
@@ -180,6 +185,8 @@ class SegmentDiagnostics:
         return result
 
     def emit(self, channel: str, *, include_gradients: bool = False) -> None:
+        if not self.enabled:
+            return
         records = self._records.pop(channel, None)
         gradient_records = self._gradient_records() if include_gradients else OrderedDict()
         if not records and not gradient_records:

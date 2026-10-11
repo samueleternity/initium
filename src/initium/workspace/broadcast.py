@@ -36,6 +36,7 @@ class WorkspaceBroadcast(nn.Module):
         self.write_gate = nn.Linear(2 * d_model, d_model)
         self.read_gate = nn.Parameter(torch.zeros(()))
         self.write_gate_closed = False
+        self.diagnostics_enabled = True
         self._last_step_diag: dict[str, torch.Tensor] = {}
         self._last_diag: dict[str, torch.Tensor] = {}
         nn.init.zeros_(self.write_gate.weight)
@@ -99,15 +100,16 @@ class WorkspaceBroadcast(nn.Module):
             selected = specialist_deltas.gather(
                 1, route_indices.unsqueeze(-1).expand(-1, -1, self.d_model)
             )
-            zero = specialist_deltas.new_zeros((), dtype=torch.float32)
-            self._last_step_diag = {
-                "write_mass": zero,
-                "active_write_frac": zero,
-                "write_gate_mean": zero,
-                "slot_rms": zero,
-                "broadcast_rms": zero,
-                "specialist_rms": specialist_deltas.detach().float().square().mean().sqrt(),
-            }
+            if self.diagnostics_enabled:
+                zero = specialist_deltas.new_zeros((), dtype=torch.float32)
+                self._last_step_diag = {
+                    "write_mass": zero,
+                    "active_write_frac": zero,
+                    "write_gate_mean": zero,
+                    "slot_rms": zero,
+                    "broadcast_rms": zero,
+                    "specialist_rms": specialist_deltas.detach().float().square().mean().sqrt(),
+                }
             return (selected * route_weights.unsqueeze(-1)).sum(dim=1), state
 
         batch, experts, width = specialist_deltas.shape
@@ -118,24 +120,32 @@ class WorkspaceBroadcast(nn.Module):
 
         if reset_each_step:
             state = torch.zeros_like(state)
+        selected_deltas = specialist_deltas.gather(
+            1, route_indices.unsqueeze(-1).expand(-1, -1, self.d_model)
+        )
         if no_selection:
+            # The random-write control intentionally samples across every
+            # specialist, so it must keep the full expert dimension here.
             write_weights = torch.rand(
                 batch, experts, device=specialist_deltas.device, dtype=torch.float32
             )
             write_weights = write_weights / write_weights.sum(-1, keepdim=True).clamp_min(1e-8)
+            write_candidates = specialist_deltas
         else:
-            write_weights = torch.zeros(
-                batch, experts, device=specialist_deltas.device, dtype=torch.float32
-            )
-            write_weights.scatter_add_(1, route_indices, route_weights.float())
+            # Only routed experts can contribute to the weighted write.
+            # Keeping the top-k axis avoids projecting and scoring all E
+            # specialists on every sequential timestep. Duplicate routes,
+            # if supplied by a caller, retain their original additive effect.
+            write_weights = route_weights.float()
+            write_candidates = selected_deltas
 
         # Candidate keys compete over slots using content-based attention;
         # slot writes are weighted by the existing sparse MoE selection.
-        keys = self.key(specialist_deltas)
+        keys = self.key(write_candidates)
         scores = torch.einsum("bed,bsd->bes", keys.float(), self.query(state).float())
         scores = scores / math.sqrt(self.d_model)
         slot_attention = scores.softmax(dim=-1).to(specialist_deltas.dtype)
-        values = self.value(specialist_deltas)
+        values = self.value(write_candidates)
         slot_proposal = torch.einsum(
             "be,bes,bed->bsd", write_weights.to(values.dtype), slot_attention, values
         )
@@ -148,9 +158,9 @@ class WorkspaceBroadcast(nn.Module):
         update = update * has_writer.to(update.dtype)
         next_state = update.mul(slot_inputs).add((1.0 - update).mul(old_inputs))
 
-        # All experts query the shared object, including those not selected
-        # for this step's write.
-        read_queries = self.query(specialist_deltas)
+        # Only routed experts are combined into the backbone residual, so
+        # computing readback for unselected experts is dead work.
+        read_queries = self.query(selected_deltas)
         read_scores = torch.einsum(
             "bed,bsd->bes", read_queries.float(), self.key(next_state).float()
         )
@@ -159,19 +169,19 @@ class WorkspaceBroadcast(nn.Module):
         read_values = self.value(next_state)
         broadcast = torch.einsum("bes,bsd->bed", read_weights, read_values)
         read_scale = torch.sigmoid(self.read_gate).to(specialist_deltas.dtype)
-        enriched = specialist_deltas + read_scale * broadcast
-        selected = enriched.gather(1, route_indices.unsqueeze(-1).expand(-1, -1, self.d_model))
-        self._last_step_diag = {
-            "write_mass": write_weights.detach().sum(dim=-1).mean(),
-            "active_write_frac": (write_weights.detach().sum(dim=-1) > 0).float().mean(),
-            "write_gate_mean": update.detach().float().mean(),
-            "slot_rms": next_state.detach().float().square().mean().sqrt(),
-            "broadcast_rms": (
-                read_scale.detach().float() * broadcast.detach().float()
-            ).square().mean().sqrt(),
-            "specialist_rms": specialist_deltas.detach().float().square().mean().sqrt(),
-        }
-        return (selected * route_weights.unsqueeze(-1)).sum(dim=1), next_state
+        enriched = selected_deltas + read_scale * broadcast
+        if self.diagnostics_enabled:
+            self._last_step_diag = {
+                "write_mass": write_weights.detach().sum(dim=-1).mean(),
+                "active_write_frac": (write_weights.detach().sum(dim=-1) > 0).float().mean(),
+                "write_gate_mean": update.detach().float().mean(),
+                "slot_rms": next_state.detach().float().square().mean().sqrt(),
+                "broadcast_rms": (
+                    read_scale.detach().float() * broadcast.detach().float()
+                ).square().mean().sqrt(),
+                "specialist_rms": specialist_deltas.detach().float().square().mean().sqrt(),
+            }
+        return (enriched * route_weights.unsqueeze(-1)).sum(dim=1), next_state
 
     def forward(
         self,
@@ -185,7 +195,7 @@ class WorkspaceBroadcast(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Process time-major specialists ``(B,T,E,D)`` sequentially."""
         outputs = []
-        step_diags = []
+        step_diags = [] if self.diagnostics_enabled else None
         for step in range(specialist_deltas.shape[1]):
             out, state = self.forward_step(
                 specialist_deltas[:, step], route_indices[:, step], route_weights[:, step],
@@ -194,7 +204,8 @@ class WorkspaceBroadcast(nn.Module):
                 reset_each_step=reset_each_step,
             )
             outputs.append(out)
-            step_diags.append(self._last_step_diag)
+            if step_diags is not None:
+                step_diags.append(self._last_step_diag)
         if step_diags:
             self._last_diag = {
                 key: torch.stack([diag[key] for diag in step_diags]).mean().detach()
@@ -210,3 +221,10 @@ class WorkspaceBroadcast(nn.Module):
     def last_diagnostics(self) -> dict[str, torch.Tensor]:
         """Detached activity metrics for the most recent sequence pass."""
         return dict(self._last_diag)
+
+    def set_diagnostics_enabled(self, enabled: bool) -> None:
+        """Enable or skip optional per-timestep workspace health reductions."""
+        self.diagnostics_enabled = bool(enabled)
+        if not self.diagnostics_enabled:
+            self._last_step_diag = {}
+            self._last_diag = {}

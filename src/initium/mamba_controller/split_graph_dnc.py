@@ -260,6 +260,10 @@ class SplitGraphDNC(nn.Module):
         self.workspace_no_selection = workspace_no_selection
         self.workspace_reset_each_step = workspace_reset_each_step
         self.workspace_train_mode = workspace_train_mode
+        # Runtime-only counterfactual for evaluation. It is deliberately not
+        # part of checkpoint config/state so a saved model can be scored with
+        # and without workspace readback using identical learned weights.
+        self.workspace_eval_bypass = False
 
         # Mamba bookkeeping, for checkpoint self-description -- same
         # rationale/convention as MambaDNC (mamba_controller.py).
@@ -629,6 +633,7 @@ class SplitGraphDNC(nn.Module):
                 workspace_state,
                 no_selection=self.workspace_no_selection,
                 reset_each_step=self.workspace_reset_each_step,
+                bypass_broadcast=self.workspace_eval_bypass,
             )
             H = base.clone()
             # The workspace returns the selected, broadcast-enriched MoE

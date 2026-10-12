@@ -809,6 +809,9 @@ def run(
     workspace_no_selection: bool = WORKSPACE_NO_SELECTION,
     workspace_reset_each_step: bool = WORKSPACE_RESET_EACH_STEP,
     workspace_train_mode: str = WORKSPACE_TRAIN_MODE,
+    eval_only: bool = False,
+    eval_workspace_mode: str = "checkpoint",
+    eval_seed: int | None = None,
     dnc_read_variant: str = DNC_READ_VARIANT,
     dnc_read_residual_scale: float = DNC_READ_RESIDUAL_SCALE,
     dnc_read_residual_max_ratio: float = DNC_READ_RESIDUAL_MAX_RATIO,
@@ -848,6 +851,14 @@ def run(
     os.makedirs(LOG_DIR, exist_ok=True)
     log_path = os.path.join(LOG_DIR, f"run_{run_id}.csv")
     resume_requested = resume_from is not None
+    if eval_only and not resume_requested:
+        raise ValueError("eval_only requires --resume with a checkpoint")
+    if eval_workspace_mode not in ("checkpoint", "reset-each-step", "bypass"):
+        raise ValueError(
+            "eval_workspace_mode must be 'checkpoint', 'reset-each-step', or 'bypass'"
+        )
+    if eval_only and eval_workspace_mode != "checkpoint" and not workspace_enabled:
+        raise ValueError("workspace evaluation modes require --workspace")
     resume_checkpoint = (
         load_checkpoint_for_resume(resume_from, device) if resume_requested else None
     )
@@ -874,9 +885,17 @@ def run(
         and workspace_train_mode == "frozen"
         and not checkpoint_workspace_enabled
     )
+    if eval_only and frozen_workspace_warm_start:
+        raise ValueError(
+            "eval_only requires a checkpoint that already contains trained workspace weights; "
+            "a workspace-disabled baseline would initialize a fresh workspace."
+        )
     # A baseline-to-frozen-workspace warm start starts a new experiment: its
     # logs must be fresh, and it gets a fresh workspace-only optimizer.
-    resuming = resume_requested and not frozen_workspace_warm_start
+    # Evaluation-only runs get independent, fresh logs keyed by their run ID;
+    # they load checkpoint weights/state but must not append rows to the
+    # original training logs.
+    resuming = resume_requested and not frozen_workspace_warm_start and not eval_only
     log_file = open(log_path, "a" if resuming else "w", newline="")
     log_writer = csv.writer(log_file)
     if not resuming:
@@ -1877,7 +1896,8 @@ def run(
         else:
             rnn.load_state_dict(ckpt["rnn_state_dict"])
             output_proj.load_state_dict(ckpt["output_proj_state_dict"])
-            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            if not eval_only:
+                optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         # v3 fix: restore GradScaler state (scale, growth tracker) instead
         # of leaving `scaler` at its freshly-constructed init_scale -- see
         # header note. `.get(...)` instead of ["..."] so a pre-v3 checkpoint
@@ -1957,6 +1977,16 @@ def run(
         if not frozen_workspace_warm_start:
             restore_rng_state(ckpt["rng_state"])
             step = ckpt["step"]
+        if eval_only and eval_seed is not None:
+            # An explicit evaluation seed overrides checkpoint RNG state so
+            # separate checkpoints/modes can be compared on identical
+            # generated episodes. Omit it to replay the checkpoint's stream.
+            random.seed(eval_seed)
+            np.random.seed(eval_seed)
+            torch.manual_seed(eval_seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(eval_seed)
+            ood_rng.seed(eval_seed)
         if not frozen_workspace_warm_start and ckpt["beta_target"] != beta_target:
             anneal_start_step = step  # Phase 1: restart the ramp here
             print(
@@ -1965,25 +1995,45 @@ def run(
                 f"restarted from step {anneal_start_step}, ramping over "
                 f"the next {KL_ANNEAL_STEPS} steps."
             )
-        if not frozen_workspace_warm_start:
+        if eval_only:
+            if not isinstance(rnn, SplitGraphDNC) or rnn.workspace is None:
+                if eval_workspace_mode != "checkpoint":
+                    raise ValueError(
+                        "workspace evaluation mode requires a checkpoint with an active workspace"
+                    )
+            else:
+                if eval_workspace_mode == "reset-each-step":
+                    rnn.workspace_reset_each_step = True
+                elif eval_workspace_mode == "bypass":
+                    rnn.workspace_eval_bypass = True
+            print(
+                f"[{run_id}] Evaluation-only checkpoint load | step={step} | "
+                f"workspace_mode={eval_workspace_mode} | "
+                f"eval_seed={eval_seed if eval_seed is not None else 'checkpoint RNG'} | "
+                "optimizer state not loaded"
+            )
+        elif not frozen_workspace_warm_start:
             print(
                 f"[{run_id}] Resumed from {resume_from} at step {step} "
                 f"(lesson {curriculum.lesson + 1}/{len(curriculum.table)}); "
                 f"continuing to total_steps={total_steps}"
             )
-        if step >= total_steps:
+        if step >= total_steps and not eval_only:
             print(
                 f"[{run_id}] Checkpoint step {step} already >= total_steps "
                 f"{total_steps} -- nothing to do. Raise --total-steps if you "
                 f"want to extend further."
             )
 
+    run_mode_label = "Evaluation-only" if eval_only else "Training"
     print(
-        f"\n=== [{run_id}] Training (beta_target={beta_target}, beta_mode={beta_mode}) "
+        f"\n=== [{run_id}] {run_mode_label} (beta_target={beta_target}, beta_mode={beta_mode}) "
         f"{'[warm-started]' if frozen_workspace_warm_start else '[resumed]' if resuming else ''} ==="
     )
-    rnn.train()
-    set_lr(step)  # Phase 1 FIX: ensure correct clamped LR from the very first
+    rnn.train(not eval_only)
+    output_proj.train(not eval_only)
+    if not eval_only:
+        set_lr(step)  # Phase 1 FIX: ensure correct clamped LR from the very first
     # iteration -- otherwise a resumed run's first step would briefly use
     # whatever LR was saved inside optimizer_state_dict at checkpoint time
     # (potentially still reflecting the old buggy drifted value).
@@ -2010,7 +2060,7 @@ def run(
     # legs already have their own timestamped log rows if that's needed).
     t_run_start = time.time()
 
-    while step < total_steps:
+    while step < total_steps and not eval_only:
         input_seq, target_digits, answer_mask = dataset.sample_batch(curriculum, BATCH_SIZE)
 
         input_seq = input_seq.to(device, non_blocking=True)
@@ -2842,13 +2892,17 @@ def run(
             latest_path = os.path.join(CHECKPOINT_DIR, f"{run_id}_latest.pt")
             shutil.copyfile(ckpt_path, latest_path)
 
-    print(f"\n[{run_id}] Training complete. Final evaluation on training-distribution lesson:")
+    completion_label = "Evaluation-only pass" if eval_only else "Training complete"
+    print(
+        f"\n[{run_id}] {completion_label}. Final evaluation on "
+        "training-distribution lesson:"
+    )
     final_id_stage_memory = rnn.memories[0]
     if hasattr(final_id_stage_memory, "begin_stage_diagnostics"):
         final_id_stage_memory.begin_stage_diagnostics()
     segment_diagnostics.set_channel("eval-final-id")
     _, id_triple_acc, id_perfect_frac = curriculum.maybe_advance(
-        rnn, device, step=step, optimizer=optimizer
+        rnn, device, step=step, optimizer=optimizer, allow_advance=not eval_only
     )
     segment_diagnostics.emit("eval-final-id")
     final_id_stage_diagnostics = (
@@ -3157,6 +3211,23 @@ if __name__ == "__main__":
         "restores model, optimizer, RNG, curriculum, and step. With --workspace "
         "--workspace-train-mode=frozen, a compatible workspace-disabled baseline "
         "instead warm-starts matching weights and begins a fresh workspace training run.",
+    )
+    parser.add_argument(
+        "--eval-only",
+        action="store_true",
+        help="Load --resume checkpoint and run only the final ID/OOD evaluation; no training updates or optimizer-state restore.",
+    )
+    parser.add_argument(
+        "--eval-workspace-mode",
+        choices=("checkpoint", "reset-each-step", "bypass"),
+        default="checkpoint",
+        help="Evaluation-only workspace counterfactual: preserve checkpoint behavior, clear slots before every timestep, or bypass workspace readback while retaining the selected MoE residual.",
+    )
+    parser.add_argument(
+        "--eval-seed",
+        type=int,
+        default=None,
+        help="Evaluation-only RNG seed. Use the same value across checkpoints to evaluate identical generated ID/OOD episodes; omit to replay checkpoint RNG state.",
     )
     parser.add_argument(
         "--run-id-suffix",
@@ -3620,6 +3691,18 @@ if __name__ == "__main__":
             "--resume requires the beta positional arg too, e.g.:\n"
             f"  python3 {sys.argv[0]} 0.02 --resume checkpoints/beta_0p02_latest.pt"
         )
+    if args.eval_only and args.resume is None:
+        parser.error("--eval-only requires --resume <checkpoint.pt>")
+    if not args.eval_only and args.eval_workspace_mode != "checkpoint":
+        parser.error("--eval-workspace-mode is only valid with --eval-only")
+    if args.eval_seed is not None and not args.eval_only:
+        parser.error("--eval-seed is only valid with --eval-only")
+    if args.eval_only and args.eval_workspace_mode != "checkpoint" and not args.workspace:
+        parser.error("non-default --eval-workspace-mode requires --workspace")
+    if args.eval_only and args.run_id_suffix is None:
+        args.run_id_suffix = f"eval-{args.eval_workspace_mode}"
+        if args.eval_seed is not None:
+            args.run_id_suffix += f"-seed{args.eval_seed}"
 
     if args.link_matrix_mode == "sparse_topk" and args.link_matrix_topk is None:
         raise SystemExit("--link-matrix-mode=sparse_topk requires --link-matrix-topk")
@@ -3774,6 +3857,9 @@ if __name__ == "__main__":
             workspace_no_selection=args.workspace_no_selection,
             workspace_reset_each_step=args.workspace_reset_each_step,
             workspace_train_mode=args.workspace_train_mode,
+            eval_only=args.eval_only,
+            eval_workspace_mode=args.eval_workspace_mode,
+            eval_seed=args.eval_seed,
             dnc_read_variant=args.dnc_read_variant,
             dnc_read_residual_scale=args.dnc_read_residual_scale,
             dnc_read_residual_max_ratio=args.dnc_read_residual_max_ratio,

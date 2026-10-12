@@ -54,6 +54,7 @@ class WorkspaceBroadcast(nn.Module):
         *,
         no_selection: bool = False,
         reset_each_step: bool = False,
+        bypass_broadcast: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Keep the zero-slot/closed-gate bypass identical to the selection-only
         # MoE path. Active workspace attention and recurrent slot updates use
@@ -158,6 +159,25 @@ class WorkspaceBroadcast(nn.Module):
         update = update * has_writer.to(update.dtype)
         next_state = update.mul(slot_inputs).add((1.0 - update).mul(old_inputs))
 
+        if bypass_broadcast:
+            # Evaluation counterfactual: preserve the selected MoE residual
+            # while preventing workspace readback from influencing it. The
+            # workspace write path still executes, so this isolates the
+            # broadcast contribution without changing routing or the model
+            # parameters loaded from the checkpoint.
+            if self.diagnostics_enabled:
+                self._last_step_diag = {
+                    "write_mass": write_weights.detach().sum(dim=-1).mean(),
+                    "active_write_frac": (write_weights.detach().sum(dim=-1) > 0)
+                    .float()
+                    .mean(),
+                    "write_gate_mean": update.detach().float().mean(),
+                    "slot_rms": next_state.detach().float().square().mean().sqrt(),
+                    "broadcast_rms": next_state.new_zeros((), dtype=torch.float32),
+                    "specialist_rms": specialist_deltas.detach().float().square().mean().sqrt(),
+                }
+            return (selected_deltas * route_weights.unsqueeze(-1)).sum(dim=1), next_state
+
         # Only routed experts are combined into the backbone residual, so
         # computing readback for unselected experts is dead work.
         read_queries = self.query(selected_deltas)
@@ -192,6 +212,7 @@ class WorkspaceBroadcast(nn.Module):
         *,
         no_selection: bool = False,
         reset_each_step: bool = False,
+        bypass_broadcast: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Process time-major specialists ``(B,T,E,D)`` sequentially."""
         outputs = []
@@ -202,6 +223,7 @@ class WorkspaceBroadcast(nn.Module):
                 state,
                 no_selection=no_selection,
                 reset_each_step=reset_each_step,
+                bypass_broadcast=bypass_broadcast,
             )
             outputs.append(out)
             if step_diags is not None:

@@ -142,7 +142,9 @@ class ChainCurriculum:
         self.lesson = 0
         self.lesson_nr_cells = list(lesson_nr_cells)
 
-    def maybe_advance(self, model, device, step=None, optimizer=None):
+    def maybe_advance(
+        self, model, device, step=None, optimizer=None, *, allow_advance=True
+    ):
         nf, nq = self.table[self.lesson]
         combined_acc, perfect_frac, breakdown = self.dataset.evaluate_chain(
             model,
@@ -174,7 +176,8 @@ class ChainCurriculum:
             )
 
         if (
-            combined_acc / 100.0 >= self.dataset.advance_threshold
+            allow_advance
+            and combined_acc / 100.0 >= self.dataset.advance_threshold
             and self.lesson < len(self.table) - 1
         ):
             self.lesson += 1

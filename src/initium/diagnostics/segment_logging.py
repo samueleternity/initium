@@ -61,6 +61,8 @@ def _segment_label(path: str, module: nn.Module) -> str | None:
         return f"controller.mamba_cell:{leaf}"
     if class_name == "WorkspaceBroadcast":
         return f"workspace:{leaf}"
+    if class_name == "BistableWriteGate":
+        return f"workspace_bistable_gate:{leaf}"
     if class_name == "Memory" or "memory" in path.lower() and "memory" in lower_name:
         return f"dnc_memory:{leaf}"
     if isinstance(module, nn.LSTM):
@@ -80,9 +82,16 @@ class SegmentDiagnostics:
     boundary or when a numerical failure needs an immediate trace.
     """
 
-    def __init__(self, model: nn.Module, *, enabled: bool = True):
+    def __init__(
+        self,
+        model: nn.Module,
+        *,
+        enabled: bool = True,
+        activation_absmax_limit: float | None = None,
+    ):
         self.model = model
         self.enabled = bool(enabled)
+        self.activation_absmax_limit = activation_absmax_limit
         self.channel: str | None = "train"
         self._records: dict[str, OrderedDict[str, dict[str, Any]]] = {}
         self._segments: list[tuple[str, str]] = []
@@ -244,6 +253,25 @@ class SegmentDiagnostics:
                 gradients.append(f"{label}={norm:.3g}/n{parameter_count}")
             parts.append("grad_norm[" + "; ".join(gradients) + "]")
         print(f"[segment-diag:{channel}] " + " | ".join(parts))
+
+    def activation_absmax_exceeded(self, channel: str) -> tuple[bool, float, str | None]:
+        """Check captured forward maxima against the optional safety limit."""
+        if not self.enabled or self.activation_absmax_limit is None:
+            return False, 0.0, None
+        records = self._records.get(channel, {})
+        candidates: list[tuple[str, torch.Tensor]] = []
+        for label, record in records.items():
+            for key in ("in_max", "out_max"):
+                value = record.get(key)
+                if torch.is_tensor(value):
+                    candidates.append((label, value))
+        if not candidates:
+            return False, 0.0, None
+        values = torch.stack([value.detach().float() for _, value in candidates])
+        maximum, index = values.max(dim=0)
+        maximum_value = float(maximum.cpu())
+        label = candidates[int(index.cpu())][0]
+        return maximum_value > self.activation_absmax_limit, maximum_value, label
 
     def close(self) -> None:
         for handle in self._handles:

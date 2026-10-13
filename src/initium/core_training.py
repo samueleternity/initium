@@ -686,6 +686,12 @@ def load_frozen_workspace_warm_start(
         "workspace_no_selection",
         "workspace_reset_each_step",
         "workspace_train_mode",
+        "workspace_train_scope",
+        "workspace_gate_variant",
+        "workspace_bistable_selection_scale",
+        "workspace_bistable_noise_scale",
+        "workspace_bistable_deterministic",
+        "workspace_stability_max_activation",
     }
     missing_config = sorted(
         key
@@ -809,6 +815,12 @@ def run(
     workspace_no_selection: bool = WORKSPACE_NO_SELECTION,
     workspace_reset_each_step: bool = WORKSPACE_RESET_EACH_STEP,
     workspace_train_mode: str = WORKSPACE_TRAIN_MODE,
+    workspace_train_scope: str = "workspace",
+    workspace_gate_variant: str = "continuous",
+    workspace_bistable_selection_scale: float = 1.0,
+    workspace_bistable_noise_scale: float = 0.75,
+    workspace_bistable_deterministic: bool = False,
+    workspace_stability_max_activation: float = 100_000.0,
     eval_only: bool = False,
     eval_workspace_mode: str = "checkpoint",
     eval_seed: int | None = None,
@@ -879,6 +891,39 @@ def run(
     checkpoint_workspace_enabled = bool(
         checkpoint_config.get("workspace_enabled", False) or checkpoint_has_workspace
     )
+    phase4_gate_control_warm_start = bool(
+        resume_requested
+        and workspace_enabled
+        and workspace_train_scope == "gate"
+        and checkpoint_workspace_enabled
+        and (
+            checkpoint_config.get("workspace_train_scope") != "gate"
+            or checkpoint_config.get("workspace_train_mode") != workspace_train_mode
+            or checkpoint_config.get("workspace_gate_variant", "continuous")
+            != workspace_gate_variant
+        )
+        and not eval_only
+    )
+    workspace_mode_warm_start = bool(
+        resume_requested
+        and workspace_enabled
+        and checkpoint_workspace_enabled
+        and checkpoint_config.get("workspace_train_mode") != workspace_train_mode
+        and not eval_only
+    )
+    gate_variant_warm_start = bool(
+        resume_requested
+        and workspace_enabled
+        and workspace_gate_variant == "bistable"
+        and checkpoint_workspace_enabled
+        and checkpoint_config.get("workspace_gate_variant", "continuous") == "continuous"
+        and not eval_only
+    )
+    phase4_gate_warm_start = bool(
+        phase4_gate_control_warm_start
+        or workspace_mode_warm_start
+        or gate_variant_warm_start
+    )
     frozen_workspace_warm_start = bool(
         resume_requested
         and workspace_enabled
@@ -895,7 +940,12 @@ def run(
     # Evaluation-only runs get independent, fresh logs keyed by their run ID;
     # they load checkpoint weights/state but must not append rows to the
     # original training logs.
-    resuming = resume_requested and not frozen_workspace_warm_start and not eval_only
+    resuming = (
+        resume_requested
+        and not frozen_workspace_warm_start
+        and not phase4_gate_warm_start
+        and not eval_only
+    )
     log_file = open(log_path, "a" if resuming else "w", newline="")
     log_writer = csv.writer(log_file)
     if not resuming:
@@ -1466,6 +1516,9 @@ def run(
             workspace_no_selection=workspace_no_selection,
             workspace_reset_each_step=workspace_reset_each_step,
             workspace_train_mode=workspace_train_mode,
+            workspace_gate_variant=workspace_gate_variant,
+            workspace_bistable_selection_scale=workspace_bistable_selection_scale,
+            workspace_bistable_noise_scale=workspace_bistable_noise_scale,
             device=device,
         ).to(device)
         if dnc_backward_trace:
@@ -1506,11 +1559,17 @@ def run(
         if workspace_enabled:
             workspace_active = isinstance(rnn, SplitGraphDNC) and rnn.workspace is not None
             write_mode = "random-control" if workspace_no_selection else "MoE-top-k"
-            persistence = "off (reset each timestep)" if workspace_reset_each_step else "on"
+            reset_workspace_each_step = workspace_reset_each_step or (
+                eval_only and eval_workspace_mode == "reset-each-step"
+            )
+            persistence = (
+                "off (reset each timestep)" if reset_workspace_each_step else "on"
+            )
             print(
                 f"[{run_id}] WORKSPACE {'active' if workspace_active else 'bypassed'} | "
                 f"slots={workspace_num_slots} | write_selection={write_mode} | "
                 f"persistence={persistence} | train_mode={workspace_train_mode} | "
+                f"gate={workspace_gate_variant} | "
                 f"compute_precision={'fp32' if workspace_active else 'bypass'} | "
                 "scope=final-backbone-MoE-bank; each specialist reads shared slots"
             )
@@ -1571,6 +1630,12 @@ def run(
         "workspace_no_selection": workspace_no_selection,
         "workspace_reset_each_step": workspace_reset_each_step,
         "workspace_train_mode": workspace_train_mode,
+        "workspace_gate_variant": workspace_gate_variant,
+        "workspace_train_scope": workspace_train_scope,
+        "workspace_bistable_selection_scale": workspace_bistable_selection_scale,
+        "workspace_bistable_noise_scale": workspace_bistable_noise_scale,
+        "workspace_bistable_deterministic": workspace_bistable_deterministic,
+        "workspace_stability_max_activation": workspace_stability_max_activation,
     }
     controller_model_config = {}
     if controller == "mamba":
@@ -1660,8 +1725,16 @@ def run(
 
     output_proj = nn.Linear(INPUT_DIM, TRIPLE_DIM).to(device)
     dataset.set_output_proj(output_proj)
+    if workspace_train_scope == "gate" and not segment_diagnostics_enabled:
+        raise ValueError("Phase 4 gate-only stability checks require segment diagnostics")
     segment_diagnostics = SegmentDiagnostics(
-        rnn, enabled=segment_diagnostics_enabled
+        rnn,
+        enabled=segment_diagnostics_enabled,
+        activation_absmax_limit=(
+            workspace_stability_max_activation
+            if workspace_train_scope == "gate"
+            else None
+        ),
     )
     segment_diagnostics.add_module(output_proj, "task_output")
     moe_layer_ids = {id(layer) for layer in getattr(rnn, "moe_layers", [])}
@@ -1673,6 +1746,7 @@ def run(
             module.set_diagnostics_enabled(moe_diagnostics_enabled)
     if isinstance(rnn, SplitGraphDNC) and rnn.workspace is not None:
         rnn.workspace.set_diagnostics_enabled(moe_diagnostics_enabled)
+        rnn.workspace_bistable_deterministic = workspace_bistable_deterministic
 
     def emit_failure_diagnostics(channel: str, *, include_gradients: bool = False) -> None:
         segment_diagnostics.emit(channel, include_gradients=include_gradients)
@@ -1690,6 +1764,32 @@ def run(
             reports = _format_moe_layer_reports(failure_moe_diag)
             if reports:
                 print(f"[moe-diag:{channel}] " + " | ".join(reports))
+
+    def report_bistable_evaluation(mode: str) -> None:
+        if not (
+            workspace_gate_variant == "bistable"
+            and isinstance(rnn, SplitGraphDNC)
+            and rnn.workspace is not None
+        ):
+            return
+        diagnostics = rnn.workspace.consume_bistable_diagnostics()
+        if not diagnostics or diagnostics["gate_candidate_count"].item() == 0:
+            print(f"[{run_id}] [bistable:{mode}] no valid gate candidates were recorded")
+            return
+        histogram = ",".join(f"{value:.3f}" for value in diagnostics["gate_histogram"].tolist())
+        writers = ",".join(f"{value:.3f}" for value in diagnostics["writer_frequency"].tolist())
+        print(
+            f"[{run_id}] [bistable:{mode}] p_mean="
+            f"{diagnostics['gate_probability_mean'].item():.3f} "
+            f"low/mid/high="
+            f"{diagnostics['gate_low_frac'].item():.1%}/"
+            f"{diagnostics['gate_mid_frac'].item():.1%}/"
+            f"{diagnostics['gate_high_frac'].item():.1%} "
+            f"commit_freq={diagnostics['write_frequency'].item():.1%} "
+            f"selection_peak={diagnostics['selection_strength_mean'].item():.3f} "
+            f"probability_histogram_10bin={histogram} "
+            f"writer_frequency={writers}"
+        )
 
     # Install the stochastic write head(s) BEFORE building the
     # optimizer, so their parameters (mu_transform, logvar_transform) are
@@ -1712,8 +1812,17 @@ def run(
         for parameter in rnn.parameters():
             parameter.requires_grad_(False)
         assert isinstance(rnn, SplitGraphDNC) and rnn.workspace is not None
-        for parameter in rnn.workspace.parameters():
-            parameter.requires_grad_(True)
+        if workspace_train_scope == "gate":
+            gate_parameters = (
+                rnn.workspace.bistable_gate_parameters()
+                if workspace_gate_variant == "bistable"
+                else rnn.workspace.write_gate.parameters()
+            )
+            for parameter in gate_parameters:
+                parameter.requires_grad_(True)
+        else:
+            for parameter in rnn.workspace.parameters():
+                parameter.requires_grad_(True)
         for parameter in output_proj.parameters():
             parameter.requires_grad_(False)
     trainable_parameters = [
@@ -1874,8 +1983,17 @@ def run(
             for parameter in rnn.parameters():
                 parameter.requires_grad_(False)
             assert isinstance(rnn, SplitGraphDNC) and rnn.workspace is not None
-            for parameter in rnn.workspace.parameters():
-                parameter.requires_grad_(True)
+            if workspace_train_scope == "gate":
+                gate_parameters = (
+                    rnn.workspace.bistable_gate_parameters()
+                    if workspace_gate_variant == "bistable"
+                    else rnn.workspace.write_gate.parameters()
+                )
+                for parameter in gate_parameters:
+                    parameter.requires_grad_(True)
+            else:
+                for parameter in rnn.workspace.parameters():
+                    parameter.requires_grad_(True)
             # Model construction and checkpoint loading consume RNG state.
             # Start the new workspace experiment from the requested seed.
             random.seed(seed)
@@ -1893,6 +2011,32 @@ def run(
                 f"{len(missing_workspace_keys)} workspace tensors freshly initialized, "
                 f"reset optimizer, scaler, RNG, and curriculum to step 0 / lesson 1."
             )
+        elif gate_variant_warm_start:
+            incompatible = rnn.load_state_dict(ckpt["rnn_state_dict"], strict=False)
+            expected_missing = {
+                key for key in rnn.state_dict() if key.startswith("workspace.bistable_gate.")
+            }
+            if set(incompatible.missing_keys) != expected_missing or incompatible.unexpected_keys:
+                raise ValueError(
+                    "Bistable gate warm start only permits newly initialized "
+                    "workspace.bistable_gate parameters; checkpoint state differs "
+                    f"(missing={incompatible.missing_keys[:8]}, "
+                    f"unexpected={incompatible.unexpected_keys[:8]})."
+                )
+            output_proj.load_state_dict(ckpt["output_proj_state_dict"])
+            print(
+                f"[{run_id}] Initialized bistable gate from continuous-workspace "
+                f"checkpoint {resume_from} at step {step}; all shared model and "
+                "workspace tensors loaded, gate parameters initialized fresh, "
+                "optimizer reset."
+            )
+        elif phase4_gate_warm_start:
+            rnn.load_state_dict(ckpt["rnn_state_dict"])
+            output_proj.load_state_dict(ckpt["output_proj_state_dict"])
+            print(
+                f"[{run_id}] Started a fresh Phase 4 condition from {resume_from} "
+                f"at step {step}; workspace/model tensors loaded, optimizer reset."
+            )
         else:
             rnn.load_state_dict(ckpt["rnn_state_dict"])
             output_proj.load_state_dict(ckpt["output_proj_state_dict"])
@@ -1902,9 +2046,9 @@ def run(
         # of leaving `scaler` at its freshly-constructed init_scale -- see
         # header note. `.get(...)` instead of ["..."] so a pre-v3 checkpoint
         # (saved before this key existed) still loads, just without this fix.
-        if not frozen_workspace_warm_start and "scaler_state_dict" in ckpt:
+        if not frozen_workspace_warm_start and not phase4_gate_warm_start and "scaler_state_dict" in ckpt:
             scaler.load_state_dict(ckpt["scaler_state_dict"])
-        elif not frozen_workspace_warm_start:
+        elif not frozen_workspace_warm_start and not phase4_gate_warm_start:
             print(
                 f"[{run_id}] WARNING: checkpoint predates GradScaler-state "
                 f"saving (v3 fix) -- scaler starting fresh at "
@@ -2097,6 +2241,18 @@ def run(
                 )
             else:
                 output, hidden = rnn(input_seq, hidden, reset_experience=True)
+            if workspace_train_scope == "gate":
+                exceeded, maximum, segment = segment_diagnostics.activation_absmax_exceeded(
+                    "train"
+                )
+                if exceeded:
+                    emit_failure_diagnostics("train")
+                    raise FloatingPointError(
+                        f"[{run_id}] Phase 4 activation safety limit "
+                        f"{workspace_stability_max_activation:.6g} exceeded in "
+                        f"{segment} (observed absmax={maximum:.6g}) at step {step}; "
+                        "stopping before backward/optimizer update."
+                    )
             if check_finite_this_step and not _first_nonfinite_report(
                 output, "rnn_output", step
             ):
@@ -2166,6 +2322,31 @@ def run(
             )
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
+        bistable_gate_grad_norm = 0.0
+        if workspace_gate_variant == "bistable":
+            assert isinstance(rnn, SplitGraphDNC) and rnn.workspace is not None
+            gate_gradients = [
+                parameter.grad.detach().float()
+                for parameter in rnn.workspace.bistable_gate_parameters()
+                if parameter.grad is not None
+            ]
+            if not gate_gradients:
+                emit_failure_diagnostics("train", include_gradients=True)
+                raise FloatingPointError(
+                    f"[{run_id}] bistable write gate received no gradients at step {step}."
+                )
+            bistable_gate_grad_norm = float(
+                torch.stack([gradient.square().sum() for gradient in gate_gradients])
+                .sum()
+                .sqrt()
+                .cpu()
+            )
+            if not math.isfinite(bistable_gate_grad_norm) or bistable_gate_grad_norm == 0.0:
+                emit_failure_diagnostics("train", include_gradients=True)
+                raise FloatingPointError(
+                    f"[{run_id}] bistable write gate gradient norm is "
+                    f"{bistable_gate_grad_norm} at step {step}."
+                )
         # Log addition #2: capture the pre-clip gradient norm instead of
         # discarding clip_grad_norm_'s return value. Gives a β=0 baseline
         # gradient-scale trajectory to compare a future β>0 switch-in
@@ -2363,6 +2544,31 @@ def run(
                             f"broadcast/specialist {workspace_diag['broadcast_to_specialist_ratio'].item():.3f} "
                             f"read_gate {workspace_diag['read_gate'].item():.3f}]"
                         )
+                        if "gate_low_frac" in workspace_diag:
+                            print(
+                                f"[{run_id}] [bistable] p_mean="
+                                f"{workspace_diag['gate_probability_mean'].item():.3f} "
+                                f"low/mid/high="
+                                f"{workspace_diag['gate_low_frac'].item():.1%}/"
+                                f"{workspace_diag['gate_mid_frac'].item():.1%}/"
+                                f"{workspace_diag['gate_high_frac'].item():.1%} "
+                                f"commit_freq={workspace_diag['write_frequency'].item():.1%} "
+                                f"selection_peak="
+                                f"{workspace_diag['selection_strength_mean'].item():.3f} "
+                                f"gate_grad_norm={bistable_gate_grad_norm:.3g}"
+                            )
+                            if "gate_histogram" in workspace_diag:
+                                histogram = ",".join(
+                                    f"{value:.2f}"
+                                    for value in workspace_diag["gate_histogram"].tolist()
+                                )
+                                print(f"[{run_id}] [bistable] probability_histogram_10bin={histogram}")
+                            if "writer_frequency" in workspace_diag:
+                                writer_frequency = ",".join(
+                                    f"{value:.3f}"
+                                    for value in workspace_diag["writer_frequency"].tolist()
+                                )
+                                print(f"[{run_id}] [workspace] writer_frequency={writer_frequency}")
             if dyn_n_str:
                 parts.append(dyn_n_str.strip(" |"))
             print(" | ".join(parts))
@@ -2893,11 +3099,19 @@ def run(
             shutil.copyfile(ckpt_path, latest_path)
 
     completion_label = "Evaluation-only pass" if eval_only else "Training complete"
+    if eval_only:
+        # No optimization step ran, so there is no effective training beta or
+        # KL measurement to attribute in the shared final-reporting path.
+        beta_eff = 0.0
+        kl_loss = None
+        kl_diag = {}
     print(
         f"\n[{run_id}] {completion_label}. Final evaluation on "
         "training-distribution lesson:"
     )
     final_id_stage_memory = rnn.memories[0]
+    if isinstance(rnn, SplitGraphDNC) and rnn.workspace is not None:
+        rnn.workspace.reset_bistable_diagnostics()
     if hasattr(final_id_stage_memory, "begin_stage_diagnostics"):
         final_id_stage_memory.begin_stage_diagnostics()
     segment_diagnostics.set_channel("eval-final-id")
@@ -2905,6 +3119,7 @@ def run(
         rnn, device, step=step, optimizer=optimizer, allow_advance=not eval_only
     )
     segment_diagnostics.emit("eval-final-id")
+    report_bistable_evaluation("ID")
     final_id_stage_diagnostics = (
         final_id_stage_memory.finish_stage_diagnostics()
         if hasattr(final_id_stage_memory, "finish_stage_diagnostics")
@@ -2934,6 +3149,8 @@ def run(
     final_ood_torch_rng = _capture_torch_rng()
     final_ood_field_log: dict[tuple[int, int], list[int]] = {}
     final_ood_stage_memory = rnn.memories[0]
+    if isinstance(rnn, SplitGraphDNC) and rnn.workspace is not None:
+        rnn.workspace.reset_bistable_diagnostics()
     if hasattr(final_ood_stage_memory, "begin_stage_diagnostics"):
         final_ood_stage_memory.begin_stage_diagnostics()
     segment_diagnostics.set_channel("eval-final-ood")
@@ -2946,6 +3163,7 @@ def run(
         field_log=final_ood_field_log,
     )
     segment_diagnostics.emit("eval-final-ood")
+    report_bistable_evaluation("OOD")
     final_ood_stage_diagnostics = (
         final_ood_stage_memory.finish_stage_diagnostics()
         if hasattr(final_ood_stage_memory, "finish_stage_diagnostics")
@@ -2985,6 +3203,14 @@ def run(
             ]
         )
         track_a_file.flush()
+        residual_ratio = final_id_stage_diagnostics.get(
+            "relational_read_residual_to_cosine_rms_mean"
+        )
+        residual_ratio_text = (
+            f"{residual_ratio:.3f}"
+            if residual_ratio is not None
+            else f"n/a (not defined for {dnc_read_variant} read)"
+        )
         print(
             f"[{run_id}] [Track A / final] stress cosine/read/held-out="
             f"{cosine_top1_accuracy(relational_probe_cases):.3f}/"
@@ -2995,8 +3221,7 @@ def run(
             f"read entropy/max="
             f"{final_id_stage_diagnostics.get('read_content_entropy_mean', float('nan')):.3f}/"
             f"{final_id_stage_diagnostics.get('read_content_max_weight_mean', float('nan')):.3f} | "
-            f"residual/cosine rms="
-            f"{final_id_stage_diagnostics.get('relational_read_residual_to_cosine_rms_mean', float('nan')):.3f}"
+            f"residual/cosine rms={residual_ratio_text}"
         )
     if track_b_writer is not None and track_b_file is not None:
 
@@ -3434,6 +3659,41 @@ if __name__ == "__main__":
                         default=WORKSPACE_TRAIN_MODE,
                         help="coadapted trains the full model; frozen trains workspace parameters and freezes substrate/task-head parameters.")
     parser.add_argument(
+        "--workspace-train-scope",
+        choices=("workspace", "gate"),
+        default="workspace",
+        help="With frozen mode, train all workspace parameters or only the active write gate. Gate-only supports matched continuous/bistable Phase 4 controls.",
+    )
+    parser.add_argument(
+        "--workspace-gate-variant",
+        choices=("continuous", "bistable"),
+        default="continuous",
+        help="Use the existing continuous update gate or the experimental recurrent stochastic bistable write gate.",
+    )
+    parser.add_argument(
+        "--workspace-bistable-selection-scale",
+        type=float,
+        default=1.0,
+        help="Scale the content-selection drive in the bistable gate; vary this for the preregistered selection-strength ablation.",
+    )
+    parser.add_argument(
+        "--workspace-bistable-noise-scale",
+        type=float,
+        default=0.75,
+        help="Independent background-noise scale for bistable ignition; set to 0 for the noise ablation.",
+    )
+    parser.add_argument(
+        "--workspace-bistable-deterministic",
+        action="store_true",
+        help="Disable independent gate noise for a deterministic diagnostic; normal bistable evaluation remains stochastic and seed-reproducible.",
+    )
+    parser.add_argument(
+        "--workspace-stability-max-activation",
+        type=float,
+        default=100_000.0,
+        help="Phase 4 absolute activation maximum; abort before backward/update if any instrumented segment exceeds this value.",
+    )
+    parser.add_argument(
         "--moe-num-experts",
         type=int,
         default=MOE_NUM_EXPERTS,
@@ -3744,6 +4004,31 @@ if __name__ == "__main__":
         parser.error("--workspace requires backbone MoE; use --moe-placement backbone or all")
     if args.workspace_num_slots < 0:
         parser.error("--workspace-num-slots must be >= 0")
+    if args.workspace_train_scope == "gate" and not args.workspace:
+        parser.error("--workspace-train-scope=gate requires --workspace")
+    if args.workspace_gate_variant == "bistable" and (
+        not args.workspace or args.workspace_num_slots < 2
+    ):
+        parser.error(
+            "--workspace-gate-variant=bistable requires --workspace and at least two slots"
+        )
+    if args.workspace_gate_variant == "bistable" and not args.moe_diagnostics:
+        parser.error("bistable gate histogram/diagnostics require --moe-diagnostics")
+    if (
+        not math.isfinite(args.workspace_bistable_selection_scale)
+        or args.workspace_bistable_selection_scale < 0
+    ):
+        parser.error("--workspace-bistable-selection-scale must be finite and >= 0")
+    if (
+        not math.isfinite(args.workspace_bistable_noise_scale)
+        or args.workspace_bistable_noise_scale < 0
+    ):
+        parser.error("--workspace-bistable-noise-scale must be finite and >= 0")
+    if (
+        not math.isfinite(args.workspace_stability_max_activation)
+        or args.workspace_stability_max_activation <= 0
+    ):
+        parser.error("--workspace-stability-max-activation must be finite and > 0")
 
     if args.beta is not None:
         betas_to_run = [args.beta]
@@ -3793,6 +4078,15 @@ if __name__ == "__main__":
                 run_id += f"_backbonerscale{args.moe_backbone_residual_scale:g}"
         if args.workspace:
             run_id += f"_workspace{args.workspace_num_slots}s_{args.workspace_train_mode}"
+            if args.workspace_gate_variant != "continuous" or args.workspace_train_scope == "gate":
+                run_id += f"_gate{args.workspace_gate_variant}_{args.workspace_train_scope}"
+            if args.workspace_gate_variant == "bistable":
+                run_id += (
+                    f"_sel{args.workspace_bistable_selection_scale:g}"
+                    f"_noise{args.workspace_bistable_noise_scale:g}"
+                )
+                if args.workspace_bistable_deterministic:
+                    run_id += "_detgate"
             if args.workspace_no_selection:
                 run_id += "_randomwrite"
             if args.workspace_reset_each_step:
@@ -3857,6 +4151,12 @@ if __name__ == "__main__":
             workspace_no_selection=args.workspace_no_selection,
             workspace_reset_each_step=args.workspace_reset_each_step,
             workspace_train_mode=args.workspace_train_mode,
+            workspace_train_scope=args.workspace_train_scope,
+            workspace_gate_variant=args.workspace_gate_variant,
+            workspace_bistable_selection_scale=args.workspace_bistable_selection_scale,
+            workspace_bistable_noise_scale=args.workspace_bistable_noise_scale,
+            workspace_bistable_deterministic=args.workspace_bistable_deterministic,
+            workspace_stability_max_activation=args.workspace_stability_max_activation,
             eval_only=args.eval_only,
             eval_workspace_mode=args.eval_workspace_mode,
             eval_seed=args.eval_seed,

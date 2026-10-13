@@ -209,6 +209,9 @@ class SplitGraphDNC(nn.Module):
         workspace_no_selection: bool = False,
         workspace_reset_each_step: bool = False,
         workspace_train_mode: str = "coadapted",
+        workspace_gate_variant: str = "continuous",
+        workspace_bistable_selection_scale: float = 1.0,
+        workspace_bistable_noise_scale: float = 0.75,
     ):
         super().__init__()
         if not independent_linears:
@@ -260,6 +263,9 @@ class SplitGraphDNC(nn.Module):
         self.workspace_no_selection = workspace_no_selection
         self.workspace_reset_each_step = workspace_reset_each_step
         self.workspace_train_mode = workspace_train_mode
+        self.workspace_bistable_noise_scale = float(workspace_bistable_noise_scale)
+        self.workspace_bistable_selection_scale = float(workspace_bistable_selection_scale)
+        self.workspace_bistable_deterministic = False
         # Runtime-only counterfactual for evaluation. It is deliberately not
         # part of checkpoint config/state so a saved model can be scored with
         # and without workspace readback using identical learned weights.
@@ -516,7 +522,14 @@ class SplitGraphDNC(nn.Module):
             else None
         )
         self.workspace = (
-            WorkspaceBroadcast(hidden_size, moe_num_experts, workspace_num_slots)
+            WorkspaceBroadcast(
+                hidden_size,
+                moe_num_experts,
+                workspace_num_slots,
+                gate_variant=workspace_gate_variant,
+                bistable_selection_scale=workspace_bistable_selection_scale,
+                bistable_noise_scale=workspace_bistable_noise_scale,
+            )
             if workspace_enabled and workspace_num_slots > 0
             else None
         )
@@ -634,6 +647,9 @@ class SplitGraphDNC(nn.Module):
                 no_selection=self.workspace_no_selection,
                 reset_each_step=self.workspace_reset_each_step,
                 bypass_broadcast=self.workspace_eval_bypass,
+                bistable_noise_scale=self.workspace_bistable_noise_scale,
+                bistable_selection_scale=self.workspace_bistable_selection_scale,
+                deterministic_gate=self.workspace_bistable_deterministic,
             )
             H = base.clone()
             # The workspace returns the selected, broadcast-enriched MoE

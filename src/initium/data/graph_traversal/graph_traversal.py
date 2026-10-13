@@ -445,6 +445,7 @@ def evaluate_traversal(
     if num_nodes is not None and nodes_range is not None:
         raise ValueError("evaluate_traversal: pass num_nodes or nodes_range, not both")
 
+    was_training = model.training
     model.eval()
     total_triples, correct_triples = 0, 0
     perfect_episodes = 0
@@ -531,7 +532,7 @@ def evaluate_traversal(
         f"Eval: triple-level acc {triple_acc:.2f}% | "
         f"perfect-traversal fraction {perfect_frac:.2f}% ({tested} episodes)"
     )
-    model.train()
+    model.train(was_training)
 
     if hop_breakdown:
         breakdown = {

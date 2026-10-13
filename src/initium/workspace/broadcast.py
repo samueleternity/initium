@@ -11,6 +11,8 @@ import math
 import torch
 import torch.nn as nn
 
+from initium.workspace.bistability import BistableWriteGate
+
 
 class WorkspaceBroadcast(nn.Module):
     """Competitive MoE-selected writes and all-expert shared-slot readback.
@@ -21,24 +23,48 @@ class WorkspaceBroadcast(nn.Module):
     receives the resulting context before the selected deltas are combined.
     """
 
-    def __init__(self, d_model: int, num_experts: int, num_slots: int = 5):
+    def __init__(
+        self,
+        d_model: int,
+        num_experts: int,
+        num_slots: int = 5,
+        *,
+        gate_variant: str = "continuous",
+        bistable_selection_scale: float = 1.0,
+        bistable_noise_scale: float = 0.75,
+    ):
         super().__init__()
         if d_model < 1 or num_experts < 1:
             raise ValueError("d_model and num_experts must be positive")
         if num_slots < 0:
             raise ValueError("num_slots must be >= 0")
+        if gate_variant not in ("continuous", "bistable"):
+            raise ValueError("gate_variant must be 'continuous' or 'bistable'")
         self.d_model = d_model
         self.num_experts = num_experts
         self.num_slots = num_slots
+        self.gate_variant = gate_variant
+        self.bistable_selection_scale = float(bistable_selection_scale)
+        self.bistable_noise_scale = float(bistable_noise_scale)
         self.query = nn.Linear(d_model, d_model, bias=False)
         self.key = nn.Linear(d_model, d_model, bias=False)
         self.value = nn.Linear(d_model, d_model, bias=False)
         self.write_gate = nn.Linear(2 * d_model, d_model)
         self.read_gate = nn.Parameter(torch.zeros(()))
         self.write_gate_closed = False
+        self.bistable_gate = (
+            BistableWriteGate(
+                selection_scale=bistable_selection_scale,
+                noise_scale=bistable_noise_scale,
+            )
+            if gate_variant == "bistable"
+            else None
+        )
         self.diagnostics_enabled = True
         self._last_step_diag: dict[str, torch.Tensor] = {}
         self._last_diag: dict[str, torch.Tensor] = {}
+        self._bistable_diagnostic_totals: dict[str, torch.Tensor] = {}
+        self._bistable_diagnostic_calls = 0
         nn.init.zeros_(self.write_gate.weight)
         nn.init.zeros_(self.write_gate.bias)
 
@@ -55,6 +81,9 @@ class WorkspaceBroadcast(nn.Module):
         no_selection: bool = False,
         reset_each_step: bool = False,
         bypass_broadcast: bool = False,
+        bistable_noise_scale: float | None = None,
+        bistable_selection_scale: float | None = None,
+        deterministic_gate: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Keep the zero-slot/closed-gate bypass identical to the selection-only
         # MoE path. Active workspace attention and recurrent slot updates use
@@ -67,6 +96,10 @@ class WorkspaceBroadcast(nn.Module):
                 state,
                 no_selection=no_selection,
                 reset_each_step=reset_each_step,
+                bypass_broadcast=bypass_broadcast,
+                bistable_noise_scale=bistable_noise_scale,
+                bistable_selection_scale=bistable_selection_scale,
+                deterministic_gate=deterministic_gate,
             )
         if specialist_deltas.is_cuda:
             with torch.autocast(device_type="cuda", enabled=False):
@@ -77,6 +110,10 @@ class WorkspaceBroadcast(nn.Module):
                     state.float(),
                     no_selection=no_selection,
                     reset_each_step=reset_each_step,
+                    bypass_broadcast=bypass_broadcast,
+                    bistable_noise_scale=bistable_noise_scale,
+                    bistable_selection_scale=bistable_selection_scale,
+                    deterministic_gate=deterministic_gate,
                 )
         return self._forward_step(
             specialist_deltas.float(),
@@ -85,6 +122,10 @@ class WorkspaceBroadcast(nn.Module):
             state.float(),
             no_selection=no_selection,
             reset_each_step=reset_each_step,
+            bypass_broadcast=bypass_broadcast,
+            bistable_noise_scale=bistable_noise_scale,
+            bistable_selection_scale=bistable_selection_scale,
+            deterministic_gate=deterministic_gate,
         )
 
     def _forward_step(
@@ -96,6 +137,10 @@ class WorkspaceBroadcast(nn.Module):
         *,
         no_selection: bool = False,
         reset_each_step: bool = False,
+        bypass_broadcast: bool = False,
+        bistable_noise_scale: float | None = None,
+        bistable_selection_scale: float | None = None,
+        deterministic_gate: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.num_slots == 0 or self.write_gate_closed:
             selected = specialist_deltas.gather(
@@ -157,6 +202,24 @@ class WorkspaceBroadcast(nn.Module):
         update = torch.sigmoid(self.write_gate(torch.cat([old_inputs, slot_inputs], dim=-1)))
         has_writer = write_weights.sum(dim=-1, keepdim=True).unsqueeze(-1) > 0
         update = update * has_writer.to(update.dtype)
+        bistable_diag = {}
+        if self.bistable_gate is not None:
+            committed, _ = self.bistable_gate(
+                mass,
+                selection_confidence=write_weights.sum(dim=-1),
+                candidate_mask=has_writer.reshape(batch),
+                noise_scale=bistable_noise_scale,
+                selection_scale=bistable_selection_scale,
+                deterministic=deterministic_gate,
+                collect_diagnostics=self.diagnostics_enabled,
+            )
+            update = update * committed.unsqueeze(-1)
+            bistable_diag = self.bistable_gate.last_diagnostics()
+        if self.diagnostics_enabled:
+            writer_weights = torch.zeros(
+                batch, self.num_experts, device=route_indices.device, dtype=torch.float32
+            ).scatter_add_(1, route_indices, route_weights.float())
+            writer_frequency = writer_weights.mean(dim=0).detach()
         next_state = update.mul(slot_inputs).add((1.0 - update).mul(old_inputs))
 
         if bypass_broadcast:
@@ -175,6 +238,8 @@ class WorkspaceBroadcast(nn.Module):
                     "slot_rms": next_state.detach().float().square().mean().sqrt(),
                     "broadcast_rms": next_state.new_zeros((), dtype=torch.float32),
                     "specialist_rms": specialist_deltas.detach().float().square().mean().sqrt(),
+                    **bistable_diag,
+                    **({"writer_frequency": writer_frequency} if self.diagnostics_enabled else {}),
                 }
             return (selected_deltas * route_weights.unsqueeze(-1)).sum(dim=1), next_state
 
@@ -200,6 +265,8 @@ class WorkspaceBroadcast(nn.Module):
                     read_scale.detach().float() * broadcast.detach().float()
                 ).square().mean().sqrt(),
                 "specialist_rms": specialist_deltas.detach().float().square().mean().sqrt(),
+                **bistable_diag,
+                **({"writer_frequency": writer_frequency} if self.diagnostics_enabled else {}),
             }
         return (enriched * route_weights.unsqueeze(-1)).sum(dim=1), next_state
 
@@ -213,6 +280,9 @@ class WorkspaceBroadcast(nn.Module):
         no_selection: bool = False,
         reset_each_step: bool = False,
         bypass_broadcast: bool = False,
+        bistable_noise_scale: float | None = None,
+        bistable_selection_scale: float | None = None,
+        deterministic_gate: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Process time-major specialists ``(B,T,E,D)`` sequentially."""
         outputs = []
@@ -224,6 +294,9 @@ class WorkspaceBroadcast(nn.Module):
                 no_selection=no_selection,
                 reset_each_step=reset_each_step,
                 bypass_broadcast=bypass_broadcast,
+                bistable_noise_scale=bistable_noise_scale,
+                bistable_selection_scale=bistable_selection_scale,
+                deterministic_gate=deterministic_gate,
             )
             outputs.append(out)
             if step_diags is not None:
@@ -238,6 +311,37 @@ class WorkspaceBroadcast(nn.Module):
                 self._last_diag["broadcast_rms"]
                 / self._last_diag["specialist_rms"].clamp_min(1e-8)
             )
+            if "writer_frequency" in step_diags[0]:
+                self._last_diag["writer_frequency"] = torch.stack(
+                    [diag["writer_frequency"] for diag in step_diags]
+                ).mean(dim=0).detach()
+            if "gate_candidate_count" in step_diags[0]:
+                candidate_counts = torch.stack(
+                    [diag["gate_candidate_count"] for diag in step_diags]
+                )
+                candidate_total = candidate_counts.sum()
+                candidate_denom = candidate_total.clamp_min(1.0)
+                self._last_diag["gate_candidate_count"] = candidate_total.detach()
+                for key in (
+                    "gate_probability_mean",
+                    "gate_low_frac",
+                    "gate_mid_frac",
+                    "gate_high_frac",
+                    "write_frequency",
+                    "selection_strength_mean",
+                ):
+                    values = torch.stack([diag[key] for diag in step_diags])
+                    self._last_diag[key] = (
+                        (values * candidate_counts).sum() / candidate_denom
+                    ).detach()
+                histograms = torch.stack(
+                    [diag["gate_histogram"] for diag in step_diags]
+                )
+                self._last_diag["gate_histogram"] = (
+                    (histograms * candidate_counts.unsqueeze(-1)).sum(dim=0)
+                    / candidate_denom
+                ).detach()
+            self._accumulate_bistable_diagnostics(self._last_diag)
         return torch.stack(outputs, dim=1), state
 
     def last_diagnostics(self) -> dict[str, torch.Tensor]:
@@ -250,3 +354,71 @@ class WorkspaceBroadcast(nn.Module):
         if not self.diagnostics_enabled:
             self._last_step_diag = {}
             self._last_diag = {}
+            self.reset_bistable_diagnostics()
+
+    def _accumulate_bistable_diagnostics(self, diagnostics: dict[str, torch.Tensor]) -> None:
+        if "gate_histogram" not in diagnostics:
+            return
+        candidate_count = diagnostics.get("gate_candidate_count")
+        if candidate_count is None:
+            return
+        keys = (
+            "gate_probability_mean",
+            "gate_histogram",
+            "gate_low_frac",
+            "gate_mid_frac",
+            "gate_high_frac",
+            "write_frequency",
+            "selection_strength_mean",
+            "writer_frequency",
+        )
+        for key in keys:
+            value = diagnostics.get(key)
+            if value is not None:
+                weight = (
+                    candidate_count / self.num_slots
+                    if key == "writer_frequency" or key == "selection_strength_mean"
+                    else candidate_count
+                )
+                self._bistable_diagnostic_totals[key] = (
+                    self._bistable_diagnostic_totals[key] + value.detach() * weight
+                    if key in self._bistable_diagnostic_totals
+                    else value.detach().clone() * weight
+                )
+        self._bistable_diagnostic_totals["gate_candidate_count"] = (
+            self._bistable_diagnostic_totals.get(
+                "gate_candidate_count", candidate_count.detach().new_zeros(())
+            )
+            + candidate_count.detach()
+        )
+        self._bistable_diagnostic_calls += 1
+
+    def consume_bistable_diagnostics(self) -> dict[str, torch.Tensor]:
+        """Return candidate diagnostics averaged across forwards since reset."""
+        if self._bistable_diagnostic_calls == 0:
+            return {}
+        candidate_count = self._bistable_diagnostic_totals["gate_candidate_count"]
+        denominator = candidate_count.clamp_min(1.0)
+        result = {
+            key: value
+            / (
+                denominator / self.num_slots
+                if key in ("writer_frequency", "selection_strength_mean")
+                else denominator
+            )
+            for key, value in self._bistable_diagnostic_totals.items()
+            if key != "gate_candidate_count"
+        }
+        result["gate_candidate_count"] = candidate_count
+        self.reset_bistable_diagnostics()
+        return result
+
+    def reset_bistable_diagnostics(self) -> None:
+        self._bistable_diagnostic_totals.clear()
+        self._bistable_diagnostic_calls = 0
+
+    def bistable_gate_parameters(self):
+        """Return experimental gate parameters, or an empty iterator."""
+        if self.bistable_gate is None:
+            return iter(())
+        return self.bistable_gate.parameters()

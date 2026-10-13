@@ -157,7 +157,7 @@ def _build_split_graph(c: _Cfg, input_dim, hidden, nr_cells, cell_size, read_hea
         ),
     )
     _moe = _moe_kwargs(c)
-    return SplitGraphDNC(
+    model = SplitGraphDNC(
         input_size=input_dim,
         hidden_size=hidden,
         nr_cells=nr_cells,
@@ -214,8 +214,17 @@ def _build_split_graph(c: _Cfg, input_dim, hidden, nr_cells, cell_size, read_hea
             "workspace_reset_each_step", cc.WORKSPACE_RESET_EACH_STEP
         ),
         workspace_train_mode=c.get("workspace_train_mode", cc.WORKSPACE_TRAIN_MODE),
+        workspace_gate_variant=c.get("workspace_gate_variant", "continuous"),
+        workspace_bistable_selection_scale=c.get(
+            "workspace_bistable_selection_scale", 1.0
+        ),
+        workspace_bistable_noise_scale=c.get("workspace_bistable_noise_scale", 0.75),
         device=device,
     ).to(device)
+    model.workspace_bistable_deterministic = c.get(
+        "workspace_bistable_deterministic", False
+    )
+    return model
 
 
 def load_model(ckpt: dict, device: torch.device, deterministic_write: bool = False) -> LoadedModel:

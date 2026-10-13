@@ -692,6 +692,9 @@ def load_frozen_workspace_warm_start(
         "workspace_bistable_noise_scale",
         "workspace_bistable_deterministic",
         "workspace_stability_max_activation",
+        # Exact implementation-only optimization; old checkpoints default
+        # to base and remain weight/state compatible with either backend.
+        "dnc_implementation",
     }
     missing_config = sorted(
         key
@@ -829,6 +832,7 @@ def run(
     dnc_read_residual_max_ratio: float = DNC_READ_RESIDUAL_MAX_RATIO,
     dnc_write_variant: str = DNC_WRITE_VARIANT,
     dnc_write_observation_variance: float = DNC_WRITE_OBSERVATION_VARIANCE,
+    dnc_implementation: str = "base",
     dnc_backward_trace: bool = False,
     dataset_type: str = DATASET_TYPE,
     dataset_link: str | None = DATASET_LINK,
@@ -1511,6 +1515,7 @@ def run(
             dnc_read_residual_max_ratio=dnc_read_residual_max_ratio,
             dnc_write_variant=dnc_write_variant,
             dnc_write_observation_variance=dnc_write_observation_variance,
+            dnc_implementation=dnc_implementation,
             workspace_enabled=workspace_enabled,
             workspace_num_slots=workspace_num_slots,
             workspace_no_selection=workspace_no_selection,
@@ -1552,8 +1557,18 @@ def run(
             # equivalence rather than a bit-identical beta=0 substitute.
             # v7: unaffected by the controller swap -- MambaDNC builds
             # dnc.memory.Memory identically regardless of rnn_type.
+            dnc_implementation=dnc_implementation,
             **mamba_kwargs,
         ).to(device)
+
+    print(
+        f"[{run_id}] DNC implementation={dnc_implementation}"
+        + (
+            " | exact allocation path avoids one full usage-permutation sort per step"
+            if dnc_implementation == "optimized"
+            else ""
+        )
+    )
 
     if split_graph_enabled:
         if workspace_enabled:
@@ -1623,6 +1638,7 @@ def run(
         "dnc_read_residual_max_ratio": dnc_read_residual_max_ratio,
         "dnc_write_variant": dnc_write_variant,
         "dnc_write_observation_variance": dnc_write_observation_variance,
+        "dnc_implementation": dnc_implementation,
         "dnc_compute_precision": "fp32",
         "dnc_backward_trace": dnc_backward_trace,
         "workspace_enabled": workspace_enabled,
@@ -3844,6 +3860,22 @@ if __name__ == "__main__":
         help="Trace the first non-finite gradient through DNC internals and report "
         "windowed memory/read/link magnitudes. Diagnostic only; adds synchronization.",
     )
+    dnc_impl_group = parser.add_mutually_exclusive_group()
+    dnc_impl_group.add_argument(
+        "--base-dnc",
+        dest="dnc_implementation",
+        action="store_const",
+        const="base",
+        help="Use the upstream DNC allocation implementation (default).",
+    )
+    dnc_impl_group.add_argument(
+        "--optimized-dnc",
+        dest="dnc_implementation",
+        action="store_const",
+        const="optimized",
+        help="Use exact dense DNC equations with one allocation permutation sort removed.",
+    )
+    parser.set_defaults(dnc_implementation="base")
     parser.add_argument(
         "--dataset-type",
         type=str,
@@ -4104,6 +4136,8 @@ if __name__ == "__main__":
                 run_id += f"_obsvar{args.dnc_write_observation_variance:g}"
             if args.split_graph_combiner_mode == "controller":
                 run_id = f"{run_id}_combctrl{args.split_graph_combiner_variant.replace('+', '')}"
+        if args.dnc_implementation == "optimized":
+            run_id += "_optimizeddnc"
         if args.dataset_type != "graph":
             run_id = f"{run_id}_ds{args.dataset_type}"
         if args.run_id_suffix:
@@ -4165,6 +4199,7 @@ if __name__ == "__main__":
             dnc_read_residual_max_ratio=args.dnc_read_residual_max_ratio,
             dnc_write_variant=args.dnc_write_variant,
             dnc_write_observation_variance=args.dnc_write_observation_variance,
+            dnc_implementation=args.dnc_implementation,
             dnc_backward_trace=args.dnc_backward_trace,
             dataset_type=args.dataset_type,
             dataset_link=args.dataset_link,

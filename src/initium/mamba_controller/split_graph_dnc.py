@@ -204,6 +204,7 @@ class SplitGraphDNC(nn.Module):
         dnc_read_residual_max_ratio: float = 0.5,
         dnc_write_variant: str = "learned",
         dnc_write_observation_variance: float = 1.0,
+        dnc_implementation: str = "base",
         workspace_enabled: bool = False,
         workspace_num_slots: int = 5,
         workspace_no_selection: bool = False,
@@ -240,6 +241,9 @@ class SplitGraphDNC(nn.Module):
         self.dnc_read_residual_max_ratio = dnc_read_residual_max_ratio
         self.dnc_write_variant = dnc_write_variant
         self.dnc_write_observation_variance = dnc_write_observation_variance
+        if dnc_implementation not in ("base", "optimized"):
+            raise ValueError("dnc_implementation must be 'base' or 'optimized'")
+        self.dnc_implementation = dnc_implementation
         self.moe_backbone_residual_scale = moe_backbone_residual_scale
         if moe_placement not in ("all", "backbone", "combiner"):
             raise ValueError("moe_placement must be 'all', 'backbone', or 'combiner'")
@@ -503,6 +507,7 @@ class SplitGraphDNC(nn.Module):
                 read_residual_scale=dnc_read_residual_scale,
                 read_residual_max_ratio=dnc_read_residual_max_ratio,
                 observation_variance=dnc_write_observation_variance,
+                dnc_implementation=dnc_implementation,
             )
         )
         # See module docstring's API-compatibility section for why this

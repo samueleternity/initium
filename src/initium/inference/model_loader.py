@@ -187,6 +187,7 @@ def _build_split_graph(c: _Cfg, input_dim, hidden, nr_cells, cell_size, read_hea
         dnc_write_observation_variance=c.get(
             "dnc_write_observation_variance", cc.DNC_WRITE_OBSERVATION_VARIANCE
         ),
+        dnc_implementation=c.get("dnc_implementation", "base"),
         independent_linears=True,
         moe_enabled=_moe["moe_enabled"],
         moe_placement=c.get("split_graph_moe_placement", "all"),
@@ -252,6 +253,7 @@ def load_model(ckpt: dict, device: torch.device, deterministic_write: bool = Fal
             batch_first=True,
             device=device,
             independent_linears=True,
+            dnc_implementation=raw.get("dnc_implementation", "base"),
             **_controller_kwargs(controller, c),
             **extra,
         ).to(device)

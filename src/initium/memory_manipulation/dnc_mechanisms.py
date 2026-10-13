@@ -1,9 +1,8 @@
 """Composable DNC read-addressing and write-value mechanisms.
 
-The stock pytorch-dnc Memory is kept as the baseline. This subclass changes
-only the read content score and/or the update applied to the selected rows;
-usage, allocation, erase/write addressing, read modes and temporal links keep
-their upstream implementations and semantics.
+The stock pytorch-dnc Memory is kept as the baseline. MechanismMemory changes
+only selected read/write rules; OptimizedMechanismMemory uses the same dense
+DNC equations and learned state while avoiding a redundant allocation sort.
 """
 
 from __future__ import annotations
@@ -12,7 +11,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from dnc.memory import Memory
-from dnc.util import σ, θ
+from dnc.util import δ, σ, θ
 from initium.memory_manipulation.nvrtc_compat import (
     pop_product_numerical_diagnostics,
     set_product_backward_trace,
@@ -20,6 +19,42 @@ from initium.memory_manipulation.nvrtc_compat import (
 
 READ_VARIANTS = ("cosine", "relational-mlp", "relational-residual")
 WRITE_VARIANTS = ("learned", "kanerva-closed-form")
+DNC_IMPLEMENTATIONS = ("base", "optimized")
+
+
+class _FastAllocationMixin:
+    """Exact DNC allocation with one full sort instead of two.
+
+    The stock implementation sorts usage with topk(k=N) and then sorts the
+    returned permutation a second time to invert it. Scattering the sorted
+    allocation weights back through the first permutation is equivalent and
+    avoids that second full sort without changing addressing semantics or
+    module state.
+    """
+
+    dnc_implementation = "optimized"
+    nr_cells: int
+
+    def allocate(self, usage: torch.Tensor, write_gate: torch.Tensor):
+        usage = δ + (1 - δ) * usage
+        sorted_usage, order = torch.topk(
+            usage, self.nr_cells, dim=1, largest=False
+        )
+        leading_one = torch.ones(
+            (usage.size(0), 1), device=usage.device, dtype=usage.dtype
+        )
+        exclusive_products = torch.cumprod(
+            torch.cat((leading_one, sorted_usage), dim=1), dim=1
+        )[:, :-1]
+        sorted_weights = (1 - sorted_usage) * exclusive_products
+        allocation_weights = torch.zeros_like(usage).scatter(
+            1, order, sorted_weights
+        )
+        return allocation_weights.unsqueeze(1), usage
+
+
+class OptimizedMemory(_FastAllocationMixin, Memory):
+    """Stock DNC memory with an exact allocation-sort optimization."""
 
 
 class MechanismMemory(Memory):
@@ -29,6 +64,8 @@ class MechanismMemory(Memory):
     controller uses CUDA autocast. This protects cosine-addressing backward
     from low-precision intermediate gradients near the DNC norm epsilon.
     """
+
+    dnc_implementation = "base"
 
     def __init__(
         self,
@@ -606,6 +643,10 @@ class MechanismMemory(Memory):
         return hidden
 
 
+class OptimizedMechanismMemory(_FastAllocationMixin, MechanismMemory):
+    """MechanismMemory with the exact allocation-sort optimization."""
+
+
 def build_memory(
     *,
     input_size: int,
@@ -619,9 +660,17 @@ def build_memory(
     read_residual_scale: float = 1.0,
     read_residual_max_ratio: float = 0.5,
     observation_variance: float = 1.0,
+    dnc_implementation: str = "base",
 ):
     """Construct a stock-compatible memory for the selected mechanism pair."""
-    return MechanismMemory(
+    if dnc_implementation not in DNC_IMPLEMENTATIONS:
+        raise ValueError(f"Unknown DNC implementation: {dnc_implementation!r}")
+    memory_cls = (
+        OptimizedMechanismMemory
+        if dnc_implementation == "optimized"
+        else MechanismMemory
+    )
+    return memory_cls(
         input_size=input_size,
         nr_cells=nr_cells,
         cell_size=cell_size,

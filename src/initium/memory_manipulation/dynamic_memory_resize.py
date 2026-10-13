@@ -50,7 +50,11 @@ import torch
 import torch.nn as nn
 from dnc.memory import Memory
 
-from initium.memory_manipulation.dnc_mechanisms import MechanismMemory, build_memory
+from initium.memory_manipulation.dnc_mechanisms import (
+    MechanismMemory,
+    OptimizedMemory,
+    build_memory,
+)
 from initium.memory_manipulation.link_matrix_ablation import AblatableSparseLinkMemory
 
 
@@ -104,6 +108,7 @@ def resize_memory(model, new_nr_cells: int, device=None, layer: int = 0, optimiz
         independent_linears=True,
         device=device,
     )
+    dnc_implementation = getattr(old_memory, "dnc_implementation", "base")
     if isinstance(old_memory, MechanismMemory):
         new_memory = build_memory(
             **memory_args,
@@ -112,9 +117,11 @@ def resize_memory(model, new_nr_cells: int, device=None, layer: int = 0, optimiz
             read_residual_scale=old_memory.read_residual_scale,
             read_residual_max_ratio=old_memory.read_residual_max_ratio,
             observation_variance=old_memory.observation_variance,
+            dnc_implementation=dnc_implementation,
         ).to(device)
     else:
-        new_memory = Memory(**memory_args).to(device)
+        memory_cls = OptimizedMemory if dnc_implementation == "optimized" else Memory
+        new_memory = memory_cls(**memory_args).to(device)
 
     # Transplant every N-independent learned sublayer except
     # write_vector_transform (that one is a StochasticWriteHead, not a

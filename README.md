@@ -97,6 +97,8 @@ The split-graph memory exposes independent read and write variants while retaini
 - The graph curriculum emits ID, OOD, and OOD-offset metrics as before. Graph runs also write `run_<id>_relational_probe.csv`, with cosine top-1, selected read-head top-1, and held-out-composition accuracy. `data/graph_traversal/order_probe.py` supplies paired prefix-permutation helpers for the Q99 order-sensitivity evaluation.
 - Split-graph graph runs also write `run_<id>_track_a.csv` and `run_<id>_track_b.csv`. Track A records ID/OOD accuracy, relational stress and held-out-composition accuracy, ordinary-input read-score/cosine correlation, and read-content entropy/maximum weight. Track B records the Q99 order-sensitivity gate, ID/OOD posterior variance and write-update diagnostics, and training-window loss, gradient norm, AMP scale, and learning rate. These are experiment logs; no training or evaluation results are checked in.
 
+The DNC implementation defaults to `--base-dnc`. `--optimized-dnc` selects an exact allocation implementation that reuses the stock sorted usage permutation to scatter allocation weights back into memory order, avoiding the second full sort in every write step. It retains dense temporal links, the same controller interface, and the same learned parameters/state-dict keys. Use the mutually exclusive `--base-dnc` flag to make a baseline run explicit; compare matched seeds, episode streams, and step budgets before adopting the optimized mode. This first optimization targets allocation overhead only; it does not claim to remove the dense link matrix's quadratic cost.
+
 Use the selected split-graph baseline with either supported controller combiner:
 
 ```bash

@@ -32,6 +32,7 @@ class WorkspaceBroadcast(nn.Module):
         gate_variant: str = "continuous",
         bistable_selection_scale: float = 1.0,
         bistable_noise_scale: float = 0.75,
+        bistable_gradient_mode: str = "truncated",
     ):
         super().__init__()
         if d_model < 1 or num_experts < 1:
@@ -56,6 +57,7 @@ class WorkspaceBroadcast(nn.Module):
             BistableWriteGate(
                 selection_scale=bistable_selection_scale,
                 noise_scale=bistable_noise_scale,
+                gradient_mode=bistable_gradient_mode,
             )
             if gate_variant == "bistable"
             else None

@@ -213,6 +213,7 @@ class SplitGraphDNC(nn.Module):
         workspace_gate_variant: str = "continuous",
         workspace_bistable_selection_scale: float = 1.0,
         workspace_bistable_noise_scale: float = 0.75,
+        workspace_bistable_gradient_mode: str = "truncated",
     ):
         super().__init__()
         if not independent_linears:
@@ -268,6 +269,7 @@ class SplitGraphDNC(nn.Module):
         self.workspace_reset_each_step = workspace_reset_each_step
         self.workspace_train_mode = workspace_train_mode
         self.workspace_bistable_noise_scale = float(workspace_bistable_noise_scale)
+        self.workspace_bistable_gradient_mode = workspace_bistable_gradient_mode
         self.workspace_bistable_selection_scale = float(workspace_bistable_selection_scale)
         self.workspace_bistable_deterministic = False
         # Runtime-only counterfactual for evaluation. It is deliberately not
@@ -534,6 +536,7 @@ class SplitGraphDNC(nn.Module):
                 gate_variant=workspace_gate_variant,
                 bistable_selection_scale=workspace_bistable_selection_scale,
                 bistable_noise_scale=workspace_bistable_noise_scale,
+                bistable_gradient_mode=workspace_bistable_gradient_mode,
             )
             if workspace_enabled and workspace_num_slots > 0
             else None
@@ -621,6 +624,11 @@ class SplitGraphDNC(nn.Module):
                 raise ValueError("start_step>0 requires a resumed hx=(chx, mhx, last_read)")
         device = input.device
 
+        def observe_tensor(label: str, value: torch.Tensor) -> None:
+            observer = getattr(self, "_initium_segment_observer", None)
+            if observer is not None:
+                observer(label, value)
+
         # ---- (a) PARALLEL BACKBONE ------------------------------------
         # Single call, whole sequence, zero dependency on memory state.
         # This is the entire "removed from the sequential critical path"
@@ -664,6 +672,7 @@ class SplitGraphDNC(nn.Module):
             H[:, start_step:] = base[:, start_step:] + (
                 self.moe_backbone_residual_scale * broadcast_delta
             )
+            observe_tensor("split_graph.h_after_workspace", H)
         else:
             backbone_stages = (
                 list(self.backbone)
@@ -717,6 +726,8 @@ class SplitGraphDNC(nn.Module):
         outputs = []
         for t in range(start_step, T):
             h_t = H[:, t, :]  # (B, hidden_size)
+            observe_tensor("split_graph.backbone_source", h_t)
+            observe_tensor("split_graph.read_source", read_vec)
 
             if self.combiner_mode == "controller":
                 assert self.combiner_wrapper is not None
@@ -725,7 +736,9 @@ class SplitGraphDNC(nn.Module):
                     and getattr(self.combiner_wrapper, "moe_source_dims", None) is not None
                 )
                 if _cfc_multi_source:
-                    xi_out, combiner_hx = self.combiner_wrapper.forward_multi_source(
+                    # Call the nn.Module entry point so registered segment
+                    # diagnostics observe the CfC combiner boundary.
+                    xi_out, combiner_hx = self.combiner_wrapper(
                         [h_t, read_vec], combiner_hx
                     )
                 else:
@@ -748,6 +761,7 @@ class SplitGraphDNC(nn.Module):
                 xi_t = h_t
 
             if pass_through_memory:
+                observe_tensor("split_graph.dnc_input", xi_t)
                 read_vec, mem_state = self.memories[0](xi_t, mem_state)
                 read_vec = read_vec.reshape(
                     B, -1

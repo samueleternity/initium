@@ -113,6 +113,15 @@ class CfCControllerBlock(nn.Module):
         y = x + out.to(x.dtype) if self.residual else out.to(x.dtype)
         return y, _state_to_fp32(new_state)
 
+    def forward(self, x, state):
+        """Run one recurrent step through ``Module.__call__``.
+
+        Keeping the step behind ``forward`` preserves the equations while
+        ensuring module hooks (including segment activation diagnostics) see
+        the CfC block boundary.
+        """
+        return self.step(x, state)
+
 
 class CfCControllerWrapper(nn.Module):
     """Stack of `num_blocks` CfCControllerBlocks with the nn.LSTM-compatible
@@ -247,6 +256,12 @@ class CfCControllerWrapper(nn.Module):
         return [blk.init_state(batch_size, device=device) for blk in blocks]
 
     def forward(self, input, hx):
+        if isinstance(input, list):
+            if self.moe_source_dims is None:
+                raise RuntimeError(
+                    "list input is supported only when moe_source_dims is configured"
+                )
+            return self.forward_multi_source(input, hx)
         assert input.dim() == 3 and input.size(1) == 1, (
             "CfCControllerWrapper only supports single-timestep calls "
             f"(got shape {tuple(input.shape)})."
@@ -262,7 +277,7 @@ class CfCControllerWrapper(nn.Module):
         new_hx = []
         blocks = cast(Iterable[CfCControllerBlock], self.blocks)
         for i, (block, state) in enumerate(zip(blocks, hx)):
-            x, new_state = block.step(x, state)
+            x, new_state = block(x, state)
             if self.moe_enabled:
                 assert self.moe_blocks is not None
                 x = self.moe_blocks[i](x)
@@ -303,7 +318,7 @@ class CfCControllerWrapper(nn.Module):
         new_hx = []
         blocks = cast(Iterable[CfCControllerBlock], self.blocks)
         for block, state in zip(blocks, hx):
-            x, new_state = block.step(x, state)
+            x, new_state = block(x, state)
             new_hx.append(new_state)
         return x.unsqueeze(1), new_hx
 

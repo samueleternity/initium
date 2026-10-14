@@ -690,6 +690,7 @@ def load_frozen_workspace_warm_start(
         "workspace_gate_variant",
         "workspace_bistable_selection_scale",
         "workspace_bistable_noise_scale",
+        "workspace_bistable_gradient_mode",
         "workspace_bistable_deterministic",
         "workspace_stability_max_activation",
         # Exact implementation-only optimization; old checkpoints default
@@ -822,6 +823,7 @@ def run(
     workspace_gate_variant: str = "continuous",
     workspace_bistable_selection_scale: float = 1.0,
     workspace_bistable_noise_scale: float = 0.75,
+    workspace_bistable_gradient_mode: str = "truncated",
     workspace_bistable_deterministic: bool = False,
     workspace_stability_max_activation: float = 100_000.0,
     eval_only: bool = False,
@@ -905,6 +907,13 @@ def run(
             or checkpoint_config.get("workspace_train_mode") != workspace_train_mode
             or checkpoint_config.get("workspace_gate_variant", "continuous")
             != workspace_gate_variant
+            or (
+                workspace_gate_variant == "bistable"
+                and checkpoint_config.get(
+                    "workspace_bistable_gradient_mode", "unrolled"
+                )
+                != workspace_bistable_gradient_mode
+            )
         )
         and not eval_only
     )
@@ -1524,6 +1533,7 @@ def run(
             workspace_gate_variant=workspace_gate_variant,
             workspace_bistable_selection_scale=workspace_bistable_selection_scale,
             workspace_bistable_noise_scale=workspace_bistable_noise_scale,
+            workspace_bistable_gradient_mode=workspace_bistable_gradient_mode,
             device=device,
         ).to(device)
         if dnc_backward_trace:
@@ -1585,6 +1595,7 @@ def run(
                 f"slots={workspace_num_slots} | write_selection={write_mode} | "
                 f"persistence={persistence} | train_mode={workspace_train_mode} | "
                 f"gate={workspace_gate_variant} | "
+                f"bistable_gradient={workspace_bistable_gradient_mode} | "
                 f"compute_precision={'fp32' if workspace_active else 'bypass'} | "
                 "scope=final-backbone-MoE-bank; each specialist reads shared slots"
             )
@@ -1650,6 +1661,7 @@ def run(
         "workspace_train_scope": workspace_train_scope,
         "workspace_bistable_selection_scale": workspace_bistable_selection_scale,
         "workspace_bistable_noise_scale": workspace_bistable_noise_scale,
+        "workspace_bistable_gradient_mode": workspace_bistable_gradient_mode,
         "workspace_bistable_deterministic": workspace_bistable_deterministic,
         "workspace_stability_max_activation": workspace_stability_max_activation,
     }
@@ -1752,7 +1764,27 @@ def run(
             else None
         ),
     )
+    if workspace_train_scope == "gate" and isinstance(rnn, SplitGraphDNC):
+        rnn._initium_segment_observer = segment_diagnostics.observe_tensor
     segment_diagnostics.add_module(output_proj, "task_output")
+    if segment_diagnostics_enabled and isinstance(rnn, SplitGraphDNC):
+        combiner = rnn.combiner_wrapper
+        if combiner is not None and hasattr(combiner, "in_adapter"):
+            segment_diagnostics.add_module(
+                combiner.in_adapter, "controller.cfc.in_adapter"
+            )
+            for index, adapter in enumerate(
+                getattr(combiner, "source_in_adapters", None) or ()
+            ):
+                segment_diagnostics.add_module(
+                    adapter, f"controller.cfc.source_adapter.{index}"
+                )
+            for index, block in enumerate(getattr(combiner, "blocks", ())):
+                cfc_cell = getattr(block, "cfc", None)
+                if isinstance(cfc_cell, nn.Module):
+                    segment_diagnostics.add_module(
+                        cfc_cell, f"controller.cfc.cell.{index}"
+                    )
     moe_layer_ids = {id(layer) for layer in getattr(rnn, "moe_layers", [])}
     for module_name, module in rnn.named_modules():
         if id(module) in moe_layer_ids:
@@ -1841,13 +1873,37 @@ def run(
                 parameter.requires_grad_(True)
         for parameter in output_proj.parameters():
             parameter.requires_grad_(False)
-    trainable_parameters = [
-        parameter
-        for parameter in list(rnn.parameters()) + list(output_proj.parameters())
+    trainable_named_parameters = [
+        (f"rnn.{name}", parameter)
+        for name, parameter in rnn.named_parameters()
+        if parameter.requires_grad
+    ] + [
+        (f"output_proj.{name}", parameter)
+        for name, parameter in output_proj.named_parameters()
         if parameter.requires_grad
     ]
+    trainable_parameters = [parameter for _, parameter in trainable_named_parameters]
     if not trainable_parameters:
         raise ValueError("training configuration has no trainable parameters")
+    if (
+        workspace_enabled
+        and workspace_train_mode == "frozen"
+        and workspace_train_scope == "gate"
+        and workspace_gate_variant in ("continuous", "bistable")
+    ):
+        gate_prefix = (
+            "rnn.workspace.bistable_gate."
+            if workspace_gate_variant == "bistable"
+            else "rnn.workspace.write_gate."
+        )
+        unexpected_trainable = [
+            name for name, _ in trainable_named_parameters if not name.startswith(gate_prefix)
+        ]
+        if unexpected_trainable:
+            raise RuntimeError(
+                "Frozen gate-only training has parameters outside the selected write gate: "
+                + ", ".join(unexpected_trainable)
+            )
     optimizer = torch.optim.Adam(trainable_parameters, lr=LR)
     # Option 3 (Concept 24/LB-17): multi-axis efficiency accounting.
     # param_count is fixed for the life of this run -- static Option 2's
@@ -2200,6 +2256,29 @@ def run(
     running_task_loss, running_kl_loss, running_div, running_grad_norm = 0.0, 0.0, 0, 0.0
     running_finite_grad_steps = 0
     running_nonfinite_grad_steps = 0
+    bistable_grad_probe = None
+    if workspace_train_scope == "gate" and workspace_gate_variant == "bistable":
+        # SegmentDiagnostics reports parameter gradients after clipping. Keep
+        # a separate pre-clip trace so an unexpectedly large global norm can
+        # be attributed to the exact trainable tensors that produced it.
+        bistable_grad_probe = {
+            name: {
+                "sum_sq": torch.zeros((), device=device, dtype=torch.float64),
+                "max": torch.zeros((), device=device, dtype=torch.float64),
+                "max_step": torch.full((), -1, device=device, dtype=torch.int64),
+            }
+            for name, _ in trainable_named_parameters
+        }
+        bistable_grad_probe_steps = 0
+        bistable_grad_probe_global_max = torch.zeros(
+            (), device=device, dtype=torch.float64
+        )
+        bistable_grad_probe_global_max_step = torch.full(
+            (), -1, device=device, dtype=torch.int64
+        )
+        bistable_grad_probe_relative_error = torch.zeros(
+            (), device=device, dtype=torch.float64
+        )
 
     # Dynamic-beta controller state (no-op / unused when beta_mode == "static").
     # Initialized post-resume so a resumed dynamic run starts its health check
@@ -2338,6 +2417,41 @@ def run(
             )
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
+        independent_grad_norm = None
+        if bistable_grad_probe is not None:
+            step_parameter_norms = []
+            for name, parameter in trainable_named_parameters:
+                if parameter.grad is None:
+                    continue
+                parameter_norm = torch.linalg.vector_norm(
+                    parameter.grad.detach().to(dtype=torch.float64)
+                )
+                probe = bistable_grad_probe[name]
+                probe["sum_sq"].add_(parameter_norm.square())
+                probe["max_step"].copy_(
+                    torch.where(
+                        parameter_norm > probe["max"],
+                        torch.full_like(probe["max_step"], step),
+                        probe["max_step"],
+                    )
+                )
+                probe["max"].copy_(torch.maximum(probe["max"], parameter_norm))
+                step_parameter_norms.append(parameter_norm)
+            if step_parameter_norms:
+                independent_grad_norm = torch.linalg.vector_norm(
+                    torch.stack(step_parameter_norms)
+                )
+                bistable_grad_probe_global_max_step.copy_(
+                    torch.where(
+                        independent_grad_norm > bistable_grad_probe_global_max,
+                        torch.full_like(bistable_grad_probe_global_max_step, step),
+                        bistable_grad_probe_global_max_step,
+                    )
+                )
+                bistable_grad_probe_global_max.copy_(
+                    torch.maximum(bistable_grad_probe_global_max, independent_grad_norm)
+                )
+                bistable_grad_probe_steps += 1
         bistable_gate_grad_norm = 0.0
         if workspace_gate_variant == "bistable":
             assert isinstance(rnn, SplitGraphDNC) and rnn.workspace is not None
@@ -2381,6 +2495,13 @@ def run(
             # error_if_nonfinite raises before applying the clip coefficient,
             # preserving the original bad gradients for the diagnostic below.
             grad_norm = torch.tensor(float("nan"), device=device)
+        if independent_grad_norm is not None and math.isfinite(float(grad_norm)):
+            relative_error = (
+                independent_grad_norm - grad_norm.detach().to(dtype=torch.float64)
+            ).abs() / independent_grad_norm.clamp_min(1e-12)
+            bistable_grad_probe_relative_error.copy_(
+                torch.maximum(bistable_grad_probe_relative_error, relative_error)
+            )
         if not math.isfinite(float(grad_norm)):
             grad_was_finite_since_eval = False
             consecutive_nonfinite_grad_steps += 1
@@ -2587,6 +2708,36 @@ def run(
                                 print(f"[{run_id}] [workspace] writer_frequency={writer_frequency}")
             if dyn_n_str:
                 parts.append(dyn_n_str.strip(" |"))
+            if bistable_grad_probe is not None:
+                probe_steps = max(bistable_grad_probe_steps, 1)
+                per_parameter = []
+                for name, probe in bistable_grad_probe.items():
+                    rms = (probe["sum_sq"] / probe_steps).sqrt()
+                    maximum = probe["max"]
+                    maximum_step = int(probe["max_step"].cpu())
+                    per_parameter.append(
+                        (float(maximum.cpu()), name, float(rms.cpu()), maximum_step)
+                    )
+                per_parameter.sort(reverse=True)
+                parameter_summary = ", ".join(
+                    f"{name}:rms={rms:.3g},max={maximum:.3g}@step{maximum_step}"
+                    for maximum, name, rms, maximum_step in per_parameter[:8]
+                ) or "none"
+                parts.append(
+                    "bistable_grad_probe["
+                    f"trainable={len(trainable_named_parameters)} steps={bistable_grad_probe_steps} "
+                    f"independent_global_max={float(bistable_grad_probe_global_max.cpu()):.3g}"
+                    f"@step{int(bistable_grad_probe_global_max_step.cpu())} "
+                    f"max_norm_relative_error={float(bistable_grad_probe_relative_error.cpu()):.3g} "
+                    f"parameters={parameter_summary}]"
+                )
+                for probe in bistable_grad_probe.values():
+                    probe["sum_sq"].zero_()
+                    probe["max"].zero_()
+                bistable_grad_probe_steps = 0
+                bistable_grad_probe_global_max.zero_()
+                bistable_grad_probe_global_max_step.fill_(-1)
+                bistable_grad_probe_relative_error.zero_()
             print(" | ".join(parts))
             segment_diagnostics.emit("train", include_gradients=True)
             if dnc_backward_trace and split_graph_enabled:
@@ -3699,6 +3850,16 @@ if __name__ == "__main__":
         help="Independent background-noise scale for bistable ignition; set to 0 for the noise ablation.",
     )
     parser.add_argument(
+        "--workspace-bistable-gradient-mode",
+        choices=("truncated", "unrolled"),
+        default="truncated",
+        help=(
+            "Backward mode for bistable settling. truncated preserves the full "
+            "forward iteration but detaches intermediate settling states; "
+            "unrolled backpropagates through every iteration."
+        ),
+    )
+    parser.add_argument(
         "--workspace-bistable-deterministic",
         action="store_true",
         help="Disable independent gate noise for a deterministic diagnostic; normal bistable evaluation remains stochastic and seed-reproducible.",
@@ -4116,6 +4277,7 @@ if __name__ == "__main__":
                 run_id += (
                     f"_sel{args.workspace_bistable_selection_scale:g}"
                     f"_noise{args.workspace_bistable_noise_scale:g}"
+                    f"_grad{args.workspace_bistable_gradient_mode}"
                 )
                 if args.workspace_bistable_deterministic:
                     run_id += "_detgate"
@@ -4189,6 +4351,7 @@ if __name__ == "__main__":
             workspace_gate_variant=args.workspace_gate_variant,
             workspace_bistable_selection_scale=args.workspace_bistable_selection_scale,
             workspace_bistable_noise_scale=args.workspace_bistable_noise_scale,
+            workspace_bistable_gradient_mode=args.workspace_bistable_gradient_mode,
             workspace_bistable_deterministic=args.workspace_bistable_deterministic,
             workspace_stability_max_activation=args.workspace_stability_max_activation,
             eval_only=args.eval_only,

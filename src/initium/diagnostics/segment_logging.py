@@ -147,7 +147,10 @@ class SegmentDiagnostics:
             f"{prefix}_bad": (~finite).sum().float(),
         }
         for key, item in values.items():
-            record[key] = record[key] + item if key in record else item
+            if key in record and key.endswith("_max"):
+                record[key] = torch.maximum(record[key], item)
+            else:
+                record[key] = record[key] + item if key in record else item
         record[f"{prefix}_numel"] = record.get(f"{prefix}_numel", 0) + value.numel()
 
     def add_module(self, module: nn.Module, label: str) -> None:
@@ -159,6 +162,20 @@ class SegmentDiagnostics:
 
     def set_channel(self, channel: str | None) -> None:
         self.channel = channel
+
+    def observe_tensor(self, label: str, tensor: torch.Tensor) -> None:
+        """Record a named tensor at a call site that has no module boundary.
+
+        This keeps diagnostics on-device and lets recurrent models expose
+        exact per-step values without adding synchronization to their loop.
+        """
+        if not self.enabled or self.channel is None:
+            return
+        record = self._records.setdefault(self.channel, OrderedDict()).setdefault(
+            label, {"path": label, "calls": 0}
+        )
+        record["calls"] += 1
+        self._accumulate_tensor(record, "out", tensor)
 
     def _gradient_records(self) -> OrderedDict[str, tuple[torch.Tensor, int]]:
         records: OrderedDict[str, list[tuple[torch.Tensor, int]]] = OrderedDict()

@@ -24,6 +24,7 @@ class BistableWriteGate(nn.Module):
         noise_scale: float = 0.75,
         iterations: int = 6,
         temperature: float = 0.4,
+        gradient_mode: str = "truncated",
     ) -> None:
         super().__init__()
         if selection_scale < 0 or noise_scale < 0:
@@ -32,10 +33,13 @@ class BistableWriteGate(nn.Module):
             raise ValueError("iterations must be >= 1")
         if temperature <= 0:
             raise ValueError("temperature must be > 0")
+        if gradient_mode not in ("truncated", "unrolled"):
+            raise ValueError("gradient_mode must be 'truncated' or 'unrolled'")
         self.selection_scale = float(selection_scale)
         self.noise_scale = float(noise_scale)
         self.iterations = int(iterations)
         self.temperature = float(temperature)
+        self.gradient_mode = gradient_mode
         self.bias = nn.Parameter(torch.tensor(1.1))
         self.self_excitation_logit = nn.Parameter(torch.tensor(1.1))
         self.inhibition_logit = nn.Parameter(torch.tensor(0.5))
@@ -137,10 +141,18 @@ class BistableWriteGate(nn.Module):
         inhibition = F.softplus(self.inhibition_logit)
         activity = torch.sigmoid(drive / self.temperature)
         for _ in range(self.iterations):
-            population_activity = activity.sum(dim=-1, keepdim=True)
-            lateral_input = population_activity - activity
+            # Keep the competitive settling trajectory intact in the forward
+            # pass. Its recurrent Jacobian can be expansive by design, so the
+            # default backward pass truncates gradients at each settling step
+            # instead of multiplying them through the full positive-feedback
+            # loop. ``unrolled`` remains available for controlled comparisons.
+            previous_activity = (
+                activity.detach() if self.gradient_mode == "truncated" else activity
+            )
+            population_activity = previous_activity.sum(dim=-1, keepdim=True)
+            lateral_input = population_activity - previous_activity
             activity = torch.sigmoid(
-                (drive + self_excitation * activity - inhibition * lateral_input)
+                (drive + self_excitation * previous_activity - inhibition * lateral_input)
                 / self.temperature
             )
 

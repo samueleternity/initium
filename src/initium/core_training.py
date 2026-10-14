@@ -691,6 +691,7 @@ def load_frozen_workspace_warm_start(
         "workspace_bistable_selection_scale",
         "workspace_bistable_noise_scale",
         "workspace_bistable_gradient_mode",
+        "workspace_bptt_horizon",
         "workspace_bistable_deterministic",
         "workspace_stability_max_activation",
         # Exact implementation-only optimization; old checkpoints default
@@ -824,6 +825,7 @@ def run(
     workspace_bistable_selection_scale: float = 1.0,
     workspace_bistable_noise_scale: float = 0.75,
     workspace_bistable_gradient_mode: str = "truncated",
+    workspace_bptt_horizon: int = 0,
     workspace_bistable_deterministic: bool = False,
     workspace_stability_max_activation: float = 100_000.0,
     eval_only: bool = False,
@@ -924,6 +926,14 @@ def run(
         and checkpoint_config.get("workspace_train_mode") != workspace_train_mode
         and not eval_only
     )
+    workspace_bptt_warm_start = bool(
+        resume_requested
+        and workspace_enabled
+        and checkpoint_workspace_enabled
+        and int(checkpoint_config.get("workspace_bptt_horizon", 0))
+        != workspace_bptt_horizon
+        and not eval_only
+    )
     gate_variant_warm_start = bool(
         resume_requested
         and workspace_enabled
@@ -932,9 +942,10 @@ def run(
         and checkpoint_config.get("workspace_gate_variant", "continuous") == "continuous"
         and not eval_only
     )
-    phase4_gate_warm_start = bool(
+    workspace_condition_warm_start = bool(
         phase4_gate_control_warm_start
         or workspace_mode_warm_start
+        or workspace_bptt_warm_start
         or gate_variant_warm_start
     )
     frozen_workspace_warm_start = bool(
@@ -956,7 +967,7 @@ def run(
     resuming = (
         resume_requested
         and not frozen_workspace_warm_start
-        and not phase4_gate_warm_start
+        and not workspace_condition_warm_start
         and not eval_only
     )
     log_file = open(log_path, "a" if resuming else "w", newline="")
@@ -1534,6 +1545,7 @@ def run(
             workspace_bistable_selection_scale=workspace_bistable_selection_scale,
             workspace_bistable_noise_scale=workspace_bistable_noise_scale,
             workspace_bistable_gradient_mode=workspace_bistable_gradient_mode,
+            workspace_bptt_horizon=workspace_bptt_horizon,
             device=device,
         ).to(device)
         if dnc_backward_trace:
@@ -1596,6 +1608,7 @@ def run(
                 f"persistence={persistence} | train_mode={workspace_train_mode} | "
                 f"gate={workspace_gate_variant} | "
                 f"bistable_gradient={workspace_bistable_gradient_mode} | "
+                f"workspace_bptt_horizon={workspace_bptt_horizon or 'full'} | "
                 f"compute_precision={'fp32' if workspace_active else 'bypass'} | "
                 "scope=final-backbone-MoE-bank; each specialist reads shared slots"
             )
@@ -1662,6 +1675,7 @@ def run(
         "workspace_bistable_selection_scale": workspace_bistable_selection_scale,
         "workspace_bistable_noise_scale": workspace_bistable_noise_scale,
         "workspace_bistable_gradient_mode": workspace_bistable_gradient_mode,
+        "workspace_bptt_horizon": workspace_bptt_horizon,
         "workspace_bistable_deterministic": workspace_bistable_deterministic,
         "workspace_stability_max_activation": workspace_stability_max_activation,
     }
@@ -1795,6 +1809,10 @@ def run(
     if isinstance(rnn, SplitGraphDNC) and rnn.workspace is not None:
         rnn.workspace.set_diagnostics_enabled(moe_diagnostics_enabled)
         rnn.workspace_bistable_deterministic = workspace_bistable_deterministic
+        if workspace_train_scope == "gate":
+            rnn.workspace._initium_recurrent_state_observer = (
+                segment_diagnostics.observe_recurrent_state
+            )
 
     def emit_failure_diagnostics(channel: str, *, include_gradients: bool = False) -> None:
         segment_diagnostics.emit(channel, include_gradients=include_gradients)
@@ -2102,7 +2120,7 @@ def run(
                 "workspace tensors loaded, gate parameters initialized fresh, "
                 "optimizer reset."
             )
-        elif phase4_gate_warm_start:
+        elif workspace_condition_warm_start:
             rnn.load_state_dict(ckpt["rnn_state_dict"])
             output_proj.load_state_dict(ckpt["output_proj_state_dict"])
             print(
@@ -2118,9 +2136,9 @@ def run(
         # of leaving `scaler` at its freshly-constructed init_scale -- see
         # header note. `.get(...)` instead of ["..."] so a pre-v3 checkpoint
         # (saved before this key existed) still loads, just without this fix.
-        if not frozen_workspace_warm_start and not phase4_gate_warm_start and "scaler_state_dict" in ckpt:
+        if not frozen_workspace_warm_start and not workspace_condition_warm_start and "scaler_state_dict" in ckpt:
             scaler.load_state_dict(ckpt["scaler_state_dict"])
-        elif not frozen_workspace_warm_start and not phase4_gate_warm_start:
+        elif not frozen_workspace_warm_start and not workspace_condition_warm_start:
             print(
                 f"[{run_id}] WARNING: checkpoint predates GradScaler-state "
                 f"saving (v3 fix) -- scaler starting fresh at "
@@ -2256,6 +2274,8 @@ def run(
     running_task_loss, running_kl_loss, running_div, running_grad_norm = 0.0, 0.0, 0, 0.0
     running_finite_grad_steps = 0
     running_nonfinite_grad_steps = 0
+    running_clipped_grad_steps = 0
+    max_grad_norm = 10.0
     bistable_grad_probe = None
     if workspace_train_scope == "gate" and workspace_gate_variant == "bistable":
         # SegmentDiagnostics reports parameter gradients after clipping. Keep
@@ -2316,6 +2336,7 @@ def run(
         optimizer.zero_grad(set_to_none=True)
 
         segment_diagnostics.set_channel("train")
+        segment_diagnostics.set_step(step)
         if dnc_backward_trace and split_graph_enabled:
             rnn.memories[0].set_backward_trace(True, step=step)
         with torch.amp.autocast("cuda", enabled=amp_enabled):
@@ -2487,7 +2508,7 @@ def run(
         # unbounded while its gradients were still being applied by Adam.
         try:
             grad_norm = torch.nn.utils.clip_grad_norm_(
-                trainable_parameters, max_norm=10.0, error_if_nonfinite=True
+                trainable_parameters, max_norm=max_grad_norm, error_if_nonfinite=True
             )
         except RuntimeError as error:
             if "non-finite" not in str(error):
@@ -2495,14 +2516,15 @@ def run(
             # error_if_nonfinite raises before applying the clip coefficient,
             # preserving the original bad gradients for the diagnostic below.
             grad_norm = torch.tensor(float("nan"), device=device)
-        if independent_grad_norm is not None and math.isfinite(float(grad_norm)):
+        grad_norm_value = float(grad_norm)
+        if independent_grad_norm is not None and math.isfinite(grad_norm_value):
             relative_error = (
                 independent_grad_norm - grad_norm.detach().to(dtype=torch.float64)
             ).abs() / independent_grad_norm.clamp_min(1e-12)
             bistable_grad_probe_relative_error.copy_(
                 torch.maximum(bistable_grad_probe_relative_error, relative_error)
             )
-        if not math.isfinite(float(grad_norm)):
+        if not math.isfinite(grad_norm_value):
             grad_was_finite_since_eval = False
             consecutive_nonfinite_grad_steps += 1
             running_nonfinite_grad_steps += 1
@@ -2542,9 +2564,11 @@ def run(
         running_task_loss += task_loss.detach()
         running_kl_loss += kl_loss.detach()
         running_div += dataset.diversity(output.detach(), target_digits, answer_mask)
-        if math.isfinite(float(grad_norm)):
-            running_grad_norm += float(grad_norm)
+        if math.isfinite(grad_norm_value):
+            running_grad_norm += grad_norm_value
             running_finite_grad_steps += 1
+            if grad_norm_value > max_grad_norm:
+                running_clipped_grad_steps += 1
         step += 1
         current_lr = set_lr(step)  # Phase 1 FIX: clamped manual LR, replaces scheduler.step()
 
@@ -2654,6 +2678,7 @@ def run(
                 f"LR {current_lr:.6f}",
                 f"grad_norm {avg_grad_norm:.4f}",
                 f"nonfinite_grad_steps {running_nonfinite_grad_steps}",
+                f"clipped_grad_steps {running_clipped_grad_steps}/{running_finite_grad_steps}",
             ]
             if amp_enabled:
                 parts.append(f"amp_scale {amp_scale:.1f}")
@@ -2817,6 +2842,7 @@ def run(
             running_task_loss, running_kl_loss, running_div, running_grad_norm = 0.0, 0.0, 0, 0.0
             running_finite_grad_steps = 0
             running_nonfinite_grad_steps = 0
+            running_clipped_grad_steps = 0
 
         if kl_on and step % PRIOR_SNAPSHOT_EVERY == 0:
             # v5 (Phase 2): refit (mu_g, Sigma_g) from the writes
@@ -3860,6 +3886,17 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--workspace-bptt-horizon",
+        type=int,
+        default=0,
+        metavar="STEPS",
+        help=(
+            "Truncate gradients carried by persistent workspace slots every STEPS "
+            "sequence positions while preserving the forward trajectory; 0 keeps "
+            "full-sequence BPTT."
+        ),
+    )
+    parser.add_argument(
         "--workspace-bistable-deterministic",
         action="store_true",
         help="Disable independent gate noise for a deterministic diagnostic; normal bistable evaluation remains stochastic and seed-reproducible.",
@@ -4197,6 +4234,8 @@ if __name__ == "__main__":
         parser.error("--workspace requires backbone MoE; use --moe-placement backbone or all")
     if args.workspace_num_slots < 0:
         parser.error("--workspace-num-slots must be >= 0")
+    if args.workspace_bptt_horizon < 0:
+        parser.error("--workspace-bptt-horizon must be >= 0")
     if args.workspace_train_scope == "gate" and not args.workspace:
         parser.error("--workspace-train-scope=gate requires --workspace")
     if args.workspace_gate_variant == "bistable" and (
@@ -4281,6 +4320,8 @@ if __name__ == "__main__":
                 )
                 if args.workspace_bistable_deterministic:
                     run_id += "_detgate"
+            if args.workspace_bptt_horizon:
+                run_id += f"_wbptt{args.workspace_bptt_horizon}"
             if args.workspace_no_selection:
                 run_id += "_randomwrite"
             if args.workspace_reset_each_step:
@@ -4352,6 +4393,7 @@ if __name__ == "__main__":
             workspace_bistable_selection_scale=args.workspace_bistable_selection_scale,
             workspace_bistable_noise_scale=args.workspace_bistable_noise_scale,
             workspace_bistable_gradient_mode=args.workspace_bistable_gradient_mode,
+            workspace_bptt_horizon=args.workspace_bptt_horizon,
             workspace_bistable_deterministic=args.workspace_bistable_deterministic,
             workspace_stability_max_activation=args.workspace_stability_max_activation,
             eval_only=args.eval_only,

@@ -33,6 +33,7 @@ class WorkspaceBroadcast(nn.Module):
         bistable_selection_scale: float = 1.0,
         bistable_noise_scale: float = 0.75,
         bistable_gradient_mode: str = "truncated",
+        bptt_horizon: int = 0,
     ):
         super().__init__()
         if d_model < 1 or num_experts < 1:
@@ -41,12 +42,15 @@ class WorkspaceBroadcast(nn.Module):
             raise ValueError("num_slots must be >= 0")
         if gate_variant not in ("continuous", "bistable"):
             raise ValueError("gate_variant must be 'continuous' or 'bistable'")
+        if bptt_horizon < 0:
+            raise ValueError("bptt_horizon must be >= 0 (0 disables truncation)")
         self.d_model = d_model
         self.num_experts = num_experts
         self.num_slots = num_slots
         self.gate_variant = gate_variant
         self.bistable_selection_scale = float(bistable_selection_scale)
         self.bistable_noise_scale = float(bistable_noise_scale)
+        self.bptt_horizon = int(bptt_horizon)
         self.query = nn.Linear(d_model, d_model, bias=False)
         self.key = nn.Linear(d_model, d_model, bias=False)
         self.value = nn.Linear(d_model, d_model, bias=False)
@@ -289,7 +293,13 @@ class WorkspaceBroadcast(nn.Module):
         """Process time-major specialists ``(B,T,E,D)`` sequentially."""
         outputs = []
         step_diags = [] if self.diagnostics_enabled else None
+        state_observer = getattr(self, "_initium_recurrent_state_observer", None)
         for step in range(specialist_deltas.shape[1]):
+            # Truncate only the gradient carried by persistent slots. Detach
+            # preserves the exact forward state and therefore the full write /
+            # read trajectory; zero keeps the historical full-sequence BPTT.
+            if self.bptt_horizon and step and step % self.bptt_horizon == 0:
+                state = state.detach()
             out, state = self.forward_step(
                 specialist_deltas[:, step], route_indices[:, step], route_weights[:, step],
                 state,
@@ -300,6 +310,8 @@ class WorkspaceBroadcast(nn.Module):
                 bistable_selection_scale=bistable_selection_scale,
                 deterministic_gate=deterministic_gate,
             )
+            if state_observer is not None:
+                state_observer(state, call_index=step)
             outputs.append(out)
             if step_diags is not None:
                 step_diags.append(self._last_step_diag)

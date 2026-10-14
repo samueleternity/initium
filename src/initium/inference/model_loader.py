@@ -223,6 +223,7 @@ def _build_split_graph(c: _Cfg, input_dim, hidden, nr_cells, cell_size, read_hea
         workspace_bistable_gradient_mode=c.get(
             "workspace_bistable_gradient_mode", "truncated"
         ),
+        workspace_bptt_horizon=c.get("workspace_bptt_horizon", 0),
         device=device,
     ).to(device)
     model.workspace_bistable_deterministic = c.get(

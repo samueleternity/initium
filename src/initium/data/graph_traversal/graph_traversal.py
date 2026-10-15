@@ -333,7 +333,9 @@ class TraversalCurriculum:
             ep = build_traversal_episode(num_nodes, out_degree_range, path_len_range)
         return ep
 
-    def maybe_advance(self, model, device, step=None, optimizer=None):
+    def maybe_advance(
+        self, model, device, step=None, optimizer=None, *, allow_advance=True
+    ):
         """Returns (lesson, id_triple_acc, id_perfect_frac). Eval samples
         num_nodes over the lesson's nodes_range (as trained), or walks the
         fixed custom_graph when one was supplied; the gate advances on
@@ -376,7 +378,11 @@ class TraversalCurriculum:
                 field_writer, self.field_log_file, step, self.lesson + 1, "id", field_log
             )
 
-        if triple_acc / 100.0 >= ADVANCE_THRESHOLD and self.lesson < len(self.table) - 1:
+        if (
+            allow_advance
+            and triple_acc / 100.0 >= ADVANCE_THRESHOLD
+            and self.lesson < len(self.table) - 1
+        ):
             self.lesson += 1
             new_n = self.lesson_nr_cells[self.lesson]
             if new_n != self.lesson_nr_cells[self.lesson - 1]:
@@ -439,6 +445,7 @@ def evaluate_traversal(
     if num_nodes is not None and nodes_range is not None:
         raise ValueError("evaluate_traversal: pass num_nodes or nodes_range, not both")
 
+    was_training = model.training
     model.eval()
     total_triples, correct_triples = 0, 0
     perfect_episodes = 0
@@ -525,7 +532,7 @@ def evaluate_traversal(
         f"Eval: triple-level acc {triple_acc:.2f}% | "
         f"perfect-traversal fraction {perfect_frac:.2f}% ({tested} episodes)"
     )
-    model.train()
+    model.train(was_training)
 
     if hop_breakdown:
         breakdown = {

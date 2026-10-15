@@ -66,6 +66,8 @@ import torch
 _EPS = 1e-6
 _PATCHED_ATTR = "_nvrtc_compat_patched"
 _STRICT_NEGATIVE_CHECK = os.environ.get("INITIUM_NVRTC_COMPAT_STRICT", "0") == "1"
+_PRODUCT_BACKWARD_TRACE: tuple[bool, object | None] = (False, None)
+_PRODUCT_INPUT_STATS: dict[str, dict[str, torch.Tensor | int]] = {}
 
 _orig_prod = torch.prod
 _orig_cumprod = torch.cumprod
@@ -84,8 +86,66 @@ def _log_space(input: torch.Tensor, dim, keepdim: bool, cumulative: bool) -> tor
     return torch.exp(reduced).to(orig_dtype)
 
 
+def set_product_backward_trace(enabled: bool, reporter=None) -> None:
+    """Attach an optional diagnostic hook to patched product outputs."""
+    global _PRODUCT_BACKWARD_TRACE
+    _PRODUCT_BACKWARD_TRACE = (bool(enabled), reporter)
+
+
+def _watch_product_output(
+    result: torch.Tensor, input: torch.Tensor, operation: str
+) -> torch.Tensor:
+    enabled, reporter = _PRODUCT_BACKWARD_TRACE
+    if enabled and reporter is not None and result.requires_grad:
+        result.register_hook(lambda grad: reporter(operation, grad))
+        if input.requires_grad:
+            input.register_hook(lambda grad: reporter(f"{operation}_input_gradient", grad))
+    return result
+
+
+def _record_product_input(input: torch.Tensor, operation: str) -> None:
+    enabled, _ = _PRODUCT_BACKWARD_TRACE
+    if not enabled:
+        return
+    values = input.detach().float()
+    metrics = {
+        "min": values.amin(),
+        "max": values.amax(),
+        "lt_1e-6_fraction": (values.abs() < _EPS).float().mean(),
+        "negative_fraction": (values < 0).float().mean(),
+        "nonfinite_fraction": (~torch.isfinite(values)).float().mean(),
+    }
+    if operation in _PRODUCT_INPUT_STATS:
+        previous = _PRODUCT_INPUT_STATS[operation]
+        previous["min"] = torch.minimum(previous["min"], metrics["min"])
+        previous["max"] = torch.maximum(previous["max"], metrics["max"])
+        for name in ("lt_1e-6_fraction", "negative_fraction", "nonfinite_fraction"):
+            previous[name] = previous[name] + metrics[name]
+        previous["calls"] = int(previous["calls"]) + 1
+    else:
+        metrics["calls"] = 1
+        _PRODUCT_INPUT_STATS[operation] = metrics
+
+
+def pop_product_numerical_diagnostics() -> dict[str, float]:
+    """Return/reset compact input summaries for patched product operations."""
+    result: dict[str, float] = {}
+    for operation, metrics in _PRODUCT_INPUT_STATS.items():
+        calls = max(1, int(metrics["calls"]))
+        result[f"{operation}_input_min"] = float(metrics["min"].detach().cpu().item())
+        result[f"{operation}_input_max"] = float(metrics["max"].detach().cpu().item())
+        for name in ("lt_1e-6_fraction", "negative_fraction", "nonfinite_fraction"):
+            result[f"{operation}_input_{name}"] = float(
+                (metrics[name] / calls).detach().cpu().item()
+            )
+        result[f"{operation}_calls"] = float(calls)
+    _PRODUCT_INPUT_STATS.clear()
+    return result
+
+
 def _patched_prod(input, dim=None, keepdim=False, *, dtype=None):
     if isinstance(input, torch.Tensor) and input.is_cuda and dim is not None:
+        _record_product_input(input, "torch_prod")
         if not input.dtype.is_floating_point:
             return _orig_prod(input, dim, keepdim=keepdim, dtype=dtype)
         if _STRICT_NEGATIVE_CHECK and bool((input < 0).any()):
@@ -93,7 +153,8 @@ def _patched_prod(input, dim=None, keepdim=False, *, dtype=None):
                 input.device
             )
         result = _log_space(input, dim, keepdim, cumulative=False)
-        return result.to(dtype) if dtype is not None else result
+        result = result.to(dtype) if dtype is not None else result
+        return _watch_product_output(result, input, "patched_torch_prod")
     if dim is None:
         return _orig_prod(input, **({"dtype": dtype} if dtype is not None else {}))
     return _orig_prod(
@@ -103,12 +164,14 @@ def _patched_prod(input, dim=None, keepdim=False, *, dtype=None):
 
 def _patched_cumprod(input, dim, *, dtype=None):
     if isinstance(input, torch.Tensor) and input.is_cuda:
+        _record_product_input(input, "torch_cumprod")
         if not input.dtype.is_floating_point:
             return _orig_cumprod(input, dim, dtype=dtype)
         if _STRICT_NEGATIVE_CHECK and bool((input < 0).any()):
             return _orig_cumprod(input.detach().cpu(), dim, dtype=dtype).to(input.device)
         result = _log_space(input, dim, keepdim=False, cumulative=True)
-        return result.to(dtype) if dtype is not None else result
+        result = result.to(dtype) if dtype is not None else result
+        return _watch_product_output(result, input, "patched_torch_cumprod")
     return _orig_cumprod(input, dim, **({"dtype": dtype} if dtype is not None else {}))
 
 

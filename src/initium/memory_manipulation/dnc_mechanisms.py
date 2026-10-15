@@ -22,6 +22,24 @@ WRITE_VARIANTS = ("learned", "kanerva-closed-form")
 DNC_IMPLEMENTATIONS = ("base", "optimized")
 
 
+def compile_memory_forward(memory: Memory) -> Memory:
+    """Compile the per-timestep Memory forward for kernel fusion.
+
+    This is an execution-only optimization: it does not change the module's
+    parameters, state dict, or addressing equations. Compilation is lazy, so
+    the first call pays compile cost; callers should use it for sustained
+    training rather than short profiling snippets.
+    """
+    if getattr(memory, "_initium_compiled_forward", False):
+        return memory
+    compiler = getattr(torch, "compile", None)
+    if compiler is None:
+        raise RuntimeError("--dnc-compile-memory requires a PyTorch build with torch.compile")
+    memory.forward = compiler(memory.forward, dynamic=False)
+    memory._initium_compiled_forward = True
+    return memory
+
+
 class _FastAllocationMixin:
     """Exact DNC allocation with one full sort instead of two.
 
@@ -40,6 +58,35 @@ class _FastAllocationMixin:
         sorted_usage, order = torch.topk(
             usage, self.nr_cells, dim=1, largest=False
         )
+        leading_one = torch.ones(
+            (usage.size(0), 1), device=usage.device, dtype=usage.dtype
+        )
+        exclusive_products = torch.cumprod(
+            torch.cat((leading_one, sorted_usage), dim=1), dim=1
+        )[:, :-1]
+        sorted_weights = (1 - sorted_usage) * exclusive_products
+        allocation_weights = torch.zeros_like(usage).scatter(
+            1, order, sorted_weights
+        )
+        return allocation_weights.unsqueeze(1), usage
+
+
+class _TopKAllocationMixin:
+    """Approximate allocation over only the K least-used memory cells.
+
+    The selected cells retain the ordinary DNC allocation formula in sorted
+    order. Omitted cells receive zero allocation mass, so this is an explicit
+    addressing approximation rather than a state-dict or implementation-only
+    optimization.
+    """
+
+    nr_cells: int
+    allocation_topk: int
+
+    def allocate(self, usage: torch.Tensor, write_gate: torch.Tensor):
+        usage = δ + (1 - δ) * usage
+        k = min(self.allocation_topk, self.nr_cells)
+        sorted_usage, order = torch.topk(usage, k, dim=1, largest=False)
         leading_one = torch.ones(
             (usage.size(0), 1), device=usage.device, dtype=usage.dtype
         )
@@ -76,6 +123,8 @@ class MechanismMemory(Memory):
         read_residual_max_ratio: float = 0.5,
         relational_hidden_size: int | None = None,
         observation_variance: float = 1.0,
+        link_sharpness: float = 1.0,
+        allocation_topk: int | None = None,
         **kwargs,
     ):
         if read_variant not in READ_VARIANTS:
@@ -88,12 +137,18 @@ class MechanismMemory(Memory):
             raise ValueError("read_residual_max_ratio must be non-negative")
         if observation_variance <= 0:
             raise ValueError("observation_variance must be positive")
+        if link_sharpness <= 0:
+            raise ValueError("link_sharpness must be positive")
+        if allocation_topk is not None and allocation_topk <= 0:
+            raise ValueError("allocation_topk must be positive")
         super().__init__(*args, **kwargs)
         self.read_variant = read_variant
         self.write_variant = write_variant
         self.read_residual_scale = float(read_residual_scale)
         self.read_residual_max_ratio = float(read_residual_max_ratio)
         self.observation_variance = float(observation_variance)
+        self.link_sharpness = float(link_sharpness)
+        self.allocation_topk = allocation_topk
         self._collect_stage_diagnostics = False
         self._stage_diagnostic_sums: dict[str, torch.Tensor] = {}
         self._stage_diagnostic_counts: dict[str, int] = {}
@@ -131,6 +186,38 @@ class MechanismMemory(Memory):
                     nn.init.zeros_(output_layer.bias)
             if self.device is not None:
                 self.relational_score.to(self.device)
+
+    def directional_weightings(self, link_matrix, read_weights):
+        """Optionally sharpen DNC temporal-link traversal distributions.
+
+        This uses a fixed exponent inspired by the link-distribution
+        sharpness method in arXiv:1904.10278. It preserves each directional
+        vector's original mass for stable DNC sub-probability semantics.
+        Exponent 1 is an exact no-op, preserving the upstream DNC path. The
+        paper's controller-predicted exponent is deliberately not used here,
+        so the experiment adds no parameters and can resume from a baseline
+        checkpoint.
+        """
+        forward, backward = super().directional_weightings(link_matrix, read_weights)
+        if self.link_sharpness == 1.0:
+            return forward, backward
+
+        def sharpen(distribution):
+            eps = torch.finfo(distribution.dtype).tiny
+            nonnegative = distribution.clamp_min(0)
+            mass = nonnegative.sum(dim=-1, keepdim=True)
+
+            # Sharpen only the normalized shape and then restore the original
+            # mass. DNC directional weights are sub-probability vectors: their
+            # total mass reflects how much temporal-link signal is available.
+            # Normalizing the sharpened vector to 1 would amplify arbitrarily
+            # weak, nearly empty link traversals and can destabilize gradients.
+            probabilities = nonnegative / mass.clamp_min(eps)
+            powered = probabilities.pow(self.link_sharpness)
+            shape = powered / powered.sum(dim=-1, keepdim=True).clamp_min(eps)
+            return shape * mass
+
+        return sharpen(forward), sharpen(backward)
 
     def forward(self, xi: torch.Tensor, hidden: dict[str, torch.Tensor]):
         """Run all DNC interface, addressing, and state math in fp32.
@@ -647,6 +734,14 @@ class OptimizedMechanismMemory(_FastAllocationMixin, MechanismMemory):
     """MechanismMemory with the exact allocation-sort optimization."""
 
 
+class TopKMechanismMemory(_TopKAllocationMixin, MechanismMemory):
+    """MechanismMemory with approximate allocation over its least-used K cells."""
+
+
+class TopKOptimizedMechanismMemory(_TopKAllocationMixin, OptimizedMechanismMemory):
+    """Top-K allocation variant retaining the optimized implementation tag."""
+
+
 def build_memory(
     *,
     input_size: int,
@@ -660,16 +755,25 @@ def build_memory(
     read_residual_scale: float = 1.0,
     read_residual_max_ratio: float = 0.5,
     observation_variance: float = 1.0,
+    link_sharpness: float = 1.0,
+    allocation_topk: int | None = None,
     dnc_implementation: str = "base",
 ):
     """Construct a stock-compatible memory for the selected mechanism pair."""
     if dnc_implementation not in DNC_IMPLEMENTATIONS:
         raise ValueError(f"Unknown DNC implementation: {dnc_implementation!r}")
-    memory_cls = (
-        OptimizedMechanismMemory
-        if dnc_implementation == "optimized"
-        else MechanismMemory
-    )
+    if allocation_topk is not None:
+        memory_cls = (
+            TopKOptimizedMechanismMemory
+            if dnc_implementation == "optimized"
+            else TopKMechanismMemory
+        )
+    else:
+        memory_cls = (
+            OptimizedMechanismMemory
+            if dnc_implementation == "optimized"
+            else MechanismMemory
+        )
     return memory_cls(
         input_size=input_size,
         nr_cells=nr_cells,
@@ -682,4 +786,6 @@ def build_memory(
         read_residual_scale=read_residual_scale,
         read_residual_max_ratio=read_residual_max_ratio,
         observation_variance=observation_variance,
+        link_sharpness=link_sharpness,
+        allocation_topk=allocation_topk,
     )

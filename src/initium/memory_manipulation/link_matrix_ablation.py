@@ -60,16 +60,12 @@ class AblatableSparseLinkMemory(Memory):
                    work exactly as before, temporal addressing contributes
                    nothing. This is the "ablate" half of the roadmap's
                    "ablate or aggressively sparsify."
-      "sparse_topk" -- link matrix is updated as normal every write() call,
-                   but immediately after each update, every row keeps only
-                   its link_matrix_topk largest-magnitude entries and zeros
-                   the rest. This is the "sparsify" half -- reduces the
-                   O(N^2) footprint the roadmap's citation flags, while
-                   still letting the model use *some* temporal signal,
-                   unlike full ablation. Recomputed fresh every step (not a
-                   one-time structural prune), so it tracks whichever links
-                   the model is actually relying on at that point in the
-                   episode rather than freezing an initial guess.
+      "sparse_topk" -- link matrix is updated densely as normal, then each
+                   row keeps only its link_matrix_topk largest-magnitude
+                   entries. This is a functional sparsity experiment only:
+                   it still allocates and updates a dense N x N tensor,
+                   performs dense traversal matmuls, and adds a top-k pass.
+                   It does not currently provide a speed or memory saving.
     """
 
     def get_link_matrix(
@@ -97,6 +93,18 @@ class AblatableSparseLinkMemory(Memory):
             return updated * mask
 
         raise ValueError(f"Unknown link_matrix_mode: {mode!r}")
+
+    def directional_weightings(self, link_matrix: torch.Tensor, read_weights: torch.Tensor):
+        # In ablated mode the link matrix is invariantly zero for the whole
+        # episode. Return the mathematically identical zero traversals without
+        # launching the two dense O(B * heads * N^2) matrix products.
+        if getattr(self, "link_matrix_mode", "dense") == "ablated":
+            # Match Memory.directional_weightings' (B, heads, 1, cells)
+            # layout. read_weightings combines read modes over that singleton
+            # write-head axis before producing its (B, heads, cells) result.
+            zeros = torch.zeros_like(read_weights).unsqueeze(2)
+            return zeros, zeros
+        return super().directional_weightings(link_matrix, read_weights)
 
 
 def patch_link_matrix(model, mode: str, topk: int | None = None, layer: int | None = None):

@@ -164,6 +164,7 @@ from initium.mamba_controller.mamba_controller import MambaDNC
 from initium.mamba_controller.split_graph_dnc import SplitGraphDNC
 from initium.memory_manipulation.dynamic_memory_resize import resize_memory
 from initium.memory_manipulation.dynamic_n_controller import DynamicNController
+from initium.memory_manipulation.dnc_mechanisms import compile_memory_forward
 from initium.memory_manipulation.link_matrix_ablation import patch_link_matrix
 from initium.memory_manipulation.stochastic_write_head_v2 import (
     get_prior_state,
@@ -697,6 +698,10 @@ def load_frozen_workspace_warm_start(
         # Exact implementation-only optimization; old checkpoints default
         # to base and remain weight/state compatible with either backend.
         "dnc_implementation",
+        "dnc_compile_memory",  # exact execution optimization; state-dict compatible
+        "dnc_link_sharpness",  # parameter-free read-addressing experiment
+        "dnc_allocation_topk",  # parameter-free allocation experiment
+        "batch_size",  # training hyperparameter, not model architecture
     }
     missing_config = sorted(
         key
@@ -836,13 +841,17 @@ def run(
     dnc_read_residual_max_ratio: float = DNC_READ_RESIDUAL_MAX_RATIO,
     dnc_write_variant: str = DNC_WRITE_VARIANT,
     dnc_write_observation_variance: float = DNC_WRITE_OBSERVATION_VARIANCE,
+    dnc_link_sharpness: float = 1.0,
+    dnc_allocation_topk: int | None = None,
     dnc_implementation: str = "base",
+    dnc_compile_memory: bool = False,
     dnc_backward_trace: bool = False,
     dataset_type: str = DATASET_TYPE,
     dataset_link: str | None = DATASET_LINK,
     test_dataset_link: str | None = None,
     prepared_dataset=None,
     ogs_weights: tuple[float, float, float] = OGS_WEIGHTS,
+    batch_size: int = BATCH_SIZE,
 ):
     # Deliberately does NOT touch LR_DECAY_STEPS - that's a separate
     # module-level constant, fixed at import time from the *original*
@@ -1535,6 +1544,8 @@ def run(
             dnc_read_residual_max_ratio=dnc_read_residual_max_ratio,
             dnc_write_variant=dnc_write_variant,
             dnc_write_observation_variance=dnc_write_observation_variance,
+            dnc_link_sharpness=dnc_link_sharpness,
+            dnc_allocation_topk=dnc_allocation_topk,
             dnc_implementation=dnc_implementation,
             workspace_enabled=workspace_enabled,
             workspace_num_slots=workspace_num_slots,
@@ -1548,6 +1559,7 @@ def run(
             workspace_bptt_horizon=workspace_bptt_horizon,
             device=device,
         ).to(device)
+
         if dnc_backward_trace:
             rnn.memories[0].set_backward_trace(True)
             print(
@@ -1583,11 +1595,25 @@ def run(
             **mamba_kwargs,
         ).to(device)
 
+    if dnc_compile_memory:
+        for memory in rnn.memories:
+            compile_memory_forward(memory)
+        print(
+            f"[{run_id}] DNC memory forward compiled with torch.compile | "
+            "first-call compilation overhead is expected"
+        )
+
     print(
         f"[{run_id}] DNC implementation={dnc_implementation}"
         + (
             " | exact allocation path avoids one full usage-permutation sort per step"
             if dnc_implementation == "optimized"
+            else ""
+        )
+        + (" | compiled memory forward" if dnc_compile_memory else "")
+        + (
+            f" | temporal-link sharpness exponent={dnc_link_sharpness:g}"
+            if dnc_link_sharpness != 1.0
             else ""
         )
     )
@@ -1662,9 +1688,13 @@ def run(
         "dnc_read_residual_max_ratio": dnc_read_residual_max_ratio,
         "dnc_write_variant": dnc_write_variant,
         "dnc_write_observation_variance": dnc_write_observation_variance,
+        "dnc_link_sharpness": dnc_link_sharpness,
+        "dnc_allocation_topk": dnc_allocation_topk,
         "dnc_implementation": dnc_implementation,
+        "dnc_compile_memory": dnc_compile_memory,
         "dnc_compute_precision": "fp32",
         "dnc_backward_trace": dnc_backward_trace,
+        "batch_size": batch_size,
         "workspace_enabled": workspace_enabled,
         "workspace_num_slots": workspace_num_slots,
         "workspace_no_selection": workspace_no_selection,
@@ -2320,7 +2350,7 @@ def run(
     t_run_start = time.time()
 
     while step < total_steps and not eval_only:
-        input_seq, target_digits, answer_mask = dataset.sample_batch(curriculum, BATCH_SIZE)
+        input_seq, target_digits, answer_mask = dataset.sample_batch(curriculum, batch_size)
 
         input_seq = input_seq.to(device, non_blocking=True)
         target_digits = target_digits.to(device, non_blocking=True)
@@ -3609,6 +3639,12 @@ if __name__ == "__main__":
     import argparse
     import sys
 
+    class _OptimizedDNCAction(argparse.Action):
+        def __call__(self, parser, namespace, values, option_string=None):
+            namespace.dnc_implementation = "optimized"
+            namespace.dnc_compile_memory = True
+            namespace._dnc_optimized_bundle = True
+
     parser = argparse.ArgumentParser(
         description="Phase 2 KL sweep (learned, periodically-snapshotted "
         "prior). Positional beta for single-beta mode; "
@@ -4053,6 +4089,28 @@ if __name__ == "__main__":
         help="Fixed positive observation variance for the Kanerva-style write.",
     )
     parser.add_argument(
+        "--dnc-link-sharpness",
+        type=float,
+        nargs="?",
+        const=2.0,
+        default=1.0,
+        metavar="EXPONENT",
+        help="Sharpen the shape of forward/backward temporal-link reads using a "
+        "fixed exponent inspired by arXiv:1904.10278 while preserving each "
+        "vector's original mass (default exponent 2 when specified; 1 leaves "
+        "the DNC unchanged). Adds no parameters, so it can resume from a "
+        "baseline checkpoint.",
+    )
+    parser.add_argument(
+        "--dnc-allocation-topk",
+        type=int,
+        default=None,
+        metavar="K",
+        help="Approximate DNC allocation using only the K least-used cells. "
+        "This can reduce allocation selection work, but omits allocation mass "
+        "outside the selected cells and may change learning behavior.",
+    )
+    parser.add_argument(
         "--dnc-backward-trace",
         action="store_true",
         help="Trace the first non-finite gradient through DNC internals and report "
@@ -4068,12 +4126,25 @@ if __name__ == "__main__":
     )
     dnc_impl_group.add_argument(
         "--optimized-dnc",
+        action=_OptimizedDNCAction,
+        nargs=0,
+        help="Enable exact fast allocation and compiled memory forward. For "
+        "--split-graph, also enable top-64 allocation and exponent-2 temporal "
+        "link sharpening as separate functional experiments.",
+    )
+    parser.set_defaults(dnc_implementation="base", _dnc_optimized_bundle=False)
+    dnc_impl_group.add_argument(
+        "--dnc-fast-allocation",
         dest="dnc_implementation",
         action="store_const",
         const="optimized",
-        help="Use exact dense DNC equations with one allocation permutation sort removed.",
+        help="Use the exact allocation path with one usage-permutation sort removed (without compilation).",
     )
-    parser.set_defaults(dnc_implementation="base")
+    parser.add_argument(
+        "--dnc-compile-memory",
+        action="store_true",
+        help="Compile the DNC memory forward with torch.compile; keeps DNC equations unchanged.",
+    )
     parser.add_argument(
         "--dataset-type",
         type=str,
@@ -4086,6 +4157,14 @@ if __name__ == "__main__":
             "multimodal",
         ],
         help="Dataset plugged into the core loop (data/dataset_registry.py).",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=BATCH_SIZE,
+        help=f"Training episodes per optimizer step (default: {BATCH_SIZE}); "
+        "larger values may improve device utilization at higher memory use and "
+        "change the effective gradient batch.",
     )
     parser.add_argument(
         "--dataset-link",
@@ -4141,6 +4220,21 @@ if __name__ == "__main__":
         parser.error("--prepare-only cannot be combined with --load-prepared")
     if args.dnc_write_observation_variance <= 0:
         parser.error("--dnc-write-observation-variance must be positive")
+    if args._dnc_optimized_bundle and args.split_graph:
+        if args.dnc_link_sharpness == 1.0:
+            args.dnc_link_sharpness = 2.0
+        if args.dnc_allocation_topk is None:
+            args.dnc_allocation_topk = 64
+    if args.dnc_link_sharpness <= 0:
+        parser.error("--dnc-link-sharpness must be positive")
+    if args.dnc_allocation_topk is not None and args.dnc_allocation_topk <= 0:
+        parser.error("--dnc-allocation-topk must be positive")
+    if args.dnc_allocation_topk is not None and not args.split_graph:
+        parser.error("--dnc-allocation-topk requires --split-graph")
+    if args.batch_size <= 0:
+        parser.error("--batch-size must be positive")
+    if args.dnc_link_sharpness != 1.0 and not args.split_graph:
+        parser.error("--dnc-link-sharpness requires --split-graph")
     if args.dnc_backward_trace and not args.split_graph:
         parser.error("--dnc-backward-trace requires --split-graph")
     if args.dnc_read_residual_scale < 0:
@@ -4337,12 +4431,20 @@ if __name__ == "__main__":
                 run_id += f"_rmax{args.dnc_read_residual_max_ratio:g}"
             if args.dnc_write_variant == "kanerva-closed-form":
                 run_id += f"_obsvar{args.dnc_write_observation_variance:g}"
+            if args.dnc_link_sharpness != 1.0:
+                run_id += f"_linksharp{args.dnc_link_sharpness:g}"
+            if args.dnc_allocation_topk is not None:
+                run_id += f"_allocK{args.dnc_allocation_topk}"
             if args.split_graph_combiner_mode == "controller":
                 run_id = f"{run_id}_combctrl{args.split_graph_combiner_variant.replace('+', '')}"
         if args.dnc_implementation == "optimized":
-            run_id += "_optimizeddnc"
+            run_id += "_optimizeddnc" if args.dnc_compile_memory else "_dncfastalloc"
+        elif args.dnc_compile_memory:
+            run_id += "_dnccompiled"
         if args.dataset_type != "graph":
             run_id = f"{run_id}_ds{args.dataset_type}"
+        if args.batch_size != BATCH_SIZE:
+            run_id += f"_bs{args.batch_size}"
         if args.run_id_suffix:
             run_id = f"{run_id}_{args.run_id_suffix}"
         summary = run(
@@ -4404,13 +4506,17 @@ if __name__ == "__main__":
             dnc_read_residual_max_ratio=args.dnc_read_residual_max_ratio,
             dnc_write_variant=args.dnc_write_variant,
             dnc_write_observation_variance=args.dnc_write_observation_variance,
+            dnc_link_sharpness=args.dnc_link_sharpness,
+            dnc_allocation_topk=args.dnc_allocation_topk,
             dnc_implementation=args.dnc_implementation,
+            dnc_compile_memory=args.dnc_compile_memory,
             dnc_backward_trace=args.dnc_backward_trace,
             dataset_type=args.dataset_type,
             dataset_link=args.dataset_link,
             test_dataset_link=args.test_dataset_link,
             prepared_dataset=prepared_dataset,
             ogs_weights=tuple(args.ogs_weights),
+            batch_size=args.batch_size,
         )
         all_summaries.append(summary)
 

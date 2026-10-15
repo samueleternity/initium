@@ -187,6 +187,8 @@ def _build_split_graph(c: _Cfg, input_dim, hidden, nr_cells, cell_size, read_hea
         dnc_write_observation_variance=c.get(
             "dnc_write_observation_variance", cc.DNC_WRITE_OBSERVATION_VARIANCE
         ),
+        dnc_link_sharpness=c.get("dnc_link_sharpness", 1.0),
+        dnc_allocation_topk=c.get("dnc_allocation_topk", None),
         dnc_implementation=c.get("dnc_implementation", "base"),
         independent_linears=True,
         moe_enabled=_moe["moe_enabled"],

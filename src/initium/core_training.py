@@ -693,6 +693,9 @@ def load_frozen_workspace_warm_start(
         "workspace_bistable_noise_scale",
         "workspace_bistable_gradient_mode",
         "workspace_bptt_horizon",
+        "workspace_reconsideration_enabled",
+        "workspace_reconsideration_surprise_threshold",
+        "workspace_reconsideration_trigger_mode",
         "workspace_bistable_deterministic",
         "workspace_stability_max_activation",
         # Exact implementation-only optimization; old checkpoints default
@@ -830,7 +833,13 @@ def run(
     workspace_bistable_selection_scale: float = 1.0,
     workspace_bistable_noise_scale: float = 0.75,
     workspace_bistable_gradient_mode: str = "truncated",
+    workspace_bistable_debug: bool = False,
+    workspace_bistable_anomaly_detection: bool = False,
+    workspace_bistable_anomaly_step: int | None = None,
     workspace_bptt_horizon: int = 0,
+    workspace_reconsideration_enabled: bool = False,
+    workspace_reconsideration_surprise_threshold: float = 0.5,
+    workspace_reconsideration_trigger_mode: str = "innovation",
     workspace_bistable_deterministic: bool = False,
     workspace_stability_max_activation: float = 100_000.0,
     eval_only: bool = False,
@@ -846,6 +855,7 @@ def run(
     dnc_implementation: str = "base",
     dnc_compile_memory: bool = False,
     dnc_backward_trace: bool = False,
+    dnc_backward_trace_step: int | None = None,
     dataset_type: str = DATASET_TYPE,
     dataset_link: str | None = DATASET_LINK,
     test_dataset_link: str | None = None,
@@ -885,6 +895,20 @@ def run(
     if eval_workspace_mode not in ("checkpoint", "reset-each-step", "bypass"):
         raise ValueError(
             "eval_workspace_mode must be 'checkpoint', 'reset-each-step', or 'bypass'"
+        )
+    if not math.isfinite(workspace_reconsideration_surprise_threshold) or not (
+        0.0 <= workspace_reconsideration_surprise_threshold <= 1.0
+    ):
+        raise ValueError(
+            "workspace_reconsideration_surprise_threshold must be finite and in [0, 1]"
+        )
+    if workspace_reconsideration_trigger_mode not in (
+        "innovation",
+        "random_rate_matched",
+    ):
+        raise ValueError(
+            "workspace_reconsideration_trigger_mode must be 'innovation' or "
+            "'random_rate_matched'"
         )
     if eval_only and eval_workspace_mode != "checkpoint" and not workspace_enabled:
         raise ValueError("workspace evaluation modes require --workspace")
@@ -943,6 +967,26 @@ def run(
         != workspace_bptt_horizon
         and not eval_only
     )
+    workspace_reconsideration_warm_start = bool(
+        resume_requested
+        and workspace_enabled
+        and checkpoint_workspace_enabled
+        and (
+            bool(checkpoint_config.get("workspace_reconsideration_enabled", False))
+            != workspace_reconsideration_enabled
+            or float(
+                checkpoint_config.get(
+                    "workspace_reconsideration_surprise_threshold", 0.5
+                )
+            )
+            != workspace_reconsideration_surprise_threshold
+            or checkpoint_config.get(
+                "workspace_reconsideration_trigger_mode", "innovation"
+            )
+            != workspace_reconsideration_trigger_mode
+        )
+        and not eval_only
+    )
     gate_variant_warm_start = bool(
         resume_requested
         and workspace_enabled
@@ -955,6 +999,7 @@ def run(
         phase4_gate_control_warm_start
         or workspace_mode_warm_start
         or workspace_bptt_warm_start
+        or workspace_reconsideration_warm_start
         or gate_variant_warm_start
     )
     frozen_workspace_warm_start = bool(
@@ -1009,6 +1054,11 @@ def run(
                 "moe_cv_load",
                 "moe_max_load_frac",
                 "moe_capacity_drop_frac",
+                "last_batch_reconsideration_eligible_frac",
+                "last_batch_reconsideration_surprise_mean",
+                "last_batch_reconsideration_trigger_frac",
+                "last_batch_reconsideration_changed_frac",
+                "last_batch_reconsideration_state_delta_rms",
             ]
         )
 
@@ -1557,10 +1607,26 @@ def run(
             workspace_bistable_noise_scale=workspace_bistable_noise_scale,
             workspace_bistable_gradient_mode=workspace_bistable_gradient_mode,
             workspace_bptt_horizon=workspace_bptt_horizon,
+            workspace_reconsideration_enabled=workspace_reconsideration_enabled,
+            workspace_reconsideration_surprise_threshold=(
+                workspace_reconsideration_surprise_threshold
+            ),
+            workspace_reconsideration_trigger_mode=(
+                workspace_reconsideration_trigger_mode
+            ),
             device=device,
         ).to(device)
 
-        if dnc_backward_trace:
+        if workspace_bistable_debug:
+            assert rnn.workspace is not None and rnn.workspace.bistable_gate is not None
+            rnn.workspace.bistable_gate.debug_diagnostics = True
+            print(
+                f"[{run_id}] bistable deep diagnostics enabled | per-update forward "
+                "conditioning, settling trajectory, raw gate gradients, clipping, "
+                "parameter deltas and Adam moments will be printed"
+            )
+
+        if dnc_backward_trace and dnc_backward_trace_step is None:
             rnn.memories[0].set_backward_trace(True)
             print(
                 f"[{run_id}] DNC backward trace enabled | watches usage, allocation, "
@@ -1635,6 +1701,9 @@ def run(
                 f"gate={workspace_gate_variant} | "
                 f"bistable_gradient={workspace_bistable_gradient_mode} | "
                 f"workspace_bptt_horizon={workspace_bptt_horizon or 'full'} | "
+                f"reconsideration={'on' if workspace_reconsideration_enabled else 'off'}"
+                f"(trigger={workspace_reconsideration_trigger_mode}, "
+                f"threshold={workspace_reconsideration_surprise_threshold:g}) | "
                 f"compute_precision={'fp32' if workspace_active else 'bypass'} | "
                 "scope=final-backbone-MoE-bank; each specialist reads shared slots"
             )
@@ -1706,6 +1775,13 @@ def run(
         "workspace_bistable_noise_scale": workspace_bistable_noise_scale,
         "workspace_bistable_gradient_mode": workspace_bistable_gradient_mode,
         "workspace_bptt_horizon": workspace_bptt_horizon,
+        "workspace_reconsideration_enabled": workspace_reconsideration_enabled,
+        "workspace_reconsideration_surprise_threshold": (
+            workspace_reconsideration_surprise_threshold
+        ),
+        "workspace_reconsideration_trigger_mode": (
+            workspace_reconsideration_trigger_mode
+        ),
         "workspace_bistable_deterministic": workspace_bistable_deterministic,
         "workspace_stability_max_activation": workspace_stability_max_activation,
     }
@@ -1885,6 +1961,43 @@ def run(
             f"selection_peak={diagnostics['selection_strength_mean'].item():.3f} "
             f"probability_histogram_10bin={histogram} "
             f"writer_frequency={writers}"
+        )
+
+    def format_bistable_forward_debug() -> str:
+        if not workspace_bistable_debug or not isinstance(rnn, SplitGraphDNC):
+            return ""
+        if rnn.workspace is None:
+            return ""
+        diagnostics = rnn.workspace.last_diagnostics()
+        fields = [
+            (key.removeprefix("debug_"), value)
+            for key, value in diagnostics.items()
+            if key.startswith("debug_")
+        ]
+        fields.extend(
+            (f"workspace_{key}", diagnostics[key])
+            for key in (
+                "slot_rms",
+                "broadcast_to_specialist_ratio",
+                "write_gate_mean",
+                "read_gate",
+            )
+            if key in diagnostics
+        )
+        if not fields:
+            return ""
+        values = torch.stack([value.detach().float() for _, value in fields]).cpu().tolist()
+        return " ".join(
+            f"{name}={value:.3g}" for (name, _), value in zip(fields, values)
+        )
+
+    def report_bistable_nonfinite(step_index: int, forward_debug: str, gradient_debug: str) -> None:
+        if not workspace_bistable_debug:
+            return
+        print(
+            f"[{run_id}] [bistable-debug:failure] step={step_index} "
+            f"forward[{forward_debug or 'unavailable'}] "
+            f"raw_gradients[{gradient_debug or 'unavailable'}]"
         )
 
     # Install the stochastic write head(s) BEFORE building the
@@ -2302,6 +2415,7 @@ def run(
     # whatever LR was saved inside optimizer_state_dict at checkpoint time
     # (potentially still reflecting the old buggy drifted value).
     running_task_loss, running_kl_loss, running_div, running_grad_norm = 0.0, 0.0, 0, 0.0
+    running_postclip_grad_norm = 0.0
     running_finite_grad_steps = 0
     running_nonfinite_grad_steps = 0
     running_clipped_grad_steps = 0
@@ -2350,6 +2464,30 @@ def run(
     t_run_start = time.time()
 
     while step < total_steps and not eval_only:
+        dnc_trace_this_step = (
+            dnc_backward_trace
+            and isinstance(rnn, SplitGraphDNC)
+            and dnc_backward_trace_step is not None
+            and step == dnc_backward_trace_step
+        )
+        if dnc_backward_trace_step is not None and isinstance(rnn, SplitGraphDNC):
+            # DNC boundary hooks synchronize while checking finiteness. Install
+            # them only for the selected absolute step during targeted tracing.
+            rnn.memories[0].set_backward_trace(dnc_trace_this_step, step=step)
+        anomaly_this_step = (
+            workspace_bistable_anomaly_detection
+            and workspace_bistable_anomaly_step is not None
+            and step == workspace_bistable_anomaly_step
+        )
+        segment_diagnostics.set_nonfinite_trace(anomaly_this_step)
+        if isinstance(rnn, SplitGraphDNC):
+            combiner = rnn.combiner_wrapper
+            if combiner is not None and hasattr(combiner, "set_gradient_trace"):
+                combiner.set_gradient_trace(anomaly_this_step, step=step)
+        if anomaly_this_step:
+            # Anomaly detection must be enabled before this step's forward so
+            # PyTorch can retain the originating stack for backward failures.
+            torch.autograd.set_detect_anomaly(True, check_nan=True)
         input_seq, target_digits, answer_mask = dataset.sample_batch(curriculum, batch_size)
 
         input_seq = input_seq.to(device, non_blocking=True)
@@ -2369,6 +2507,7 @@ def run(
         segment_diagnostics.set_step(step)
         if dnc_backward_trace and split_graph_enabled:
             rnn.memories[0].set_backward_trace(True, step=step)
+        bistable_forward_debug = ""
         with torch.amp.autocast("cuda", enabled=amp_enabled):
             if split_graph_enabled:
                 # Graph episodes are variable length and collate_fn pads them
@@ -2387,6 +2526,7 @@ def run(
                 )
             else:
                 output, hidden = rnn(input_seq, hidden, reset_experience=True)
+            bistable_forward_debug = format_bistable_forward_debug()
             if workspace_train_scope == "gate":
                 exceeded, maximum, segment = segment_diagnostics.activation_absmax_exceeded(
                     "train"
@@ -2466,8 +2606,46 @@ def run(
             raise FloatingPointError(
                 f"[{run_id}] non-finite total loss at step {step}; stopping before backward."
             )
-        scaler.scale(loss).backward()
+        try:
+            scaler.scale(loss).backward()
+        except RuntimeError:
+            if anomaly_this_step:
+                # Anomaly detection raises as soon as one backward node emits
+                # NaN, before the normal post-backward failure path can flush
+                # module-boundary summaries. Emit the hooks collected up to
+                # that point while they still carry this step's evidence.
+                emit_failure_diagnostics("train", include_gradients=True)
+                segment_diagnostics.set_nonfinite_trace(False)
+            raise
+        if anomaly_this_step:
+            torch.autograd.set_detect_anomaly(False)
+            segment_diagnostics.set_nonfinite_trace(False)
+        if dnc_trace_this_step and isinstance(rnn, SplitGraphDNC):
+            rnn.memories[0].set_backward_trace(False, step=step)
         scaler.unscale_(optimizer)
+        bistable_debug_gradient_stats: dict[str, tuple[float, float, int]] = {}
+        bistable_debug_parameter_before: dict[str, torch.Tensor] = {}
+        if workspace_bistable_debug and isinstance(rnn, SplitGraphDNC):
+            assert rnn.workspace is not None and rnn.workspace.bistable_gate is not None
+            for name, parameter in rnn.workspace.bistable_gate.named_parameters():
+                bistable_debug_parameter_before[name] = parameter.detach().clone()
+                gradient = parameter.grad
+                if gradient is None:
+                    bistable_debug_gradient_stats[name] = (0.0, 0.0, 0)
+                    continue
+                finite_mask = torch.isfinite(gradient)
+                finite_gradient = torch.where(finite_mask, gradient, 0.0).detach().float()
+                finite_count = int(finite_mask.sum().item())
+                nonfinite_count = gradient.numel() - finite_count
+                norm = float(
+                    torch.linalg.vector_norm(finite_gradient.to(torch.float64)).cpu()
+                )
+                absmax = float(finite_gradient.abs().max().cpu())
+                bistable_debug_gradient_stats[name] = (
+                    norm,
+                    absmax,
+                    nonfinite_count,
+                )
         independent_grad_norm = None
         if bistable_grad_probe is not None:
             step_parameter_norms = []
@@ -2506,27 +2684,54 @@ def run(
         bistable_gate_grad_norm = 0.0
         if workspace_gate_variant == "bistable":
             assert isinstance(rnn, SplitGraphDNC) and rnn.workspace is not None
-            gate_gradients = [
-                parameter.grad.detach().float()
-                for parameter in rnn.workspace.bistable_gate_parameters()
+            assert rnn.workspace.bistable_gate is not None
+            gate_gradient_items = [
+                (name, parameter.grad.detach())
+                for name, parameter in rnn.workspace.bistable_gate.named_parameters()
                 if parameter.grad is not None
             ]
-            if not gate_gradients:
+            if not gate_gradient_items:
+                if workspace_bistable_debug:
+                    report_bistable_nonfinite(
+                        step,
+                        bistable_forward_debug,
+                        "no bistable gate parameter received a gradient",
+                    )
                 emit_failure_diagnostics("train", include_gradients=True)
                 raise FloatingPointError(
                     f"[{run_id}] bistable write gate received no gradients at step {step}."
                 )
+            gate_gradients = [gradient for _, gradient in gate_gradient_items]
             bistable_gate_grad_norm = float(
-                torch.stack([gradient.square().sum() for gradient in gate_gradients])
-                .sum()
-                .sqrt()
+                torch.linalg.vector_norm(
+                    torch.cat(
+                        [gradient.to(torch.float64).reshape(-1) for gradient in gate_gradients]
+                    )
+                )
                 .cpu()
             )
             if not math.isfinite(bistable_gate_grad_norm) or bistable_gate_grad_norm == 0.0:
+                gradient_debug_parts = []
+                for name, gradient in gate_gradient_items:
+                    finite = torch.isfinite(gradient)
+                    finite_values = gradient[finite]
+                    finite_norm = float(
+                        torch.linalg.vector_norm(finite_values.to(torch.float64)).cpu()
+                    ) if finite_values.numel() else 0.0
+                    finite_absmax = float(finite_values.abs().max().cpu()) if finite_values.numel() else 0.0
+                    bad_count = gradient.numel() - finite_values.numel()
+                    gradient_debug_parts.append(
+                        f"{name}:finite_norm={finite_norm:.3g},"
+                        f"finite_absmax={finite_absmax:.3g},nonfinite={bad_count}"
+                    )
+                gradient_debug = " ".join(gradient_debug_parts)
+                if workspace_bistable_debug:
+                    report_bistable_nonfinite(step, bistable_forward_debug, gradient_debug)
                 emit_failure_diagnostics("train", include_gradients=True)
                 raise FloatingPointError(
                     f"[{run_id}] bistable write gate gradient norm is "
-                    f"{bistable_gate_grad_norm} at step {step}."
+                    f"{bistable_gate_grad_norm} at step {step}; "
+                    f"parameter-gradient details: {gradient_debug}."
                 )
         # Log addition #2: capture the pre-clip gradient norm instead of
         # discarding clip_grad_norm_'s return value. Gives a β=0 baseline
@@ -2536,17 +2741,45 @@ def run(
         # Clip every parameter in this optimizer, including output_proj.
         # Clipping only rnn.parameters() left the trainable prediction head
         # unbounded while its gradients were still being applied by Adam.
-        try:
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                trainable_parameters, max_norm=max_grad_norm, error_if_nonfinite=True
-            )
-        except RuntimeError as error:
-            if "non-finite" not in str(error):
-                raise
-            # error_if_nonfinite raises before applying the clip coefficient,
-            # preserving the original bad gradients for the diagnostic below.
-            grad_norm = torch.tensor(float("nan"), device=device)
+        if bistable_grad_probe is not None:
+            # Gate-only bistable runs have three scalar trainables. Their raw
+            # gradients can be large but finite; clipping_grad_norm_'s usual
+            # FP32 sum-of-squares can overflow before it gets a chance to
+            # rescale them. Compute the norm in FP64 and scale the original
+            # gradients directly so Adam never sees the unbounded values.
+            grad_norm = independent_grad_norm
+            if grad_norm is None:
+                grad_norm = torch.zeros((), device=device, dtype=torch.float64)
+            clip_coefficient = (
+                max_grad_norm / grad_norm.clamp_min(1e-12)
+            ).clamp(max=1.0)
+            for parameter in trainable_parameters:
+                if parameter.grad is not None:
+                    parameter.grad.mul_(clip_coefficient.to(parameter.grad.dtype))
+            postclip_grad_norm = grad_norm * clip_coefficient
+        else:
+            try:
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    trainable_parameters, max_norm=max_grad_norm, error_if_nonfinite=True
+                )
+                # clip_grad_norm_ scales every gradient by this shared
+                # coefficient. Derive the resulting norm from its returned
+                # pre-clip norm instead of making another full pass over all
+                # model gradients on every training step.
+                clip_coefficient = (
+                    max_grad_norm / (grad_norm + 1e-6)
+                ).clamp(max=1.0)
+                postclip_grad_norm = grad_norm * clip_coefficient
+            except RuntimeError as error:
+                if "non-finite" not in str(error):
+                    raise
+                # error_if_nonfinite raises before applying the clip coefficient,
+                # preserving the original bad gradients for the diagnostic below.
+                grad_norm = torch.tensor(float("nan"), device=device)
+                postclip_grad_norm = torch.tensor(float("nan"), device=device)
         grad_norm_value = float(grad_norm)
+        postclip_grad_norm_value = float(postclip_grad_norm)
+        bistable_optimizer_updated = False
         if independent_grad_norm is not None and math.isfinite(grad_norm_value):
             relative_error = (
                 independent_grad_norm - grad_norm.detach().to(dtype=torch.float64)
@@ -2555,6 +2788,12 @@ def run(
                 torch.maximum(bistable_grad_probe_relative_error, relative_error)
             )
         if not math.isfinite(grad_norm_value):
+            if workspace_bistable_debug:
+                gradient_debug = " ".join(
+                    f"{name}:norm={norm:.3g},absmax={absmax:.3g},nonfinite={bad}"
+                    for name, (norm, absmax, bad) in bistable_debug_gradient_stats.items()
+                )
+                report_bistable_nonfinite(step, bistable_forward_debug, gradient_debug)
             grad_was_finite_since_eval = False
             consecutive_nonfinite_grad_steps += 1
             running_nonfinite_grad_steps += 1
@@ -2585,6 +2824,65 @@ def run(
             consecutive_nonfinite_grad_steps = 0
             scaler.step(optimizer)
             scaler.update()
+            bistable_optimizer_updated = True
+        if workspace_bistable_debug and isinstance(rnn, SplitGraphDNC):
+            assert rnn.workspace is not None and rnn.workspace.bistable_gate is not None
+            clip_scale = (
+                min(1.0, max_grad_norm / max(grad_norm_value, 1e-12))
+                if math.isfinite(grad_norm_value)
+                else float("nan")
+            )
+            parameter_reports = []
+            for name, parameter in rnn.workspace.bistable_gate.named_parameters():
+                grad_norm_raw, grad_absmax, bad_count = bistable_debug_gradient_stats.get(
+                    name, (0.0, 0.0, 0)
+                )
+                before = bistable_debug_parameter_before.get(name, parameter.detach())
+                after = parameter.detach()
+                delta = after - before
+                state = optimizer.state.get(parameter, {})
+                exp_avg = state.get("exp_avg")
+                exp_avg_sq = state.get("exp_avg_sq")
+                step_state = state.get("step")
+                adam_step = (
+                    int(step_state.item())
+                    if torch.is_tensor(step_state)
+                    else int(step_state or 0)
+                )
+                m_absmax = (
+                    float(exp_avg.detach().abs().max().cpu())
+                    if exp_avg is not None
+                    else 0.0
+                )
+                v_max = (
+                    float(exp_avg_sq.detach().max().cpu())
+                    if exp_avg_sq is not None
+                    else 0.0
+                )
+                parameter_reports.append(
+                    f"{name}[v={float(after.cpu()):.4g},g_norm_raw={grad_norm_raw:.3g},"
+                    f"g_absmax_raw={grad_absmax:.3g},g_nonfinite={bad_count},"
+                    f"delta={float(delta.cpu()):.3g},m_absmax={m_absmax:.3g},"
+                    f"v_max={v_max:.3g},adam_step={adam_step}]"
+                )
+            print(
+                f"[{run_id}] [bistable-debug:update] step={step} "
+                f"loss={float(loss.detach().cpu()):.5g} "
+                f"task={float(task_loss.detach().cpu()):.5g} "
+                f"kl={float(kl_loss.detach().cpu()):.5g} beta={beta_eff:.4g} "
+                f"moe_aux={float(moe_aux_loss.detach().cpu()):.5g} "
+                f"lr={optimizer.param_groups[0]['lr']:.5g} "
+                f"preclip_global_norm={grad_norm_value:.4g} "
+                f"clip_scale={clip_scale:.4g} max_grad_norm={max_grad_norm:g} "
+                f"updated={bistable_optimizer_updated} amp_scale={scaler.get_scale():.4g} "
+                f"forward[{bistable_forward_debug or 'unavailable'}] "
+                f"parameters[{'; '.join(parameter_reports)}]"
+            )
+            # Segment hooks collect this optimizer step's per-call gate/slot,
+            # controller, and DNC backward statistics. Emitting here gives a
+            # step-resolved view, while the normal 100-step aggregation stays
+            # unchanged for non-debug runs.
+            segment_diagnostics.emit("train", include_gradients=True)
         # Log addition #3: AMP loss-scale value. A collapsing/repeatedly
         # halved scale is the standard AMP symptom of inf/NaN gradients --
         # the exp()/logvar path in the stochastic write head is the most
@@ -2596,6 +2894,7 @@ def run(
         running_div += dataset.diversity(output.detach(), target_digits, answer_mask)
         if math.isfinite(grad_norm_value):
             running_grad_norm += grad_norm_value
+            running_postclip_grad_norm += postclip_grad_norm_value
             running_finite_grad_steps += 1
             if grad_norm_value > max_grad_norm:
                 running_clipped_grad_steps += 1
@@ -2675,6 +2974,9 @@ def run(
             ) / LOG_EVERY
             avg_div = running_div / LOG_EVERY
             avg_grad_norm = running_grad_norm / max(running_finite_grad_steps, 1)
+            avg_postclip_grad_norm = (
+                running_postclip_grad_norm / max(running_finite_grad_steps, 1)
+            )
             kl_contrib = (
                 beta_eff * avg_kl
             )  # actual beta*L_KL added to total loss, vs. avg_kl (pre-beta, raw clamped sum)
@@ -2706,7 +3008,8 @@ def run(
                 f"diversity {avg_div:.2f}",
                 f"{LOG_EVERY / elapsed:.2f} steps/s",
                 f"LR {current_lr:.6f}",
-                f"grad_norm {avg_grad_norm:.4f}",
+                f"grad_norm {avg_grad_norm:.4g}",
+                f"postclip_grad_norm {avg_postclip_grad_norm:.4g}",
                 f"nonfinite_grad_steps {running_nonfinite_grad_steps}",
                 f"clipped_grad_steps {running_clipped_grad_steps}/{running_finite_grad_steps}",
             ]
@@ -2721,6 +3024,7 @@ def run(
                     f"moe_capacity_drop {moe_diag.get('moe_capacity_drop_frac', 0.0):.1%}",
                 ]
                 parts.extend(_format_moe_layer_reports(moe_diag))
+            workspace_diag = {}
             if workspace_enabled and isinstance(rnn, SplitGraphDNC):
                 if rnn.workspace is None:
                     parts.append("workspace[bypassed: slots=0]")
@@ -2736,6 +3040,20 @@ def run(
                             f"broadcast/specialist {workspace_diag['broadcast_to_specialist_ratio'].item():.3f} "
                             f"read_gate {workspace_diag['read_gate'].item():.3f}]"
                         )
+                        if workspace_reconsideration_enabled:
+                            parts.append(
+                                "reconsideration["
+                                f"eligible "
+                                f"{workspace_diag['reconsideration_eligible_frac'].item():.1%} "
+                                f"surprise "
+                                f"{workspace_diag['reconsideration_surprise_mean'].item():.3f} "
+                                f"trigger "
+                                f"{workspace_diag['reconsideration_trigger_frac'].item():.1%} "
+                                f"changed "
+                                f"{workspace_diag['reconsideration_changed_frac'].item():.1%} "
+                                f"delta_rms "
+                                f"{workspace_diag['reconsideration_state_delta_rms'].item():.3f}]"
+                            )
                         if "gate_low_frac" in workspace_diag:
                             print(
                                 f"[{run_id}] [bistable] p_mean="
@@ -2794,7 +3112,8 @@ def run(
                 bistable_grad_probe_global_max_step.fill_(-1)
                 bistable_grad_probe_relative_error.zero_()
             print(" | ".join(parts))
-            segment_diagnostics.emit("train", include_gradients=True)
+            if not workspace_bistable_debug:
+                segment_diagnostics.emit("train", include_gradients=True)
             if dnc_backward_trace and split_graph_enabled:
                 memory_diag = rnn.memories[0].pop_numerical_diagnostics()
                 if memory_diag:
@@ -2864,12 +3183,18 @@ def run(
                     moe_diag.get("moe_cv_load", 0.0),
                     moe_diag.get("moe_max_load_frac", 0.0),
                     moe_diag.get("moe_capacity_drop_frac", 0.0),
+                    float(workspace_diag.get("reconsideration_eligible_frac", 0.0)),
+                    float(workspace_diag.get("reconsideration_surprise_mean", 0.0)),
+                    float(workspace_diag.get("reconsideration_trigger_frac", 0.0)),
+                    float(workspace_diag.get("reconsideration_changed_frac", 0.0)),
+                    float(workspace_diag.get("reconsideration_state_delta_rms", 0.0)),
                 ]
             )
             if torch.cuda.is_available():
                 torch.cuda.reset_peak_memory_stats(device)  # so next window's peak isn't cumulative
             log_file.flush()
             running_task_loss, running_kl_loss, running_div, running_grad_norm = 0.0, 0.0, 0, 0.0
+            running_postclip_grad_norm = 0.0
             running_finite_grad_steps = 0
             running_nonfinite_grad_steps = 0
             running_clipped_grad_steps = 0
@@ -3933,9 +4258,66 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--workspace-reconsideration",
+        action="store_true",
+        help=(
+            "Phase 5: reopen writes to previously occupied workspace slots when "
+            "the current routed proposal has sufficiently high normalized "
+            "content innovation. Uses no labels or future tokens."
+        ),
+    )
+    parser.add_argument(
+        "--workspace-reconsideration-surprise-threshold",
+        type=float,
+        default=0.5,
+        metavar="THRESHOLD",
+        help=(
+            "Phase 5 normalized innovation threshold in [0, 1] for reconsidering "
+            "an occupied slot (default: 0.5)."
+        ),
+    )
+    parser.add_argument(
+        "--workspace-reconsideration-trigger",
+        choices=("innovation", "random_rate_matched"),
+        default="innovation",
+        help=(
+            "Phase 5 trigger policy: use normalized innovation (default), or "
+            "select a uniformly random set of eligible slots with the exact same "
+            "per-step firing count as the innovation threshold."
+        ),
+    )
+    parser.add_argument(
         "--workspace-bistable-deterministic",
         action="store_true",
         help="Disable independent gate noise for a deterministic diagnostic; normal bistable evaluation remains stochastic and seed-reproducible.",
+    )
+    parser.add_argument(
+        "--bistable-debug",
+        action="store_true",
+        help=(
+            "Print per-update bistable input conditioning, all settling iterations, "
+            "raw gate gradients, clipping scale, parameter updates, and Adam moments. "
+            "Diagnostic only; expect slower training and high console volume."
+        ),
+    )
+    parser.add_argument(
+        "--bistable-anomaly-detection",
+        action="store_true",
+        help=(
+            "Enable PyTorch autograd anomaly detection for a bistable workspace run. "
+            "Reports the forward callsite of the first backward operation returning "
+            "NaN; diagnostic only and substantially slower."
+        ),
+    )
+    parser.add_argument(
+        "--bistable-anomaly-step",
+        type=int,
+        default=None,
+        metavar="STEP",
+        help=(
+            "Restrict --bistable-anomaly-detection to one absolute training step. "
+            "Use the failing step from the log to avoid the cost on earlier steps."
+        ),
     )
     parser.add_argument(
         "--workspace-stability-max-activation",
@@ -4116,6 +4498,16 @@ if __name__ == "__main__":
         help="Trace the first non-finite gradient through DNC internals and report "
         "windowed memory/read/link magnitudes. Diagnostic only; adds synchronization.",
     )
+    parser.add_argument(
+        "--dnc-backward-trace-step",
+        type=int,
+        default=None,
+        metavar="STEP",
+        help=(
+            "Restrict --dnc-backward-trace hooks to one absolute training step "
+            "to reduce diagnostic overhead."
+        ),
+    )
     dnc_impl_group = parser.add_mutually_exclusive_group()
     dnc_impl_group.add_argument(
         "--base-dnc",
@@ -4237,6 +4629,10 @@ if __name__ == "__main__":
         parser.error("--dnc-link-sharpness requires --split-graph")
     if args.dnc_backward_trace and not args.split_graph:
         parser.error("--dnc-backward-trace requires --split-graph")
+    if args.dnc_backward_trace_step is not None and not args.dnc_backward_trace:
+        parser.error("--dnc-backward-trace-step requires --dnc-backward-trace")
+    if args.dnc_backward_trace_step is not None and args.dnc_backward_trace_step < 0:
+        parser.error("--dnc-backward-trace-step must be >= 0")
     if args.dnc_read_residual_scale < 0:
         parser.error("--dnc-read-residual-scale must be non-negative")
     if args.dnc_read_residual_max_ratio < 0:
@@ -4330,6 +4726,27 @@ if __name__ == "__main__":
         parser.error("--workspace-num-slots must be >= 0")
     if args.workspace_bptt_horizon < 0:
         parser.error("--workspace-bptt-horizon must be >= 0")
+    if (
+        not math.isfinite(args.workspace_reconsideration_surprise_threshold)
+        or not 0.0 <= args.workspace_reconsideration_surprise_threshold <= 1.0
+    ):
+        parser.error(
+            "--workspace-reconsideration-surprise-threshold must be finite and in [0, 1]"
+        )
+    if args.workspace_reconsideration and not args.workspace:
+        parser.error("--workspace-reconsideration requires --workspace")
+    if (
+        args.workspace_reconsideration_trigger != "innovation"
+        and not args.workspace_reconsideration
+    ):
+        parser.error(
+            "--workspace-reconsideration-trigger=random_rate_matched requires "
+            "--workspace-reconsideration"
+        )
+    if args.workspace_reconsideration and not args.moe_diagnostics:
+        parser.error(
+            "--workspace-reconsideration requires --moe-diagnostics for trigger telemetry"
+        )
     if args.workspace_train_scope == "gate" and not args.workspace:
         parser.error("--workspace-train-scope=gate requires --workspace")
     if args.workspace_gate_variant == "bistable" and (
@@ -4340,6 +4757,18 @@ if __name__ == "__main__":
         )
     if args.workspace_gate_variant == "bistable" and not args.moe_diagnostics:
         parser.error("bistable gate histogram/diagnostics require --moe-diagnostics")
+    if args.bistable_debug and args.workspace_gate_variant != "bistable":
+        parser.error("--bistable-debug requires --workspace-gate-variant=bistable")
+    if args.bistable_debug and (not args.workspace or not args.split_graph):
+        parser.error("--bistable-debug requires --workspace and --split-graph")
+    if args.bistable_anomaly_detection and args.workspace_gate_variant != "bistable":
+        parser.error("--bistable-anomaly-detection requires --workspace-gate-variant=bistable")
+    if args.bistable_anomaly_detection and (not args.workspace or not args.split_graph):
+        parser.error("--bistable-anomaly-detection requires --workspace and --split-graph")
+    if args.bistable_anomaly_step is not None and not args.bistable_anomaly_detection:
+        parser.error("--bistable-anomaly-step requires --bistable-anomaly-detection")
+    if args.bistable_anomaly_step is not None and args.bistable_anomaly_step < 0:
+        parser.error("--bistable-anomaly-step must be >= 0")
     if (
         not math.isfinite(args.workspace_bistable_selection_scale)
         or args.workspace_bistable_selection_scale < 0
@@ -4368,6 +4797,21 @@ if __name__ == "__main__":
         betas_to_run = BETAS_TO_SWEEP
 
     all_summaries = []
+    if args.bistable_anomaly_detection:
+        # Anomaly detection must cover both forward graph construction and
+        # backward execution in order to print the originating forward stack.
+        # Keep it opt-in because it retains extra graph metadata and is slow.
+        if args.bistable_anomaly_step is None:
+            print(
+                "[bistable-anomaly] PyTorch autograd anomaly detection enabled "
+                "for every step; the run will be substantially slower."
+            )
+            torch.autograd.set_detect_anomaly(True, check_nan=True)
+        else:
+            print(
+                f"[bistable-anomaly] anomaly detection restricted to training "
+                f"step {args.bistable_anomaly_step}; all other steps use normal autograd."
+            )
     for beta in betas_to_run:
         # These are made to avoid checkpoint collisions between different types of runs.
         run_id = f"beta_{beta}_seed{args.seed}_learnedprior".replace(".", "p")
@@ -4416,6 +4860,18 @@ if __name__ == "__main__":
                     run_id += "_detgate"
             if args.workspace_bptt_horizon:
                 run_id += f"_wbptt{args.workspace_bptt_horizon}"
+            if args.workspace_reconsideration:
+                threshold_tag = (
+                    f"{args.workspace_reconsideration_surprise_threshold:g}"
+                    .replace(".", "p")
+                    .replace("-", "m")
+                )
+                trigger_tag = (
+                    "innovation"
+                    if args.workspace_reconsideration_trigger == "innovation"
+                    else "randommatched"
+                )
+                run_id += f"_reconsider{trigger_tag}{threshold_tag}"
             if args.workspace_no_selection:
                 run_id += "_randomwrite"
             if args.workspace_reset_each_step:
@@ -4495,7 +4951,17 @@ if __name__ == "__main__":
             workspace_bistable_selection_scale=args.workspace_bistable_selection_scale,
             workspace_bistable_noise_scale=args.workspace_bistable_noise_scale,
             workspace_bistable_gradient_mode=args.workspace_bistable_gradient_mode,
+            workspace_bistable_debug=args.bistable_debug,
+            workspace_bistable_anomaly_detection=args.bistable_anomaly_detection,
+            workspace_bistable_anomaly_step=args.bistable_anomaly_step,
             workspace_bptt_horizon=args.workspace_bptt_horizon,
+            workspace_reconsideration_enabled=args.workspace_reconsideration,
+            workspace_reconsideration_surprise_threshold=(
+                args.workspace_reconsideration_surprise_threshold
+            ),
+            workspace_reconsideration_trigger_mode=(
+                args.workspace_reconsideration_trigger
+            ),
             workspace_bistable_deterministic=args.workspace_bistable_deterministic,
             workspace_stability_max_activation=args.workspace_stability_max_activation,
             eval_only=args.eval_only,
@@ -4511,6 +4977,7 @@ if __name__ == "__main__":
             dnc_implementation=args.dnc_implementation,
             dnc_compile_memory=args.dnc_compile_memory,
             dnc_backward_trace=args.dnc_backward_trace,
+            dnc_backward_trace_step=args.dnc_backward_trace_step,
             dataset_type=args.dataset_type,
             dataset_link=args.dataset_link,
             test_dataset_link=args.test_dataset_link,

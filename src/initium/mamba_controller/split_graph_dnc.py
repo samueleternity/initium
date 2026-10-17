@@ -217,6 +217,9 @@ class SplitGraphDNC(nn.Module):
         workspace_bistable_noise_scale: float = 0.75,
         workspace_bistable_gradient_mode: str = "truncated",
         workspace_bptt_horizon: int = 0,
+        workspace_reconsideration_enabled: bool = False,
+        workspace_reconsideration_surprise_threshold: float = 0.5,
+        workspace_reconsideration_trigger_mode: str = "innovation",
     ):
         super().__init__()
         if not independent_linears:
@@ -277,6 +280,15 @@ class SplitGraphDNC(nn.Module):
         self.workspace_bistable_gradient_mode = workspace_bistable_gradient_mode
         self.workspace_bistable_selection_scale = float(workspace_bistable_selection_scale)
         self.workspace_bptt_horizon = int(workspace_bptt_horizon)
+        self.workspace_reconsideration_enabled = bool(
+            workspace_reconsideration_enabled
+        )
+        self.workspace_reconsideration_surprise_threshold = float(
+            workspace_reconsideration_surprise_threshold
+        )
+        self.workspace_reconsideration_trigger_mode = (
+            workspace_reconsideration_trigger_mode
+        )
         self.workspace_bistable_deterministic = False
         # Runtime-only counterfactual for evaluation. It is deliberately not
         # part of checkpoint config/state so a saved model can be scored with
@@ -546,6 +558,13 @@ class SplitGraphDNC(nn.Module):
                 bistable_noise_scale=workspace_bistable_noise_scale,
                 bistable_gradient_mode=workspace_bistable_gradient_mode,
                 bptt_horizon=workspace_bptt_horizon,
+                reconsideration_enabled=workspace_reconsideration_enabled,
+                reconsideration_surprise_threshold=(
+                    workspace_reconsideration_surprise_threshold
+                ),
+                reconsideration_trigger_mode=(
+                    workspace_reconsideration_trigger_mode
+                ),
             )
             if workspace_enabled and workspace_num_slots > 0
             else None

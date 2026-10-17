@@ -176,13 +176,18 @@ class SwitchMoE(nn.Module):
         *,
         return_details: bool = False,
         token_mask: torch.Tensor | None = None,
+        gradient_trace=None,
     ):
+        def trace(label: str, tensor: torch.Tensor) -> torch.Tensor:
+            return gradient_trace(f"switch_moe.{label}", tensor) if gradient_trace else tensor
+
         orig_shape = x.shape
         d_model = orig_shape[-1]
         assert d_model == self.d_model, (
             f"SwitchMoE: input last dim {d_model} != configured d_model {self.d_model}"
         )
         flat = x.reshape(-1, d_model)  # (num_tokens, d_model)
+        flat = trace("input", flat)
         num_tokens = flat.shape[0]
         if token_mask is not None:
             if tuple(token_mask.shape) != tuple(orig_shape[:-1]):
@@ -205,6 +210,7 @@ class SwitchMoE(nn.Module):
                 self.router.weight.float(),
                 None if self.router.bias is None else self.router.bias.float(),
             )
+        logits32 = trace("router_logits", logits32)
         if self.training and self.router_noise_eps > 0:
             # Switch's own exploration mechanism (Appendix C): multiplicative
             # jitter noise. We apply it directly to the router logits here
@@ -215,6 +221,7 @@ class SwitchMoE(nn.Module):
             )
             logits32 = logits32 * noise
         probs = torch.softmax(logits32, dim=-1)  # (num_tokens, num_experts)
+        probs = trace("router_probabilities", probs)
 
         # Top-K routing (Shazeer et al. 2017 / GShard), generalizing Switch's
         # own k=1 special case: top-1 retains its selected probability from
@@ -236,6 +243,7 @@ class SwitchMoE(nn.Module):
             gate_weights = topk_prob
         else:
             gate_weights = topk_prob / topk_prob.sum(dim=-1, keepdim=True).clamp(min=1e-9)
+        gate_weights = trace("gate_weights", gate_weights)
 
         collect_diagnostics = self.diagnostics_enabled
         # The auxiliary loss needs the non-differentiable assignment fraction
@@ -322,6 +330,7 @@ class SwitchMoE(nn.Module):
                     )
                 )
             expert_outputs = torch.stack(expert_outputs, dim=0)
+            expert_outputs = trace("expert_outputs", expert_outputs)
 
             # Both advanced indices must have identical (T, top_k) shapes.
             # Leaving flat_idx flat (T*top_k,) makes PyTorch broadcast it
@@ -333,7 +342,9 @@ class SwitchMoE(nn.Module):
             route_experts = flat_idx.reshape(num_tokens, top_k)
             route_slots_2d = route_slots.reshape(num_tokens, top_k)
             selected_outputs = expert_outputs[route_experts, route_slots_2d]
+            selected_outputs = trace("selected_outputs", selected_outputs)
             output32 = (selected_outputs * accepted_gates.unsqueeze(-1)).sum(dim=1)
+            output32 = trace("routed_output", output32)
             accepted_outputs = (
                 selected_outputs * keep.unsqueeze(-1).to(selected_outputs.dtype)
                 if collect_diagnostics
@@ -671,17 +682,35 @@ class MultiSourceMoEBlock(nn.Module):
         if device is not None and getattr(device, "type", None) == "cuda":
             self.to(device)
 
-    def forward(self, sources: list[torch.Tensor]) -> list[torch.Tensor]:
+    def forward(
+        self, sources: list[torch.Tensor], *, gradient_trace=None
+    ) -> list[torch.Tensor]:
         if len(sources) != self.num_sources:
             raise ValueError(
                 f"MultiSourceMoEBlock: expected {self.num_sources} source tensors, "
                 f"got {len(sources)}"
             )
         batch_sizes = [s.shape[0] for s in sources]
-        tagged = torch.cat(
-            [self.source_embed(self.norm(s), i) for i, s in enumerate(sources)], dim=0
-        )
-        routed = self.moe(tagged)
+        normalized = [self.norm(source) for source in sources]
+        if gradient_trace is not None:
+            normalized = [
+                gradient_trace(f"multisource.norm.{i}", value)
+                for i, value in enumerate(normalized)
+            ]
+        embedded = [
+            self.source_embed(value, i) for i, value in enumerate(normalized)
+        ]
+        if gradient_trace is not None:
+            embedded = [
+                gradient_trace(f"multisource.source_embedding.{i}", value)
+                for i, value in enumerate(embedded)
+            ]
+        tagged = torch.cat(embedded, dim=0)
+        if gradient_trace is not None:
+            tagged = gradient_trace("multisource.tagged", tagged)
+        routed = self.moe(tagged, gradient_trace=gradient_trace)
+        if gradient_trace is not None:
+            routed = gradient_trace("multisource.routed", routed)
 
         # Per-source routing breakdown: which experts did THIS source's rows
         # actually go to, independent of the pooled cv_load/cv_importance
@@ -726,7 +755,10 @@ class MultiSourceMoEBlock(nn.Module):
 
         outs, offset = [], 0
         for i, b in enumerate(batch_sizes):
-            outs.append(sources[i] + routed[offset : offset + b])  # per-source residual
+            output = sources[i] + routed[offset : offset + b]
+            if gradient_trace is not None:
+                output = gradient_trace(f"multisource.output.{i}", output)
+            outs.append(output)  # per-source residual
             offset += b
         return outs
 

@@ -30,6 +30,7 @@ from typing import cast
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from initium.MoE.moe_layer import MoEBlock, MultiSourceMoEBlock
 
@@ -152,6 +153,13 @@ class CfCControllerWrapper(nn.Module):
     ):
         super().__init__()
         self.d_model, self.num_blocks = d_model, num_blocks
+        # Disabled during normal training; the trainer enables edge tracing
+        # only on a selected anomaly-detection step.
+        self._gradient_trace_enabled = False
+        self._gradient_trace_step: int | None = None
+        self._gradient_trace_call = 0
+        self._gradient_trace_reports = 0
+        self._gradient_trace_forward_reported: set[str] = set()
 
         # moe_source_dims: when given (>=1 entries, each an input SOURCE's
         # OWN raw width -- e.g. [hidden_size, read_vectors_size] for
@@ -298,6 +306,115 @@ class CfCControllerWrapper(nn.Module):
         if self.moe_source_dims is None:
             raise RuntimeError("forward_multi_source requires moe_source_dims to have been set")
         assert self.source_in_adapters is not None and self.moe_blocks is not None
+
+        trace_call = self._gradient_trace_call
+        self._gradient_trace_call += 1
+
+        def trace_gradient(label: str, tensor: torch.Tensor) -> torch.Tensor:
+            if not self._gradient_trace_enabled:
+                return tensor
+            if tensor.requires_grad and label not in self._gradient_trace_forward_reported:
+                self._gradient_trace_forward_reported.add(label)
+                print(
+                    "[cfc-gradient-trace:forward] "
+                    f"step={self._gradient_trace_step} call={trace_call} "
+                    f"tensor={label} dtype={tensor.dtype} "
+                    f"requires_grad={tensor.requires_grad} shape={tuple(tensor.shape)}"
+                )
+            if not tensor.requires_grad:
+                return tensor
+
+            def report(gradient: torch.Tensor) -> torch.Tensor:
+                if self._gradient_trace_reports >= 96:
+                    return gradient
+                finite = torch.isfinite(gradient)
+                bad_count = int((~finite).sum().detach().cpu())
+                if not bad_count:
+                    return gradient
+                nan_count = int(torch.isnan(gradient).sum().detach().cpu())
+                inf_count = int(torch.isinf(gradient).sum().detach().cpu())
+                finite_values = gradient.detach()[finite].float()
+                finite_absmax = (
+                    float(finite_values.abs().max().cpu())
+                    if finite_values.numel()
+                    else float("nan")
+                )
+                print(
+                    "[cfc-gradient-trace] "
+                    f"step={self._gradient_trace_step} call={trace_call} "
+                    f"tensor={label} bad={bad_count / max(1, gradient.numel()):.3%} "
+                    f"nan={nan_count} inf={inf_count} "
+                    f"finite_absmax={finite_absmax:.4g} "
+                    f"grad_dtype={gradient.dtype} "
+                    f"shape={tuple(gradient.shape)}"
+                )
+                self._gradient_trace_reports += 1
+                return gradient
+
+            tensor.register_hook(report)
+            return tensor
+
+        def report_parameter_health(label: str, module: nn.Module | None) -> None:
+            if not self._gradient_trace_enabled or trace_call != 0 or module is None:
+                return
+            parameters = list(module.parameters())
+            if not parameters:
+                print(
+                    "[cfc-gradient-trace:params] "
+                    f"step={self._gradient_trace_step} module={label} parameters=none"
+                )
+                return
+            bad_count = torch.zeros((), device=parameters[0].device, dtype=torch.long)
+            total = 0
+            absmax = torch.zeros((), device=parameters[0].device, dtype=torch.float32)
+            dtypes = sorted({str(parameter.dtype) for parameter in parameters})
+            for parameter in parameters:
+                values = parameter.detach()
+                bad_count = bad_count + (~torch.isfinite(values)).sum()
+                total += values.numel()
+                if values.numel():
+                    absmax = torch.maximum(
+                        absmax, values.float().abs().amax()
+                    )
+            bad, maximum = torch.stack(
+                (bad_count.float(), absmax)
+            ).cpu().tolist()
+            print(
+                "[cfc-gradient-trace:params] "
+                f"step={self._gradient_trace_step} module={label} "
+                f"dtypes={','.join(dtypes)} nonfinite={int(bad)}/{total} "
+                f"absmax={maximum:.4g}"
+            )
+
+        def trace_state(label: str, state):
+            if isinstance(state, tuple):
+                return tuple(
+                    trace_state(f"{label}.{index}", value)
+                    for index, value in enumerate(state)
+                )
+            if isinstance(state, list):
+                return [
+                    trace_state(f"{label}.{index}", value)
+                    for index, value in enumerate(state)
+                ]
+            if torch.is_tensor(state):
+                return trace_gradient(label, state)
+            return state
+
+        if self._gradient_trace_enabled:
+            report_parameter_health("in_adapter", self.in_adapter)
+            for index, adapter in enumerate(self.source_in_adapters):
+                report_parameter_health(f"source_adapter.{index}", adapter)
+            multisource_moe = self.moe_blocks[0]
+            report_parameter_health("multisource.norm", multisource_moe.norm)
+            report_parameter_health("multisource.source_embed", multisource_moe.source_embed)
+            report_parameter_health("switch_moe.router", multisource_moe.moe.router)
+            report_parameter_health("switch_moe.experts", multisource_moe.moe.experts)
+            sources = [
+                trace_gradient(f"source.{index}", source)
+                for index, source in enumerate(sources)
+            ]
+            hx = trace_state("state.in", hx)
         # Preserve the stock CfC input-fusion path exactly: the baseline
         # receives one affine projection of concat([backbone, previous
         # read]). The source-aware MoE is an additive residual around that
@@ -305,22 +422,76 @@ class CfCControllerWrapper(nn.Module):
         # initialization intact while still allowing the experts to learn
         # source-specific corrections.
         concatenated = torch.cat(sources, dim=-1)
-        x = self.in_adapter(concatenated)
-        projected = [adapter(s) for adapter, s in zip(self.source_in_adapters, sources)]
-        fused_per_source = self.moe_blocks[0](projected)  # source + routed delta
+        concatenated = trace_gradient("fusion.concat", concatenated)
+        # Keep the CFC fusion projections in fp32. The CfC block below already
+        # disables autocast; letting these Linear layers emit fp16 introduces
+        # a low-precision backward boundary before the recurrent controller.
+        with torch.autocast(device_type=concatenated.device.type, enabled=False):
+            if isinstance(self.in_adapter, nn.Linear):
+                x = F.linear(
+                    concatenated.float(),
+                    self.in_adapter.weight.float(),
+                    None
+                    if self.in_adapter.bias is None
+                    else self.in_adapter.bias.float(),
+                )
+            else:
+                x = self.in_adapter(concatenated.float())
+            projected = []
+            for adapter, source in zip(self.source_in_adapters, sources):
+                source = source.float()
+                if isinstance(adapter, nn.Linear):
+                    projected.append(
+                        F.linear(
+                            source,
+                            adapter.weight.float(),
+                            None if adapter.bias is None else adapter.bias.float(),
+                        )
+                    )
+                else:
+                    projected.append(adapter(source))
+        x = trace_gradient("fusion.base_projection", x)
+        if self._gradient_trace_enabled:
+            projected = [
+                trace_gradient(f"source_projection.{index}", value)
+                for index, value in enumerate(projected)
+            ]
+        fused_per_source = self.moe_blocks[0](
+            projected,
+            gradient_trace=(trace_gradient if self._gradient_trace_enabled else None),
+        )  # source + routed delta
+        if self._gradient_trace_enabled:
+            fused_per_source = [
+                trace_gradient(f"source_moe.{index}", value)
+                for index, value in enumerate(fused_per_source)
+            ]
         moe_delta = torch.stack(
             [fused - source for fused, source in zip(fused_per_source, projected)],
             dim=0,
         ).sum(dim=0)
+        moe_delta = trace_gradient("fusion.moe_delta", moe_delta)
         x = x + moe_delta
+        x = trace_gradient("fusion.combined", x)
         if hx is None:
             hx = self.init_state(x.size(0), device=x.device)
         new_hx = []
         blocks = cast(Iterable[CfCControllerBlock], self.blocks)
-        for block, state in zip(blocks, hx):
+        for index, (block, state) in enumerate(zip(blocks, hx)):
+            x = trace_gradient(f"cfc.{index}.input", x)
+            state = trace_state(f"cfc.{index}.state", state)
             x, new_state = block(x, state)
+            x = trace_gradient(f"cfc.{index}.output", x)
+            new_state = trace_state(f"cfc.{index}.state_out", new_state)
             new_hx.append(new_state)
         return x.unsqueeze(1), new_hx
+
+    def set_gradient_trace(self, enabled: bool, *, step: int | None = None) -> None:
+        """Enable low-volume edge tracing for one targeted training step."""
+        self._gradient_trace_enabled = bool(enabled)
+        self._gradient_trace_step = step if enabled else None
+        self._gradient_trace_call = 0
+        self._gradient_trace_reports = 0
+        self._gradient_trace_forward_reported.clear()
 
 
 if (

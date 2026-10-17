@@ -52,6 +52,20 @@ def _all_tensors(value: Any) -> list[torch.Tensor]:
     return tensors
 
 
+def _stable_sum_squares(value: torch.Tensor) -> torch.Tensor:
+    """Sum squares without overflowing the input dtype's accumulator."""
+    if not value.numel():
+        return torch.zeros((), device=value.device, dtype=torch.float64)
+    scale = value.abs().amax().clamp_min(1.0)
+    scaled_sum = (value / scale).square().sum()
+    result = scaled_sum.to(torch.float64) * scale.to(torch.float64).square()
+    return torch.where(
+        torch.isfinite(scale),
+        result,
+        torch.full_like(result, float("inf")),
+    )
+
+
 def _segment_label(path: str, module: nn.Module) -> str | None:
     class_name = type(module).__name__
     lower_name = class_name.lower()
@@ -121,6 +135,8 @@ class SegmentDiagnostics:
         self._segments: list[tuple[str, str]] = []
         self._external_modules: list[tuple[str, nn.Module]] = []
         self._handles = []
+        self._nonfinite_trace_enabled = False
+        self._nonfinite_trace_reported = False
         if not self.enabled:
             return
         for path, module in model.named_modules():
@@ -137,8 +153,9 @@ class SegmentDiagnostics:
             channel = self.channel
             input_tensor = _first_tensor(inputs)
             tracks_secondary_outputs = label.startswith(
-                ("workspace:", "workspace_bistable_gate:")
+                ("workspace:", "workspace_bistable_gate:", "controller.cfc_block:")
             )
+            tracks_cfc_state = label.startswith("controller.cfc_block:")
             output_tensors = (
                 _all_tensors(output)
                 if tracks_secondary_outputs
@@ -211,6 +228,21 @@ class SegmentDiagnostics:
                         )
                     )
 
+            # CfC's recurrent state is a separate input/output path. Keep its
+            # hidden-state gradients visible so BPTT spikes are not hidden by
+            # the block's ordinary output gradient.
+            if tracks_cfc_state:
+                for state_index, state_tensor in enumerate(_all_tensors(inputs[1:]), start=1):
+                    if state_tensor.requires_grad:
+                        state_tensor.register_hook(
+                            lambda grad,
+                            target=record,
+                            call_location=location,
+                            prefix=f"grad_in_{state_index}": self._accumulate_tensor(
+                                target, prefix, grad, location=call_location
+                            )
+                        )
+
             # Structured recurrent modules can return a large persistent state
             # alongside their visible output. Keep these gradients separate so
             # a state-path spike cannot be hidden by the first returned tensor.
@@ -236,8 +268,8 @@ class SegmentDiagnostics:
 
         self._handles.append(module.register_forward_hook(hook))
 
-    @staticmethod
     def _accumulate_tensor(
+        self,
         record: dict[str, Any],
         prefix: str,
         tensor: torch.Tensor,
@@ -247,9 +279,32 @@ class SegmentDiagnostics:
     ) -> None:
         value = tensor.detach().float().reshape(-1)
         finite = torch.isfinite(value)
+        if (
+            prefix.startswith("grad")
+            and self._nonfinite_trace_enabled
+            and not self._nonfinite_trace_reported
+        ):
+            bad_count = (~finite).sum()
+            if bool(bad_count):
+                finite_values = value[finite]
+                bad_fraction = float((bad_count.float() / max(1, value.numel())).cpu())
+                finite_max = (
+                    float(finite_values.abs().max().cpu())
+                    if finite_values.numel()
+                    else float("nan")
+                )
+                call_location = (
+                    f" step={location[0]} call={location[1]}" if location else ""
+                )
+                print(
+                    f"[segment-first-nonfinite] {record['path']} {prefix}"
+                    f"{call_location} bad={bad_fraction:.3%} "
+                    f"finite_absmax={finite_max:.4g} shape={tuple(tensor.shape)}"
+                )
+                self._nonfinite_trace_reported = True
         safe = torch.where(finite, value, torch.zeros_like(value))
         values = {
-            f"{prefix}_sum_sq": safe.square().sum(),
+            f"{prefix}_sum_sq": _stable_sum_squares(safe),
             f"{prefix}_max": safe.abs().amax() if safe.numel() else safe.new_zeros(()),
             f"{prefix}_bad": (~finite).sum().float(),
         }
@@ -285,6 +340,11 @@ class SegmentDiagnostics:
                     for context_name, context_value in (context or {}).items():
                         record[f"{key}_context_{context_name}"] = context_value.detach().clone()
         record[f"{prefix}_numel"] = record.get(f"{prefix}_numel", 0) + value.numel()
+
+    def set_nonfinite_trace(self, enabled: bool) -> None:
+        """Print the first bad segment-boundary gradient for one diagnostic step."""
+        self._nonfinite_trace_enabled = bool(enabled)
+        self._nonfinite_trace_reported = False
 
     def add_module(self, module: nn.Module, label: str) -> None:
         """Add a caller-named module such as the task output projection."""
@@ -345,7 +405,7 @@ class SegmentDiagnostics:
             if grad is None:
                 continue
             value = grad.detach().float()
-            contribution = value.square().sum()
+            contribution = _stable_sum_squares(value)
             matched = False
             for path, label in self._segments:
                 if path and (name == path or name.startswith(path + ".")):
@@ -357,8 +417,9 @@ class SegmentDiagnostics:
             for parameter in module.parameters():
                 grad = parameter.grad
                 if grad is not None:
+                    value = grad.detach().float()
                     records.setdefault(label, []).append(
-                        (grad.detach().float().square().sum(), parameter.numel())
+                        (_stable_sum_squares(value), parameter.numel())
                     )
         if unassigned:
             records["other"] = unassigned
@@ -396,6 +457,15 @@ class SegmentDiagnostics:
                 if key.startswith("out_") and key.endswith("_numel")
                 and key[4:-6].isdigit()
             )
+            secondary_input_indices = sorted(
+                int(key[8:-6])
+                for key in record
+                if key.startswith("grad_in_") and key.endswith("_numel")
+                and key[8:-6].isdigit()
+            )
+            gradient_prefixes.extend(
+                f"grad_in_{input_index}" for input_index in secondary_input_indices
+            )
             gradient_prefixes.extend(
                 f"grad_out_{output_index}" for output_index in secondary_output_indices
             )
@@ -422,6 +492,14 @@ class SegmentDiagnostics:
                 ("grad_in", record.get("grad_in_numel", 0), "g_in"),
                 ("grad_out", record.get("grad_out_numel", 0), "g_out"),
             ]
+            metrics.extend(
+                (
+                    f"grad_in_{input_index}",
+                    record.get(f"grad_in_{input_index}_numel", 0),
+                    f"g_in{input_index}",
+                )
+                for input_index in secondary_input_indices
+            )
             for output_index in secondary_output_indices:
                 metrics.extend(
                     (

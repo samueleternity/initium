@@ -44,6 +44,9 @@ class BistableWriteGate(nn.Module):
         self.self_excitation_logit = nn.Parameter(torch.tensor(1.1))
         self.inhibition_logit = nn.Parameter(torch.tensor(0.5))
         self._last_diagnostics: dict[str, torch.Tensor] = {}
+        # Runtime-only detailed telemetry. The core trainer toggles this with
+        # --bistable-debug; it does not affect the gate equations or checkpoints.
+        self.debug_diagnostics = False
         self._noise_seed = int(torch.randint(0, 2**31 - 1, ()).item())
         self._noise_generators: dict[str, torch.Generator] = {}
         self._pending_generator_states: dict[str, torch.Tensor] = {}
@@ -110,6 +113,11 @@ class BistableWriteGate(nn.Module):
             raise ValueError("bistable competition requires at least two slots")
         if candidate_mask is not None and tuple(candidate_mask.shape) != (selection.shape[0],):
             raise ValueError("candidate_mask must have shape (batch,)")
+        valid = (
+            torch.ones(selection.shape[0], device=selection.device, dtype=torch.bool)
+            if candidate_mask is None
+            else candidate_mask.to(device=selection.device, dtype=torch.bool)
+        )
         scale = self.selection_scale if selection_scale is None else selection_scale
         noise = self.noise_scale if noise_scale is None else noise_scale
         if scale < 0 or noise < 0:
@@ -140,6 +148,10 @@ class BistableWriteGate(nn.Module):
         self_excitation = F.softplus(self.self_excitation_logit)
         inhibition = F.softplus(self.inhibition_logit)
         activity = torch.sigmoid(drive / self.temperature)
+        debug_iterations: list[dict[str, torch.Tensor]] = []
+        if self.debug_diagnostics:
+            with torch.no_grad():
+                debug_iterations.append(self._iteration_diagnostics(activity, None, valid))
         for _ in range(self.iterations):
             # Keep the competitive settling trajectory intact in the forward
             # pass. Its recurrent Jacobian can be expansive by design, so the
@@ -151,18 +163,19 @@ class BistableWriteGate(nn.Module):
             )
             population_activity = previous_activity.sum(dim=-1, keepdim=True)
             lateral_input = population_activity - previous_activity
+            previous = activity
             activity = torch.sigmoid(
                 (drive + self_excitation * previous_activity - inhibition * lateral_input)
                 / self.temperature
             )
+            if self.debug_diagnostics:
+                with torch.no_grad():
+                    debug_iterations.append(
+                        self._iteration_diagnostics(activity, previous, valid)
+                    )
 
         hard = (activity >= 0.5).to(activity.dtype)
         committed = hard + activity - activity.detach()
-        valid = (
-            torch.ones(selection.shape[0], device=selection.device, dtype=torch.bool)
-            if candidate_mask is None
-            else candidate_mask.to(device=selection.device, dtype=torch.bool)
-        )
         committed = committed * valid.unsqueeze(-1).to(committed.dtype)
         if collect_diagnostics:
             with torch.no_grad():
@@ -186,9 +199,113 @@ class BistableWriteGate(nn.Module):
                     "selection_strength_mean": normalized.detach()[valid].amax(dim=-1).sum()
                     / valid.sum().clamp_min(1),
                 }
+                if self.debug_diagnostics:
+                    selected = normalized.detach()[valid]
+                    mass = selection.detach()[valid]
+                    logits = selection_logit.detach()[valid]
+                    drives = drive.detach()[valid]
+                    noise_values = background.detach()[valid]
+                    if selected.numel():
+                        debug = {
+                            "debug_selection_scale": selection.new_tensor(float(scale)),
+                            "debug_noise_scale": selection.new_tensor(float(noise)),
+                            "debug_temperature": selection.new_tensor(self.temperature),
+                            "debug_self_excitation": F.softplus(
+                                self.self_excitation_logit.detach()
+                            ),
+                            "debug_inhibition": F.softplus(self.inhibition_logit.detach()),
+                            "debug_selection_mass_min": mass.min(),
+                            "debug_selection_mass_max": mass.max(),
+                            "debug_selection_mass_zero_frac": (mass <= 0).float().mean(),
+                            "debug_selection_prob_min": selected.min(),
+                            "debug_selection_prob_max": selected.max(),
+                            "debug_selection_prob_lt_1e4": (selected < 1e-4).float().mean(),
+                            "debug_selection_prob_lt_1e3": (selected < 1e-3).float().mean(),
+                            "debug_selection_prob_gt_099": (selected > 0.99).float().mean(),
+                            "debug_selection_nonfinite_frac": (
+                                ~torch.isfinite(selected)
+                            ).float().mean(),
+                            "debug_selection_logit_absmax": logits.abs().max(),
+                            "debug_drive_absmax": drives.abs().max(),
+                            "debug_drive_rms": drives.square().mean().sqrt(),
+                            "debug_drive_nonfinite_frac": (
+                                ~torch.isfinite(drives)
+                            ).float().mean(),
+                            "debug_noise_rms": noise_values.square().mean().sqrt(),
+                            "debug_confidence_min": confidence_logit.detach()[valid].min(),
+                            "debug_confidence_max": confidence_logit.detach()[valid].max(),
+                        }
+                        for iteration, metrics in enumerate(debug_iterations):
+                            for metric, value in metrics.items():
+                                debug[f"debug_iter{iteration}_{metric}"] = value
+                    else:
+                        zero = selection.new_zeros(())
+                        debug = {
+                            "debug_selection_scale": zero,
+                            "debug_noise_scale": zero,
+                            "debug_temperature": zero,
+                            "debug_self_excitation": zero,
+                            "debug_inhibition": zero,
+                            "debug_selection_mass_min": zero,
+                            "debug_selection_mass_max": zero,
+                            "debug_selection_mass_zero_frac": zero,
+                            "debug_selection_prob_min": zero,
+                            "debug_selection_prob_max": zero,
+                            "debug_selection_prob_lt_1e4": zero,
+                            "debug_selection_prob_lt_1e3": zero,
+                            "debug_selection_prob_gt_099": zero,
+                            "debug_selection_nonfinite_frac": zero,
+                            "debug_selection_logit_absmax": zero,
+                            "debug_drive_absmax": zero,
+                            "debug_drive_rms": zero,
+                            "debug_drive_nonfinite_frac": zero,
+                            "debug_noise_rms": zero,
+                            "debug_confidence_min": zero,
+                            "debug_confidence_max": zero,
+                        }
+                        for iteration, metrics in enumerate(debug_iterations):
+                            for metric in metrics:
+                                debug[f"debug_iter{iteration}_{metric}"] = zero
+                    self._last_diagnostics.update(debug)
         else:
             self._last_diagnostics = {}
         return committed.to(selection.dtype), activity
 
     def last_diagnostics(self) -> dict[str, torch.Tensor]:
         return dict(self._last_diagnostics)
+
+    @staticmethod
+    def _iteration_diagnostics(
+        activity: torch.Tensor,
+        previous: torch.Tensor | None,
+        valid: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        detached = activity.detach()[valid]
+        if not detached.numel():
+            zero = activity.detach().new_zeros(())
+            return {
+                "mean": zero,
+                "min": zero,
+                "max": zero,
+                "low_frac": zero,
+                "high_frac": zero,
+                "nonfinite_frac": zero,
+                **(
+                    {"delta_rms": zero, "delta_max": zero}
+                    if previous is not None
+                    else {}
+                ),
+            }
+        result = {
+            "mean": detached.mean(),
+            "min": detached.min(),
+            "max": detached.max(),
+            "low_frac": (detached < 0.01).float().mean(),
+            "high_frac": (detached > 0.99).float().mean(),
+            "nonfinite_frac": (~torch.isfinite(detached)).float().mean(),
+        }
+        if previous is not None:
+            delta = (detached - previous.detach()[valid]).abs()
+            result["delta_rms"] = delta.square().mean().sqrt()
+            result["delta_max"] = delta.max()
+        return result

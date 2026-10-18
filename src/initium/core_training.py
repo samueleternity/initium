@@ -1883,7 +1883,9 @@ def run(
         rnn.workspace.set_diagnostics_enabled(moe_diagnostics_enabled)
         rnn.workspace_bistable_deterministic = workspace_bistable_deterministic
         if workspace_train_scope == "gate":
-            rnn.workspace._initium_recurrent_state_observer = segment_diagnostics.observe_recurrent_state
+            rnn.workspace._initium_recurrent_state_observer = (
+                segment_diagnostics.observe_recurrent_state
+            )
 
     def emit_failure_diagnostics(channel: str, *, include_gradients: bool = False) -> None:
         segment_diagnostics.emit(channel, include_gradients=include_gradients)

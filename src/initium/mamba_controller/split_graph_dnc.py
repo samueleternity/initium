@@ -657,11 +657,12 @@ class SplitGraphDNC(nn.Module):
             for stage in backbone_stages[:-1]:
                 stage_input = stage(stage_input, token_mask=sequence_valid_mask)
             final_stage = backbone_stages[-1]
-            if not hasattr(final_stage, "forward_with_specialists"):
+            forward_with_specialists = getattr(final_stage, "forward_with_specialists", None)
+            if not callable(forward_with_specialists):
                 raise RuntimeError(
                     "workspace requires the final parallel-backbone stage to expose its MoE specialists"
                 )
-            base, specialists, route_indices, route_weights = final_stage.forward_with_specialists(
+            base, specialists, route_indices, route_weights = forward_with_specialists(
                 stage_input, token_mask=sequence_valid_mask
             )
             broadcast_delta, workspace_state = self.workspace(

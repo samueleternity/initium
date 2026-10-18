@@ -397,7 +397,9 @@ class CfCControllerWrapper(nn.Module):
             report_parameter_health("in_adapter", self.in_adapter)
             for index, adapter in enumerate(self.source_in_adapters):
                 report_parameter_health(f"source_adapter.{index}", adapter)
+            assert self.moe_blocks is not None
             multisource_moe = self.moe_blocks[0]
+            assert isinstance(multisource_moe, MultiSourceMoEBlock)
             report_parameter_health("multisource.norm", multisource_moe.norm)
             report_parameter_health("multisource.source_embed", multisource_moe.source_embed)
             report_parameter_health("switch_moe.router", multisource_moe.moe.router)

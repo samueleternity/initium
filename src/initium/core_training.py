@@ -1762,7 +1762,7 @@ def run(
         "workspace_bistable_deterministic": workspace_bistable_deterministic,
         "workspace_stability_max_activation": workspace_stability_max_activation,
     }
-    controller_model_config = {}
+    controller_model_config: dict[str, Any] = {}
     if controller == "mamba":
         controller_model_config = {
             "mamba_d_state": MAMBA_D_STATE,
@@ -1817,7 +1817,7 @@ def run(
             "cfc_residual": CFC_RESIDUAL,
             "hybrid_cfc_num_blocks": HYBRID_CFC_NUM_BLOCKS,
         }
-    expected_resume_model_config = {
+    expected_resume_model_config: dict[str, Any] = {
         "input_size": INPUT_DIM,
         "hidden_size": hidden_size,
         "num_hidden_layers": getattr(rnn, "num_hidden_layers", None),
@@ -1883,9 +1883,7 @@ def run(
         rnn.workspace.set_diagnostics_enabled(moe_diagnostics_enabled)
         rnn.workspace_bistable_deterministic = workspace_bistable_deterministic
         if workspace_train_scope == "gate":
-            rnn.workspace._initium_recurrent_state_observer = (
-                segment_diagnostics.observe_recurrent_state
-            )
+            rnn.workspace._initium_recurrent_state_observer = segment_diagnostics.observe_recurrent_state
 
     def emit_failure_diagnostics(channel: str, *, include_gradients: bool = False) -> None:
         segment_diagnostics.emit(channel, include_gradients=include_gradients)
@@ -3014,13 +3012,18 @@ def run(
                 parts.append(dyn_n_str.strip(" |"))
             if bistable_grad_probe is not None:
                 probe_steps = max(bistable_grad_probe_steps, 1)
-                per_parameter = []
+                per_parameter: list[tuple[float, str, float, int]] = []
                 for name, probe in bistable_grad_probe.items():
                     rms = (probe["sum_sq"] / probe_steps).sqrt()
-                    maximum = probe["max"]
+                    maximum_tensor = probe["max"]
                     maximum_step = int(probe["max_step"].cpu())
                     per_parameter.append(
-                        (float(maximum.cpu()), name, float(rms.cpu()), maximum_step)
+                        (
+                            float(maximum_tensor.cpu()),
+                            name,
+                            float(rms.cpu()),
+                            maximum_step,
+                        )
                     )
                 per_parameter.sort(reverse=True)
                 parameter_summary = (

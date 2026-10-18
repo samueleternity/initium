@@ -14,7 +14,8 @@ def test_bistable_gate_commits_hard_writes_with_finite_gradients():
         selection,
         selection_confidence=confidence,
     )
-    assert torch.all((committed == 0) | (committed == 1))
+    forward_values = committed.detach()
+    assert torch.all((forward_values == 0) | (forward_values == 1))
     assert torch.isfinite(probabilities).all()
 
     committed.sum().backward()

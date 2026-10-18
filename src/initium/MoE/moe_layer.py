@@ -82,6 +82,7 @@ itself check (see Experiment-Roadmap.md, "Option 4" failure-mode table):
 from __future__ import annotations
 
 import math
+from typing import cast
 
 import torch
 import torch.nn as nn
@@ -154,7 +155,9 @@ class SwitchMoE(nn.Module):
         self.top_k = top_k
 
         self.router = nn.Linear(d_model, num_experts, bias=False)
-        self.experts = nn.ModuleList([Expert(d_model, expert_dim) for _ in range(num_experts)])
+        self.experts: nn.ModuleList = nn.ModuleList(
+            [Expert(d_model, expert_dim) for _ in range(num_experts)]
+        )
 
         self._aux_losses: list[torch.Tensor] = []
         # Routing/activation reports are useful for experiments but can be
@@ -316,20 +319,21 @@ class SwitchMoE(nn.Module):
             dispatch = dispatch.index_add(0, dispatch_indices, route_inputs)
             dispatch = dispatch.reshape(self.num_experts, capacity, d_model)
 
-            expert_outputs = []
-            for expert_index, expert in enumerate(self.experts):
+            expert_output_list: list[torch.Tensor] = []
+            for expert_index, raw_expert in enumerate(self.experts):
+                expert = cast(Expert, raw_expert)
                 expert_input = dispatch[expert_index]
                 expert_hidden = F.linear(
                     expert_input, expert.w_in.weight.float(), expert.w_in.bias.float()
                 ).relu()
-                expert_outputs.append(
+                expert_output_list.append(
                     F.linear(
                         expert_hidden,
                         expert.w_out.weight.float(),
                         expert.w_out.bias.float(),
                     )
                 )
-            expert_outputs = torch.stack(expert_outputs, dim=0)
+            expert_outputs = torch.stack(expert_output_list, dim=0)
             expert_outputs = trace("expert_outputs", expert_outputs)
 
             # Both advanced indices must have identical (T, top_k) shapes.
@@ -357,23 +361,22 @@ class SwitchMoE(nn.Module):
                 # specialist candidates, including experts not selected by
                 # the sparse route. Keep this expensive activation path
                 # explicit, while still using each expert's shared weights.
-                expert_out_all = torch.stack(
-                    [
+                all_expert_outputs: list[torch.Tensor] = []
+                for raw_expert in self.experts:
+                    expert = cast(Expert, raw_expert)
+                    hidden = F.linear(
+                        flat32,
+                        expert.w_in.weight.float(),
+                        expert.w_in.bias.float(),
+                    ).relu()
+                    all_expert_outputs.append(
                         F.linear(
-                            F.relu(
-                                F.linear(
-                                    flat32,
-                                    expert.w_in.weight.float(),
-                                    expert.w_in.bias.float(),
-                                )
-                            ),
+                            hidden,
                             expert.w_out.weight.float(),
                             expert.w_out.bias.float(),
                         )
-                        for expert in self.experts
-                    ],
-                    dim=1,
-                )
+                    )
+                expert_out_all = torch.stack(all_expert_outputs, dim=1)
 
         # Keep the result in fp32 when the input was autocast to fp16/bf16.
         # Casting a large but finite fp32 expert result back to fp16 can
@@ -385,6 +388,7 @@ class SwitchMoE(nn.Module):
         output = output32.to(output_dtype)
 
         if collect_diagnostics:
+            assert accepted_outputs is not None
             with torch.no_grad():
                 one_hot_k = F.one_hot(topk_idx, num_classes=self.num_experts).float()
                 self._last_accepted = keep.detach()
@@ -448,6 +452,7 @@ class SwitchMoE(nn.Module):
 
         output = output.reshape(orig_shape)
         if return_details:
+            assert expert_out_all is not None
             expert_shape = (*orig_shape[:-1], self.num_experts, d_model)
             route_shape = (*orig_shape[:-1], top_k)
             return (

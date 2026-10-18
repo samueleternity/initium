@@ -60,14 +60,32 @@ a correctness regression - there is no reason to remove it once applied.
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
+from typing import TypedDict
 
 import torch
 
 _EPS = 1e-6
 _PATCHED_ATTR = "_nvrtc_compat_patched"
 _STRICT_NEGATIVE_CHECK = os.environ.get("INITIUM_NVRTC_COMPAT_STRICT", "0") == "1"
-_PRODUCT_BACKWARD_TRACE: tuple[bool, object | None] = (False, None)
-_PRODUCT_INPUT_STATS: dict[str, dict[str, torch.Tensor | int]] = {}
+ProductInputStats = TypedDict(
+    "ProductInputStats",
+    {
+        "min": torch.Tensor,
+        "max": torch.Tensor,
+        "lt_1e-6_fraction": torch.Tensor,
+        "negative_fraction": torch.Tensor,
+        "nonfinite_fraction": torch.Tensor,
+        "calls": int,
+    },
+)
+
+
+_PRODUCT_BACKWARD_TRACE: tuple[bool, Callable[[str, torch.Tensor], None] | None] = (
+    False,
+    None,
+)
+_PRODUCT_INPUT_STATS: dict[str, ProductInputStats] = {}
 
 _orig_prod = torch.prod
 _orig_cumprod = torch.cumprod
@@ -86,7 +104,9 @@ def _log_space(input: torch.Tensor, dim, keepdim: bool, cumulative: bool) -> tor
     return torch.exp(reduced).to(orig_dtype)
 
 
-def set_product_backward_trace(enabled: bool, reporter=None) -> None:
+def set_product_backward_trace(
+    enabled: bool, reporter: Callable[[str, torch.Tensor], None] | None = None
+) -> None:
     """Attach an optional diagnostic hook to patched product outputs."""
     global _PRODUCT_BACKWARD_TRACE
     _PRODUCT_BACKWARD_TRACE = (bool(enabled), reporter)
@@ -108,19 +128,21 @@ def _record_product_input(input: torch.Tensor, operation: str) -> None:
     if not enabled:
         return
     values = input.detach().float()
-    metrics = {
+    metrics: ProductInputStats = {
         "min": values.amin(),
         "max": values.amax(),
         "lt_1e-6_fraction": (values.abs() < _EPS).float().mean(),
         "negative_fraction": (values < 0).float().mean(),
         "nonfinite_fraction": (~torch.isfinite(values)).float().mean(),
+        "calls": 0,
     }
     if operation in _PRODUCT_INPUT_STATS:
         previous = _PRODUCT_INPUT_STATS[operation]
         previous["min"] = torch.minimum(previous["min"], metrics["min"])
         previous["max"] = torch.maximum(previous["max"], metrics["max"])
-        for name in ("lt_1e-6_fraction", "negative_fraction", "nonfinite_fraction"):
-            previous[name] = previous[name] + metrics[name]
+        previous["lt_1e-6_fraction"] += metrics["lt_1e-6_fraction"]
+        previous["negative_fraction"] += metrics["negative_fraction"]
+        previous["nonfinite_fraction"] += metrics["nonfinite_fraction"]
         previous["calls"] = int(previous["calls"]) + 1
     else:
         metrics["calls"] = 1
@@ -134,10 +156,15 @@ def pop_product_numerical_diagnostics() -> dict[str, float]:
         calls = max(1, int(metrics["calls"]))
         result[f"{operation}_input_min"] = float(metrics["min"].detach().cpu().item())
         result[f"{operation}_input_max"] = float(metrics["max"].detach().cpu().item())
-        for name in ("lt_1e-6_fraction", "negative_fraction", "nonfinite_fraction"):
-            result[f"{operation}_input_{name}"] = float(
-                (metrics[name] / calls).detach().cpu().item()
-            )
+        result[f"{operation}_input_lt_1e-6_fraction"] = float(
+            (metrics["lt_1e-6_fraction"] / calls).detach().cpu().item()
+        )
+        result[f"{operation}_input_negative_fraction"] = float(
+            (metrics["negative_fraction"] / calls).detach().cpu().item()
+        )
+        result[f"{operation}_input_nonfinite_fraction"] = float(
+            (metrics["nonfinite_fraction"] / calls).detach().cpu().item()
+        )
         result[f"{operation}_calls"] = float(calls)
     _PRODUCT_INPUT_STATS.clear()
     return result

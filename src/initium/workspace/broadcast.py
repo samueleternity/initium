@@ -372,8 +372,8 @@ class WorkspaceBroadcast(nn.Module):
         deterministic_gate: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Process time-major specialists ``(B,T,E,D)`` sequentially."""
-        outputs = []
-        step_diags = [] if self.diagnostics_enabled else None
+        outputs: list[torch.Tensor] = []
+        step_diags: list[dict[str, torch.Tensor]] | None = [] if self.diagnostics_enabled else None
         state_observer = getattr(self, "_initium_recurrent_state_observer", None)
         for step in range(specialist_deltas.shape[1]):
             # Truncate only the gradient carried by persistent slots. Detach

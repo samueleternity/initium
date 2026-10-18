@@ -8,10 +8,12 @@ Mamba+CfC, recurrent DNC, and workspace models.
 from __future__ import annotations
 
 from collections import OrderedDict
+from collections.abc import Mapping
 from typing import Any
 
 import torch
 from torch import nn
+from torch.utils.hooks import RemovableHandle
 
 
 def _first_tensor(value: Any) -> torch.Tensor | None:
@@ -138,7 +140,7 @@ class SegmentDiagnostics:
         self._records: dict[str, OrderedDict[str, dict[str, Any]]] = {}
         self._segments: list[tuple[str, str]] = []
         self._external_modules: list[tuple[str, nn.Module]] = []
-        self._handles = []
+        self._handles: list[RemovableHandle] = []
         self._nonfinite_trace_enabled = False
         self._nonfinite_trace_reported = False
         if not self.enabled:
@@ -565,7 +567,7 @@ class SegmentDiagnostics:
         """Check captured forward maxima against the optional safety limit."""
         if not self.enabled or self.activation_absmax_limit is None:
             return False, 0.0, None
-        records = self._records.get(channel, {})
+        records: Mapping[str, dict[str, Any]] = self._records.get(channel, {})
         candidates: list[tuple[str, torch.Tensor]] = []
         for label, record in records.items():
             secondary_output_maxima = (

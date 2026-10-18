@@ -76,10 +76,12 @@ class _TopKAllocationMixin:
     """
 
     nr_cells: int
-    allocation_topk: int
+    allocation_topk: int | None
 
     def allocate(self, usage: torch.Tensor, write_gate: torch.Tensor):
         usage = δ + (1 - δ) * usage
+        if self.allocation_topk is None:
+            raise RuntimeError("top-k allocation requires allocation_topk")
         k = min(self.allocation_topk, self.nr_cells)
         sorted_usage, order = torch.topk(usage, k, dim=1, largest=False)
         leading_one = torch.ones((usage.size(0), 1), device=usage.device, dtype=usage.dtype)

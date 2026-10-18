@@ -295,11 +295,11 @@ class MambaBackboneParallel(nn.Module):
         # MambaControllerWrapper) -- this single call is the entire
         # "backbone half" of the Option 5 split.
         h = self.in_adapter(x)
+        moe_blocks = self.moe_blocks
         for i, block in enumerate(self.blocks):
             h = block(h)
-            if self.moe_enabled and isinstance(self.moe_blocks[i], MoEBlock):
-                assert self.moe_blocks is not None
-                h = self.moe_blocks[i](h, token_mask=token_mask)
+            if moe_blocks is not None and isinstance(moe_blocks[i], MoEBlock):
+                h = moe_blocks[i](h, token_mask=token_mask)
         return h
 
     def forward_with_specialists(self, x: torch.Tensor, *, token_mask: torch.Tensor | None = None):

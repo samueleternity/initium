@@ -169,7 +169,11 @@ class BistableWriteGate(nn.Module):
                     debug_iterations.append(self._iteration_diagnostics(activity, previous, valid))
 
         hard = (activity >= 0.5).to(activity.dtype)
-        committed = hard + activity - activity.detach()
+        # Parenthesize the zero-valued straight-through residual.  Evaluating
+        # ``hard + activity - activity.detach()`` left-to-right can introduce
+        # round-off around the hard 0/1 forward values when activity is added
+        # before it is subtracted.
+        committed = hard + (activity - activity.detach())
         committed = committed * valid.unsqueeze(-1).to(committed.dtype)
         if collect_diagnostics:
             with torch.no_grad():

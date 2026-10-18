@@ -168,6 +168,7 @@ from dnc import DNC
 from dnc.memory import Memory
 from dnc.util import cuda
 
+from initium.memory_manipulation.dnc_mechanisms import OptimizedMemory
 from initium.MoE.moe_layer import MoEBlock, MoERNNWrapper
 
 _MAMBA_IMPORT_ERROR: str | None
@@ -603,7 +604,11 @@ class MambaDNC(DNC):
         moe_capacity_factor: float = 1.5,
         moe_load_balance_alpha: float = 0.01,
         moe_top_k: int = 1,
+        dnc_implementation: str = "base",
     ):
+        if dnc_implementation not in ("base", "optimized"):
+            raise ValueError("dnc_implementation must be 'base' or 'optimized'")
+        memory_cls = OptimizedMemory if dnc_implementation == "optimized" else Memory
         if rnn_type.lower() not in ("mamba", "mamba2", "mamba3", "cfc") and not is_hybrid_rnn_type(
             rnn_type
         ):
@@ -626,6 +631,10 @@ class MambaDNC(DNC):
                 clip=clip,
                 device=device,
             )
+            if dnc_implementation == "optimized":
+                for memory in self.memories:
+                    memory.__class__ = OptimizedMemory
+            self.dnc_implementation = dnc_implementation
             if moe_enabled:
                 # Basic MoE for the plain LSTM/GRU/RNN baseline (per the
                 # roadmap: the shallow baseline controller only needs a
@@ -697,6 +706,7 @@ class MambaDNC(DNC):
         self.debug = debug
         self.clip = clip
         self.device = device
+        self.dnc_implementation = dnc_implementation
 
         # Mamba-only bookkeeping, stored for __repr__ / checkpoint metadata.
         self.mamba_d_state = mamba_d_state
@@ -887,7 +897,7 @@ class MambaDNC(DNC):
             # memories for each layer -- copied verbatim from dnc.DNC.__init__
             if not self.share_memory_between_layers:
                 self.memories.append(
-                    Memory(
+                    memory_cls(
                         input_size=self.output_size,
                         nr_cells=self.nr_cells,
                         cell_size=self.w,
@@ -902,7 +912,7 @@ class MambaDNC(DNC):
         # dnc.DNC.__init__
         if self.share_memory_between_layers:
             self.memories.append(
-                Memory(
+                memory_cls(
                     input_size=self.output_size,
                     nr_cells=self.nr_cells,
                     cell_size=self.w,

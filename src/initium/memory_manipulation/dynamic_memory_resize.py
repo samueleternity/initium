@@ -50,7 +50,12 @@ import torch
 import torch.nn as nn
 from dnc.memory import Memory
 
-from initium.memory_manipulation.dnc_mechanisms import MechanismMemory, build_memory
+from initium.memory_manipulation.dnc_mechanisms import (
+    MechanismMemory,
+    OptimizedMemory,
+    build_memory,
+    compile_memory_forward,
+)
 from initium.memory_manipulation.link_matrix_ablation import AblatableSparseLinkMemory
 
 
@@ -104,6 +109,7 @@ def resize_memory(model, new_nr_cells: int, device=None, layer: int = 0, optimiz
         independent_linears=True,
         device=device,
     )
+    dnc_implementation = getattr(old_memory, "dnc_implementation", "base")
     if isinstance(old_memory, MechanismMemory):
         new_memory = build_memory(
             **memory_args,
@@ -112,9 +118,13 @@ def resize_memory(model, new_nr_cells: int, device=None, layer: int = 0, optimiz
             read_residual_scale=old_memory.read_residual_scale,
             read_residual_max_ratio=old_memory.read_residual_max_ratio,
             observation_variance=old_memory.observation_variance,
+            link_sharpness=old_memory.link_sharpness,
+            allocation_topk=old_memory.allocation_topk,
+            dnc_implementation=dnc_implementation,
         ).to(device)
     else:
-        new_memory = Memory(**memory_args).to(device)
+        memory_cls = OptimizedMemory if dnc_implementation == "optimized" else Memory
+        new_memory = memory_cls(**memory_args).to(device)
 
     # Transplant every N-independent learned sublayer except
     # write_vector_transform (that one is a StochasticWriteHead, not a
@@ -147,6 +157,11 @@ def resize_memory(model, new_nr_cells: int, device=None, layer: int = 0, optimiz
         new_memory.link_matrix_mode = old_memory.link_matrix_mode
         if hasattr(old_memory, "link_matrix_topk"):
             new_memory.link_matrix_topk = old_memory.link_matrix_topk
+
+    # Compilation is execution-only state and is not represented in a state
+    # dict. Preserve it when the curriculum replaces the size-dependent memory.
+    if getattr(old_memory, "_initium_compiled_forward", False):
+        compile_memory_forward(new_memory)
 
     model.memories[layer] = new_memory
     # model.memories is a plain python list, not an nn.ModuleList -- the

@@ -157,7 +157,7 @@ def _build_split_graph(c: _Cfg, input_dim, hidden, nr_cells, cell_size, read_hea
         ),
     )
     _moe = _moe_kwargs(c)
-    return SplitGraphDNC(
+    model = SplitGraphDNC(
         input_size=input_dim,
         hidden_size=hidden,
         nr_cells=nr_cells,
@@ -187,8 +187,14 @@ def _build_split_graph(c: _Cfg, input_dim, hidden, nr_cells, cell_size, read_hea
         dnc_write_observation_variance=c.get(
             "dnc_write_observation_variance", cc.DNC_WRITE_OBSERVATION_VARIANCE
         ),
+        dnc_link_sharpness=c.get("dnc_link_sharpness", 1.0),
+        dnc_allocation_topk=c.get("dnc_allocation_topk", None),
+        dnc_implementation=c.get("dnc_implementation", "base"),
         independent_linears=True,
         moe_enabled=_moe["moe_enabled"],
+        moe_placement=c.get("split_graph_moe_placement", "all"),
+        moe_backbone_block_isolation=c.get("split_graph_moe_backbone_block_isolation", None),
+        moe_backbone_residual_scale=c.get("split_graph_moe_backbone_residual_scale", 1.0),
         moe_num_experts=_moe["moe_num_experts"],
         moe_expert_dim=_moe["moe_expert_dim"],
         moe_top_k=_moe["moe_top_k"],
@@ -198,8 +204,27 @@ def _build_split_graph(c: _Cfg, input_dim, hidden, nr_cells, cell_size, read_hea
             "split_graph_combiner_cfc_multi_source_moe",
             cc.SPLIT_GRAPH_COMBINER_CFC_MULTI_SOURCE_MOE,
         ),
+        workspace_enabled=c.get("workspace_enabled", cc.WORKSPACE_ENABLED),
+        workspace_num_slots=c.get("workspace_num_slots", cc.WORKSPACE_NUM_SLOTS),
+        workspace_no_selection=c.get("workspace_no_selection", cc.WORKSPACE_NO_SELECTION),
+        workspace_reset_each_step=c.get("workspace_reset_each_step", cc.WORKSPACE_RESET_EACH_STEP),
+        workspace_train_mode=c.get("workspace_train_mode", cc.WORKSPACE_TRAIN_MODE),
+        workspace_gate_variant=c.get("workspace_gate_variant", "continuous"),
+        workspace_bistable_selection_scale=c.get("workspace_bistable_selection_scale", 1.0),
+        workspace_bistable_noise_scale=c.get("workspace_bistable_noise_scale", 0.75),
+        workspace_bistable_gradient_mode=c.get("workspace_bistable_gradient_mode", "truncated"),
+        workspace_bptt_horizon=c.get("workspace_bptt_horizon", 0),
+        workspace_reconsideration_enabled=c.get("workspace_reconsideration_enabled", False),
+        workspace_reconsideration_surprise_threshold=c.get(
+            "workspace_reconsideration_surprise_threshold", 0.5
+        ),
+        workspace_reconsideration_trigger_mode=c.get(
+            "workspace_reconsideration_trigger_mode", "innovation"
+        ),
         device=device,
     ).to(device)
+    model.workspace_bistable_deterministic = c.get("workspace_bistable_deterministic", False)
+    return model
 
 
 def load_model(ckpt: dict, device: torch.device, deterministic_write: bool = False) -> LoadedModel:
@@ -227,6 +252,7 @@ def load_model(ckpt: dict, device: torch.device, deterministic_write: bool = Fal
             batch_first=True,
             device=device,
             independent_linears=True,
+            dnc_implementation=raw.get("dnc_implementation", "base"),
             **_controller_kwargs(controller, c),
             **extra,
         ).to(device)

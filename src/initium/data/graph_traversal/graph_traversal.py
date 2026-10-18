@@ -333,9 +333,7 @@ class TraversalCurriculum:
             ep = build_traversal_episode(num_nodes, out_degree_range, path_len_range)
         return ep
 
-    def maybe_advance(
-        self, model, device, step=None, optimizer=None, *, allow_advance=True
-    ):
+    def maybe_advance(self, model, device, step=None, optimizer=None, *, allow_advance=True):
         """Returns (lesson, id_triple_acc, id_perfect_frac). Eval samples
         num_nodes over the lesson's nodes_range (as trained), or walks the
         fixed custom_graph when one was supplied; the gate advances on

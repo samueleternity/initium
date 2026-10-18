@@ -17,7 +17,7 @@ from torch import nn
 def _first_tensor(value: Any) -> torch.Tensor | None:
     if torch.is_tensor(value):
         return value
-    if isinstance(value, (tuple, list)):
+    if isinstance(value, tuple | list):
         for item in value:
             found = _first_tensor(item)
             if found is not None:
@@ -41,7 +41,7 @@ def _all_tensors(value: Any) -> list[torch.Tensor]:
             if identity not in seen:
                 seen.add(identity)
                 tensors.append(item)
-        elif isinstance(item, (tuple, list)):
+        elif isinstance(item, tuple | list):
             for child in item:
                 visit(child)
         elif isinstance(item, dict):
@@ -85,7 +85,11 @@ def _segment_label(path: str, module: nn.Module) -> str | None:
         return f"controller.cfc:{leaf}"
     if class_name == "CfCControllerBlock":
         return f"controller.cfc_block:{leaf}"
-    if class_name in {"MambaControllerWrapper", "Mamba2ControllerWrapper", "Mamba3ControllerWrapper"}:
+    if class_name in {
+        "MambaControllerWrapper",
+        "Mamba2ControllerWrapper",
+        "Mamba3ControllerWrapper",
+    }:
         return f"controller.{class_name.removesuffix('ControllerWrapper').lower()}:{leaf}"
     if class_name in {
         "MambaControllerBlock",
@@ -191,7 +195,7 @@ class SegmentDiagnostics:
             if (
                 location is not None
                 and label.startswith("workspace_bistable_gate:")
-                and isinstance(output, (tuple, list))
+                and isinstance(output, tuple | list)
                 and len(output) > 1
                 and torch.is_tensor(output[1])
                 and output_tensor is not None
@@ -207,7 +211,10 @@ class SegmentDiagnostics:
                 self._accumulate_tensor(record, "in", input_tensor, location=location)
                 if input_tensor.requires_grad:
                     input_tensor.register_hook(
-                        lambda grad, target=record, call_location=location, context=input_context: self._accumulate_tensor(
+                        lambda grad,
+                        target=record,
+                        call_location=location,
+                        context=input_context: self._accumulate_tensor(
                             target,
                             "grad_in",
                             grad,
@@ -219,7 +226,10 @@ class SegmentDiagnostics:
                 self._accumulate_tensor(record, "out", output_tensor, location=location)
                 if output_tensor.requires_grad:
                     output_tensor.register_hook(
-                        lambda grad, target=record, call_location=location, context=output_context: self._accumulate_tensor(
+                        lambda grad,
+                        target=record,
+                        call_location=location,
+                        context=output_context: self._accumulate_tensor(
                             target,
                             "grad_out",
                             grad,
@@ -257,7 +267,9 @@ class SegmentDiagnostics:
                         target=record,
                         call_location=location,
                         prefix=gradient_prefix,
-                        context=output_context if output_index == 1 else None: self._accumulate_tensor(
+                        context=output_context
+                        if output_index == 1
+                        else None: self._accumulate_tensor(
                             target,
                             prefix,
                             grad,
@@ -293,9 +305,7 @@ class SegmentDiagnostics:
                     if finite_values.numel()
                     else float("nan")
                 )
-                call_location = (
-                    f" step={location[0]} call={location[1]}" if location else ""
-                )
+                call_location = f" step={location[0]} call={location[1]}" if location else ""
                 print(
                     f"[segment-first-nonfinite] {record['path']} {prefix}"
                     f"{call_location} bad={bad_fraction:.3%} "
@@ -326,9 +336,7 @@ class SegmentDiagnostics:
                     )
                     for context_name, context_value in (context or {}).items():
                         context_key = f"{key}_context_{context_name}"
-                        previous_context = record.get(
-                            context_key, torch.zeros_like(context_value)
-                        )
+                        previous_context = record.get(context_key, torch.zeros_like(context_value))
                         record[context_key] = torch.where(
                             is_new_max, context_value.to(previous_context), previous_context
                         )
@@ -384,11 +392,7 @@ class SegmentDiagnostics:
             label, {"path": label, "calls": 0}
         )
         record["calls"] += 1
-        location = (
-            (self._current_step, call_index)
-            if self._current_step is not None
-            else None
-        )
+        location = (self._current_step, call_index) if self._current_step is not None else None
         self._accumulate_tensor(record, "out", tensor, location=location)
         if tensor.requires_grad:
             tensor.register_hook(
@@ -454,14 +458,12 @@ class SegmentDiagnostics:
             secondary_output_indices = sorted(
                 int(key[4:-6])
                 for key in record
-                if key.startswith("out_") and key.endswith("_numel")
-                and key[4:-6].isdigit()
+                if key.startswith("out_") and key.endswith("_numel") and key[4:-6].isdigit()
             )
             secondary_input_indices = sorted(
                 int(key[8:-6])
                 for key in record
-                if key.startswith("grad_in_") and key.endswith("_numel")
-                and key[8:-6].isdigit()
+                if key.startswith("grad_in_") and key.endswith("_numel") and key[8:-6].isdigit()
             )
             gradient_prefixes.extend(
                 f"grad_in_{input_index}" for input_index in secondary_input_indices
@@ -483,9 +485,7 @@ class SegmentDiagnostics:
                         for name, value in record.items()
                         if name.startswith(f"{maximum_key}_context_")
                     }
-                    locations[prefix] = (
-                        int(step_value.cpu()), int(call_value.cpu()), context
-                    )
+                    locations[prefix] = (int(step_value.cpu()), int(call_value.cpu()), context)
             metrics = [
                 ("in", record.get("in_numel", 0), "in"),
                 ("out", record.get("out_numel", 0), "out"),
@@ -503,7 +503,11 @@ class SegmentDiagnostics:
             for output_index in secondary_output_indices:
                 metrics.extend(
                     (
-                        (f"out_{output_index}", record.get(f"out_{output_index}_numel", 0), f"out{output_index}"),
+                        (
+                            f"out_{output_index}",
+                            record.get(f"out_{output_index}_numel", 0),
+                            f"out{output_index}",
+                        ),
                         (
                             f"grad_out_{output_index}",
                             record.get(f"grad_out_{output_index}_numel", 0),
@@ -511,9 +515,7 @@ class SegmentDiagnostics:
                         ),
                     )
                 )
-            record_shapes.append(
-                (label, record["calls"], metrics, locations)
-            )
+            record_shapes.append((label, record["calls"], metrics, locations))
             for prefix, _, _ in metrics:
                 for suffix in ("sum_sq", "max", "bad"):
                     item = record.get(f"{prefix}_{suffix}")
@@ -521,7 +523,9 @@ class SegmentDiagnostics:
                         item = torch.zeros((), device=next(self.model.parameters()).device)
                     scalar_tensors.append(item.detach().float().reshape(()))
         gradient_shapes = list(gradient_records.items())
-        scalar_tensors.extend(value.detach().float().reshape(()) for value, _ in gradient_records.values())
+        scalar_tensors.extend(
+            value.detach().float().reshape(()) for value, _ in gradient_records.values()
+        )
         if scalar_tensors:
             values = torch.stack(scalar_tensors).cpu().tolist()
         else:
@@ -542,9 +546,7 @@ class SegmentDiagnostics:
                             f"{name}={value:.3g}" for name, value in context.items()
                         )
                         context_suffix = f",{context_text}" if context_text else ""
-                        location_text = (
-                            f"@step{location_step}/call{location_call}{context_suffix}"
-                        )
+                        location_text = f"@step{location_step}/call{location_call}{context_suffix}"
                     summaries.append(
                         f"{display}:rms={(sum_sq / numel) ** 0.5:.3g},"
                         f"max={maximum:.3g}{location_text},nonfinite={bad / numel:.2%}"

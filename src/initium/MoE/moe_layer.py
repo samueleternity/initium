@@ -252,22 +252,21 @@ class SwitchMoE(nn.Module):
         # costly for recurrent MoE calls. The one-hot form is built only when
         # detailed reports are enabled and token-subset statistics need it.
         if self.training:
-            f_i = torch.bincount(
-                topk_idx.reshape(-1), minlength=self.num_experts
-            ).to(dtype=probs.dtype) / max(num_tokens * top_k, 1)
+            f_i = torch.bincount(topk_idx.reshape(-1), minlength=self.num_experts).to(
+                dtype=probs.dtype
+            ) / max(num_tokens * top_k, 1)
             P_i = probs.mean(dim=0)
             aux_loss = self.load_balance_alpha * self.num_experts * (f_i * P_i).sum()
             self._aux_losses.append(aux_loss)
         elif collect_diagnostics:
-            f_i = torch.bincount(
-                topk_idx.reshape(-1), minlength=self.num_experts
-            ).to(dtype=probs.dtype) / max(num_tokens * top_k, 1)
+            f_i = torch.bincount(topk_idx.reshape(-1), minlength=self.num_experts).to(
+                dtype=probs.dtype
+            ) / max(num_tokens * top_k, 1)
             P_i = probs.mean(dim=0)
 
         if collect_diagnostics:
             with torch.no_grad():
                 self._last_topk_idx = topk_idx.detach()
-
 
         # Expert capacity, scaled by top_k (each slot competes for the same
         # per-expert buffer).
@@ -283,20 +282,21 @@ class SwitchMoE(nn.Module):
         flat_priority = topk_prob.reshape(-1)
         priority_order = torch.argsort(flat_priority, descending=True, stable=True)
         expert_in_priority_order = flat_idx.index_select(0, priority_order)
-        one_hot_priority = F.one_hot(
-            expert_in_priority_order, num_classes=self.num_experts
+        one_hot_priority = F.one_hot(expert_in_priority_order, num_classes=self.num_experts)
+        ranks_in_priority_order = (
+            one_hot_priority.cumsum(dim=0)
+            .gather(1, expert_in_priority_order.unsqueeze(1))
+            .squeeze(1)
+            - 1
         )
-        ranks_in_priority_order = one_hot_priority.cumsum(dim=0).gather(
-            1, expert_in_priority_order.unsqueeze(1)
-        ).squeeze(1) - 1
         rank_in_expert = torch.empty_like(ranks_in_priority_order)
         rank_in_expert.scatter_(0, priority_order, ranks_in_priority_order)
         keep = (rank_in_expert < capacity).reshape(num_tokens, top_k)
         accepted_gates = gate_weights * keep.to(gate_weights.dtype)
         if top_k > 1:
-            accepted_gates = accepted_gates / accepted_gates.sum(
-                dim=-1, keepdim=True
-            ).clamp_min(1e-9)
+            accepted_gates = accepted_gates / accepted_gates.sum(dim=-1, keepdim=True).clamp_min(
+                1e-9
+            )
 
         with torch.autocast(device_type=x.device.type, enabled=False):
             # Dispatch activations into fixed-capacity expert buffers. The
@@ -380,9 +380,7 @@ class SwitchMoE(nn.Module):
         # create an Inf before the residual or DNC path has a chance to
         # stabilize it. The surrounding residual naturally promotes to fp32.
         output_dtype = (
-            torch.float32
-            if flat.dtype in (torch.float16, torch.bfloat16)
-            else flat.dtype
+            torch.float32 if flat.dtype in (torch.float16, torch.bfloat16) else flat.dtype
         )
         output = output32.to(output_dtype)
 
@@ -413,9 +411,7 @@ class SwitchMoE(nn.Module):
                 if token_mask_flat is not None:
                     valid = token_mask_flat
                     padded = ~valid
-                    per_token_entropy = -(
-                        probs * probs.clamp_min(1e-9).log()
-                    ).sum(dim=-1)
+                    per_token_entropy = -(probs * probs.clamp_min(1e-9).log()).sum(dim=-1)
                     per_token_max_prob = probs.max(dim=-1).values
                     per_token_drop = 1.0 - keep.float().mean(dim=-1)
 
@@ -423,13 +419,10 @@ class SwitchMoE(nn.Module):
                         subset_weight = subset.to(probs.dtype)
                         count = subset_weight.sum()
                         denom = count.clamp_min(1.0)
-                        subset_load = (
-                            one_hot_k
-                            * subset_weight[:, None, None]
-                        ).sum(dim=(0, 1)) / (denom * top_k)
-                        subset_importance = (
-                            probs * subset_weight[:, None]
-                        ).sum(dim=0) / denom
+                        subset_load = (one_hot_k * subset_weight[:, None, None]).sum(dim=(0, 1)) / (
+                            denom * top_k
+                        )
+                        subset_importance = (probs * subset_weight[:, None]).sum(dim=0) / denom
                         entropy = (per_token_entropy * subset_weight).sum() / denom
                         max_prob = (per_token_max_prob * subset_weight).sum() / denom
                         drop_frac = (per_token_drop * subset_weight).sum() / denom
@@ -682,9 +675,7 @@ class MultiSourceMoEBlock(nn.Module):
         if device is not None and getattr(device, "type", None) == "cuda":
             self.to(device)
 
-    def forward(
-        self, sources: list[torch.Tensor], *, gradient_trace=None
-    ) -> list[torch.Tensor]:
+    def forward(self, sources: list[torch.Tensor], *, gradient_trace=None) -> list[torch.Tensor]:
         if len(sources) != self.num_sources:
             raise ValueError(
                 f"MultiSourceMoEBlock: expected {self.num_sources} source tensors, "
@@ -694,12 +685,9 @@ class MultiSourceMoEBlock(nn.Module):
         normalized = [self.norm(source) for source in sources]
         if gradient_trace is not None:
             normalized = [
-                gradient_trace(f"multisource.norm.{i}", value)
-                for i, value in enumerate(normalized)
+                gradient_trace(f"multisource.norm.{i}", value) for i, value in enumerate(normalized)
             ]
-        embedded = [
-            self.source_embed(value, i) for i, value in enumerate(normalized)
-        ]
+        embedded = [self.source_embed(value, i) for i, value in enumerate(normalized)]
         if gradient_trace is not None:
             embedded = [
                 gradient_trace(f"multisource.source_embedding.{i}", value)

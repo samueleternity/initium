@@ -373,12 +373,8 @@ class CfCControllerWrapper(nn.Module):
                 bad_count = bad_count + (~torch.isfinite(values)).sum()
                 total += values.numel()
                 if values.numel():
-                    absmax = torch.maximum(
-                        absmax, values.float().abs().amax()
-                    )
-            bad, maximum = torch.stack(
-                (bad_count.float(), absmax)
-            ).cpu().tolist()
+                    absmax = torch.maximum(absmax, values.float().abs().amax())
+            bad, maximum = torch.stack((bad_count.float(), absmax)).cpu().tolist()
             print(
                 "[cfc-gradient-trace:params] "
                 f"step={self._gradient_trace_step} module={label} "
@@ -389,14 +385,10 @@ class CfCControllerWrapper(nn.Module):
         def trace_state(label: str, state):
             if isinstance(state, tuple):
                 return tuple(
-                    trace_state(f"{label}.{index}", value)
-                    for index, value in enumerate(state)
+                    trace_state(f"{label}.{index}", value) for index, value in enumerate(state)
                 )
             if isinstance(state, list):
-                return [
-                    trace_state(f"{label}.{index}", value)
-                    for index, value in enumerate(state)
-                ]
+                return [trace_state(f"{label}.{index}", value) for index, value in enumerate(state)]
             if torch.is_tensor(state):
                 return trace_gradient(label, state)
             return state
@@ -411,8 +403,7 @@ class CfCControllerWrapper(nn.Module):
             report_parameter_health("switch_moe.router", multisource_moe.moe.router)
             report_parameter_health("switch_moe.experts", multisource_moe.moe.experts)
             sources = [
-                trace_gradient(f"source.{index}", source)
-                for index, source in enumerate(sources)
+                trace_gradient(f"source.{index}", source) for index, source in enumerate(sources)
             ]
             hx = trace_state("state.in", hx)
         # Preserve the stock CfC input-fusion path exactly: the baseline
@@ -431,9 +422,7 @@ class CfCControllerWrapper(nn.Module):
                 x = F.linear(
                     concatenated.float(),
                     self.in_adapter.weight.float(),
-                    None
-                    if self.in_adapter.bias is None
-                    else self.in_adapter.bias.float(),
+                    None if self.in_adapter.bias is None else self.in_adapter.bias.float(),
                 )
             else:
                 x = self.in_adapter(concatenated.float())

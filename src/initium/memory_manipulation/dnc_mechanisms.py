@@ -11,7 +11,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from dnc.memory import Memory
-from dnc.util import δ, σ, θ
+from dnc.util import δ, θ, σ
+
 from initium.memory_manipulation.nvrtc_compat import (
     pop_product_numerical_diagnostics,
     set_product_backward_trace,
@@ -55,19 +56,13 @@ class _FastAllocationMixin:
 
     def allocate(self, usage: torch.Tensor, write_gate: torch.Tensor):
         usage = δ + (1 - δ) * usage
-        sorted_usage, order = torch.topk(
-            usage, self.nr_cells, dim=1, largest=False
-        )
-        leading_one = torch.ones(
-            (usage.size(0), 1), device=usage.device, dtype=usage.dtype
-        )
-        exclusive_products = torch.cumprod(
-            torch.cat((leading_one, sorted_usage), dim=1), dim=1
-        )[:, :-1]
+        sorted_usage, order = torch.topk(usage, self.nr_cells, dim=1, largest=False)
+        leading_one = torch.ones((usage.size(0), 1), device=usage.device, dtype=usage.dtype)
+        exclusive_products = torch.cumprod(torch.cat((leading_one, sorted_usage), dim=1), dim=1)[
+            :, :-1
+        ]
         sorted_weights = (1 - sorted_usage) * exclusive_products
-        allocation_weights = torch.zeros_like(usage).scatter(
-            1, order, sorted_weights
-        )
+        allocation_weights = torch.zeros_like(usage).scatter(1, order, sorted_weights)
         return allocation_weights.unsqueeze(1), usage
 
 
@@ -87,16 +82,12 @@ class _TopKAllocationMixin:
         usage = δ + (1 - δ) * usage
         k = min(self.allocation_topk, self.nr_cells)
         sorted_usage, order = torch.topk(usage, k, dim=1, largest=False)
-        leading_one = torch.ones(
-            (usage.size(0), 1), device=usage.device, dtype=usage.dtype
-        )
-        exclusive_products = torch.cumprod(
-            torch.cat((leading_one, sorted_usage), dim=1), dim=1
-        )[:, :-1]
+        leading_one = torch.ones((usage.size(0), 1), device=usage.device, dtype=usage.dtype)
+        exclusive_products = torch.cumprod(torch.cat((leading_one, sorted_usage), dim=1), dim=1)[
+            :, :-1
+        ]
         sorted_weights = (1 - sorted_usage) * exclusive_products
-        allocation_weights = torch.zeros_like(usage).scatter(
-            1, order, sorted_weights
-        )
+        allocation_weights = torch.zeros_like(usage).scatter(1, order, sorted_weights)
         return allocation_weights.unsqueeze(1), usage
 
 
@@ -405,7 +396,9 @@ class MechanismMemory(Memory):
             "allocation_usage", updated_usage
         )
 
-    def write_weighting(self, memory, write_content_weights, allocation_weights, write_gate, allocation_gate):
+    def write_weighting(
+        self, memory, write_content_weights, allocation_weights, write_gate, allocation_gate
+    ):
         self._watch_backward("write_address_content_weights", write_content_weights)
         self._watch_backward("write_address_allocation_weights", allocation_weights)
         self._watch_backward("write_address_gate", write_gate)
@@ -450,7 +443,9 @@ class MechanismMemory(Memory):
         return self._watch_backward("content_weights", weights)
 
     def read_weightings(self, memory, content_weights, link_matrix, read_modes, read_weights):
-        raw = super().read_weightings(memory, content_weights, link_matrix, read_modes, read_weights)
+        raw = super().read_weightings(
+            memory, content_weights, link_matrix, read_modes, read_weights
+        )
         if self._backward_trace_enabled:
             raw_mass = raw.detach().float().sum(dim=-1, keepdim=True)
             self._read_weight_raw_mass_max = self._track_peak(
@@ -770,9 +765,7 @@ def build_memory(
         )
     else:
         memory_cls = (
-            OptimizedMechanismMemory
-            if dnc_implementation == "optimized"
-            else MechanismMemory
+            OptimizedMechanismMemory if dnc_implementation == "optimized" else MechanismMemory
         )
     return memory_cls(
         input_size=input_size,

@@ -193,12 +193,8 @@ def _build_split_graph(c: _Cfg, input_dim, hidden, nr_cells, cell_size, read_hea
         independent_linears=True,
         moe_enabled=_moe["moe_enabled"],
         moe_placement=c.get("split_graph_moe_placement", "all"),
-        moe_backbone_block_isolation=c.get(
-            "split_graph_moe_backbone_block_isolation", None
-        ),
-        moe_backbone_residual_scale=c.get(
-            "split_graph_moe_backbone_residual_scale", 1.0
-        ),
+        moe_backbone_block_isolation=c.get("split_graph_moe_backbone_block_isolation", None),
+        moe_backbone_residual_scale=c.get("split_graph_moe_backbone_residual_scale", 1.0),
         moe_num_experts=_moe["moe_num_experts"],
         moe_expert_dim=_moe["moe_expert_dim"],
         moe_top_k=_moe["moe_top_k"],
@@ -210,25 +206,15 @@ def _build_split_graph(c: _Cfg, input_dim, hidden, nr_cells, cell_size, read_hea
         ),
         workspace_enabled=c.get("workspace_enabled", cc.WORKSPACE_ENABLED),
         workspace_num_slots=c.get("workspace_num_slots", cc.WORKSPACE_NUM_SLOTS),
-        workspace_no_selection=c.get(
-            "workspace_no_selection", cc.WORKSPACE_NO_SELECTION
-        ),
-        workspace_reset_each_step=c.get(
-            "workspace_reset_each_step", cc.WORKSPACE_RESET_EACH_STEP
-        ),
+        workspace_no_selection=c.get("workspace_no_selection", cc.WORKSPACE_NO_SELECTION),
+        workspace_reset_each_step=c.get("workspace_reset_each_step", cc.WORKSPACE_RESET_EACH_STEP),
         workspace_train_mode=c.get("workspace_train_mode", cc.WORKSPACE_TRAIN_MODE),
         workspace_gate_variant=c.get("workspace_gate_variant", "continuous"),
-        workspace_bistable_selection_scale=c.get(
-            "workspace_bistable_selection_scale", 1.0
-        ),
+        workspace_bistable_selection_scale=c.get("workspace_bistable_selection_scale", 1.0),
         workspace_bistable_noise_scale=c.get("workspace_bistable_noise_scale", 0.75),
-        workspace_bistable_gradient_mode=c.get(
-            "workspace_bistable_gradient_mode", "truncated"
-        ),
+        workspace_bistable_gradient_mode=c.get("workspace_bistable_gradient_mode", "truncated"),
         workspace_bptt_horizon=c.get("workspace_bptt_horizon", 0),
-        workspace_reconsideration_enabled=c.get(
-            "workspace_reconsideration_enabled", False
-        ),
+        workspace_reconsideration_enabled=c.get("workspace_reconsideration_enabled", False),
         workspace_reconsideration_surprise_threshold=c.get(
             "workspace_reconsideration_surprise_threshold", 0.5
         ),
@@ -237,9 +223,7 @@ def _build_split_graph(c: _Cfg, input_dim, hidden, nr_cells, cell_size, read_hea
         ),
         device=device,
     ).to(device)
-    model.workspace_bistable_deterministic = c.get(
-        "workspace_bistable_deterministic", False
-    )
+    model.workspace_bistable_deterministic = c.get("workspace_bistable_deterministic", False)
     return model
 
 

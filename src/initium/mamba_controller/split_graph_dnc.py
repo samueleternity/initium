@@ -280,15 +280,11 @@ class SplitGraphDNC(nn.Module):
         self.workspace_bistable_gradient_mode = workspace_bistable_gradient_mode
         self.workspace_bistable_selection_scale = float(workspace_bistable_selection_scale)
         self.workspace_bptt_horizon = int(workspace_bptt_horizon)
-        self.workspace_reconsideration_enabled = bool(
-            workspace_reconsideration_enabled
-        )
+        self.workspace_reconsideration_enabled = bool(workspace_reconsideration_enabled)
         self.workspace_reconsideration_surprise_threshold = float(
             workspace_reconsideration_surprise_threshold
         )
-        self.workspace_reconsideration_trigger_mode = (
-            workspace_reconsideration_trigger_mode
-        )
+        self.workspace_reconsideration_trigger_mode = workspace_reconsideration_trigger_mode
         self.workspace_bistable_deterministic = False
         # Runtime-only counterfactual for evaluation. It is deliberately not
         # part of checkpoint config/state so a saved model can be scored with
@@ -544,9 +540,7 @@ class SplitGraphDNC(nn.Module):
         # backbone, combiner, DNC, and output-projection initializations and
         # subsequent global RNG stream intact for matched-seed controls.
         rng_state = (
-            torch.random.get_rng_state()
-            if workspace_enabled and workspace_num_slots > 0
-            else None
+            torch.random.get_rng_state() if workspace_enabled and workspace_num_slots > 0 else None
         )
         self.workspace = (
             WorkspaceBroadcast(
@@ -559,12 +553,8 @@ class SplitGraphDNC(nn.Module):
                 bistable_gradient_mode=workspace_bistable_gradient_mode,
                 bptt_horizon=workspace_bptt_horizon,
                 reconsideration_enabled=workspace_reconsideration_enabled,
-                reconsideration_surprise_threshold=(
-                    workspace_reconsideration_surprise_threshold
-                ),
-                reconsideration_trigger_mode=(
-                    workspace_reconsideration_trigger_mode
-                ),
+                reconsideration_surprise_threshold=(workspace_reconsideration_surprise_threshold),
+                reconsideration_trigger_mode=(workspace_reconsideration_trigger_mode),
             )
             if workspace_enabled and workspace_num_slots > 0
             else None
@@ -635,9 +625,7 @@ class SplitGraphDNC(nn.Module):
                 workspace_state = chx["_initium_workspace_state"]
                 combiner_hx_in = chx.get("_initium_combiner_state")
             if start_step > 0 and workspace_state is None:
-                raise ValueError(
-                    "workspace-enabled start_step>0 requires workspace state in hx[0]"
-                )
+                raise ValueError("workspace-enabled start_step>0 requires workspace state in hx[0]")
             if workspace_state is None or reset_experience:
                 workspace_state = self.workspace.init_state(
                     B, device=input.device, dtype=input.dtype
@@ -663,9 +651,7 @@ class SplitGraphDNC(nn.Module):
         # half of Option 5.
         if self.workspace is not None:
             backbone_stages = (
-                list(self.backbone)
-                if isinstance(self.backbone, nn.Sequential)
-                else [self.backbone]
+                list(self.backbone) if isinstance(self.backbone, nn.Sequential) else [self.backbone]
             )
             stage_input = input
             for stage in backbone_stages[:-1]:
@@ -675,10 +661,8 @@ class SplitGraphDNC(nn.Module):
                 raise RuntimeError(
                     "workspace requires the final parallel-backbone stage to expose its MoE specialists"
                 )
-            base, specialists, route_indices, route_weights = (
-                final_stage.forward_with_specialists(
-                    stage_input, token_mask=sequence_valid_mask
-                )
+            base, specialists, route_indices, route_weights = final_stage.forward_with_specialists(
+                stage_input, token_mask=sequence_valid_mask
             )
             broadcast_delta, workspace_state = self.workspace(
                 specialists[:, start_step:],
@@ -703,9 +687,7 @@ class SplitGraphDNC(nn.Module):
             observe_tensor("split_graph.h_after_workspace", H)
         else:
             backbone_stages = (
-                list(self.backbone)
-                if isinstance(self.backbone, nn.Sequential)
-                else [self.backbone]
+                list(self.backbone) if isinstance(self.backbone, nn.Sequential) else [self.backbone]
             )
             H = input
             for stage in backbone_stages:
@@ -766,9 +748,7 @@ class SplitGraphDNC(nn.Module):
                 if _cfc_multi_source:
                     # Call the nn.Module entry point so registered segment
                     # diagnostics observe the CfC combiner boundary.
-                    xi_out, combiner_hx = self.combiner_wrapper(
-                        [h_t, read_vec], combiner_hx
-                    )
+                    xi_out, combiner_hx = self.combiner_wrapper([h_t, read_vec], combiner_hx)
                 else:
                     combiner_in = torch.cat([h_t, read_vec], dim=-1).unsqueeze(
                         1
@@ -811,9 +791,7 @@ class SplitGraphDNC(nn.Module):
             chx = {
                 "_initium_workspace_state": workspace_state,
                 "_initium_combiner_state": (
-                    combiner_hx
-                    if self.combiner_mode == "controller"
-                    else combiner_hx_in
+                    combiner_hx if self.combiner_mode == "controller" else combiner_hx_in
                 ),
             }
 

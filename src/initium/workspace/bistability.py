@@ -128,9 +128,7 @@ class BistableWriteGate(nn.Module):
         eps = torch.finfo(normalized.dtype).eps
         selection_logit = torch.logit(normalized.clamp(eps, 1.0 - eps))
         uniform_logit = torch.logit(
-            torch.full_like(normalized[:, :1], 1.0 / normalized.shape[-1]).clamp(
-                eps, 1.0 - eps
-            )
+            torch.full_like(normalized[:, :1], 1.0 / normalized.shape[-1]).clamp(eps, 1.0 - eps)
         )
         selection_logit = selection_logit - uniform_logit
         if selection_confidence is None:
@@ -158,9 +156,7 @@ class BistableWriteGate(nn.Module):
             # default backward pass truncates gradients at each settling step
             # instead of multiplying them through the full positive-feedback
             # loop. ``unrolled`` remains available for controlled comparisons.
-            previous_activity = (
-                activity.detach() if self.gradient_mode == "truncated" else activity
-            )
+            previous_activity = activity.detach() if self.gradient_mode == "truncated" else activity
             population_activity = previous_activity.sum(dim=-1, keepdim=True)
             lateral_input = population_activity - previous_activity
             previous = activity
@@ -170,9 +166,7 @@ class BistableWriteGate(nn.Module):
             )
             if self.debug_diagnostics:
                 with torch.no_grad():
-                    debug_iterations.append(
-                        self._iteration_diagnostics(activity, previous, valid)
-                    )
+                    debug_iterations.append(self._iteration_diagnostics(activity, previous, valid))
 
         hard = (activity >= 0.5).to(activity.dtype)
         committed = hard + activity - activity.detach()
@@ -222,15 +216,13 @@ class BistableWriteGate(nn.Module):
                             "debug_selection_prob_lt_1e4": (selected < 1e-4).float().mean(),
                             "debug_selection_prob_lt_1e3": (selected < 1e-3).float().mean(),
                             "debug_selection_prob_gt_099": (selected > 0.99).float().mean(),
-                            "debug_selection_nonfinite_frac": (
-                                ~torch.isfinite(selected)
-                            ).float().mean(),
+                            "debug_selection_nonfinite_frac": (~torch.isfinite(selected))
+                            .float()
+                            .mean(),
                             "debug_selection_logit_absmax": logits.abs().max(),
                             "debug_drive_absmax": drives.abs().max(),
                             "debug_drive_rms": drives.square().mean().sqrt(),
-                            "debug_drive_nonfinite_frac": (
-                                ~torch.isfinite(drives)
-                            ).float().mean(),
+                            "debug_drive_nonfinite_frac": (~torch.isfinite(drives)).float().mean(),
                             "debug_noise_rms": noise_values.square().mean().sqrt(),
                             "debug_confidence_min": confidence_logit.detach()[valid].min(),
                             "debug_confidence_max": confidence_logit.detach()[valid].max(),
@@ -290,11 +282,7 @@ class BistableWriteGate(nn.Module):
                 "low_frac": zero,
                 "high_frac": zero,
                 "nonfinite_frac": zero,
-                **(
-                    {"delta_rms": zero, "delta_max": zero}
-                    if previous is not None
-                    else {}
-                ),
+                **({"delta_rms": zero, "delta_max": zero} if previous is not None else {}),
             }
         result = {
             "mean": detached.mean(),

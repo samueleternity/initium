@@ -19,9 +19,7 @@ def test_optimized_allocation_matches_base_values_and_gradients():
     write_gate = torch.ones(3, 1)
 
     base_weights, base_adjusted_usage = base.allocate(base_usage, write_gate)
-    optimized_weights, optimized_adjusted_usage = optimized.allocate(
-        optimized_usage, write_gate
-    )
+    optimized_weights, optimized_adjusted_usage = optimized.allocate(optimized_usage, write_gate)
 
     torch.testing.assert_close(optimized_weights, base_weights)
     torch.testing.assert_close(optimized_adjusted_usage, base_adjusted_usage)
@@ -75,9 +73,7 @@ def test_optimized_memory_forward_and_parameter_gradients_match_base():
     optimized_input = base_input.detach().clone().requires_grad_(True)
 
     base_read, base_state = base(base_input, base.new(batch_size=2))
-    optimized_read, optimized_state = optimized(
-        optimized_input, optimized.new(batch_size=2)
-    )
+    optimized_read, optimized_state = optimized(optimized_input, optimized.new(batch_size=2))
 
     torch.testing.assert_close(optimized_read, base_read)
     for key in base_state:

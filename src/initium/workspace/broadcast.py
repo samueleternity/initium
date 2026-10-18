@@ -53,8 +53,7 @@ class WorkspaceBroadcast(nn.Module):
             raise ValueError("reconsideration_surprise_threshold must be finite and in [0, 1]")
         if reconsideration_trigger_mode not in ("innovation", "random_rate_matched"):
             raise ValueError(
-                "reconsideration_trigger_mode must be 'innovation' or "
-                "'random_rate_matched'"
+                "reconsideration_trigger_mode must be 'innovation' or 'random_rate_matched'"
             )
         self.d_model = d_model
         self.num_experts = num_experts
@@ -64,9 +63,7 @@ class WorkspaceBroadcast(nn.Module):
         self.bistable_noise_scale = float(bistable_noise_scale)
         self.bptt_horizon = int(bptt_horizon)
         self.reconsideration_enabled = bool(reconsideration_enabled)
-        self.reconsideration_surprise_threshold = float(
-            reconsideration_surprise_threshold
-        )
+        self.reconsideration_surprise_threshold = float(reconsideration_surprise_threshold)
         self.reconsideration_trigger_mode = reconsideration_trigger_mode
         self.query = nn.Linear(d_model, d_model, bias=False)
         self.key = nn.Linear(d_model, d_model, bias=False)
@@ -236,26 +233,17 @@ class WorkspaceBroadcast(nn.Module):
             proposal_probe = slot_inputs.detach().float()
             old_norm = torch.linalg.vector_norm(old_probe, dim=-1)
             proposal_norm = torch.linalg.vector_norm(proposal_probe, dim=-1)
-            innovation = torch.linalg.vector_norm(
-                proposal_probe - old_probe, dim=-1
-            )
+            innovation = torch.linalg.vector_norm(proposal_probe - old_probe, dim=-1)
             surprise = innovation / (old_norm + proposal_norm).clamp_min(1e-6)
-            eligible = (
-                (old_norm > 1e-6)
-                & has_writer.squeeze(-1).squeeze(-1).unsqueeze(-1)
-            )
-            innovation_trigger = eligible & (
-                surprise >= self.reconsideration_surprise_threshold
-            )
+            eligible = (old_norm > 1e-6) & has_writer.squeeze(-1).squeeze(-1).unsqueeze(-1)
+            innovation_trigger = eligible & (surprise >= self.reconsideration_surprise_threshold)
             # Draw a fixed-shape random tape in both arms. This gives the
             # rate-matched null an independent choice among eligible slots while
             # keeping global RNG advancement aligned between matched runs.
             random_scores = torch.rand_like(surprise)
             if self.reconsideration_trigger_mode == "random_rate_matched":
                 eligible_flat = eligible.reshape(-1)
-                random_scores_flat = random_scores.reshape(-1).masked_fill(
-                    ~eligible_flat, -1.0
-                )
+                random_scores_flat = random_scores.reshape(-1).masked_fill(~eligible_flat, -1.0)
                 order = torch.argsort(random_scores_flat, descending=True)
                 ranks = torch.empty_like(order)
                 ranks.scatter_(
@@ -264,9 +252,7 @@ class WorkspaceBroadcast(nn.Module):
                     torch.arange(order.numel(), device=order.device),
                 )
                 target_count = innovation_trigger.sum()
-                reconsideration_trigger = eligible & (
-                    ranks.reshape_as(eligible) < target_count
-                )
+                reconsideration_trigger = eligible & (ranks.reshape_as(eligible) < target_count)
             else:
                 reconsideration_trigger = innovation_trigger
             if self.diagnostics_enabled:
@@ -312,20 +298,15 @@ class WorkspaceBroadcast(nn.Module):
         next_state = update.mul(slot_inputs).add((1.0 - update).mul(old_inputs))
         if self.diagnostics_enabled and reconsideration_trigger is not None:
             triggered_count = reconsideration_trigger.sum().clamp_min(1)
-            actual_change = torch.linalg.vector_norm(
-                (next_state - old_inputs).float(), dim=-1
-            )
+            actual_change = torch.linalg.vector_norm((next_state - old_inputs).float(), dim=-1)
             reconsideration_diag["reconsideration_changed_frac"] = (
-                (
-                    reconsideration_trigger
-                    & (actual_change > 1e-6)
-                ).sum().float()
-                / triggered_count
+                (reconsideration_trigger & (actual_change > 1e-6)).sum().float() / triggered_count
             ).detach()
             reconsideration_diag["reconsideration_state_delta_rms"] = (
-                (actual_change * reconsideration_trigger).square().sum()
-                / triggered_count
-            ).sqrt().detach()
+                ((actual_change * reconsideration_trigger).square().sum() / triggered_count)
+                .sqrt()
+                .detach()
+            )
 
         if bypass_broadcast:
             # Evaluation counterfactual: preserve the selected MoE residual
@@ -336,9 +317,7 @@ class WorkspaceBroadcast(nn.Module):
             if self.diagnostics_enabled:
                 self._last_step_diag = {
                     "write_mass": write_weights.detach().sum(dim=-1).mean(),
-                    "active_write_frac": (write_weights.detach().sum(dim=-1) > 0)
-                    .float()
-                    .mean(),
+                    "active_write_frac": (write_weights.detach().sum(dim=-1) > 0).float().mean(),
                     "write_gate_mean": update.detach().float().mean(),
                     "slot_rms": next_state.detach().float().square().mean().sqrt(),
                     "broadcast_rms": next_state.new_zeros((), dtype=torch.float32),
@@ -367,9 +346,10 @@ class WorkspaceBroadcast(nn.Module):
                 "active_write_frac": (write_weights.detach().sum(dim=-1) > 0).float().mean(),
                 "write_gate_mean": update.detach().float().mean(),
                 "slot_rms": next_state.detach().float().square().mean().sqrt(),
-                "broadcast_rms": (
-                    read_scale.detach().float() * broadcast.detach().float()
-                ).square().mean().sqrt(),
+                "broadcast_rms": (read_scale.detach().float() * broadcast.detach().float())
+                .square()
+                .mean()
+                .sqrt(),
                 "specialist_rms": specialist_deltas.detach().float().square().mean().sqrt(),
                 **reconsideration_diag,
                 **bistable_diag,
@@ -402,7 +382,9 @@ class WorkspaceBroadcast(nn.Module):
             if self.bptt_horizon and step and step % self.bptt_horizon == 0:
                 state = state.detach()
             out, state = self.forward_step(
-                specialist_deltas[:, step], route_indices[:, step], route_weights[:, step],
+                specialist_deltas[:, step],
+                route_indices[:, step],
+                route_weights[:, step],
                 state,
                 no_selection=no_selection,
                 reset_each_step=reset_each_step,
@@ -436,14 +418,15 @@ class WorkspaceBroadcast(nn.Module):
                     aggregate = values.mean()
                 self._last_diag[key] = aggregate.detach()
             self._last_diag["read_gate"] = torch.sigmoid(self.read_gate.detach()).float()
-            self._last_diag["broadcast_to_specialist_ratio"] = (
-                self._last_diag["broadcast_rms"]
-                / self._last_diag["specialist_rms"].clamp_min(1e-8)
-            )
+            self._last_diag["broadcast_to_specialist_ratio"] = self._last_diag[
+                "broadcast_rms"
+            ] / self._last_diag["specialist_rms"].clamp_min(1e-8)
             if "writer_frequency" in step_diags[0]:
-                self._last_diag["writer_frequency"] = torch.stack(
-                    [diag["writer_frequency"] for diag in step_diags]
-                ).mean(dim=0).detach()
+                self._last_diag["writer_frequency"] = (
+                    torch.stack([diag["writer_frequency"] for diag in step_diags])
+                    .mean(dim=0)
+                    .detach()
+                )
             if "gate_candidate_count" in step_diags[0]:
                 candidate_counts = torch.stack(
                     [diag["gate_candidate_count"] for diag in step_diags]
@@ -463,12 +446,9 @@ class WorkspaceBroadcast(nn.Module):
                     self._last_diag[key] = (
                         (values * candidate_counts).sum() / candidate_denom
                     ).detach()
-                histograms = torch.stack(
-                    [diag["gate_histogram"] for diag in step_diags]
-                )
+                histograms = torch.stack([diag["gate_histogram"] for diag in step_diags])
                 self._last_diag["gate_histogram"] = (
-                    (histograms * candidate_counts.unsqueeze(-1)).sum(dim=0)
-                    / candidate_denom
+                    (histograms * candidate_counts.unsqueeze(-1)).sum(dim=0) / candidate_denom
                 ).detach()
             self._accumulate_bistable_diagnostics(self._last_diag)
         return torch.stack(outputs, dim=1), state

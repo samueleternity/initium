@@ -168,8 +168,8 @@ from dnc import DNC
 from dnc.memory import Memory
 from dnc.util import cuda
 
-from initium.MoE.moe_layer import MoEBlock, MoERNNWrapper
 from initium.memory_manipulation.dnc_mechanisms import OptimizedMemory
+from initium.MoE.moe_layer import MoEBlock, MoERNNWrapper
 
 _MAMBA_IMPORT_ERROR: str | None
 

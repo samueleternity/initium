@@ -162,9 +162,9 @@ from initium.data.prepared_dataset import load_prepared_dataset, save_prepared_d
 from initium.diagnostics.segment_logging import SegmentDiagnostics
 from initium.mamba_controller.mamba_controller import MambaDNC
 from initium.mamba_controller.split_graph_dnc import SplitGraphDNC
+from initium.memory_manipulation.dnc_mechanisms import compile_memory_forward
 from initium.memory_manipulation.dynamic_memory_resize import resize_memory
 from initium.memory_manipulation.dynamic_n_controller import DynamicNController
-from initium.memory_manipulation.dnc_mechanisms import compile_memory_forward
 from initium.memory_manipulation.link_matrix_ablation import patch_link_matrix
 from initium.memory_manipulation.stochastic_write_head_v2 import (
     get_prior_state,
@@ -245,7 +245,9 @@ def _report_first_nonfinite_gradient(named_parameters, step):
                 f"'{name}' ({bad_fraction * 100:.2f}% of elements)"
             )
             return name
-    print(f"[NaN-TRACE] step {step}: gradient norm is non-finite but no bad gradient tensor was found")
+    print(
+        f"[NaN-TRACE] step {step}: gradient norm is non-finite but no bad gradient tensor was found"
+    )
     return None
 
 
@@ -733,14 +735,12 @@ def load_frozen_workspace_warm_start(
             details.append(
                 "configuration differs: "
                 + ", ".join(
-                    f"{key}={checkpoint_config[key]!r} (expected "
-                    f"{expected_model_config[key]!r})"
+                    f"{key}={checkpoint_config[key]!r} (expected {expected_model_config[key]!r})"
                     for key in mismatched_config
                 )
             )
         raise ValueError(
-            "Checkpoint is not a compatible frozen-workspace baseline: "
-            + "; ".join(details)
+            "Checkpoint is not a compatible frozen-workspace baseline: " + "; ".join(details)
         )
 
     checkpoint_state = checkpoint.get("rnn_state_dict")
@@ -893,9 +893,7 @@ def run(
     if eval_only and not resume_requested:
         raise ValueError("eval_only requires --resume with a checkpoint")
     if eval_workspace_mode not in ("checkpoint", "reset-each-step", "bypass"):
-        raise ValueError(
-            "eval_workspace_mode must be 'checkpoint', 'reset-each-step', or 'bypass'"
-        )
+        raise ValueError("eval_workspace_mode must be 'checkpoint', 'reset-each-step', or 'bypass'")
     if not math.isfinite(workspace_reconsideration_surprise_threshold) or not (
         0.0 <= workspace_reconsideration_surprise_threshold <= 1.0
     ):
@@ -907,8 +905,7 @@ def run(
         "random_rate_matched",
     ):
         raise ValueError(
-            "workspace_reconsideration_trigger_mode must be 'innovation' or "
-            "'random_rate_matched'"
+            "workspace_reconsideration_trigger_mode must be 'innovation' or 'random_rate_matched'"
         )
     if eval_only and eval_workspace_mode != "checkpoint" and not workspace_enabled:
         raise ValueError("workspace evaluation modes require --workspace")
@@ -916,18 +913,13 @@ def run(
         load_checkpoint_for_resume(resume_from, device) if resume_requested else None
     )
     checkpoint_config = (
-        (resume_checkpoint.get("model_config") or {})
-        if resume_checkpoint is not None
-        else {}
+        (resume_checkpoint.get("model_config") or {}) if resume_checkpoint is not None else {}
     )
     checkpoint_state = (
-        (resume_checkpoint.get("rnn_state_dict") or {})
-        if resume_checkpoint is not None
-        else {}
+        (resume_checkpoint.get("rnn_state_dict") or {}) if resume_checkpoint is not None else {}
     )
     checkpoint_has_workspace = any(
-        key.startswith("workspace.") or ".workspace." in key
-        for key in checkpoint_state
+        key.startswith("workspace.") or ".workspace." in key for key in checkpoint_state
     )
     checkpoint_workspace_enabled = bool(
         checkpoint_config.get("workspace_enabled", False) or checkpoint_has_workspace
@@ -944,9 +936,7 @@ def run(
             != workspace_gate_variant
             or (
                 workspace_gate_variant == "bistable"
-                and checkpoint_config.get(
-                    "workspace_bistable_gradient_mode", "unrolled"
-                )
+                and checkpoint_config.get("workspace_bistable_gradient_mode", "unrolled")
                 != workspace_bistable_gradient_mode
             )
         )
@@ -963,8 +953,7 @@ def run(
         resume_requested
         and workspace_enabled
         and checkpoint_workspace_enabled
-        and int(checkpoint_config.get("workspace_bptt_horizon", 0))
-        != workspace_bptt_horizon
+        and int(checkpoint_config.get("workspace_bptt_horizon", 0)) != workspace_bptt_horizon
         and not eval_only
     )
     workspace_reconsideration_warm_start = bool(
@@ -974,15 +963,9 @@ def run(
         and (
             bool(checkpoint_config.get("workspace_reconsideration_enabled", False))
             != workspace_reconsideration_enabled
-            or float(
-                checkpoint_config.get(
-                    "workspace_reconsideration_surprise_threshold", 0.5
-                )
-            )
+            or float(checkpoint_config.get("workspace_reconsideration_surprise_threshold", 0.5))
             != workspace_reconsideration_surprise_threshold
-            or checkpoint_config.get(
-                "workspace_reconsideration_trigger_mode", "innovation"
-            )
+            or checkpoint_config.get("workspace_reconsideration_trigger_mode", "innovation")
             != workspace_reconsideration_trigger_mode
         )
         and not eval_only
@@ -1611,9 +1594,7 @@ def run(
             workspace_reconsideration_surprise_threshold=(
                 workspace_reconsideration_surprise_threshold
             ),
-            workspace_reconsideration_trigger_mode=(
-                workspace_reconsideration_trigger_mode
-            ),
+            workspace_reconsideration_trigger_mode=(workspace_reconsideration_trigger_mode),
             device=device,
         ).to(device)
 
@@ -1691,9 +1672,7 @@ def run(
             reset_workspace_each_step = workspace_reset_each_step or (
                 eval_only and eval_workspace_mode == "reset-each-step"
             )
-            persistence = (
-                "off (reset each timestep)" if reset_workspace_each_step else "on"
-            )
+            persistence = "off (reset each timestep)" if reset_workspace_each_step else "on"
             print(
                 f"[{run_id}] WORKSPACE {'active' if workspace_active else 'bypassed'} | "
                 f"slots={workspace_num_slots} | write_selection={write_mode} | "
@@ -1779,9 +1758,7 @@ def run(
         "workspace_reconsideration_surprise_threshold": (
             workspace_reconsideration_surprise_threshold
         ),
-        "workspace_reconsideration_trigger_mode": (
-            workspace_reconsideration_trigger_mode
-        ),
+        "workspace_reconsideration_trigger_mode": (workspace_reconsideration_trigger_mode),
         "workspace_bistable_deterministic": workspace_bistable_deterministic,
         "workspace_stability_max_activation": workspace_stability_max_activation,
     }
@@ -1879,9 +1856,7 @@ def run(
         rnn,
         enabled=segment_diagnostics_enabled,
         activation_absmax_limit=(
-            workspace_stability_max_activation
-            if workspace_train_scope == "gate"
-            else None
+            workspace_stability_max_activation if workspace_train_scope == "gate" else None
         ),
     )
     if workspace_train_scope == "gate" and isinstance(rnn, SplitGraphDNC):
@@ -1890,21 +1865,13 @@ def run(
     if segment_diagnostics_enabled and isinstance(rnn, SplitGraphDNC):
         combiner = rnn.combiner_wrapper
         if combiner is not None and hasattr(combiner, "in_adapter"):
-            segment_diagnostics.add_module(
-                combiner.in_adapter, "controller.cfc.in_adapter"
-            )
-            for index, adapter in enumerate(
-                getattr(combiner, "source_in_adapters", None) or ()
-            ):
-                segment_diagnostics.add_module(
-                    adapter, f"controller.cfc.source_adapter.{index}"
-                )
+            segment_diagnostics.add_module(combiner.in_adapter, "controller.cfc.in_adapter")
+            for index, adapter in enumerate(getattr(combiner, "source_in_adapters", None) or ()):
+                segment_diagnostics.add_module(adapter, f"controller.cfc.source_adapter.{index}")
             for index, block in enumerate(getattr(combiner, "blocks", ())):
                 cfc_cell = getattr(block, "cfc", None)
                 if isinstance(cfc_cell, nn.Module):
-                    segment_diagnostics.add_module(
-                        cfc_cell, f"controller.cfc.cell.{index}"
-                    )
+                    segment_diagnostics.add_module(cfc_cell, f"controller.cfc.cell.{index}")
     moe_layer_ids = {id(layer) for layer in getattr(rnn, "moe_layers", [])}
     for module_name, module in rnn.named_modules():
         if id(module) in moe_layer_ids:
@@ -1930,9 +1897,7 @@ def run(
                     + " ".join(f"{name}={value:.4g}" for name, value in memory_diag.items())
                 )
         if moe_enabled and moe_diagnostics_enabled:
-            _, failure_moe_diag = pop_total_moe_aux_loss(
-                rnn.moe_layers, include_diagnostics=True
-            )
+            _, failure_moe_diag = pop_total_moe_aux_loss(rnn.moe_layers, include_diagnostics=True)
             reports = _format_moe_layer_reports(failure_moe_diag)
             if reports:
                 print(f"[moe-diag:{channel}] " + " | ".join(reports))
@@ -1987,9 +1952,7 @@ def run(
         if not fields:
             return ""
         values = torch.stack([value.detach().float() for _, value in fields]).cpu().tolist()
-        return " ".join(
-            f"{name}={value:.3g}" for (name, _), value in zip(fields, values)
-        )
+        return " ".join(f"{name}={value:.3g}" for (name, _), value in zip(fields, values))
 
     def report_bistable_nonfinite(step_index: int, forward_debug: str, gradient_debug: str) -> None:
         if not workspace_bistable_debug:
@@ -2279,7 +2242,11 @@ def run(
         # of leaving `scaler` at its freshly-constructed init_scale -- see
         # header note. `.get(...)` instead of ["..."] so a pre-v3 checkpoint
         # (saved before this key existed) still loads, just without this fix.
-        if not frozen_workspace_warm_start and not workspace_condition_warm_start and "scaler_state_dict" in ckpt:
+        if (
+            not frozen_workspace_warm_start
+            and not workspace_condition_warm_start
+            and "scaler_state_dict" in ckpt
+        ):
             scaler.load_state_dict(ckpt["scaler_state_dict"])
         elif not frozen_workspace_warm_start and not workspace_condition_warm_start:
             print(
@@ -2434,15 +2401,9 @@ def run(
             for name, _ in trainable_named_parameters
         }
         bistable_grad_probe_steps = 0
-        bistable_grad_probe_global_max = torch.zeros(
-            (), device=device, dtype=torch.float64
-        )
-        bistable_grad_probe_global_max_step = torch.full(
-            (), -1, device=device, dtype=torch.int64
-        )
-        bistable_grad_probe_relative_error = torch.zeros(
-            (), device=device, dtype=torch.float64
-        )
+        bistable_grad_probe_global_max = torch.zeros((), device=device, dtype=torch.float64)
+        bistable_grad_probe_global_max_step = torch.full((), -1, device=device, dtype=torch.int64)
+        bistable_grad_probe_relative_error = torch.zeros((), device=device, dtype=torch.float64)
 
     # Dynamic-beta controller state (no-op / unused when beta_mode == "static").
     # Initialized post-resume so a resumed dynamic run starts its health check
@@ -2514,9 +2475,7 @@ def run(
                 # with all-zero feature rows. This mask is diagnostic-only for
                 # MoE routing: routing/capacity behavior remains unchanged.
                 sequence_valid_mask = (
-                    input_seq.ne(0).any(dim=-1)
-                    if moe_enabled and dataset_type == "graph"
-                    else None
+                    input_seq.ne(0).any(dim=-1) if moe_enabled and dataset_type == "graph" else None
                 )
                 output, hidden = rnn(
                     input_seq,
@@ -2528,9 +2487,7 @@ def run(
                 output, hidden = rnn(input_seq, hidden, reset_experience=True)
             bistable_forward_debug = format_bistable_forward_debug()
             if workspace_train_scope == "gate":
-                exceeded, maximum, segment = segment_diagnostics.activation_absmax_exceeded(
-                    "train"
-                )
+                exceeded, maximum, segment = segment_diagnostics.activation_absmax_exceeded("train")
                 if exceeded:
                     emit_failure_diagnostics("train")
                     raise FloatingPointError(
@@ -2539,9 +2496,7 @@ def run(
                         f"{segment} (observed absmax={maximum:.6g}) at step {step}; "
                         "stopping before backward/optimizer update."
                     )
-            if check_finite_this_step and not _first_nonfinite_report(
-                output, "rnn_output", step
-            ):
+            if check_finite_this_step and not _first_nonfinite_report(output, "rnn_output", step):
                 emit_failure_diagnostics("train")
                 raise FloatingPointError(
                     f"[{run_id}] non-finite recurrent output at step {step}; "
@@ -2559,18 +2514,14 @@ def run(
                 )
             task_loss = dataset.loss(output, target_digits, answer_mask)
 
-        if check_finite_this_step and not _first_nonfinite_report(
-            task_loss, "task_loss", step
-        ):
+        if check_finite_this_step and not _first_nonfinite_report(task_loss, "task_loss", step):
             emit_failure_diagnostics("train")
             raise FloatingPointError(
                 f"[{run_id}] non-finite task loss at step {step}; "
                 "stopping before backward/optimizer update to protect the checkpoint."
             )
         kl_loss, kl_diag = pop_total_kl(stochastic_heads, free_bits=FREE_BITS)  # Phase 1
-        if check_finite_this_step and not _first_nonfinite_report(
-            kl_loss, "kl_loss", step
-        ):
+        if check_finite_this_step and not _first_nonfinite_report(kl_loss, "kl_loss", step):
             emit_failure_diagnostics("train")
             raise FloatingPointError(
                 f"[{run_id}] non-finite KL loss at step {step}; stopping before backward."
@@ -2578,9 +2529,7 @@ def run(
         moe_aux_loss, moe_diag = (
             pop_total_moe_aux_loss(
                 rnn.moe_layers,
-                include_diagnostics=(
-                    moe_diagnostics_enabled and (step + 1) % LOG_EVERY == 0
-                ),
+                include_diagnostics=(moe_diagnostics_enabled and (step + 1) % LOG_EVERY == 0),
             )
             if moe_enabled
             else (torch.zeros((), device=device), {})
@@ -2637,9 +2586,7 @@ def run(
                 finite_gradient = torch.where(finite_mask, gradient, 0.0).detach().float()
                 finite_count = int(finite_mask.sum().item())
                 nonfinite_count = gradient.numel() - finite_count
-                norm = float(
-                    torch.linalg.vector_norm(finite_gradient.to(torch.float64)).cpu()
-                )
+                norm = float(torch.linalg.vector_norm(finite_gradient.to(torch.float64)).cpu())
                 absmax = float(finite_gradient.abs().max().cpu())
                 bistable_debug_gradient_stats[name] = (
                     norm,
@@ -2667,9 +2614,7 @@ def run(
                 probe["max"].copy_(torch.maximum(probe["max"], parameter_norm))
                 step_parameter_norms.append(parameter_norm)
             if step_parameter_norms:
-                independent_grad_norm = torch.linalg.vector_norm(
-                    torch.stack(step_parameter_norms)
-                )
+                independent_grad_norm = torch.linalg.vector_norm(torch.stack(step_parameter_norms))
                 bistable_grad_probe_global_max_step.copy_(
                     torch.where(
                         independent_grad_norm > bistable_grad_probe_global_max,
@@ -2707,18 +2652,21 @@ def run(
                     torch.cat(
                         [gradient.to(torch.float64).reshape(-1) for gradient in gate_gradients]
                     )
-                )
-                .cpu()
+                ).cpu()
             )
             if not math.isfinite(bistable_gate_grad_norm) or bistable_gate_grad_norm == 0.0:
                 gradient_debug_parts = []
                 for name, gradient in gate_gradient_items:
                     finite = torch.isfinite(gradient)
                     finite_values = gradient[finite]
-                    finite_norm = float(
-                        torch.linalg.vector_norm(finite_values.to(torch.float64)).cpu()
-                    ) if finite_values.numel() else 0.0
-                    finite_absmax = float(finite_values.abs().max().cpu()) if finite_values.numel() else 0.0
+                    finite_norm = (
+                        float(torch.linalg.vector_norm(finite_values.to(torch.float64)).cpu())
+                        if finite_values.numel()
+                        else 0.0
+                    )
+                    finite_absmax = (
+                        float(finite_values.abs().max().cpu()) if finite_values.numel() else 0.0
+                    )
                     bad_count = gradient.numel() - finite_values.numel()
                     gradient_debug_parts.append(
                         f"{name}:finite_norm={finite_norm:.3g},"
@@ -2750,9 +2698,7 @@ def run(
             grad_norm = independent_grad_norm
             if grad_norm is None:
                 grad_norm = torch.zeros((), device=device, dtype=torch.float64)
-            clip_coefficient = (
-                max_grad_norm / grad_norm.clamp_min(1e-12)
-            ).clamp(max=1.0)
+            clip_coefficient = (max_grad_norm / grad_norm.clamp_min(1e-12)).clamp(max=1.0)
             for parameter in trainable_parameters:
                 if parameter.grad is not None:
                     parameter.grad.mul_(clip_coefficient.to(parameter.grad.dtype))
@@ -2766,9 +2712,7 @@ def run(
                 # coefficient. Derive the resulting norm from its returned
                 # pre-clip norm instead of making another full pass over all
                 # model gradients on every training step.
-                clip_coefficient = (
-                    max_grad_norm / (grad_norm + 1e-6)
-                ).clamp(max=1.0)
+                clip_coefficient = (max_grad_norm / (grad_norm + 1e-6)).clamp(max=1.0)
                 postclip_grad_norm = grad_norm * clip_coefficient
             except RuntimeError as error:
                 if "non-finite" not in str(error):
@@ -2798,10 +2742,7 @@ def run(
             consecutive_nonfinite_grad_steps += 1
             running_nonfinite_grad_steps += 1
             _report_first_nonfinite_gradient(
-                [
-                    (f"rnn.{name}", parameter)
-                    for name, parameter in rnn.named_parameters()
-                ]
+                [(f"rnn.{name}", parameter) for name, parameter in rnn.named_parameters()]
                 + [
                     (f"output_proj.{name}", parameter)
                     for name, parameter in output_proj.named_parameters()
@@ -2845,20 +2786,10 @@ def run(
                 exp_avg_sq = state.get("exp_avg_sq")
                 step_state = state.get("step")
                 adam_step = (
-                    int(step_state.item())
-                    if torch.is_tensor(step_state)
-                    else int(step_state or 0)
+                    int(step_state.item()) if torch.is_tensor(step_state) else int(step_state or 0)
                 )
-                m_absmax = (
-                    float(exp_avg.detach().abs().max().cpu())
-                    if exp_avg is not None
-                    else 0.0
-                )
-                v_max = (
-                    float(exp_avg_sq.detach().max().cpu())
-                    if exp_avg_sq is not None
-                    else 0.0
-                )
+                m_absmax = float(exp_avg.detach().abs().max().cpu()) if exp_avg is not None else 0.0
+                v_max = float(exp_avg_sq.detach().max().cpu()) if exp_avg_sq is not None else 0.0
                 parameter_reports.append(
                     f"{name}[v={float(after.cpu()):.4g},g_norm_raw={grad_norm_raw:.3g},"
                     f"g_absmax_raw={grad_absmax:.3g},g_nonfinite={bad_count},"
@@ -2974,9 +2905,7 @@ def run(
             ) / LOG_EVERY
             avg_div = running_div / LOG_EVERY
             avg_grad_norm = running_grad_norm / max(running_finite_grad_steps, 1)
-            avg_postclip_grad_norm = (
-                running_postclip_grad_norm / max(running_finite_grad_steps, 1)
-            )
+            avg_postclip_grad_norm = running_postclip_grad_norm / max(running_finite_grad_steps, 1)
             kl_contrib = (
                 beta_eff * avg_kl
             )  # actual beta*L_KL added to total loss, vs. avg_kl (pre-beta, raw clamped sum)
@@ -3072,7 +3001,9 @@ def run(
                                     f"{value:.2f}"
                                     for value in workspace_diag["gate_histogram"].tolist()
                                 )
-                                print(f"[{run_id}] [bistable] probability_histogram_10bin={histogram}")
+                                print(
+                                    f"[{run_id}] [bistable] probability_histogram_10bin={histogram}"
+                                )
                             if "writer_frequency" in workspace_diag:
                                 writer_frequency = ",".join(
                                     f"{value:.3f}"
@@ -3092,10 +3023,13 @@ def run(
                         (float(maximum.cpu()), name, float(rms.cpu()), maximum_step)
                     )
                 per_parameter.sort(reverse=True)
-                parameter_summary = ", ".join(
-                    f"{name}:rms={rms:.3g},max={maximum:.3g}@step{maximum_step}"
-                    for maximum, name, rms, maximum_step in per_parameter[:8]
-                ) or "none"
+                parameter_summary = (
+                    ", ".join(
+                        f"{name}:rms={rms:.3g},max={maximum:.3g}@step{maximum_step}"
+                        for maximum, name, rms, maximum_step in per_parameter[:8]
+                    )
+                    or "none"
+                )
                 parts.append(
                     "bistable_grad_probe["
                     f"trainable={len(trainable_named_parameters)} steps={bistable_grad_probe_steps} "
@@ -3119,9 +3053,7 @@ def run(
                 if memory_diag:
                     print(
                         f"[dnc-numerics:train] step={step} "
-                        + " ".join(
-                            f"{name}={value:.4g}" for name, value in memory_diag.items()
-                        )
+                        + " ".join(f"{name}={value:.4g}" for name, value in memory_diag.items())
                     )
 
             if (
@@ -3653,10 +3585,7 @@ def run(
         beta_eff = 0.0
         kl_loss = None
         kl_diag = {}
-    print(
-        f"\n[{run_id}] {completion_label}. Final evaluation on "
-        "training-distribution lesson:"
-    )
+    print(f"\n[{run_id}] {completion_label}. Final evaluation on training-distribution lesson:")
     final_id_stage_memory = rnn.memories[0]
     if isinstance(rnn, SplitGraphDNC) and rnn.workspace is not None:
         rnn.workspace.reset_bistable_diagnostics()
@@ -4200,18 +4129,32 @@ if __name__ == "__main__":
         "block's MoE residual is scaled.",
     )
     parser.add_argument(
-        "--workspace", action="store_true",
+        "--workspace",
+        action="store_true",
         help="Phase 0 shared workspace: competitively write selected MoE expert outputs to persistent slots, then broadcast slots back to every specialist. Requires --split-graph and --moe.",
     )
-    parser.add_argument("--workspace-num-slots", type=int, default=WORKSPACE_NUM_SLOTS,
-                        help="Persistent workspace slot count (0 is the plumbing/bypass control).")
-    parser.add_argument("--workspace-no-selection", action="store_true",
-                        help="Control: use random, unweighted specialist writes instead of MoE-selected writes.")
-    parser.add_argument("--workspace-reset-each-step", action="store_true",
-                        help="Persistence ablation: reset workspace before each timestep's write/read cycle.")
-    parser.add_argument("--workspace-train-mode", choices=["coadapted", "frozen"],
-                        default=WORKSPACE_TRAIN_MODE,
-                        help="coadapted trains the full model; frozen trains workspace parameters and freezes substrate/task-head parameters.")
+    parser.add_argument(
+        "--workspace-num-slots",
+        type=int,
+        default=WORKSPACE_NUM_SLOTS,
+        help="Persistent workspace slot count (0 is the plumbing/bypass control).",
+    )
+    parser.add_argument(
+        "--workspace-no-selection",
+        action="store_true",
+        help="Control: use random, unweighted specialist writes instead of MoE-selected writes.",
+    )
+    parser.add_argument(
+        "--workspace-reset-each-step",
+        action="store_true",
+        help="Persistence ablation: reset workspace before each timestep's write/read cycle.",
+    )
+    parser.add_argument(
+        "--workspace-train-mode",
+        choices=["coadapted", "frozen"],
+        default=WORKSPACE_TRAIN_MODE,
+        help="coadapted trains the full model; frozen trains workspace parameters and freezes substrate/task-head parameters.",
+    )
     parser.add_argument(
         "--workspace-train-scope",
         choices=("workspace", "gate"),
@@ -4711,15 +4654,16 @@ if __name__ == "__main__":
                 "--moe-backbone-block-isolation must be in [0, "
                 f"{args.split_graph_num_blocks - 1}] for the configured number of blocks"
             )
-    if not math.isfinite(args.moe_backbone_residual_scale) or args.moe_backbone_residual_scale < 0.0:
+    if (
+        not math.isfinite(args.moe_backbone_residual_scale)
+        or args.moe_backbone_residual_scale < 0.0
+    ):
         parser.error("--moe-backbone-residual-scale must be finite and >= 0")
     if args.moe_backbone_residual_scale != 1.0:
         if not args.moe or not args.split_graph:
             parser.error("--moe-backbone-residual-scale requires --moe and --split-graph")
         if args.moe_placement not in ("backbone", "all"):
-            parser.error(
-                "--moe-backbone-residual-scale requires --moe-placement backbone or all"
-            )
+            parser.error("--moe-backbone-residual-scale requires --moe-placement backbone or all")
     if args.workspace and args.moe_placement == "combiner":
         parser.error("--workspace requires backbone MoE; use --moe-placement backbone or all")
     if args.workspace_num_slots < 0:
@@ -4730,9 +4674,7 @@ if __name__ == "__main__":
         not math.isfinite(args.workspace_reconsideration_surprise_threshold)
         or not 0.0 <= args.workspace_reconsideration_surprise_threshold <= 1.0
     ):
-        parser.error(
-            "--workspace-reconsideration-surprise-threshold must be finite and in [0, 1]"
-        )
+        parser.error("--workspace-reconsideration-surprise-threshold must be finite and in [0, 1]")
     if args.workspace_reconsideration and not args.workspace:
         parser.error("--workspace-reconsideration requires --workspace")
     if (
@@ -4744,9 +4686,7 @@ if __name__ == "__main__":
             "--workspace-reconsideration"
         )
     if args.workspace_reconsideration and not args.moe_diagnostics:
-        parser.error(
-            "--workspace-reconsideration requires --moe-diagnostics for trigger telemetry"
-        )
+        parser.error("--workspace-reconsideration requires --moe-diagnostics for trigger telemetry")
     if args.workspace_train_scope == "gate" and not args.workspace:
         parser.error("--workspace-train-scope=gate requires --workspace")
     if args.workspace_gate_variant == "bistable" and (
@@ -4861,11 +4801,9 @@ if __name__ == "__main__":
             if args.workspace_bptt_horizon:
                 run_id += f"_wbptt{args.workspace_bptt_horizon}"
             if args.workspace_reconsideration:
-                threshold_tag = (
-                    f"{args.workspace_reconsideration_surprise_threshold:g}"
-                    .replace(".", "p")
-                    .replace("-", "m")
-                )
+                threshold_tag = f"{args.workspace_reconsideration_surprise_threshold:g}".replace(
+                    ".", "p"
+                ).replace("-", "m")
                 trigger_tag = (
                     "innovation"
                     if args.workspace_reconsideration_trigger == "innovation"
@@ -4959,9 +4897,7 @@ if __name__ == "__main__":
             workspace_reconsideration_surprise_threshold=(
                 args.workspace_reconsideration_surprise_threshold
             ),
-            workspace_reconsideration_trigger_mode=(
-                args.workspace_reconsideration_trigger
-            ),
+            workspace_reconsideration_trigger_mode=(args.workspace_reconsideration_trigger),
             workspace_bistable_deterministic=args.workspace_bistable_deterministic,
             workspace_stability_max_activation=args.workspace_stability_max_activation,
             eval_only=args.eval_only,

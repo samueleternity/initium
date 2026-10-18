@@ -289,9 +289,7 @@ class MambaBackboneParallel(nn.Module):
                 ]
             )
 
-    def forward(
-        self, x: torch.Tensor, *, token_mask: torch.Tensor | None = None
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, *, token_mask: torch.Tensor | None = None) -> torch.Tensor:
         # x: (B, L, in_dim) -> (B, L, d_model). Called EXACTLY ONCE per
         # training step (not once per DNC timestep, unlike
         # MambaControllerWrapper) -- this single call is the entire
@@ -304,9 +302,7 @@ class MambaBackboneParallel(nn.Module):
                 h = self.moe_blocks[i](h, token_mask=token_mask)
         return h
 
-    def forward_with_specialists(
-        self, x: torch.Tensor, *, token_mask: torch.Tensor | None = None
-    ):
+    def forward_with_specialists(self, x: torch.Tensor, *, token_mask: torch.Tensor | None = None):
         """Return final MoE candidates and sparse routes for workspace use.
 
         Earlier backbone/MoE blocks remain unchanged. The final MoE block

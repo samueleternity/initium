@@ -174,9 +174,7 @@ class CfCBackboneParallel(nn.Module):
                 h = self.moe_blocks[i](h, token_mask=token_mask)
         return h
 
-    def forward_with_specialists(
-        self, x: torch.Tensor, *, token_mask: torch.Tensor | None = None
-    ):
+    def forward_with_specialists(self, x: torch.Tensor, *, token_mask: torch.Tensor | None = None):
         """Return final MoE candidates and routes for shared-workspace use."""
         if not self.moe_enabled or self.moe_blocks is None:
             raise RuntimeError("workspace broadcast requires an enabled MoE expert pool")

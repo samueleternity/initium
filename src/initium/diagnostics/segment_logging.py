@@ -213,30 +213,28 @@ class SegmentDiagnostics:
                 self._accumulate_tensor(record, "in", input_tensor, location=location)
                 if input_tensor.requires_grad:
                     input_tensor.register_hook(
-                        lambda grad,
-                        target=record,
-                        call_location=location,
-                        context=input_context: self._accumulate_tensor(
-                            target,
-                            "grad_in",
-                            grad,
-                            location=call_location,
-                            context=context,
+                        lambda grad, target=record, call_location=location, context=input_context: (
+                            self._accumulate_tensor(
+                                target,
+                                "grad_in",
+                                grad,
+                                location=call_location,
+                                context=context,
+                            )
                         )
                     )
             if output_tensor is not None:
                 self._accumulate_tensor(record, "out", output_tensor, location=location)
                 if output_tensor.requires_grad:
                     output_tensor.register_hook(
-                        lambda grad,
-                        target=record,
-                        call_location=location,
-                        context=output_context: self._accumulate_tensor(
-                            target,
-                            "grad_out",
-                            grad,
-                            location=call_location,
-                            context=context,
+                        lambda grad, target=record, call_location=location, context=output_context: (
+                            self._accumulate_tensor(
+                                target,
+                                "grad_out",
+                                grad,
+                                location=call_location,
+                                context=context,
+                            )
                         )
                     )
 
@@ -247,11 +245,10 @@ class SegmentDiagnostics:
                 for state_index, state_tensor in enumerate(_all_tensors(inputs[1:]), start=1):
                     if state_tensor.requires_grad:
                         state_tensor.register_hook(
-                            lambda grad,
-                            target=record,
-                            call_location=location,
-                            prefix=f"grad_in_{state_index}": self._accumulate_tensor(
-                                target, prefix, grad, location=call_location
+                            lambda grad, target=record, call_location=location, prefix=f"grad_in_{state_index}": (
+                                self._accumulate_tensor(
+                                    target, prefix, grad, location=call_location
+                                )
                             )
                         )
 
@@ -265,18 +262,14 @@ class SegmentDiagnostics:
                 self._accumulate_tensor(record, output_prefix, tensor, location=location)
                 if tensor.requires_grad:
                     tensor.register_hook(
-                        lambda grad,
-                        target=record,
-                        call_location=location,
-                        prefix=gradient_prefix,
-                        context=output_context
-                        if output_index == 1
-                        else None: self._accumulate_tensor(
-                            target,
-                            prefix,
-                            grad,
-                            location=call_location,
-                            context=context,
+                        lambda grad, target=record, call_location=location, prefix=gradient_prefix, context=output_context if output_index == 1 else None: (
+                            self._accumulate_tensor(
+                                target,
+                                prefix,
+                                grad,
+                                location=call_location,
+                                context=context,
+                            )
                         )
                     )
 

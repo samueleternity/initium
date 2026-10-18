@@ -1860,7 +1860,7 @@ def run(
         ),
     )
     if workspace_train_scope == "gate" and isinstance(rnn, SplitGraphDNC):
-        rnn._initium_segment_observer = segment_diagnostics.observe_tensor
+        setattr(rnn, "_initium_segment_observer", segment_diagnostics.observe_tensor)
     segment_diagnostics.add_module(output_proj, "task_output")
     if segment_diagnostics_enabled and isinstance(rnn, SplitGraphDNC):
         combiner = rnn.combiner_wrapper
@@ -1883,8 +1883,10 @@ def run(
         rnn.workspace.set_diagnostics_enabled(moe_diagnostics_enabled)
         rnn.workspace_bistable_deterministic = workspace_bistable_deterministic
         if workspace_train_scope == "gate":
-            rnn.workspace._initium_recurrent_state_observer = (
-                segment_diagnostics.observe_recurrent_state
+            setattr(
+                rnn.workspace,
+                "_initium_recurrent_state_observer",
+                segment_diagnostics.observe_recurrent_state,
             )
 
     def emit_failure_diagnostics(channel: str, *, include_gradients: bool = False) -> None:

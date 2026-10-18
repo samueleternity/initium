@@ -81,7 +81,7 @@ ProductInputStats = TypedDict(
 )
 
 
-_PRODUCT_BACKWARD_TRACE: tuple[bool, Callable[[str, torch.Tensor], None] | None] = (
+_PRODUCT_BACKWARD_TRACE: tuple[bool, Callable[[str, torch.Tensor], torch.Tensor] | None] = (
     False,
     None,
 )
@@ -105,7 +105,7 @@ def _log_space(input: torch.Tensor, dim, keepdim: bool, cumulative: bool) -> tor
 
 
 def set_product_backward_trace(
-    enabled: bool, reporter: Callable[[str, torch.Tensor], None] | None = None
+    enabled: bool, reporter: Callable[[str, torch.Tensor], torch.Tensor] | None = None
 ) -> None:
     """Attach an optional diagnostic hook to patched product outputs."""
     global _PRODUCT_BACKWARD_TRACE

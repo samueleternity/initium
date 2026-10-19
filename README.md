@@ -81,6 +81,30 @@ Dataset registry ──► task episodes / curriculum ──► batch and sequen
 
 The training core delegates task construction and task-specific behavior to a dataset interface. The model combines a selected controller with DNC memory operations. During training, the loop computes task and optional auxiliary objectives, updates model parameters, periodically evaluates ID and OOD performance, advances the curriculum when its criteria are met, writes diagnostics, and saves resumable checkpoints. Inference reconstructs a model from a checkpoint, checks that the requested task and dimensions are supported, creates the task runner, and reports episode metrics. Optional inference caches can reuse eligible results or shared prefixes.
 
+### Surprise-Gated Recall task (Phase 0)
+
+`--dataset-type surprise-recall` selects a synthetic next-token recall task with a seven-lesson curriculum. The generator records expected and observed tokens and exposes A1 marked events, A2 silent replacements drawn from the same episode pattern, A3 predictable alert-token decoys, A4 phase slips, A5 regime changes, and A6 benign channel jitter. Targets are masked to the answer span; Phase 0 adds no prediction decoder or error-to-Δ path. Its generator-level checks cover label consistency, A2/A3 content-detector behavior, a stateless random-guess reference, and the direct oracle-answer upper bound. These checks do not train the required no-memory or oracle-flag model controls. The command also reports generated sequence-token counts by lesson.
+
+Run the gate from the repository root with `python -m initium.data.surprise_recall.validate` (in an editable/source checkout, set `PYTHONPATH=src` if needed). Start a training run with the requested split-graph architecture by adding `--dataset-type surprise-recall` to the usual command:
+
+```bash
+python -m initium.core_training 0.0 --dataset-type surprise-recall --seed 0 --split-graph --split-graph-variant mamba1 --split-graph-num-blocks 2 --split-graph-combiner-mode controller --split-graph-combiner-variant cfc
+```
+
+The optional MoE and diagnostic flags remain independent architecture/training options. Phase 0 does not add prediction-error gating, DNC/workspace error salience, or a special inference task runner.
+
+### Surprise-Gated Recall task (Phase 1)
+
+Phase 1 adds a dense next-token decoder over block 0's causal split-graph features, preserving the planned inter-layer source for a later phase. `--sgr-pred-loss-weight` enables its stream-only cross-entropy objective alongside the existing answer-masked recall objective; the decoder receives the representation at `t-1` and predicts token `t`. Query, answer, and padding positions are excluded. This phase adds no error injection, gating, MoE, or workspace path. Use a fresh run for each prediction-loss weight (the roadmap suggests 0.1, 0.3, and 1.0) and keep seed, step budget, and architecture matched to the baseline:
+
+```bash
+python -m initium.core_training 0.0 --dataset-type surprise-recall --seed 0 --split-graph --split-graph-variant mamba1 --split-graph-num-blocks 2 --split-graph-combiner-mode controller --split-graph-combiner-variant cfc --sgr-pred-loss-weight 0.3
+```
+
+`--sgr-pred-eval-episodes` controls the fixed, deterministic probe count per lesson (default 128). Phase 1 writes `run_<run-id>_sgr_phase1.csv` alongside the general SGR logs. It records raw-surprisal and excess-surprise AUROC for each A type against clean normal positions, calibration (ECE, accuracy, and Brier score), and A5 recovery. A6's per-type AUROCs measure benign jitter against clean normal positions; the additional A6-versus-true-anomaly comparison is diagnostic. Treat Phase 1 as implemented until its signal gate is evaluated on completed runs; it does not establish that prediction error improves recall.
+
+When `--dataset-type surprise-recall` is active, the trainer also creates `run_<run-id>_sgr_train.csv`, `run_<run-id>_sgr_positions.csv`, and `run_<run-id>_sgr_eval.csv` in the log directory. The batch log records A1–A6 prevalence and task conditions; the position trace records each stream token against its expected pattern token, event label, alert flag, recall-target status, and benign-jitter status. The evaluation log records task and exact-episode accuracy, recalled-event accuracy by A type, event prevalence, alert-token and pattern-mismatch detector confusion, and detector responses at each A-type event (including A3 decoy flags and A6 benign-jitter false alarms). It includes periodic and final ID/OOD results plus paired ID memory-on/memory-off results.
+
 ## Architecture and major components
 
 ### Differentiable external memory

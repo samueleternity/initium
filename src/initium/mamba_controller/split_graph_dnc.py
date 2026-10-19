@@ -591,6 +591,7 @@ class SplitGraphDNC(nn.Module):
         combiner_skip_stages=None,
         start_step: int = 0,  # v20: resume the sequential loop mid-sequence (inference caching)
         sequence_valid_mask: torch.Tensor | None = None,
+        return_backbone_features: bool = False,
     ):
         """
         input: (B, T, input_size) -- batch-first, the whole padded episode
@@ -649,13 +650,16 @@ class SplitGraphDNC(nn.Module):
         # Single call, whole sequence, zero dependency on memory state.
         # This is the entire "removed from the sequential critical path"
         # half of Option 5.
+        prediction_features = None
         if self.workspace is not None:
             backbone_stages = (
                 list(self.backbone) if isinstance(self.backbone, nn.Sequential) else [self.backbone]
             )
             stage_input = input
-            for stage in backbone_stages[:-1]:
+            for stage_index, stage in enumerate(backbone_stages[:-1]):
                 stage_input = stage(stage_input, token_mask=sequence_valid_mask)
+                if stage_index == 0:
+                    prediction_features = stage_input
             final_stage = backbone_stages[-1]
             forward_with_specialists = getattr(final_stage, "forward_with_specialists", None)
             if not callable(forward_with_specialists):
@@ -691,8 +695,20 @@ class SplitGraphDNC(nn.Module):
                 list(self.backbone) if isinstance(self.backbone, nn.Sequential) else [self.backbone]
             )
             H = input
-            for stage in backbone_stages:
+            for stage_index, stage in enumerate(backbone_stages):
                 H = stage(H, token_mask=sequence_valid_mask)
+                if stage_index == 0:
+                    prediction_features = H
+
+        # The Phase 1 prediction head is intended to read block 0 so its
+        # signal can later be injected between parallel backbone blocks.
+        # Capture that stage output without changing the default return API.
+        backbone_features = None
+        if return_backbone_features:
+            # With a single stage, its output is also the final backbone
+            # representation. Otherwise use block 0's output, the planned
+            # inter-layer source for the later error-injection phase.
+            backbone_features = prediction_features if prediction_features is not None else H
 
         # ---- memory hidden-state init (byte-identical convention to
         # dnc.DNC._init_hidden / MambaDNC._init_hidden's memory branch) ---
@@ -799,4 +815,8 @@ class SplitGraphDNC(nn.Module):
         mhx = [mem_state]
         output = torch.stack(outputs, dim=0)  # (T, B, input_size)
 
-        return output, (chx, mhx, read_vec)
+        state = (chx, mhx, read_vec)
+        if return_backbone_features:
+            assert backbone_features is not None
+            return output, state, backbone_features
+        return output, state

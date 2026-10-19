@@ -160,6 +160,12 @@ from initium.data.graph_traversal.relational_probe import (
 )
 from initium.data.prepared_dataset import load_prepared_dataset, save_prepared_dataset
 from initium.diagnostics.segment_logging import SegmentDiagnostics
+from initium.diagnostics.surprise_recall_logging import SurpriseRecallLogger
+from initium.data.surprise_recall.next_token_prediction import (
+    SurprisePredictionHead,
+    evaluate_prediction_signals,
+    masked_next_token_loss,
+)
 from initium.mamba_controller.mamba_controller import MambaDNC
 from initium.mamba_controller.split_graph_dnc import SplitGraphDNC
 from initium.memory_manipulation.dnc_mechanisms import compile_memory_forward
@@ -439,6 +445,7 @@ def save_checkpoint(
     split_graph_enabled=SPLIT_GRAPH_ENABLED,
     split_graph_variant=SPLIT_GRAPH_MAMBA_VARIANT,
     extra_model_config=None,
+    sgr_prediction_decoder=None,
 ):
     """Save everything needed to resume training or re-run eval later:
     - model + output-projection + optimizer state
@@ -598,14 +605,18 @@ def save_checkpoint(
     if extra_model_config:  # v19: dataset type / dims / split-graph details, read by inference/
         model_config.update(extra_model_config)
 
-    torch.save(
-        {
+    checkpoint_payload = {
             "step": step,
             "run_id": run_id,
             "beta_target": beta_target,
             "model_config": model_config,
             "rnn_state_dict": rnn.state_dict(),
             "output_proj_state_dict": output_proj.state_dict(),
+            "sgr_prediction_decoder_state_dict": (
+                sgr_prediction_decoder.state_dict()
+                if sgr_prediction_decoder is not None
+                else None
+            ),
             "optimizer_state_dict": optimizer.state_dict(),
             "scaler_state_dict": scaler.state_dict(),  # v3 fix
             "curriculum_lesson": curriculum.lesson,
@@ -618,9 +629,8 @@ def save_checkpoint(
                 "torch": torch.get_rng_state(),
                 "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
             },
-        },
-        path,
-    )
+        }
+    torch.save(checkpoint_payload, path)
 
 
 def load_checkpoint_for_resume(path, device):
@@ -862,6 +872,8 @@ def run(
     prepared_dataset=None,
     ogs_weights: tuple[float, float, float] = OGS_WEIGHTS,
     batch_size: int = BATCH_SIZE,
+    sgr_prediction_loss_weight: float = 0.0,
+    sgr_prediction_eval_episodes: int = 128,
 ):
     # Deliberately does NOT touch LR_DECAY_STEPS - that's a separate
     # module-level constant, fixed at import time from the *original*
@@ -875,6 +887,18 @@ def run(
         test_dataset_link=test_dataset_link,
         prepared_dataset=prepared_dataset,
     )
+    sgr_prediction_enabled = sgr_prediction_loss_weight > 0.0
+    if not math.isfinite(sgr_prediction_loss_weight) or sgr_prediction_loss_weight < 0.0:
+        raise ValueError("sgr_prediction_loss_weight must be finite and >= 0")
+    if sgr_prediction_enabled:
+        if getattr(dataset, "name", None) != "surprise-recall":
+            raise ValueError("--sgr-pred-loss-weight requires --dataset-type surprise-recall")
+        if not split_graph_enabled:
+            raise ValueError("Phase 1 prediction loss requires --split-graph backbone features")
+        if moe_enabled or workspace_enabled:
+            raise ValueError("Phase 1 signal isolation requires MoE and workspace to be disabled")
+        if sgr_prediction_eval_episodes < 1:
+            raise ValueError("sgr_prediction_eval_episodes must be positive")
     periodic_ood_episodes = OOD_EVAL_EPISODES_PERIODIC
     final_ood_episodes = OOD_EVAL_EPISODES
     INPUT_DIM, TRIPLE_DIM = dataset.input_dim, dataset.output_dim
@@ -1315,6 +1339,16 @@ def run(
         )
 
     curriculum = dataset.make_curriculum()
+    surprise_recall_logger = (
+        SurpriseRecallLogger(
+            LOG_DIR,
+            run_id,
+            append=resuming,
+            phase1_enabled=sgr_prediction_enabled,
+        )
+        if getattr(dataset, "name", None) == "surprise-recall"
+        else None
+    )
     curriculum.advance_log_writer = lesson_log_writer  # log addition #4, read by maybe_advance
     curriculum.advance_log_file = lesson_log_file  # flushed after each write
     curriculum.hop_log_writer = hop_log_writer  # Static Option 1 watch-item
@@ -1762,6 +1796,9 @@ def run(
         "workspace_bistable_deterministic": workspace_bistable_deterministic,
         "workspace_stability_max_activation": workspace_stability_max_activation,
     }
+    if sgr_prediction_enabled:
+        extra_model_config["sgr_prediction_decoder_enabled"] = True
+        extra_model_config["sgr_prediction_loss_weight"] = float(sgr_prediction_loss_weight)
     controller_model_config: dict[str, Any] = {}
     if controller == "mamba":
         controller_model_config = {
@@ -1850,6 +1887,11 @@ def run(
 
     output_proj = nn.Linear(INPUT_DIM, TRIPLE_DIM).to(device)
     dataset.set_output_proj(output_proj)
+    sgr_prediction_decoder = (
+        SurprisePredictionHead(hidden_size, INPUT_DIM).to(device)
+        if sgr_prediction_enabled
+        else None
+    )
     if workspace_train_scope == "gate" and not segment_diagnostics_enabled:
         raise ValueError("Phase 4 gate-only stability checks require segment diagnostics")
     segment_diagnostics = SegmentDiagnostics(
@@ -2011,6 +2053,12 @@ def run(
         for name, parameter in output_proj.named_parameters()
         if parameter.requires_grad
     ]
+    if sgr_prediction_decoder is not None:
+        trainable_named_parameters.extend(
+            (f"sgr_prediction_decoder.{name}", parameter)
+            for name, parameter in sgr_prediction_decoder.named_parameters()
+            if parameter.requires_grad
+        )
     trainable_parameters = [parameter for _, parameter in trainable_named_parameters]
     if not trainable_parameters:
         raise ValueError("training configuration has no trainable parameters")
@@ -2042,11 +2090,18 @@ def run(
     param_count = sum(p.numel() for p in rnn.parameters()) + sum(
         p.numel() for p in output_proj.parameters()
     )
+    if sgr_prediction_decoder is not None:
+        param_count += sum(p.numel() for p in sgr_prediction_decoder.parameters())
     amp_enabled = USE_AMP and device.type == "cuda"
     kl_on = bool(stochastic_heads) and stochastic_heads[0].sample
     print(
         f"[{run_id}] params {param_count} | kl_terms={'on' if kl_on else 'off'} | amp={'on' if amp_enabled else 'off'}"
     )
+    if sgr_prediction_decoder is not None:
+        print(
+            f"[{run_id}] SGR Phase 1 decoder enabled | pred_loss_weight="
+            f"{sgr_prediction_loss_weight:g} | signal source=causal backbone features"
+        )
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled, init_scale=AMP_INIT_SCALE)
 
     # Dynamic-N (macro-scale): None unless dynamic_n_mode -- every call site
@@ -2243,6 +2298,13 @@ def run(
             output_proj.load_state_dict(ckpt["output_proj_state_dict"])
             if not eval_only:
                 optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        if sgr_prediction_decoder is not None:
+            prediction_state = ckpt.get("sgr_prediction_decoder_state_dict")
+            if prediction_state is None:
+                raise ValueError(
+                    "Phase 1 resume requires a checkpoint with a trained SGR prediction decoder"
+                )
+            sgr_prediction_decoder.load_state_dict(prediction_state)
         # v3 fix: restore GradScaler state (scale, growth tracker) instead
         # of leaving `scaler` at its freshly-constructed init_scale -- see
         # header note. `.get(...)` instead of ["..."] so a pre-v3 checkpoint
@@ -2387,6 +2449,7 @@ def run(
     # whatever LR was saved inside optimizer_state_dict at checkpoint time
     # (potentially still reflecting the old buggy drifted value).
     running_task_loss, running_kl_loss, running_div, running_grad_norm = 0.0, 0.0, 0, 0.0
+    running_sgr_prediction_loss = 0.0
     running_postclip_grad_norm = 0.0
     running_finite_grad_steps = 0
     running_nonfinite_grad_steps = 0
@@ -2474,6 +2537,7 @@ def run(
         if dnc_backward_trace and split_graph_enabled:
             rnn.memories[0].set_backward_trace(True, step=step)
         bistable_forward_debug = ""
+        prediction_loss = None
         with torch.amp.autocast("cuda", enabled=amp_enabled):
             if split_graph_enabled:
                 # Graph episodes are variable length and collate_fn pads them
@@ -2482,12 +2546,21 @@ def run(
                 sequence_valid_mask = (
                     input_seq.ne(0).any(dim=-1) if moe_enabled and dataset_type == "graph" else None
                 )
-                output, hidden = rnn(
-                    input_seq,
-                    hidden,
-                    reset_experience=True,
-                    sequence_valid_mask=sequence_valid_mask,
-                )
+                if sgr_prediction_decoder is not None:
+                    output, hidden, backbone_features = rnn(
+                        input_seq,
+                        hidden,
+                        reset_experience=True,
+                        sequence_valid_mask=sequence_valid_mask,
+                        return_backbone_features=True,
+                    )
+                else:
+                    output, hidden = rnn(
+                        input_seq,
+                        hidden,
+                        reset_experience=True,
+                        sequence_valid_mask=sequence_valid_mask,
+                    )
             else:
                 output, hidden = rnn(input_seq, hidden, reset_experience=True)
             bistable_forward_debug = format_bistable_forward_debug()
@@ -2518,12 +2591,26 @@ def run(
                     "stopping before backward/optimizer update to protect the checkpoint."
                 )
             task_loss = dataset.loss(output, target_digits, answer_mask)
+            if sgr_prediction_decoder is not None:
+                prediction_logits = sgr_prediction_decoder(backbone_features[:, :-1])
+                prediction_loss = masked_next_token_loss(
+                    prediction_logits,
+                    input_seq,
+                    dataset.last_stream_lengths,
+                )
 
         if check_finite_this_step and not _first_nonfinite_report(task_loss, "task_loss", step):
             emit_failure_diagnostics("train")
             raise FloatingPointError(
                 f"[{run_id}] non-finite task loss at step {step}; "
                 "stopping before backward/optimizer update to protect the checkpoint."
+            )
+        if prediction_loss is not None and check_finite_this_step and not _first_nonfinite_report(
+            prediction_loss, "sgr_prediction_loss", step
+        ):
+            emit_failure_diagnostics("train")
+            raise FloatingPointError(
+                f"[{run_id}] non-finite SGR prediction loss at step {step}; stopping."
             )
         kl_loss, kl_diag = pop_total_kl(stochastic_heads, free_bits=FREE_BITS)  # Phase 1
         if check_finite_this_step and not _first_nonfinite_report(kl_loss, "kl_loss", step):
@@ -2553,8 +2640,11 @@ def run(
         lesson_dip_ramp = min(1.0, (step - lesson_dip_start_step) / max(1, LESSON_KL_DIP_STEPS))
         beta_eff = beta_target * global_ramp * lesson_dip_ramp
         loss = (
-            task_loss + beta_eff * kl_loss + moe_aux_loss
-        )  # Phase 1 + Option 4: L = L_task + beta*L_KL + L_moe_aux
+            task_loss
+            + (sgr_prediction_loss_weight * prediction_loss if prediction_loss is not None else 0.0)
+            + beta_eff * kl_loss
+            + moe_aux_loss
+        )
         if check_finite_this_step and not _first_nonfinite_report(loss, "total_loss", step):
             emit_failure_diagnostics("train")
             raise FloatingPointError(
@@ -2827,6 +2917,8 @@ def run(
         amp_scale = scaler.get_scale()
         running_task_loss += task_loss.detach()
         running_kl_loss += kl_loss.detach()
+        if prediction_loss is not None:
+            running_sgr_prediction_loss += prediction_loss.detach()
         running_div += dataset.diversity(output.detach(), target_digits, answer_mask)
         if math.isfinite(grad_norm_value):
             running_grad_norm += grad_norm_value
@@ -2905,6 +2997,24 @@ def run(
                 if torch.is_tensor(running_task_loss)
                 else running_task_loss
             ) / LOG_EVERY
+            avg_sgr_prediction_loss = (
+                (
+                    running_sgr_prediction_loss.item()
+                    if torch.is_tensor(running_sgr_prediction_loss)
+                    else running_sgr_prediction_loss
+                )
+                / LOG_EVERY
+                if sgr_prediction_decoder is not None
+                else None
+            )
+            if surprise_recall_logger is not None:
+                surprise_recall_logger.write_training_batch(
+                    step,
+                    curriculum.lesson + 1,
+                    dataset.last_batch_examples,
+                    task_loss=avg_task,
+                    prediction_loss=avg_sgr_prediction_loss,
+                )
             avg_kl = (
                 running_kl_loss.item() if torch.is_tensor(running_kl_loss) else running_kl_loss
             ) / LOG_EVERY
@@ -2928,6 +3038,8 @@ def run(
                 f"[{run_id}] Step {step}/{total_steps} | Lesson {curriculum.lesson + 1}/{len(curriculum.table)}",
                 f"L_task {avg_task:.4f}",
             ]
+            if avg_sgr_prediction_loss is not None:
+                parts.append(f"L_pred {avg_sgr_prediction_loss:.4f}")
             if kl_on:
                 parts += [
                     f"L_KL {avg_kl:.4f}",
@@ -3136,6 +3248,7 @@ def run(
                 torch.cuda.reset_peak_memory_stats(device)  # so next window's peak isn't cumulative
             log_file.flush()
             running_task_loss, running_kl_loss, running_div, running_grad_norm = 0.0, 0.0, 0, 0.0
+            running_sgr_prediction_loss = 0.0
             running_postclip_grad_norm = 0.0
             running_finite_grad_steps = 0
             running_nonfinite_grad_steps = 0
@@ -3194,6 +3307,23 @@ def run(
             _, id_triple_acc, id_perfect_frac = curriculum.maybe_advance(
                 rnn, device, step=step, optimizer=optimizer
             )
+            if surprise_recall_logger is not None:
+                surprise_recall_logger.write_evaluation(
+                    step, pre_advance_lesson + 1, "id", dataset.last_eval_diagnostics
+                )
+            if sgr_prediction_decoder is not None:
+                sgr_phase1_eval = evaluate_prediction_signals(
+                    rnn.backbone,
+                    sgr_prediction_decoder,
+                    device,
+                    episodes_per_lesson=sgr_prediction_eval_episodes,
+                    lesson_indices=(pre_advance_lesson,),
+                    seed=seed + 730_201,
+                )
+                if surprise_recall_logger is not None:
+                    surprise_recall_logger.write_phase1_evaluation(
+                        step, "periodic-active-lesson", sgr_phase1_eval
+                    )
             segment_diagnostics.emit("eval-id")
             id_stage_diagnostics = (
                 id_stage_memory.finish_stage_diagnostics()
@@ -3289,6 +3419,10 @@ def run(
                 rng=ood_rng,
                 field_log=ood_field_log,
             )
+            if surprise_recall_logger is not None:
+                surprise_recall_logger.write_evaluation(
+                    step, curriculum.lesson + 1, "ood", dataset.last_eval_diagnostics
+                )
             segment_diagnostics.emit("eval-ood")
             ood_stage_diagnostics = (
                 ood_stage_memory.finish_stage_diagnostics()
@@ -3470,6 +3604,13 @@ def run(
                 ablated_triple_acc, ablated_perfect_frac = dataset.evaluate_id_ablated(
                     rnn, device, curriculum, pre_advance_lesson
                 )
+                if surprise_recall_logger is not None:
+                    surprise_recall_logger.write_evaluation(
+                        step,
+                        pre_advance_lesson + 1,
+                        "id-memory-off",
+                        dataset.last_eval_diagnostics,
+                    )
             finally:
                 _restore_rng_state(rng_state_after_other_evaluations)
             segment_diagnostics.emit("eval-id-memory-off")
@@ -3584,6 +3725,7 @@ def run(
                 split_graph_enabled=split_graph_enabled,
                 split_graph_variant=split_graph_variant,
                 extra_model_config=extra_model_config,
+                sgr_prediction_decoder=sgr_prediction_decoder,
             )
             latest_path = os.path.join(CHECKPOINT_DIR, f"{run_id}_latest.pt")
             shutil.copyfile(ckpt_path, latest_path)
@@ -3605,6 +3747,23 @@ def run(
     _, id_triple_acc, id_perfect_frac = curriculum.maybe_advance(
         rnn, device, step=step, optimizer=optimizer, allow_advance=not eval_only
     )
+    if surprise_recall_logger is not None:
+        surprise_recall_logger.write_evaluation(
+            step, curriculum.lesson + 1, "final-id", dataset.last_eval_diagnostics
+        )
+    final_sgr_phase1_eval = None
+    if sgr_prediction_decoder is not None:
+        final_sgr_phase1_eval = evaluate_prediction_signals(
+            rnn.backbone,
+            sgr_prediction_decoder,
+            device,
+            episodes_per_lesson=sgr_prediction_eval_episodes,
+            seed=seed + 730_201,
+        )
+        if surprise_recall_logger is not None:
+            surprise_recall_logger.write_phase1_evaluation(
+                step, "final-all-lessons", final_sgr_phase1_eval
+            )
     segment_diagnostics.emit("eval-final-id")
     report_bistable_evaluation("ID")
     final_id_stage_diagnostics = (
@@ -3649,6 +3808,10 @@ def run(
         verbose_n=10,
         field_log=final_ood_field_log,
     )
+    if surprise_recall_logger is not None:
+        surprise_recall_logger.write_evaluation(
+            step, curriculum.lesson + 1, "final-ood", dataset.last_eval_diagnostics
+        )
     segment_diagnostics.emit("eval-final-ood")
     report_bistable_evaluation("OOD")
     final_ood_stage_diagnostics = (
@@ -3866,6 +4029,25 @@ def run(
         "ood_offset_perfect": ood_offset_perfect,
         "total_elapsed_sec": time.time() - t_run_start,
     }
+    if final_sgr_phase1_eval is not None:
+        summary["sgr_prediction_loss_weight"] = float(sgr_prediction_loss_weight)
+        for kind, values in final_sgr_phase1_eval["per_type"].items():
+            summary[f"phase1_{kind.lower()}_raw_auroc"] = values[
+                "raw_auroc_vs_clean_normal"
+            ]
+            summary[f"phase1_{kind.lower()}_excess_auroc"] = values[
+                "excess_auroc_vs_clean_normal"
+            ]
+        summary["phase1_a6_vs_anomalies_raw_auroc"] = final_sgr_phase1_eval[
+            "a6_vs_true_anomalies"
+        ]["raw_auroc"]
+        summary["phase1_a6_vs_anomalies_excess_auroc"] = final_sgr_phase1_eval[
+            "a6_vs_true_anomalies"
+        ]["excess_auroc"]
+        summary["phase1_next_token_ece"] = final_sgr_phase1_eval["calibration"]["ece"]
+        summary["phase1_a5_mean_tokens_to_recovery"] = final_sgr_phase1_eval[
+            "a5_recovery"
+        ]["mean_tokens_to_recovery"]
     if q99_metrics is not None:
         summary["q99_gate"] = q99_metrics["gate"]
         summary["q99_fact_permuted_accuracy"] = q99_metrics["fact_permuted_accuracy"]
@@ -3893,6 +4075,8 @@ def run(
         dynamic_n_log_file.close()
 
     segment_diagnostics.close()
+    if surprise_recall_logger is not None:
+        surprise_recall_logger.close()
     return summary
 
 
@@ -4500,6 +4684,7 @@ if __name__ == "__main__":
             "audio",
             "video",
             "multimodal",
+            "surprise-recall",
         ],
         help="Dataset plugged into the core loop (data/dataset_registry.py).",
     )
@@ -4510,6 +4695,20 @@ if __name__ == "__main__":
         help=f"Training episodes per optimizer step (default: {BATCH_SIZE}); "
         "larger values may improve device utilization at higher memory use and "
         "change the effective gradient batch.",
+    )
+    parser.add_argument(
+        "--sgr-pred-loss-weight",
+        type=float,
+        default=0.0,
+        help="Enable the Phase 1 SGR next-token decoder with this auxiliary CE weight. "
+        "Requires --dataset-type surprise-recall and --split-graph; no error gating is added.",
+    )
+    parser.add_argument(
+        "--sgr-pred-eval-episodes",
+        type=int,
+        default=128,
+        help="Fixed probe episodes per lesson for periodic active-lesson and final all-lesson "
+        "Phase 1 signal evaluation (default: 128).",
     )
     parser.add_argument(
         "--dataset-link",
@@ -4847,6 +5046,9 @@ if __name__ == "__main__":
             run_id += "_dnccompiled"
         if args.dataset_type != "graph":
             run_id = f"{run_id}_ds{args.dataset_type}"
+        if args.sgr_pred_loss_weight > 0:
+            pred_weight_tag = f"{args.sgr_pred_loss_weight:g}".replace(".", "p")
+            run_id += f"_sgrpred{pred_weight_tag}"
         if args.batch_size != BATCH_SIZE:
             run_id += f"_bs{args.batch_size}"
         if args.run_id_suffix:
@@ -4930,6 +5132,8 @@ if __name__ == "__main__":
             prepared_dataset=prepared_dataset,
             ogs_weights=tuple(args.ogs_weights),
             batch_size=args.batch_size,
+            sgr_prediction_loss_weight=args.sgr_pred_loss_weight,
+            sgr_prediction_eval_episodes=args.sgr_pred_eval_episodes,
         )
         all_summaries.append(summary)
 

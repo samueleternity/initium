@@ -26,6 +26,7 @@ TEXT_ALIASES = ("text",)
 AUDIO_ALIASES = ("audio",)
 VIDEO_ALIASES = ("video",)
 MULTIMODAL_ALIASES = ("multimodal", "multi-modal", "multi_modal")
+SURPRISE_RECALL_ALIASES = ("surprise-recall", "surprise_recall", "sgr")
 
 
 def get_dataset(
@@ -59,4 +60,8 @@ def get_dataset(
         from initium.data.multimodal.multimodal_dataset import MultimodalDataset
 
         return MultimodalDataset((dataset_link or "text+audio").split("+"))
+    if t in SURPRISE_RECALL_ALIASES:
+        from initium.data.surprise_recall.surprise_recall import SurpriseRecallDataset
+
+        return SurpriseRecallDataset()
     raise ValueError(f"unknown dataset type {dataset_type!r}")

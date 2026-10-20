@@ -186,13 +186,28 @@ class _ParallelBlock(nn.Module):
         # running under fp16 (this block no longer benefits from tensor-core
         # fp16 matmuls), but matches every other Mamba SSM computation path
         # in this project, all of which already force fp32 for this reason.
+        numeric_observer = getattr(self, "_initium_forward_numeric_observer", None)
         if self.variant == "mamba3" and _MAMBA3_BF16_OK:
             with torch.autocast(device_type=x.device.type, dtype=torch.bfloat16, enabled=True):
-                out = self.mixer(self.norm(x.float()).to(torch.bfloat16))
+                normed = self.norm(x.float()).to(torch.bfloat16)
+                if numeric_observer is not None:
+                    numeric_observer("normalized_input", normed)
+                out = self.mixer(normed)
         else:
             with torch.autocast(device_type=x.device.type, enabled=False):
-                out = self.mixer(self.norm(x.float()))
-        return x + out.to(x.dtype)
+                normed = self.norm(x.float())
+                if numeric_observer is not None:
+                    numeric_observer("normalized_input", normed)
+                out = self.mixer(normed)
+        if numeric_observer is not None:
+            numeric_observer("mixer_output", out)
+        residual = out.to(x.dtype)
+        if numeric_observer is not None:
+            numeric_observer("residual_branch_cast", residual)
+        result = x + residual
+        if numeric_observer is not None:
+            numeric_observer("residual_output", result)
+        return result
 
 
 class MambaBackboneParallel(nn.Module):
@@ -295,11 +310,18 @@ class MambaBackboneParallel(nn.Module):
         # MambaControllerWrapper) -- this single call is the entire
         # "backbone half" of the Option 5 split.
         h = self.in_adapter(x)
+        numeric_observer = getattr(self, "_initium_forward_numeric_observer", None)
+        if numeric_observer is not None:
+            numeric_observer("input_adapter.output", h)
         moe_blocks = self.moe_blocks
         for i, block in enumerate(self.blocks):
             h = block(h)
+            if numeric_observer is not None:
+                numeric_observer(f"block.{i}.output", h)
             if moe_blocks is not None and isinstance(moe_blocks[i], MoEBlock):
                 h = moe_blocks[i](h, token_mask=token_mask)
+                if numeric_observer is not None:
+                    numeric_observer(f"block.{i}.moe_output", h)
         return h
 
     def forward_with_specialists(self, x: torch.Tensor, *, token_mask: torch.Tensor | None = None):
@@ -314,6 +336,9 @@ class MambaBackboneParallel(nn.Module):
         if not self.moe_enabled or self.moe_blocks is None:
             raise RuntimeError("workspace broadcast requires an enabled MoE expert pool")
         h = self.in_adapter(x)
+        numeric_observer = getattr(self, "_initium_forward_numeric_observer", None)
+        if numeric_observer is not None:
+            numeric_observer("input_adapter.output", h)
         final_index = len(self.blocks) - 1
         if not isinstance(self.moe_blocks[final_index], MoEBlock):
             raise RuntimeError(
@@ -321,12 +346,19 @@ class MambaBackboneParallel(nn.Module):
             )
         for i, block in enumerate(self.blocks):
             h = block(h)
+            if numeric_observer is not None:
+                numeric_observer(f"block.{i}.output", h)
             if i == final_index:
                 base = h
                 _, experts, indices, weights = self.moe_blocks[i](
                     h, return_details=True, token_mask=token_mask
                 )
+                if numeric_observer is not None:
+                    numeric_observer(f"block.{i}.specialists", experts)
+                    numeric_observer(f"block.{i}.route_weights", weights)
                 return base, experts, indices, weights
             if isinstance(self.moe_blocks[i], MoEBlock):
                 h = self.moe_blocks[i](h, token_mask=token_mask)
+                if numeric_observer is not None:
+                    numeric_observer(f"block.{i}.moe_output", h)
         raise RuntimeError("parallel backbone has no blocks")

@@ -105,6 +105,22 @@ python -m initium.core_training 0.0 --dataset-type surprise-recall --seed 0 --sp
 
 When `--dataset-type surprise-recall` is active, the trainer also creates `run_<run-id>_sgr_train.csv`, `run_<run-id>_sgr_positions.csv`, and `run_<run-id>_sgr_eval.csv` in the log directory. The batch log records A1–A6 prevalence and task conditions; the position trace records each stream token against its expected pattern token, event label, alert flag, recall-target status, and benign-jitter status. The evaluation log records task and exact-episode accuracy, recalled-event accuracy by A type, event prevalence, alert-token and pattern-mismatch detector confusion, and detector responses at each A-type event (including A3 decoy flags and A6 benign-jitter false alarms). It includes periodic and final ID/OOD results plus paired ID memory-on/memory-off results.
 
+#### Tracing split-graph forward instability
+
+Use `--split-graph-numeric-trace-step STEP` to inspect one absolute optimizer step after resuming from a checkpoint saved before the suspected failure. Re-run with the same seed, architecture, task, and relevant training options. For every observed boundary, the trace prints dtype, shape, finite/non-finite counts, maximum finite absolute value, and (on failure) the first bad coordinate to the console and CSV. It checks before and after Mamba normalization, mixer, cast, and residual; it also covers the CfC adapter/cell/residual/state, DNC state/read, recurrent output, logits, and loss. Timesteps are included for recurrent boundaries. It writes `run_<run-id>_splitgraph_forward_trace.csv` in the configured log directory and stops at the first observed non-finite value. The completion line reports rows written and warns if no boundary was observed. For example, to investigate the reported step 11,635 failure:
+
+```bash
+python -m initium.core_training 0.0 --dataset-type surprise-recall --seed 0 --resume <checkpoint-before-step-11635.pt> --split-graph --split-graph-variant mamba1 --split-graph-num-blocks 2 --split-graph-combiner-mode controller --split-graph-combiner-variant cfc --total-steps 12000 --split-graph-numeric-trace-step 11635
+```
+
+The selected step synchronizes CUDA at every observed boundary, so this flag is intended for a narrow replay and adds no such checks to other steps. A clean selected step means no observed tensor was non-finite at those boundaries; use the largest `max_abs_finite` rows to identify where scale first grows. A failure reports the first *instrumented* bad boundary; it cannot identify an internal operation between two boundaries. MoE and workspace boundaries are included when those paths are active, but compare runs with identical options to preserve replay conditions.
+
+For intermittent failures whose step shifts between runs, use `--split-graph-numeric-trace-on-error` instead of selecting a step. It performs no boundary tensor checks during healthy training. When the trainer's existing finite checks detect a non-finite recurrent output, task logit/loss, or SGR prediction loss, it replays that same batch once with detailed tracing enabled, prints each boundary to the console, and writes the same CSV. The original training failure is still raised before backward or an optimizer update; if the replay does not reproduce the non-finite value, the trace reports that result and preserves the original failure. This option requires `--split-graph`, is for training runs, and cannot be combined with `--split-graph-numeric-trace-step`.
+
+```bash
+python -m initium.core_training 0.0 --dataset-type surprise-recall --seed 0 --resume <checkpoint.pt> --split-graph --split-graph-variant mamba1 --split-graph-num-blocks 2 --split-graph-combiner-mode controller --split-graph-combiner-variant cfc --total-steps 30000 --split-graph-numeric-trace-on-error
+```
+
 ## Architecture and major components
 
 ### Differentiable external memory

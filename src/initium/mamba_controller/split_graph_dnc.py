@@ -461,6 +461,11 @@ class SplitGraphDNC(nn.Module):
                     in_dim=combiner_in_dim,
                     d_model=hidden_size,
                     num_blocks=combiner_num_blocks,
+                    # SplitGraphDNC applies the outer backbone residual
+                    # below (xi_t = h_t + xi_out). The CfC stack must emit
+                    # the update, rather than adding its adapter input as a
+                    # second residual path and amplifying large fp16 values.
+                    residual=False,
                     moe_enabled=combiner_moe_enabled,
                     moe_num_experts=moe_num_experts,
                     moe_expert_dim=moe_expert_dim,
@@ -646,6 +651,23 @@ class SplitGraphDNC(nn.Module):
             if observer is not None:
                 observer(label, value)
 
+        numeric_observer = getattr(self, "_initium_forward_numeric_observer", None)
+        numeric_context = getattr(self, "_initium_forward_numeric_context", None)
+        if numeric_context is not None and not numeric_context.active:
+            numeric_observer = None
+
+        def observe_numeric_tree(label: str, value) -> None:
+            if numeric_observer is None:
+                return
+            if isinstance(value, torch.Tensor):
+                numeric_observer(label, value)
+            elif isinstance(value, dict):
+                for key, child in value.items():
+                    observe_numeric_tree(f"{label}.{key}", child)
+            elif isinstance(value, (tuple, list)):
+                for index, child in enumerate(value):
+                    observe_numeric_tree(f"{label}.{index}", child)
+
         # ---- (a) PARALLEL BACKBONE ------------------------------------
         # Single call, whole sequence, zero dependency on memory state.
         # This is the entire "removed from the sequential critical path"
@@ -690,6 +712,7 @@ class SplitGraphDNC(nn.Module):
                 self.moe_backbone_residual_scale * broadcast_delta
             )
             observe_tensor("split_graph.h_after_workspace", H)
+            observe_numeric_tree("backbone.workspace_output", H)
         else:
             backbone_stages = (
                 list(self.backbone) if isinstance(self.backbone, nn.Sequential) else [self.backbone]
@@ -720,6 +743,7 @@ class SplitGraphDNC(nn.Module):
             else:
                 mhx = [self.memories[0].reset(B, mhx[0], erase=reset_experience)]
         mem_state = mhx[0]
+        observe_numeric_tree("memory.state.initial", mem_state)
 
         if last_read is None:
             read_vec = torch.zeros(B, self.w * self.r, device=device, dtype=H.dtype)
@@ -752,7 +776,11 @@ class SplitGraphDNC(nn.Module):
 
         outputs = []
         for t in range(start_step, T):
+            if numeric_context is not None:
+                numeric_context.set_time_index(t)
             h_t = H[:, t, :]  # (B, hidden_size)
+            observe_numeric_tree("backbone.timestep", h_t)
+            observe_numeric_tree("memory.read.previous", read_vec)
             observe_tensor("split_graph.backbone_source", h_t)
             observe_tensor("split_graph.read_source", read_vec)
 
@@ -770,13 +798,20 @@ class SplitGraphDNC(nn.Module):
                     combiner_in = torch.cat([h_t, read_vec], dim=-1).unsqueeze(
                         1
                     )  # (B, 1, hidden+read)
+                    observe_numeric_tree("controller.input.concatenated", combiner_in)
                     if combiner_skip_stages is not None:
                         xi_out, combiner_hx = self.combiner_wrapper(
                             combiner_in, combiner_hx, skip_stages=combiner_skip_stages
                         )
                     else:
                         xi_out, combiner_hx = self.combiner_wrapper(combiner_in, combiner_hx)
-                xi_t = h_t + xi_out.squeeze(1)
+                # Accumulate the single graph-level residual in fp32. The
+                # backbone and controller may run under autocast; adding two
+                # near-limit fp16 activations here can overflow before the
+                # DNC's fp32 memory path gets a chance to process the input.
+                xi_t = h_t.float() + xi_out.squeeze(1).float()
+                observe_numeric_tree("controller.output.residual", xi_out)
+                observe_numeric_tree("memory.input.xi_t", xi_t)
             elif self.combine_reads:
                 assert self.combiner is not None
                 xi_t = h_t + self.combiner(torch.cat([h_t, read_vec], dim=-1))
@@ -788,6 +823,8 @@ class SplitGraphDNC(nn.Module):
             if pass_through_memory:
                 observe_tensor("split_graph.dnc_input", xi_t)
                 read_vec, mem_state = self.memories[0](xi_t, mem_state)
+                observe_numeric_tree("memory.state.output", mem_state)
+                observe_numeric_tree("memory.read.output", read_vec)
                 read_vec = read_vec.reshape(
                     B, -1
                 )  # dnc.memory.Memory returns (B, r, w) unflattened
@@ -798,6 +835,7 @@ class SplitGraphDNC(nn.Module):
                 read_vec = torch.zeros(B, self.w * self.r, device=device, dtype=H.dtype)
 
             step_out = self.output(torch.cat([xi_t, read_vec], dim=-1))  # (B, input_size)
+            observe_numeric_tree("model.step_output", step_out)
             outputs.append(step_out)
 
         if self.combiner_mode == "controller":

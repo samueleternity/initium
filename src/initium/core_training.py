@@ -161,6 +161,7 @@ from initium.data.graph_traversal.relational_probe import (
 from initium.data.prepared_dataset import load_prepared_dataset, save_prepared_dataset
 from initium.diagnostics.segment_logging import SegmentDiagnostics
 from initium.diagnostics.surprise_recall_logging import SurpriseRecallLogger
+from initium.diagnostics.split_graph_forward_trace import SplitGraphForwardTrace
 from initium.data.surprise_recall.next_token_prediction import (
     SurprisePredictionHead,
     evaluate_prediction_signals,
@@ -866,6 +867,8 @@ def run(
     dnc_compile_memory: bool = False,
     dnc_backward_trace: bool = False,
     dnc_backward_trace_step: int | None = None,
+    split_graph_numeric_trace_step: int | None = None,
+    split_graph_numeric_trace_on_error: bool = False,
     dataset_type: str = DATASET_TYPE,
     dataset_link: str | None = DATASET_LINK,
     test_dataset_link: str | None = None,
@@ -887,6 +890,22 @@ def run(
         test_dataset_link=test_dataset_link,
         prepared_dataset=prepared_dataset,
     )
+    if split_graph_numeric_trace_step is not None:
+        if not split_graph_enabled:
+            raise ValueError("--split-graph-numeric-trace-step requires --split-graph")
+        if eval_only:
+            raise ValueError("--split-graph-numeric-trace-step requires a training run")
+        if split_graph_numeric_trace_step < 0:
+            raise ValueError("--split-graph-numeric-trace-step must be >= 0")
+    if split_graph_numeric_trace_on_error and not split_graph_enabled:
+        raise ValueError("--split-graph-numeric-trace-on-error requires --split-graph")
+    if split_graph_numeric_trace_on_error and eval_only:
+        raise ValueError("--split-graph-numeric-trace-on-error requires a training run")
+    if split_graph_numeric_trace_on_error and split_graph_numeric_trace_step is not None:
+        raise ValueError(
+            "--split-graph-numeric-trace-on-error cannot be combined with "
+            "--split-graph-numeric-trace-step"
+        )
     sgr_prediction_enabled = sgr_prediction_loss_weight > 0.0
     if not math.isfinite(sgr_prediction_loss_weight) or sgr_prediction_loss_weight < 0.0:
         raise ValueError("sgr_prediction_loss_weight must be finite and >= 0")
@@ -1683,6 +1702,114 @@ def run(
             f"[{run_id}] DNC memory forward compiled with torch.compile | "
             "first-call compilation overhead is expected"
         )
+
+    split_graph_forward_trace = None
+    if split_graph_numeric_trace_step is not None or split_graph_numeric_trace_on_error:
+        if not isinstance(rnn, SplitGraphDNC):
+            raise ValueError("split-graph numeric tracing requires SplitGraphDNC")
+        split_graph_forward_trace = SplitGraphForwardTrace(
+            LOG_DIR,
+            run_id,
+            split_graph_numeric_trace_step,
+            trigger_on_error=split_graph_numeric_trace_on_error,
+        )
+        rnn._initium_forward_numeric_context = split_graph_forward_trace
+        for module_name, module in rnn.named_modules():
+            if module is rnn:
+                prefix = "split_graph"
+            elif module is rnn.backbone:
+                prefix = "backbone"
+            elif module.__class__.__name__ == "MambaBackboneParallel":
+                prefix = module_name
+            elif module.__class__.__name__ == "_ParallelBlock":
+                prefix = module_name
+            elif module.__class__.__name__ == "CfCControllerWrapper":
+                prefix = "controller.cfc"
+            elif module.__class__.__name__ == "CfCControllerBlock":
+                prefix = module_name.replace("combiner_wrapper", "controller.cfc")
+            else:
+                continue
+
+            def make_observer(module_prefix: str):
+                return lambda boundary, tensor: split_graph_forward_trace.observe(
+                    f"{module_prefix}.{boundary}", tensor
+                )
+
+            module._initium_forward_numeric_observer = make_observer(prefix)
+        if split_graph_numeric_trace_on_error:
+            print(
+                f"[{run_id}] automatic split-graph forward numeric trace armed; "
+                "detailed boundary tracing starts only after a trainer finite check "
+                "fails, then replays that batch; output: "
+                f"{split_graph_forward_trace.path}"
+            )
+        else:
+            print(
+                f"[{run_id}] split-graph forward numeric trace armed for absolute optimizer "
+                f"step {split_graph_numeric_trace_step}; output: "
+                f"{split_graph_forward_trace.path}"
+            )
+
+    def trace_split_graph_failure(
+        step: int,
+        failure: str,
+        input_seq: torch.Tensor,
+        target_digits: torch.Tensor,
+        answer_mask: torch.Tensor,
+        sequence_valid_mask: torch.Tensor | None,
+    ) -> None:
+        """Replay only the batch that tripped a finite check, with detailed tracing."""
+        trace = split_graph_forward_trace
+        if trace is None or not trace.activate_on_error(step, failure):
+            return
+        try:
+            with torch.amp.autocast("cuda", enabled=amp_enabled):
+                replay_result = rnn(
+                    input_seq,
+                    (None, None, None),
+                    reset_experience=True,
+                    sequence_valid_mask=sequence_valid_mask,
+                    return_backbone_features=sgr_prediction_decoder is not None,
+                )
+                replay_output = replay_result[0]
+                replay_features = replay_result[2] if len(replay_result) > 2 else None
+                trace.set_time_index(None)
+                trace.observe("rnn.output", replay_output)
+                replay_logits = output_proj(replay_output.transpose(0, 1))
+                trace.observe("task_output.logits", replay_logits)
+                replay_task_loss = dataset.loss(
+                    replay_logits, target_digits, answer_mask
+                )
+                trace.observe("task_output.loss", replay_task_loss)
+                if sgr_prediction_decoder is not None:
+                    replay_prediction_logits = sgr_prediction_decoder(
+                        replay_features[:, :-1]
+                    )
+                    trace.observe(
+                        "sgr_prediction.logits", replay_prediction_logits
+                    )
+                    replay_prediction_loss = masked_next_token_loss(
+                        replay_prediction_logits,
+                        input_seq,
+                        dataset.last_stream_lengths,
+                    )
+                    trace.observe("sgr_prediction.loss", replay_prediction_loss)
+            trace.finish_error_replay(step)
+        except FloatingPointError as trace_error:
+            print(
+                f"[split-graph-forward-trace] automatic replay localized the first "
+                f"non-finite boundary: {trace_error}",
+                flush=True,
+            )
+            trace.close()
+        except Exception as trace_error:
+            print(
+                f"[split-graph-forward-trace] automatic diagnostic replay failed "
+                f"({type(trace_error).__name__}: {trace_error}); preserving the "
+                "original training failure",
+                flush=True,
+            )
+            trace.close()
 
     print(
         f"[{run_id}] DNC implementation={dnc_implementation}"
@@ -2493,6 +2620,8 @@ def run(
     t_run_start = time.time()
 
     while step < total_steps and not eval_only:
+        if split_graph_forward_trace is not None:
+            split_graph_forward_trace.begin_step(step)
         dnc_trace_this_step = (
             dnc_backward_trace
             and isinstance(rnn, SplitGraphDNC)
@@ -2574,23 +2703,50 @@ def run(
                         f"{segment} (observed absmax={maximum:.6g}) at step {step}; "
                         "stopping before backward/optimizer update."
                     )
+            if split_graph_forward_trace is not None and split_graph_forward_trace.active:
+                split_graph_forward_trace.set_time_index(None)
+                split_graph_forward_trace.observe("rnn.output", output)
             if check_finite_this_step and not _first_nonfinite_report(output, "rnn_output", step):
                 emit_failure_diagnostics("train")
+                output = None
+                hidden = None
+                trace_split_graph_failure(
+                    step,
+                    "non-finite recurrent output",
+                    input_seq,
+                    target_digits,
+                    answer_mask,
+                    sequence_valid_mask,
+                )
                 raise FloatingPointError(
                     f"[{run_id}] non-finite recurrent output at step {step}; "
                     "stopping before backward/optimizer update to protect the checkpoint."
                 )
             output = output.transpose(0, 1)  # (B, T, 92); Linear accepts non-contiguous input.
             output = output_proj(output)  # (B, T, 90)
+            if split_graph_forward_trace is not None and split_graph_forward_trace.active:
+                split_graph_forward_trace.observe("task_output.logits", output)
             if check_finite_this_step and not _first_nonfinite_report(
                 output, "output_logits", step
             ):
                 emit_failure_diagnostics("train")
+                output = None
+                hidden = None
+                trace_split_graph_failure(
+                    step,
+                    "non-finite task output logits",
+                    input_seq,
+                    target_digits,
+                    answer_mask,
+                    sequence_valid_mask,
+                )
                 raise FloatingPointError(
                     f"[{run_id}] non-finite output logits at step {step}; "
                     "stopping before backward/optimizer update to protect the checkpoint."
                 )
             task_loss = dataset.loss(output, target_digits, answer_mask)
+            if split_graph_forward_trace is not None and split_graph_forward_trace.active:
+                split_graph_forward_trace.observe("task_output.loss", task_loss)
             if sgr_prediction_decoder is not None:
                 prediction_logits = sgr_prediction_decoder(backbone_features[:, :-1])
                 prediction_loss = masked_next_token_loss(
@@ -2601,6 +2757,17 @@ def run(
 
         if check_finite_this_step and not _first_nonfinite_report(task_loss, "task_loss", step):
             emit_failure_diagnostics("train")
+            output = None
+            task_loss = None
+            hidden = None
+            trace_split_graph_failure(
+                step,
+                "non-finite task loss",
+                input_seq,
+                target_digits,
+                answer_mask,
+                sequence_valid_mask,
+            )
             raise FloatingPointError(
                 f"[{run_id}] non-finite task loss at step {step}; "
                 "stopping before backward/optimizer update to protect the checkpoint."
@@ -2609,6 +2776,17 @@ def run(
             prediction_loss, "sgr_prediction_loss", step
         ):
             emit_failure_diagnostics("train")
+            prediction_loss = None
+            output = None
+            hidden = None
+            trace_split_graph_failure(
+                step,
+                "non-finite SGR prediction loss",
+                input_seq,
+                target_digits,
+                answer_mask,
+                sequence_valid_mask,
+            )
             raise FloatingPointError(
                 f"[{run_id}] non-finite SGR prediction loss at step {step}; stopping."
             )
@@ -2645,11 +2823,15 @@ def run(
             + beta_eff * kl_loss
             + moe_aux_loss
         )
+        if split_graph_forward_trace is not None and split_graph_forward_trace.active:
+            split_graph_forward_trace.observe("training.total_loss", loss)
         if check_finite_this_step and not _first_nonfinite_report(loss, "total_loss", step):
             emit_failure_diagnostics("train")
             raise FloatingPointError(
                 f"[{run_id}] non-finite total loss at step {step}; stopping before backward."
             )
+        if split_graph_forward_trace is not None:
+            split_graph_forward_trace.end_step(step)
         try:
             scaler.scale(loss).backward()
         except RuntimeError:
@@ -4077,6 +4259,8 @@ def run(
     segment_diagnostics.close()
     if surprise_recall_logger is not None:
         surprise_recall_logger.close()
+    if split_graph_forward_trace is not None:
+        split_graph_forward_trace.close()
     return summary
 
 
@@ -4645,6 +4829,28 @@ if __name__ == "__main__":
             "to reduce diagnostic overhead."
         ),
     )
+    parser.add_argument(
+        "--split-graph-numeric-trace-step",
+        type=int,
+        default=None,
+        metavar="STEP",
+        help=(
+            "Trace finite counts, dtypes, shapes, and peak finite magnitudes at split-graph "
+            "backbone/CfC/DNC boundaries for one absolute training step; stop at the first "
+            "observed non-finite tensor. Writes run_<id>_splitgraph_forward_trace.csv. "
+            "This diagnostic synchronizes CUDA and should be targeted at a replayable step."
+        ),
+    )
+    parser.add_argument(
+        "--split-graph-numeric-trace-on-error",
+        action="store_true",
+        help=(
+            "Keep split-graph numeric tracing dormant during training. When an "
+            "existing finite check detects a non-finite forward result, replay "
+            "that same batch once and trace split-graph boundaries to the first "
+            "non-finite tensor. Writes run_<id>_splitgraph_forward_trace.csv."
+        ),
+    )
     dnc_impl_group = parser.add_mutually_exclusive_group()
     dnc_impl_group.add_argument(
         "--base-dnc",
@@ -4785,6 +4991,21 @@ if __name__ == "__main__":
         parser.error("--dnc-backward-trace-step requires --dnc-backward-trace")
     if args.dnc_backward_trace_step is not None and args.dnc_backward_trace_step < 0:
         parser.error("--dnc-backward-trace-step must be >= 0")
+    if args.split_graph_numeric_trace_step is not None and not args.split_graph:
+        parser.error("--split-graph-numeric-trace-step requires --split-graph")
+    if args.split_graph_numeric_trace_step is not None and args.split_graph_numeric_trace_step < 0:
+        parser.error("--split-graph-numeric-trace-step must be >= 0")
+    if args.split_graph_numeric_trace_step is not None and args.eval_only:
+        parser.error("--split-graph-numeric-trace-step requires a training run")
+    if args.split_graph_numeric_trace_on_error and not args.split_graph:
+        parser.error("--split-graph-numeric-trace-on-error requires --split-graph")
+    if args.split_graph_numeric_trace_on_error and args.eval_only:
+        parser.error("--split-graph-numeric-trace-on-error requires a training run")
+    if args.split_graph_numeric_trace_on_error and args.split_graph_numeric_trace_step is not None:
+        parser.error(
+            "--split-graph-numeric-trace-on-error cannot be combined with "
+            "--split-graph-numeric-trace-step"
+        )
     if args.dnc_read_residual_scale < 0:
         parser.error("--dnc-read-residual-scale must be non-negative")
     if args.dnc_read_residual_max_ratio < 0:
@@ -5126,6 +5347,8 @@ if __name__ == "__main__":
             dnc_compile_memory=args.dnc_compile_memory,
             dnc_backward_trace=args.dnc_backward_trace,
             dnc_backward_trace_step=args.dnc_backward_trace_step,
+            split_graph_numeric_trace_step=args.split_graph_numeric_trace_step,
+            split_graph_numeric_trace_on_error=args.split_graph_numeric_trace_on_error,
             dataset_type=args.dataset_type,
             dataset_link=args.dataset_link,
             test_dataset_link=args.test_dataset_link,

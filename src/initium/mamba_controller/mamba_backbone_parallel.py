@@ -282,6 +282,12 @@ class MambaBackboneParallel(nn.Module):
                 for _ in range(num_blocks)
             ]
         )
+        # Match the standard pre-norm SSM stack contract: normalize the
+        # residual stream after the final mixer before exposing features to
+        # downstream modules. This is deliberately non-affine, so activation
+        # scale cannot be relearned to an unsafe range and existing checkpoint
+        # state dicts remain load-compatible (no parameters or buffers).
+        self.output_norm = nn.LayerNorm(d_model, elementwise_affine=False)
         if moe_enabled:
             self.moe_blocks = nn.ModuleList(
                 [
@@ -322,7 +328,21 @@ class MambaBackboneParallel(nn.Module):
                 h = moe_blocks[i](h, token_mask=token_mask)
                 if numeric_observer is not None:
                     numeric_observer(f"block.{i}.moe_output", h)
-        return h
+        return self.normalize_output(h)
+
+    def normalize_output(self, h: torch.Tensor) -> torch.Tensor:
+        """Normalize the final residual stream before exposing backbone features."""
+        numeric_observer = getattr(self, "_initium_forward_numeric_observer", None)
+        if numeric_observer is not None:
+            numeric_observer("output_norm.input", h)
+        # Keep normalization math in fp32 even when the caller is under AMP;
+        # return the incoming dtype to preserve the backbone's public dtype
+        # contract and mixed-precision memory/output paths.
+        with torch.autocast(device_type=h.device.type, enabled=False):
+            normalized = self.output_norm(h.float()).to(dtype=h.dtype)
+        if numeric_observer is not None:
+            numeric_observer("output_norm.output", normalized)
+        return normalized
 
     def forward_with_specialists(self, x: torch.Tensor, *, token_mask: torch.Tensor | None = None):
         """Return final MoE candidates and sparse routes for workspace use.

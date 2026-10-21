@@ -711,6 +711,13 @@ class SplitGraphDNC(nn.Module):
             H[:, start_step:] = base[:, start_step:] + (
                 self.moe_backbone_residual_scale * broadcast_delta
             )
+            normalize_backbone_output = getattr(final_stage, "normalize_output", None)
+            if callable(normalize_backbone_output):
+                # forward_with_specialists exposes the pre-normalized final
+                # residual stream so the workspace delta is combined in the
+                # same feature space. Normalize only after that combination,
+                # matching the ordinary backbone forward path.
+                H = normalize_backbone_output(H)
             observe_tensor("split_graph.h_after_workspace", H)
             observe_numeric_tree("backbone.workspace_output", H)
         else:

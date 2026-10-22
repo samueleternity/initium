@@ -32,6 +32,53 @@ class SurprisePredictionHead(nn.Module):
         return self.projection(features)
 
 
+def prediction_error_signal(
+    features: torch.Tensor,
+    input_one_hot: torch.Tensor,
+    decoder: SurprisePredictionHead,
+    *,
+    signal_mode: str,
+    stream_lengths: list[int] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return detached, bounded per-token error and next-token logits.
+
+    Signal at position ``t`` is computed only from the block-0 state at
+    ``t-1`` and observed token ``x_t``. Query, answer, and padding positions
+    are zeroed so consumers cannot use target-side information.
+    """
+    if signal_mode not in {"surprisal", "excess-surprise"}:
+        raise ValueError("signal_mode must be surprisal or excess-surprise")
+    if features.ndim != 3 or input_one_hot.ndim != 3:
+        raise ValueError("features and input_one_hot must be rank-three tensors")
+    if features.shape[:2] != input_one_hot.shape[:2]:
+        raise ValueError("features and input sequence must have matching batch/time dimensions")
+    logits = decoder(features[:, :-1]).float()
+    log_probs = F.log_softmax(logits, dim=-1)
+    targets = input_one_hot[:, 1:].argmax(dim=-1)
+    raw = -log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+    if signal_mode == "excess-surprise":
+        probs = log_probs.exp()
+        entropy = -(probs * log_probs).sum(dim=-1)
+        scores = raw - entropy
+    else:
+        scores = raw
+
+    batch, sequence = input_one_hot.shape[:2]
+    signal = torch.zeros(batch, sequence, dtype=torch.float32, device=input_one_hot.device)
+    signal[:, 1:] = torch.tanh(scores.detach())
+    token_ids = input_one_hot.argmax(dim=-1)
+    if stream_lengths is None:
+        positions = torch.arange(sequence, device=input_one_hot.device).unsqueeze(0)
+        query_positions = torch.where(token_ids.eq(20), positions, sequence)
+        lengths = query_positions.amin(dim=1)
+    else:
+        if len(stream_lengths) != batch:
+            raise ValueError("stream_lengths must contain one value per batch row")
+        lengths = torch.as_tensor(stream_lengths, device=input_one_hot.device)
+    stream_mask = torch.arange(sequence, device=input_one_hot.device).unsqueeze(0) < lengths.unsqueeze(1)
+    return signal * stream_mask, logits
+
+
 def masked_next_token_loss(
     logits: torch.Tensor,
     input_one_hot: torch.Tensor,
@@ -169,7 +216,21 @@ def evaluate_prediction_signals(
                 one_hot = F.one_hot(token_ids, num_classes=VOCAB_SIZE).to(dtype=torch.float32)
                 # Match training and the roadmap's inter-layer plan: measure
                 # predictions from block 0, before any later backbone block.
-                if isinstance(backbone, nn.Sequential) and len(backbone) > 1:
+                forward_with_intermediate = getattr(backbone, "forward_with_intermediate", None)
+                if callable(forward_with_intermediate):
+                    feature_holder = {}
+                    forward_with_intermediate(
+                        one_hot,
+                        intermediate_observer=lambda value: feature_holder.setdefault(
+                            "features", value
+                        ),
+                    )
+                    features = feature_holder.get("features")
+                    if features is None:
+                        raise RuntimeError(
+                            "backbone forward_with_intermediate did not expose block-0 features"
+                        )
+                elif isinstance(backbone, nn.Sequential) and len(backbone) > 1:
                     features = backbone[0](one_hot)
                 else:
                     features = backbone(one_hot)

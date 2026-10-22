@@ -169,6 +169,8 @@ from initium.data.surprise_recall.next_token_prediction import (
 )
 from initium.mamba_controller.mamba_controller import MambaDNC
 from initium.mamba_controller.split_graph_dnc import SplitGraphDNC
+from initium.mamba_controller.sgr_backbone_only import SurpriseRecallBackboneOnly
+from initium.workspace.broadcast import WorkspaceBroadcast
 from initium.memory_manipulation.dnc_mechanisms import compile_memory_forward
 from initium.memory_manipulation.dynamic_memory_resize import resize_memory
 from initium.memory_manipulation.dynamic_n_controller import DynamicNController
@@ -877,6 +879,11 @@ def run(
     batch_size: int = BATCH_SIZE,
     sgr_prediction_loss_weight: float = 0.0,
     sgr_prediction_eval_episodes: int = 128,
+    sgr_phase2_arm: str | None = None,
+    sgr_phase2_signal: str = "excess-surprise",
+    sgr_gate_eval_override: str = "none",
+    sgr_dnc_write_salience: bool = False,
+    sgr_workspace_write_salience: bool = False,
 ):
     # Deliberately does NOT touch LR_DECAY_STEPS - that's a separate
     # module-level constant, fixed at import time from the *original*
@@ -907,6 +914,9 @@ def run(
             "--split-graph-numeric-trace-step"
         )
     sgr_prediction_enabled = sgr_prediction_loss_weight > 0.0
+    sgr_phase4_enabled = sgr_dnc_write_salience or sgr_workspace_write_salience or (
+        workspace_reconsideration_enabled and sgr_prediction_enabled
+    )
     if not math.isfinite(sgr_prediction_loss_weight) or sgr_prediction_loss_weight < 0.0:
         raise ValueError("sgr_prediction_loss_weight must be finite and >= 0")
     if sgr_prediction_enabled:
@@ -914,10 +924,60 @@ def run(
             raise ValueError("--sgr-pred-loss-weight requires --dataset-type surprise-recall")
         if not split_graph_enabled:
             raise ValueError("Phase 1 prediction loss requires --split-graph backbone features")
-        if moe_enabled or workspace_enabled:
+        if (moe_enabled or workspace_enabled) and not sgr_phase4_enabled:
             raise ValueError("Phase 1 signal isolation requires MoE and workspace to be disabled")
         if sgr_prediction_eval_episodes < 1:
             raise ValueError("sgr_prediction_eval_episodes must be positive")
+    if sgr_phase2_arm is not None:
+        valid_phase2_arms = {"content", "aux-only", "error", "blend", "shuffled", "oracle"}
+        if sgr_phase2_arm not in valid_phase2_arms:
+            raise ValueError(f"sgr_phase2_arm must be one of {sorted(valid_phase2_arms)}")
+        if getattr(dataset, "name", None) != "surprise-recall":
+            raise ValueError("Phase 2 arms require --dataset-type surprise-recall")
+        if not split_graph_enabled or split_graph_variant != "mamba1" or split_graph_num_blocks != 2:
+            raise ValueError("Phase 2 requires --split-graph-variant mamba1 and exactly 2 blocks")
+        if moe_enabled or workspace_enabled or dnc_compile_memory or dnc_backward_trace:
+            raise ValueError("Phase 2 requires a backbone-only run with MoE/workspace/DNC tools off")
+        if dynamic_n_mode or link_matrix_mode != "dense" or isolate_link_ablation:
+            raise ValueError("Phase 2 does not support memory sizing or link-matrix ablations")
+        if sgr_phase2_signal not in {"surprisal", "excess-surprise"}:
+            raise ValueError("sgr_phase2_signal must be surprisal or excess-surprise")
+        if sgr_gate_eval_override not in {"none", "zero", "shuffle"}:
+            raise ValueError("sgr_gate_eval_override must be none, zero, or shuffle")
+        needs_decoder = sgr_phase2_arm in {"aux-only", "error", "blend", "shuffled"}
+        if needs_decoder != sgr_prediction_enabled:
+            raise ValueError(
+                "Phase 2 arms aux-only/error/blend/shuffled require --sgr-pred-loss-weight > 0; "
+                "content/oracle arms require it to be 0"
+            )
+    if sgr_phase4_enabled:
+        if getattr(dataset, "name", None) != "surprise-recall":
+            raise ValueError("Phase 4 error consumers require --dataset-type surprise-recall")
+        if not split_graph_enabled or split_graph_variant != "mamba1" or split_graph_num_blocks < 2:
+            raise ValueError("Phase 4 SGR consumers require a split-graph Mamba-1 backbone")
+        if not sgr_prediction_enabled:
+            raise ValueError("Phase 4 error consumers require --sgr-pred-loss-weight > 0")
+        if sgr_dnc_write_salience and dnc_compile_memory:
+            raise ValueError(
+                "DNC compiled-forward mode does not include the Phase 4 prediction-error path"
+            )
+        if sgr_workspace_write_salience and not workspace_enabled:
+            raise ValueError("workspace write salience requires --workspace")
+        if sgr_workspace_write_salience and workspace_num_slots < 1:
+            raise ValueError("workspace write salience requires at least one workspace slot")
+        if (
+            workspace_reconsideration_enabled
+            and workspace_reconsideration_trigger_mode.startswith("prediction_error")
+            and workspace_num_slots < 1
+        ):
+            raise ValueError("prediction-error reconsideration requires at least one workspace slot")
+        if sgr_dnc_write_salience and workspace_enabled and workspace_train_mode == "frozen":
+            raise ValueError(
+                "DNC write salience cannot be learned with a frozen-workspace run; "
+                "use workspace_train_mode='coadapted'"
+            )
+        if sgr_phase2_arm is not None:
+            raise ValueError("Phase 2 backbone-only arms cannot be combined with Phase 4 consumers")
     periodic_ood_episodes = OOD_EVAL_EPISODES_PERIODIC
     final_ood_episodes = OOD_EVAL_EPISODES
     INPUT_DIM, TRIPLE_DIM = dataset.input_dim, dataset.output_dim
@@ -946,10 +1006,10 @@ def run(
     if workspace_reconsideration_trigger_mode not in (
         "innovation",
         "random_rate_matched",
+        "prediction_error",
+        "prediction_error_random_rate_matched",
     ):
-        raise ValueError(
-            "workspace_reconsideration_trigger_mode must be 'innovation' or 'random_rate_matched'"
-        )
+        raise ValueError("unknown workspace reconsideration trigger mode")
     if eval_only and eval_workspace_mode != "checkpoint" and not workspace_enabled:
         raise ValueError("workspace evaluation modes require --workspace")
     resume_checkpoint = (
@@ -1085,6 +1145,13 @@ def run(
                 "last_batch_reconsideration_trigger_frac",
                 "last_batch_reconsideration_changed_frac",
                 "last_batch_reconsideration_state_delta_rms",
+                "sgr_prediction_loss",
+                "sgr_error_signal_mean",
+                "sgr_error_signal_abs_mean",
+                "sgr_error_signal_positive_frac",
+                "sgr_gate_signal_mean",
+                "sgr_dnc_write_salience_coefficient",
+                "sgr_workspace_write_scale_rms",
             ]
         )
 
@@ -1546,7 +1613,27 @@ def run(
             moe_top_k=moe_top_k,
         )
 
-    if split_graph_enabled:
+    if sgr_phase2_arm is not None:
+        rnn = SurpriseRecallBackboneOnly(
+            input_size=INPUT_DIM,
+            hidden_size=hidden_size,
+            nr_cells_metadata=nr_cells,
+            variant="mamba1",
+            d_state=MAMBA_D_STATE,
+            d_conv=MAMBA_D_CONV,
+            expand=MAMBA_EXPAND,
+            delta_error_gating=True,
+            device=device,
+        ).to(device)
+        rnn.phase2_arm = sgr_phase2_arm
+        rnn.phase2_signal_mode = sgr_phase2_signal
+        rnn.gate_eval_override = sgr_gate_eval_override
+        print(
+            f"[{run_id}] SGR Phase 2 arm={sgr_phase2_arm} signal={sgr_phase2_signal} "
+            f"| backbone-only Mamba-1 x2 | DNC/MoE/workspace absent | "
+            f"eval_gate_override={sgr_gate_eval_override}"
+        )
+    elif split_graph_enabled:
         if moe_enabled:
             print(
                 f"[{run_id}] split-graph MoE placement={split_graph_moe_placement}: "
@@ -1633,6 +1720,8 @@ def run(
             dnc_link_sharpness=dnc_link_sharpness,
             dnc_allocation_topk=dnc_allocation_topk,
             dnc_implementation=dnc_implementation,
+            sgr_write_salience_enabled=sgr_dnc_write_salience,
+            sgr_workspace_salience_enabled=sgr_workspace_write_salience,
             workspace_enabled=workspace_enabled,
             workspace_num_slots=workspace_num_slots,
             workspace_no_selection=workspace_no_selection,
@@ -1695,7 +1784,7 @@ def run(
             **mamba_kwargs,
         ).to(device)
 
-    if dnc_compile_memory:
+    if dnc_compile_memory and not isinstance(rnn, SurpriseRecallBackboneOnly):
         for memory in rnn.memories:
             compile_memory_forward(memory)
         print(
@@ -1889,6 +1978,12 @@ def run(
             else None
         ),
         "split_graph_combiner_cfc_multi_source_moe": split_graph_combiner_cfc_multi_source_moe,
+        "sgr_phase2_arm": sgr_phase2_arm,
+        "sgr_phase2_signal": sgr_phase2_signal if sgr_phase2_arm is not None else None,
+        "sgr_gate_eval_override": sgr_gate_eval_override if sgr_phase2_arm is not None else None,
+        "sgr_phase4_dnc_write_salience": bool(sgr_dnc_write_salience),
+        "sgr_phase4_workspace_write_salience": bool(sgr_workspace_write_salience),
+        "sgr_prediction_error_signal": sgr_phase2_signal if sgr_prediction_enabled else None,
         "split_graph_moe_placement": split_graph_moe_placement,
         "split_graph_moe_backbone_block_isolation": split_graph_moe_backbone_block_isolation,
         "split_graph_moe_backbone_residual_scale": split_graph_moe_backbone_residual_scale,
@@ -2012,13 +2107,19 @@ def run(
             f"Static Option 1 applied to rnn.memories."
         )
 
-    output_proj = nn.Linear(INPUT_DIM, TRIPLE_DIM).to(device)
+    output_proj = nn.Linear(
+        hidden_size if sgr_phase2_arm is not None else INPUT_DIM, TRIPLE_DIM
+    ).to(device)
     dataset.set_output_proj(output_proj)
     sgr_prediction_decoder = (
         SurprisePredictionHead(hidden_size, INPUT_DIM).to(device)
         if sgr_prediction_enabled
         else None
     )
+    if isinstance(rnn, SurpriseRecallBackboneOnly):
+        rnn.set_prediction_decoder(sgr_prediction_decoder)
+    elif isinstance(rnn, SplitGraphDNC) and sgr_phase4_enabled:
+        rnn.set_sgr_prediction_decoder(sgr_prediction_decoder, sgr_phase2_signal)
     if workspace_train_scope == "gate" and not segment_diagnostics_enabled:
         raise ValueError("Phase 4 gate-only stability checks require segment diagnostics")
     segment_diagnostics = SegmentDiagnostics(
@@ -2162,8 +2263,13 @@ def run(
             gate_parameters = (
                 rnn.workspace.bistable_gate_parameters()
                 if workspace_gate_variant == "bistable"
-                else rnn.workspace.write_gate.parameters()
+                else list(rnn.workspace.write_gate.parameters())
             )
+            if rnn.workspace.prediction_error_to_write_gate is not None:
+                gate_parameters = [
+                    *gate_parameters,
+                    *rnn.workspace.prediction_error_to_write_gate.parameters(),
+                ]
             for parameter in gate_parameters:
                 parameter.requires_grad_(True)
         else:
@@ -2225,9 +2331,41 @@ def run(
         f"[{run_id}] params {param_count} | kl_terms={'on' if kl_on else 'off'} | amp={'on' if amp_enabled else 'off'}"
     )
     if sgr_prediction_decoder is not None:
+        if sgr_phase2_arm is not None:
+            decoder_phase_label = "Phase 2"
+        elif sgr_phase4_enabled:
+            decoder_phase_label = "Phase 4"
+        else:
+            decoder_phase_label = "Phase 1"
         print(
-            f"[{run_id}] SGR Phase 1 decoder enabled | pred_loss_weight="
+            f"[{run_id}] SGR {decoder_phase_label} decoder enabled | "
+            "pred_loss_weight="
             f"{sgr_prediction_loss_weight:g} | signal source=causal backbone features"
+        )
+    if sgr_phase4_enabled:
+        consumers = []
+        if sgr_dnc_write_salience:
+            consumers.append("DNC write-strength")
+        if sgr_workspace_write_salience:
+            consumers.append("workspace write-gate")
+        if (
+            workspace_reconsideration_enabled
+            and workspace_reconsideration_trigger_mode.startswith("prediction_error")
+        ):
+            consumers.append(
+                f"workspace reconsideration ({workspace_reconsideration_trigger_mode}, "
+                f"EMA decay={WorkspaceBroadcast._RECONSIDERATION_ERROR_EMA_DECAY:g})"
+            )
+        dnc_weight = (
+            f", initial DNC salience coefficient="
+            f"{rnn.memories[0].sgr_error_to_write_strength.detach().item():.3g}"
+            if sgr_dnc_write_salience and hasattr(rnn.memories[0], "sgr_error_to_write_strength")
+            else ""
+        )
+        consumer_summary = "; ".join(consumers) if consumers else "none (matched control arm)"
+        print(
+            f"[{run_id}] SGR Phase 4 consumers={consumer_summary} | "
+            f"signal={sgr_phase2_signal} (detached){dnc_weight}"
         )
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled, init_scale=AMP_INIT_SCALE)
 
@@ -2343,7 +2481,8 @@ def run(
                 f"nr_cells={ckpt_nr_cells} from LESSON_NR_CELLS"
                 f"[{ckpt['curriculum_lesson']}] instead of a recorded value."
             )
-        resize_memory(rnn, ckpt_nr_cells, device=device, optimizer=optimizer)
+        if not isinstance(rnn, SurpriseRecallBackboneOnly):
+            resize_memory(rnn, ckpt_nr_cells, device=device, optimizer=optimizer)
 
         if frozen_workspace_warm_start:
             if ckpt.get("beta_target") != beta_target:
@@ -2370,8 +2509,13 @@ def run(
                 gate_parameters = (
                     rnn.workspace.bistable_gate_parameters()
                     if workspace_gate_variant == "bistable"
-                    else rnn.workspace.write_gate.parameters()
+                    else list(rnn.workspace.write_gate.parameters())
                 )
+                if rnn.workspace.prediction_error_to_write_gate is not None:
+                    gate_parameters = [
+                        *gate_parameters,
+                        *rnn.workspace.prediction_error_to_write_gate.parameters(),
+                    ]
                 for parameter in gate_parameters:
                     parameter.requires_grad_(True)
             else:
@@ -2577,6 +2721,7 @@ def run(
     # (potentially still reflecting the old buggy drifted value).
     running_task_loss, running_kl_loss, running_div, running_grad_norm = 0.0, 0.0, 0, 0.0
     running_sgr_prediction_loss = 0.0
+    last_train_sgr_signal_diagnostics: dict[str, torch.Tensor] = {}
     running_postclip_grad_norm = 0.0
     running_finite_grad_steps = 0
     running_nonfinite_grad_steps = 0
@@ -2668,7 +2813,34 @@ def run(
         bistable_forward_debug = ""
         prediction_loss = None
         with torch.amp.autocast("cuda", enabled=amp_enabled):
-            if split_graph_enabled:
+            if isinstance(rnn, SurpriseRecallBackboneOnly):
+                oracle_flags = None
+                if sgr_phase2_arm == "oracle":
+                    oracle_flags = torch.zeros(
+                        input_seq.shape[:2], device=device, dtype=torch.float32
+                    )
+                    for batch_index, example in enumerate(dataset.last_batch_examples):
+                        for position, kind in zip(
+                            example.anomaly_positions, example.anomaly_types
+                        ):
+                            if kind in {"A1", "A2", "A4", "A5"}:
+                                oracle_flags[batch_index, position] = 1.0
+                output, hidden, backbone_features, prediction_logits = rnn(
+                    input_seq,
+                    hidden,
+                    reset_experience=True,
+                    return_backbone_features=True,
+                    return_prediction_logits=True,
+                    oracle_flags=oracle_flags,
+                    stream_lengths=dataset.last_stream_lengths,
+                )
+                if prediction_logits is not None:
+                    prediction_loss = masked_next_token_loss(
+                        prediction_logits,
+                        input_seq,
+                        dataset.last_stream_lengths,
+                    )
+            elif split_graph_enabled:
                 # Graph episodes are variable length and collate_fn pads them
                 # with all-zero feature rows. This mask is diagnostic-only for
                 # MoE routing: routing/capacity behavior remains unchanged.
@@ -2676,13 +2848,26 @@ def run(
                     input_seq.ne(0).any(dim=-1) if moe_enabled and dataset_type == "graph" else None
                 )
                 if sgr_prediction_decoder is not None:
-                    output, hidden, backbone_features = rnn(
-                        input_seq,
-                        hidden,
-                        reset_experience=True,
-                        sequence_valid_mask=sequence_valid_mask,
-                        return_backbone_features=True,
-                    )
+                    if sgr_phase4_enabled:
+                        output, hidden, backbone_features, prediction_logits = rnn(
+                            input_seq,
+                            hidden,
+                            reset_experience=True,
+                            sequence_valid_mask=sequence_valid_mask,
+                            return_backbone_features=True,
+                            return_prediction_logits=True,
+                        )
+                        prediction_loss = masked_next_token_loss(
+                            prediction_logits, input_seq, dataset.last_stream_lengths
+                        )
+                    else:
+                        output, hidden, backbone_features = rnn(
+                            input_seq,
+                            hidden,
+                            reset_experience=True,
+                            sequence_valid_mask=sequence_valid_mask,
+                            return_backbone_features=True,
+                        )
                 else:
                     output, hidden = rnn(
                         input_seq,
@@ -2692,6 +2877,10 @@ def run(
                     )
             else:
                 output, hidden = rnn(input_seq, hidden, reset_experience=True)
+            if sgr_phase2_arm is not None or sgr_phase4_enabled:
+                last_train_sgr_signal_diagnostics = dict(
+                    getattr(rnn, "last_sgr_signal_diagnostics", {})
+                )
             bistable_forward_debug = format_bistable_forward_debug()
             if workspace_train_scope == "gate":
                 exceeded, maximum, segment = segment_diagnostics.activation_absmax_exceeded("train")
@@ -2747,7 +2936,9 @@ def run(
             task_loss = dataset.loss(output, target_digits, answer_mask)
             if split_graph_forward_trace is not None and split_graph_forward_trace.active:
                 split_graph_forward_trace.observe("task_output.loss", task_loss)
-            if sgr_prediction_decoder is not None:
+            if sgr_prediction_decoder is not None and not isinstance(
+                rnn, SurpriseRecallBackboneOnly
+            ) and not sgr_phase4_enabled:
                 prediction_logits = sgr_prediction_decoder(backbone_features[:, :-1])
                 prediction_loss = masked_next_token_loss(
                     prediction_logits,
@@ -3222,6 +3413,23 @@ def run(
             ]
             if avg_sgr_prediction_loss is not None:
                 parts.append(f"L_pred {avg_sgr_prediction_loss:.4f}")
+            sgr_signal_values = {
+                key: float(value.detach().float().item())
+                for key, value in last_train_sgr_signal_diagnostics.items()
+            }
+            if sgr_phase2_arm is not None or sgr_phase4_enabled:
+                parts.append(
+                    "sgr_error["
+                    f"mean={sgr_signal_values.get('mean', 0.0):.3f} "
+                    f"abs_mean={sgr_signal_values.get('abs_mean', 0.0):.3f} "
+                    f"positive={sgr_signal_values.get('positive_frac', 0.0):.1%} "
+                    f"gate_mean={sgr_signal_values.get('gate_mean', 0.0):.3f}]"
+                )
+                if sgr_dnc_write_salience:
+                    parts.append(
+                        "dnc_error_write_scale="
+                        f"{rnn.memories[0].sgr_error_to_write_strength.detach().item():.4g}"
+                    )
             if kl_on:
                 parts += [
                     f"L_KL {avg_kl:.4f}",
@@ -3268,6 +3476,11 @@ def run(
                             f"broadcast/specialist {workspace_diag['broadcast_to_specialist_ratio'].item():.3f} "
                             f"read_gate {workspace_diag['read_gate'].item():.3f}]"
                         )
+                        if "prediction_error_write_scale_rms" in workspace_diag:
+                            parts.append(
+                                "sgr_workspace_write_scale_rms="
+                                f"{workspace_diag['prediction_error_write_scale_rms'].item():.4g}"
+                            )
                         if workspace_reconsideration_enabled:
                             parts.append(
                                 "reconsideration["
@@ -3282,6 +3495,12 @@ def run(
                                 f"delta_rms "
                                 f"{workspace_diag['reconsideration_state_delta_rms'].item():.3f}]"
                             )
+                            if "prediction_error_mean" in workspace_diag:
+                                parts.append(
+                                    "sgr_reconsideration_error["
+                                    f"raw={workspace_diag['prediction_error_mean'].item():.3f} "
+                                    f"ema={workspace_diag['reconsideration_prediction_error_mean'].item():.3f}]"
+                                )
                         if "gate_low_frac" in workspace_diag:
                             print(
                                 f"[{run_id}] [bistable] p_mean="
@@ -3424,6 +3643,21 @@ def run(
                     float(workspace_diag.get("reconsideration_trigger_frac", 0.0)),
                     float(workspace_diag.get("reconsideration_changed_frac", 0.0)),
                     float(workspace_diag.get("reconsideration_state_delta_rms", 0.0)),
+                    avg_sgr_prediction_loss,
+                    sgr_signal_values.get("mean"),
+                    sgr_signal_values.get("abs_mean"),
+                    sgr_signal_values.get("positive_frac"),
+                    sgr_signal_values.get("gate_mean"),
+                    (
+                        float(rnn.memories[0].sgr_error_to_write_strength.detach().item())
+                        if sgr_dnc_write_salience
+                        else None
+                    ),
+                    (
+                        float(workspace_diag["prediction_error_write_scale_rms"].item())
+                        if "prediction_error_write_scale_rms" in workspace_diag
+                        else None
+                    ),
                 ]
             )
             if torch.cuda.is_available():
@@ -3779,42 +4013,49 @@ def run(
             # whether the model actually used memory. Restore the post-ID
             # stream afterward so the paired evaluation consumes no extra
             # randomness from the run.
-            rng_state_after_other_evaluations = _capture_rng_state()
-            _restore_rng_state(id_eval_rng_state)
-            segment_diagnostics.set_channel("eval-id-memory-off")
-            try:
-                ablated_triple_acc, ablated_perfect_frac = dataset.evaluate_id_ablated(
-                    rnn, device, curriculum, pre_advance_lesson
+            if isinstance(rnn, SurpriseRecallBackboneOnly):
+                print(
+                    f"[{run_id}] Step {step} memory-dependency check: n/a "
+                    "(Phase 2 model contains no DNC memory)."
                 )
-                if surprise_recall_logger is not None:
-                    surprise_recall_logger.write_evaluation(
+            else:
+                rng_state_after_other_evaluations = _capture_rng_state()
+                _restore_rng_state(id_eval_rng_state)
+                segment_diagnostics.set_channel("eval-id-memory-off")
+                try:
+                    ablated_triple_acc, ablated_perfect_frac = dataset.evaluate_id_ablated(
+                        rnn, device, curriculum, pre_advance_lesson
+                    )
+                    if surprise_recall_logger is not None:
+                        surprise_recall_logger.write_evaluation(
+                            step,
+                            pre_advance_lesson + 1,
+                            "id-memory-off",
+                            dataset.last_eval_diagnostics,
+                        )
+                finally:
+                    _restore_rng_state(rng_state_after_other_evaluations)
+                segment_diagnostics.emit("eval-id-memory-off")
+
+                mem_check_writer.writerow(
+                    [
                         step,
                         pre_advance_lesson + 1,
-                        "id-memory-off",
-                        dataset.last_eval_diagnostics,
-                    )
-            finally:
-                _restore_rng_state(rng_state_after_other_evaluations)
-            segment_diagnostics.emit("eval-id-memory-off")
-
-            mem_check_writer.writerow(
-                [
-                    step,
-                    pre_advance_lesson + 1,
-                    id_triple_acc,
-                    id_perfect_frac,
-                    ablated_triple_acc,
-                    ablated_perfect_frac,
-                    id_triple_acc - ablated_triple_acc,
-                    id_perfect_frac - ablated_perfect_frac,
-                ]
-            )
-            mem_check_file.flush()
-            print(
-                f"[{run_id}] Step {step} memory-dependency check: "
-                f"ID (memory on) {id_triple_acc:.2f}% | ablated (memory off) "
-                f"{ablated_triple_acc:.2f}% | dependency {id_triple_acc - ablated_triple_acc:.2f}"
-            )
+                        id_triple_acc,
+                        id_perfect_frac,
+                        ablated_triple_acc,
+                        ablated_perfect_frac,
+                        id_triple_acc - ablated_triple_acc,
+                        id_perfect_frac - ablated_perfect_frac,
+                    ]
+                )
+                mem_check_file.flush()
+                print(
+                    f"[{run_id}] Step {step} memory-dependency check: "
+                    f"ID (memory on) {id_triple_acc:.2f}% | ablated (memory off) "
+                    f"{ablated_triple_acc:.2f}% | dependency "
+                    f"{id_triple_acc - ablated_triple_acc:.2f}"
+                )
 
             if combiner_stage_kinds is not None:
                 # Same pattern as the memory-dependency check above, but
@@ -4599,12 +4840,16 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--workspace-reconsideration-trigger",
-        choices=("innovation", "random_rate_matched"),
+        choices=(
+            "innovation",
+            "random_rate_matched",
+            "prediction_error",
+            "prediction_error_random_rate_matched",
+        ),
         default="innovation",
         help=(
-            "Phase 5 trigger policy: use normalized innovation (default), or "
-            "select a uniformly random set of eligible slots with the exact same "
-            "per-step firing count as the innovation threshold."
+            "Reconsider using normalized innovation or SGR prediction error; "
+            "the random_rate_matched modes provide firing-rate-matched null controls."
         ),
     )
     parser.add_argument(
@@ -4906,8 +5151,8 @@ if __name__ == "__main__":
         "--sgr-pred-loss-weight",
         type=float,
         default=0.0,
-        help="Enable the Phase 1 SGR next-token decoder with this auxiliary CE weight. "
-        "Requires --dataset-type surprise-recall and --split-graph; no error gating is added.",
+        help="Enable the SGR next-token decoder with this auxiliary CE weight. "
+        "Requires --dataset-type surprise-recall and --split-graph.",
     )
     parser.add_argument(
         "--sgr-pred-eval-episodes",
@@ -4915,6 +5160,35 @@ if __name__ == "__main__":
         default=128,
         help="Fixed probe episodes per lesson for periodic active-lesson and final all-lesson "
         "Phase 1 signal evaluation (default: 128).",
+    )
+    parser.add_argument(
+        "--sgr-phase2-arm",
+        choices=["content", "aux-only", "error", "blend", "shuffled", "oracle"],
+        default=None,
+        help="Run one isolated Phase 2 SGR arm with a true two-block Mamba-1 backbone and no DNC. "
+        "Decoder arms (aux-only/error/blend/shuffled) require --sgr-pred-loss-weight > 0.",
+    )
+    parser.add_argument(
+        "--sgr-phase2-signal",
+        choices=["surprisal", "excess-surprise"],
+        default="excess-surprise",
+        help="Prediction-error signal used by Phase 2 error/blend/shuffled arms.",
+    )
+    parser.add_argument(
+        "--sgr-dnc-write-salience",
+        action="store_true",
+        help="Phase 4: add detached SGR prediction error to the DNC write-strength logits.",
+    )
+    parser.add_argument(
+        "--sgr-workspace-write-salience",
+        action="store_true",
+        help="Phase 4: add detached SGR prediction error to the workspace write-gate logits; requires --workspace.",
+    )
+    parser.add_argument(
+        "--sgr-gate-eval-override",
+        choices=["none", "zero", "shuffle"],
+        default="none",
+        help="Inference-only pathway-dependency ablation for Phase 2 gated arms.",
     )
     parser.add_argument(
         "--dataset-link",
@@ -5050,6 +5324,64 @@ if __name__ == "__main__":
         parser.error("--eval-workspace-mode is only valid with --eval-only")
     if args.eval_seed is not None and not args.eval_only:
         parser.error("--eval-seed is only valid with --eval-only")
+    if args.sgr_phase2_arm is not None:
+        if args.dataset_type != "surprise-recall":
+            parser.error("--sgr-phase2-arm requires --dataset-type surprise-recall")
+        if not args.split_graph or args.split_graph_variant != "mamba1" or args.split_graph_num_blocks != 2:
+            parser.error("Phase 2 requires --split-graph --split-graph-variant mamba1 --split-graph-num-blocks 2")
+        if args.moe or args.workspace or args.dynamic_n_mode or args.dnc_compile_memory:
+            parser.error("Phase 2 is backbone-only; disable MoE, workspace, Dynamic-N, and DNC compilation")
+        if args.dnc_backward_trace or args.split_graph_numeric_trace_step is not None or args.split_graph_numeric_trace_on_error:
+            parser.error("DNC/split-graph numeric tracing options are not applicable to the Phase 2 backbone-only model")
+        decoder_arm = args.sgr_phase2_arm in {"aux-only", "error", "blend", "shuffled"}
+        if decoder_arm and args.sgr_pred_loss_weight <= 0:
+            parser.error("Phase 2 decoder arms require --sgr-pred-loss-weight > 0")
+        if not decoder_arm and args.sgr_pred_loss_weight != 0:
+            parser.error("content/oracle Phase 2 arms require --sgr-pred-loss-weight 0")
+        if args.sgr_gate_eval_override != "none" and args.sgr_phase2_arm == "aux-only":
+            parser.error("--sgr-gate-eval-override is only meaningful for gated Phase 2 arms")
+        if args.sgr_dnc_write_salience or args.sgr_workspace_write_salience:
+            parser.error("Phase 2 arms cannot be combined with Phase 4 salience consumers")
+        if args.workspace_reconsideration and args.sgr_pred_loss_weight > 0.0:
+            parser.error("Phase 2 arms cannot be combined with Phase 4 workspace controls")
+    elif args.sgr_gate_eval_override != "none":
+        parser.error("--sgr-gate-eval-override requires --sgr-phase2-arm")
+    sgr_phase4_requested = (
+        args.sgr_dnc_write_salience
+        or args.sgr_workspace_write_salience
+        or (
+            args.workspace_reconsideration
+            and args.sgr_pred_loss_weight > 0.0
+        )
+    )
+    if sgr_phase4_requested:
+        if args.sgr_phase2_arm is not None:
+            parser.error("Phase 2 arms cannot be combined with Phase 4 consumers or controls")
+        if args.dataset_type != "surprise-recall":
+            parser.error("Phase 4 prediction-error consumers require --dataset-type surprise-recall")
+        if not args.split_graph or args.split_graph_variant != "mamba1" or args.split_graph_num_blocks < 2:
+            parser.error("Phase 4 SGR consumers require split-graph Mamba-1 with at least two blocks")
+        if args.sgr_pred_loss_weight <= 0:
+            parser.error("Phase 4 SGR consumers require --sgr-pred-loss-weight > 0")
+        if args.sgr_dnc_write_salience and args.dnc_compile_memory:
+            parser.error(
+                "--dnc-compile-memory does not compile the Phase 4 prediction-error write path"
+            )
+        if args.sgr_workspace_write_salience and not args.workspace:
+            parser.error("--sgr-workspace-write-salience requires --workspace")
+        if args.sgr_workspace_write_salience and args.workspace_num_slots < 1:
+            parser.error("--sgr-workspace-write-salience requires --workspace-num-slots >= 1")
+        if args.sgr_dnc_write_salience and args.workspace and args.workspace_train_mode == "frozen":
+            parser.error(
+                "DNC write salience cannot be learned with --workspace-train-mode frozen; "
+                "use coadapted"
+            )
+        if (
+            args.workspace_reconsideration_trigger.startswith("prediction_error")
+            and args.workspace_reconsideration
+            and args.workspace_num_slots < 1
+        ):
+            parser.error("prediction-error reconsideration requires --workspace-num-slots >= 1")
     if args.eval_only and args.eval_workspace_mode != "checkpoint" and not args.workspace:
         parser.error("non-default --eval-workspace-mode requires --workspace")
     if args.eval_only and args.run_id_suffix is None:
@@ -5234,11 +5566,12 @@ if __name__ == "__main__":
                 threshold_tag = f"{args.workspace_reconsideration_surprise_threshold:g}".replace(
                     ".", "p"
                 ).replace("-", "m")
-                trigger_tag = (
-                    "innovation"
-                    if args.workspace_reconsideration_trigger == "innovation"
-                    else "randommatched"
-                )
+                trigger_tag = {
+                    "innovation": "innovation",
+                    "random_rate_matched": "randommatched",
+                    "prediction_error": "prederror",
+                    "prediction_error_random_rate_matched": "prederrormatched",
+                }[args.workspace_reconsideration_trigger]
                 run_id += f"_reconsider{trigger_tag}{threshold_tag}"
             if args.workspace_no_selection:
                 run_id += "_randomwrite"
@@ -5270,6 +5603,19 @@ if __name__ == "__main__":
         if args.sgr_pred_loss_weight > 0:
             pred_weight_tag = f"{args.sgr_pred_loss_weight:g}".replace(".", "p")
             run_id += f"_sgrpred{pred_weight_tag}"
+        if args.sgr_phase2_arm is not None:
+            run_id += f"_sgrphase2-{args.sgr_phase2_arm}_{args.sgr_phase2_signal}"
+            if args.sgr_gate_eval_override != "none":
+                run_id += f"_gateeval-{args.sgr_gate_eval_override}"
+        if args.sgr_dnc_write_salience:
+            run_id += f"_sgrdncwrite-{args.sgr_phase2_signal}"
+        if args.sgr_workspace_write_salience:
+            run_id += f"_sgrworkspacewrite-{args.sgr_phase2_signal}"
+        if args.workspace_reconsideration_trigger.startswith("prediction_error"):
+            run_id += (
+                f"_sgrreconsider-{args.workspace_reconsideration_trigger}"
+                f"_{args.sgr_phase2_signal}"
+            )
         if args.batch_size != BATCH_SIZE:
             run_id += f"_bs{args.batch_size}"
         if args.run_id_suffix:
@@ -5357,6 +5703,11 @@ if __name__ == "__main__":
             batch_size=args.batch_size,
             sgr_prediction_loss_weight=args.sgr_pred_loss_weight,
             sgr_prediction_eval_episodes=args.sgr_pred_eval_episodes,
+            sgr_phase2_arm=args.sgr_phase2_arm,
+            sgr_phase2_signal=args.sgr_phase2_signal,
+            sgr_gate_eval_override=args.sgr_gate_eval_override,
+            sgr_dnc_write_salience=args.sgr_dnc_write_salience,
+            sgr_workspace_write_salience=args.sgr_workspace_write_salience,
         )
         all_summaries.append(summary)
 

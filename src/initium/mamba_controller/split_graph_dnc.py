@@ -110,6 +110,7 @@ the opposite order, this is the one line to fix.
 
 from __future__ import annotations
 
+import weakref
 from typing import Any
 
 import torch
@@ -129,6 +130,7 @@ from initium.mamba_controller.mamba3_controller import Mamba3ControllerWrapper
 from initium.mamba_controller.mamba_controller import MambaControllerWrapper
 from initium.memory_manipulation.dnc_mechanisms import build_memory
 from initium.workspace.broadcast import WorkspaceBroadcast
+from initium.data.surprise_recall.next_token_prediction import prediction_error_signal
 
 
 class SplitGraphDNC(nn.Module):
@@ -220,6 +222,8 @@ class SplitGraphDNC(nn.Module):
         workspace_reconsideration_enabled: bool = False,
         workspace_reconsideration_surprise_threshold: float = 0.5,
         workspace_reconsideration_trigger_mode: str = "innovation",
+        sgr_write_salience_enabled: bool = False,
+        sgr_workspace_salience_enabled: bool = False,
     ):
         super().__init__()
         if not independent_linears:
@@ -285,6 +289,11 @@ class SplitGraphDNC(nn.Module):
             workspace_reconsideration_surprise_threshold
         )
         self.workspace_reconsideration_trigger_mode = workspace_reconsideration_trigger_mode
+        self.sgr_write_salience_enabled = bool(sgr_write_salience_enabled)
+        self.sgr_workspace_salience_enabled = bool(sgr_workspace_salience_enabled)
+        self.sgr_error_signal_mode = "excess-surprise"
+        self._sgr_prediction_decoder_ref = None
+        self.last_sgr_signal_diagnostics: dict[str, torch.Tensor] = {}
         self.workspace_bistable_deterministic = False
         # Runtime-only counterfactual for evaluation. It is deliberately not
         # part of checkpoint config/state so a saved model can be scored with
@@ -531,6 +540,7 @@ class SplitGraphDNC(nn.Module):
                 link_sharpness=dnc_link_sharpness,
                 allocation_topk=dnc_allocation_topk,
                 dnc_implementation=dnc_implementation,
+                sgr_write_salience_enabled=sgr_write_salience_enabled,
             )
         )
         # See module docstring's API-compatibility section for why this
@@ -560,6 +570,7 @@ class SplitGraphDNC(nn.Module):
                 reconsideration_enabled=workspace_reconsideration_enabled,
                 reconsideration_surprise_threshold=(workspace_reconsideration_surprise_threshold),
                 reconsideration_trigger_mode=(workspace_reconsideration_trigger_mode),
+                prediction_error_salience_enabled=sgr_workspace_salience_enabled,
             )
             if workspace_enabled and workspace_num_slots > 0
             else None
@@ -587,6 +598,14 @@ class SplitGraphDNC(nn.Module):
         if self.device is not None and getattr(self.device, "type", None) == "cuda":
             self.to(self.device)
 
+    def set_sgr_prediction_decoder(self, decoder: nn.Module | None, signal_mode: str) -> None:
+        object.__setattr__(
+            self,
+            "_sgr_prediction_decoder_ref",
+            weakref.ref(decoder) if decoder is not None else None,
+        )
+        self.sgr_error_signal_mode = signal_mode
+
     def forward(
         self,
         input: torch.Tensor,
@@ -597,6 +616,7 @@ class SplitGraphDNC(nn.Module):
         start_step: int = 0,  # v20: resume the sequential loop mid-sequence (inference caching)
         sequence_valid_mask: torch.Tensor | None = None,
         return_backbone_features: bool = False,
+        return_prediction_logits: bool = False,
     ):
         """
         input: (B, T, input_size) -- batch-first, the whole padded episode
@@ -673,6 +693,42 @@ class SplitGraphDNC(nn.Module):
         # This is the entire "removed from the sequential critical path"
         # half of Option 5.
         prediction_features = None
+        prediction_logits = None
+        prediction_error = None
+        workspace_error_consumer = self.sgr_workspace_salience_enabled or (
+            self.workspace_reconsideration_trigger_mode.startswith("prediction_error")
+        )
+        decoder_ref = self._sgr_prediction_decoder_ref
+        sgr_decoder = decoder_ref() if decoder_ref is not None else None
+
+        def compute_prediction_error(features):
+            nonlocal prediction_logits, prediction_error
+            if sgr_decoder is None:
+                return
+            prediction_error, prediction_logits = prediction_error_signal(
+                features,
+                input,
+                sgr_decoder,
+                signal_mode=self.sgr_error_signal_mode,
+            )
+            detached_signal = prediction_error.detach()
+            token_ids = input.argmax(dim=-1)
+            positions = torch.arange(input.shape[1], device=input.device).unsqueeze(0)
+            stream_lengths = torch.where(token_ids.eq(20), positions, input.shape[1]).amin(dim=1)
+            stream_mask = positions < stream_lengths.unsqueeze(1)
+            valid_signal = detached_signal[stream_mask]
+            valid_count = stream_mask.sum().clamp_min(1)
+            self.last_sgr_signal_diagnostics = {
+                "mean": valid_signal.sum() / valid_count,
+                "abs_mean": valid_signal.abs().sum() / valid_count,
+                "positive_frac": valid_signal.gt(0).float().sum() / valid_count,
+            }
+
+        def observe_prediction_features(features):
+            nonlocal prediction_features
+            prediction_features = features
+            compute_prediction_error(features)
+
         if self.workspace is not None:
             backbone_stages = (
                 list(self.backbone) if isinstance(self.backbone, nn.Sequential) else [self.backbone]
@@ -682,6 +738,8 @@ class SplitGraphDNC(nn.Module):
                 stage_input = stage(stage_input, token_mask=sequence_valid_mask)
                 if stage_index == 0:
                     prediction_features = stage_input
+                    if return_backbone_features or self.sgr_write_salience_enabled or workspace_error_consumer:
+                        compute_prediction_error(prediction_features)
             final_stage = backbone_stages[-1]
             forward_with_specialists = getattr(final_stage, "forward_with_specialists", None)
             if not callable(forward_with_specialists):
@@ -689,7 +747,13 @@ class SplitGraphDNC(nn.Module):
                     "workspace requires the final parallel-backbone stage to expose its MoE specialists"
                 )
             base, specialists, route_indices, route_weights = forward_with_specialists(
-                stage_input, token_mask=sequence_valid_mask
+                stage_input,
+                token_mask=sequence_valid_mask,
+                intermediate_observer=(
+                    observe_prediction_features
+                    if return_backbone_features or self.sgr_write_salience_enabled or workspace_error_consumer
+                    else None
+                ),
             )
             broadcast_delta, workspace_state = self.workspace(
                 specialists[:, start_step:],
@@ -702,6 +766,11 @@ class SplitGraphDNC(nn.Module):
                 bistable_noise_scale=self.workspace_bistable_noise_scale,
                 bistable_selection_scale=self.workspace_bistable_selection_scale,
                 deterministic_gate=self.workspace_bistable_deterministic,
+                prediction_error=(
+                    prediction_error[:, start_step:]
+                    if prediction_error is not None and workspace_error_consumer
+                    else None
+                ),
             )
             H = base.clone()
             # The workspace returns the selected, broadcast-enriched MoE
@@ -721,14 +790,33 @@ class SplitGraphDNC(nn.Module):
             observe_tensor("split_graph.h_after_workspace", H)
             observe_numeric_tree("backbone.workspace_output", H)
         else:
-            backbone_stages = (
-                list(self.backbone) if isinstance(self.backbone, nn.Sequential) else [self.backbone]
+            needs_prediction_features = (
+                return_backbone_features
+                or self.sgr_write_salience_enabled
+                or workspace_error_consumer
             )
-            H = input
-            for stage_index, stage in enumerate(backbone_stages):
-                H = stage(H, token_mask=sequence_valid_mask)
-                if stage_index == 0:
-                    prediction_features = H
+            forward_with_intermediate = getattr(self.backbone, "forward_with_intermediate", None)
+            if needs_prediction_features and callable(forward_with_intermediate):
+                H = forward_with_intermediate(
+                    input,
+                    token_mask=sequence_valid_mask,
+                    intermediate_observer=observe_prediction_features,
+                )
+            else:
+                if not needs_prediction_features and not isinstance(self.backbone, nn.Sequential):
+                    H = self.backbone(input, token_mask=sequence_valid_mask)
+                else:
+                    backbone_stages = (
+                        list(self.backbone)
+                        if isinstance(self.backbone, nn.Sequential)
+                        else [self.backbone]
+                    )
+                    H = input
+                    for stage_index, stage in enumerate(backbone_stages):
+                        H = stage(H, token_mask=sequence_valid_mask)
+                        if stage_index == 0 and needs_prediction_features:
+                            prediction_features = H
+                            compute_prediction_error(prediction_features)
 
         # The Phase 1 prediction head is intended to read block 0 so its
         # signal can later be injected between parallel backbone blocks.
@@ -829,7 +917,12 @@ class SplitGraphDNC(nn.Module):
 
             if pass_through_memory:
                 observe_tensor("split_graph.dnc_input", xi_t)
-                read_vec, mem_state = self.memories[0](xi_t, mem_state)
+                if prediction_error is not None and self.sgr_write_salience_enabled:
+                    read_vec, mem_state = self.memories[0].forward_with_prediction_error(
+                        xi_t, mem_state, prediction_error[:, t]
+                    )
+                else:
+                    read_vec, mem_state = self.memories[0](xi_t, mem_state)
                 observe_numeric_tree("memory.state.output", mem_state)
                 observe_numeric_tree("memory.read.output", read_vec)
                 read_vec = read_vec.reshape(
@@ -863,5 +956,9 @@ class SplitGraphDNC(nn.Module):
         state = (chx, mhx, read_vec)
         if return_backbone_features:
             assert backbone_features is not None
+            if return_prediction_logits:
+                return output, state, backbone_features, prediction_logits
             return output, state, backbone_features
+        if return_prediction_logits:
+            return output, state, prediction_logits
         return output, state

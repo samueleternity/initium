@@ -27,7 +27,7 @@ ANSWER_TOKEN = 21
 EOS_TOKEN = 22
 VOCAB_SIZE = 23
 MAX_ANSWER_TOKENS = 7  # six anomalies plus EOS
-ADVANCE_THRESHOLD = 0.80
+ADVANCE_THRESHOLD = 0.75
 OLD_LESSON_MIX_RATE = 0.10
 EVAL_BATCH_SIZE = 128
 
@@ -375,11 +375,19 @@ class SurpriseRecallDataset(BaseDataset):
                     torch.arange(len(ep.inputs), device=device),
                     torch.tensor(ep.inputs, device=device),
                 ] = 1
+                model_kwargs = {}
+                if getattr(model, "phase2_arm", None) == "oracle":
+                    flags = torch.zeros(1, len(ep.inputs), dtype=torch.float32, device=device)
+                    for position, kind in zip(ep.anomaly_positions, ep.anomaly_types):
+                        if kind in {"A1", "A2", "A4", "A5"}:
+                            flags[0, position] = 1.0
+                    model_kwargs["oracle_flags"] = flags
                 output, _ = model(
                     x,
                     (None, None, None),
                     reset_experience=True,
                     pass_through_memory=not ablate_memory,
+                    **model_kwargs,
                 )
                 logits = self._output_proj(output.transpose(0, 1).contiguous().squeeze(0))
                 n_ok, n = self.score(logits, ep)

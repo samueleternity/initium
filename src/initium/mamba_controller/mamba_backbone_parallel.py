@@ -71,6 +71,13 @@ import torch.nn as nn
 
 from initium.MoE.moe_layer import MoEBlock
 
+try:
+    from einops import rearrange
+    from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
+except ImportError:  # pragma: no cover - optional CUDA extension
+    rearrange = None
+    selective_scan_fn = None
+
 _MAMBA1_IMPORT_ERROR: str | None
 _MAMBA2_IMPORT_ERROR: str | None
 _MAMBA3_IMPORT_ERROR: str | None
@@ -147,11 +154,20 @@ class _ParallelBlock(nn.Module):
         mamba_kwargs: dict,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
+        sgr_delta_error_gating: bool = False,
     ):
         super().__init__()
         _require_variant(variant)
         self.norm = nn.LayerNorm(d_model, device=device, dtype=dtype)
         self.variant = variant
+        self.sgr_delta_error_gating = bool(sgr_delta_error_gating)
+        self.error_to_delta = None
+        if self.sgr_delta_error_gating:
+            if variant != "mamba1":
+                raise ValueError("SGR delta-error gating currently supports only Mamba-1")
+            inner_size = int(d_model * mamba_kwargs.get("expand", 2))
+            self.error_to_delta = nn.Linear(1, inner_size, bias=False, device=device, dtype=dtype)
+            nn.init.zeros_(self.error_to_delta.weight)
         if variant == "mamba3":
             self.mixer = Mamba3(d_model=d_model, device=device, dtype=dtype, **mamba_kwargs)
         elif variant == "mamba1":
@@ -159,7 +175,9 @@ class _ParallelBlock(nn.Module):
         else:
             self.mixer = Mamba2(d_model=d_model, device=device, dtype=dtype, **mamba_kwargs)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, *, prediction_error: torch.Tensor | None = None
+    ) -> torch.Tensor:
         # x: (B, L, D). mamba_ssm's own forward() handles the whole
         # sequence's parallel scan / SSD chunked-scan internally -- this is
         # the entire mechanism that makes Option 5 different from
@@ -186,6 +204,8 @@ class _ParallelBlock(nn.Module):
         # running under fp16 (this block no longer benefits from tensor-core
         # fp16 matmuls), but matches every other Mamba SSM computation path
         # in this project, all of which already force fp32 for this reason.
+        if prediction_error is not None:
+            return self.forward_with_prediction_error(x, prediction_error)
         numeric_observer = getattr(self, "_initium_forward_numeric_observer", None)
         if self.variant == "mamba3" and _MAMBA3_BF16_OK:
             with torch.autocast(device_type=x.device.type, dtype=torch.bfloat16, enabled=True):
@@ -208,6 +228,64 @@ class _ParallelBlock(nn.Module):
         if numeric_observer is not None:
             numeric_observer("residual_output", result)
         return result
+
+    def forward_with_prediction_error(
+        self, x: torch.Tensor, prediction_error: torch.Tensor
+    ) -> torch.Tensor:
+        """Run Mamba-1's selective scan with an inter-layer error term on Δ.
+
+        The injected scalar is transformed into a per-channel additive bias
+        on the pre-softplus Δ projection. The zero-initialized projection
+        makes the initial forward function equal to the ordinary block. This
+        intentionally uses the unfused selective-scan path because the fused
+        Mamba-1 kernel does not expose a per-position Δ override.
+        """
+        if self.variant != "mamba1" or self.error_to_delta is None:
+            raise RuntimeError("prediction-error injection requires a configured Mamba-1 block")
+        if rearrange is None or selective_scan_fn is None:
+            raise RuntimeError(
+                "SGR delta-error gating requires einops and mamba_ssm's selective_scan_fn"
+            )
+        if prediction_error.ndim != 2 or prediction_error.shape != x.shape[:2]:
+            raise ValueError("prediction_error must have shape (batch, sequence)")
+
+        numeric_observer = getattr(self, "_initium_forward_numeric_observer", None)
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            normed = self.norm(x.float())
+            mixer = self.mixer
+            batch, sequence, _ = normed.shape
+            xz = mixer.in_proj(normed).transpose(1, 2)
+            x_branch, z = xz.chunk(2, dim=1)
+            x_branch = mixer.act(mixer.conv1d(x_branch)[..., :sequence])
+            projected = mixer.x_proj(rearrange(x_branch, "b d l -> (b l) d"))
+            dt_low_rank, B, C = torch.split(
+                projected, [mixer.dt_rank, mixer.d_state, mixer.d_state], dim=-1
+            )
+            dt = mixer.dt_proj.weight @ dt_low_rank.transpose(0, 1)
+            dt = rearrange(dt, "d (b l) -> b d l", b=batch, l=sequence)
+            error_bias = self.error_to_delta(prediction_error.float().unsqueeze(-1))
+            dt = dt + error_bias.transpose(1, 2).to(dtype=dt.dtype)
+            B = rearrange(B, "(b l) n -> b n l", b=batch, l=sequence).contiguous()
+            C = rearrange(C, "(b l) n -> b n l", b=batch, l=sequence).contiguous()
+            A = -torch.exp(mixer.A_log.float())
+            if numeric_observer is not None:
+                numeric_observer("delta_pre_softplus", dt)
+                numeric_observer("prediction_error", prediction_error)
+            y = selective_scan_fn(
+                x_branch,
+                dt,
+                A,
+                B,
+                C,
+                mixer.D.float(),
+                z=z,
+                delta_bias=mixer.dt_proj.bias.float(),
+                delta_softplus=True,
+            )
+            y = rearrange(y, "b d l -> b l d")
+            mixer_output = mixer.out_proj(y)
+        residual = mixer_output.to(dtype=x.dtype)
+        return x + residual
 
 
 class MambaBackboneParallel(nn.Module):
@@ -241,6 +319,7 @@ class MambaBackboneParallel(nn.Module):
         moe_load_balance_alpha: float = 0.01,
         moe_residual_scale: float = 1.0,
         moe_block_isolation: int | None = None,
+        sgr_delta_error_gating: bool = False,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
     ):
@@ -278,8 +357,15 @@ class MambaBackboneParallel(nn.Module):
 
         self.blocks = nn.ModuleList(
             [
-                _ParallelBlock(d_model, variant, mamba_kwargs, device=device, dtype=dtype)
-                for _ in range(num_blocks)
+                _ParallelBlock(
+                    d_model,
+                    variant,
+                    mamba_kwargs,
+                    device=device,
+                    dtype=dtype,
+                    sgr_delta_error_gating=sgr_delta_error_gating and i == 1,
+                )
+                for i in range(num_blocks)
             ]
         )
         # Match the standard pre-norm SSM stack contract: normalize the
@@ -330,6 +416,128 @@ class MambaBackboneParallel(nn.Module):
                     numeric_observer(f"block.{i}.moe_output", h)
         return self.normalize_output(h)
 
+    def forward_with_intermediate(
+        self,
+        x: torch.Tensor,
+        *,
+        token_mask: torch.Tensor | None = None,
+        intermediate_observer=None,
+    ) -> torch.Tensor:
+        """Run the normal stack and expose block-0 features without a second pass."""
+        h = self.in_adapter(x)
+        numeric_observer = getattr(self, "_initium_forward_numeric_observer", None)
+        if numeric_observer is not None:
+            numeric_observer("input_adapter.output", h)
+        for index, block in enumerate(self.blocks):
+            h = block(h)
+            if numeric_observer is not None:
+                numeric_observer(f"block.{index}.output", h)
+            if index == 0 and intermediate_observer is not None:
+                intermediate_observer(h)
+            if self.moe_blocks is not None and isinstance(self.moe_blocks[index], MoEBlock):
+                h = self.moe_blocks[index](h, token_mask=token_mask)
+                if numeric_observer is not None:
+                    numeric_observer(f"block.{index}.moe_output", h)
+        return self.normalize_output(h)
+
+    def forward_sgr(
+        self,
+        x: torch.Tensor,
+        *,
+        arm: str,
+        decoder: nn.Module | None = None,
+        signal_mode: str = "excess-surprise",
+        stream_lengths: list[int] | None = None,
+        oracle_flags: torch.Tensor | None = None,
+        gate_override: str = "none",
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, dict[str, torch.Tensor]]:
+        """Forward for the isolated SGR Phase 2 experiment arms."""
+        valid_arms = {"content", "aux-only", "error", "blend", "shuffled", "oracle"}
+        if arm not in valid_arms:
+            raise ValueError(f"unknown SGR Phase 2 arm {arm!r}")
+        if self.variant != "mamba1" or len(self.blocks) != 2:
+            raise ValueError("SGR Phase 2 requires exactly two Mamba-1 blocks")
+        if gate_override not in {"none", "zero", "shuffle"}:
+            raise ValueError("gate_override must be none, zero, or shuffle")
+        if arm in {"aux-only", "error", "blend", "shuffled"} and decoder is None:
+            raise ValueError(f"Phase 2 arm {arm!r} requires the prediction decoder")
+
+        h = self.in_adapter(x)
+        first_features = self.blocks[0](h)
+        batch, sequence, _ = first_features.shape
+        token_ids = x.argmax(dim=-1)
+        if stream_lengths is None:
+            positions = torch.arange(sequence, device=x.device).unsqueeze(0)
+            lengths = torch.where(token_ids.eq(20), positions, sequence).amin(dim=1)
+        else:
+            if len(stream_lengths) != batch:
+                raise ValueError("stream_lengths must contain one value per batch row")
+            if any(not 0 <= int(length) <= sequence for length in stream_lengths):
+                raise ValueError("stream_lengths must be valid lengths for each batch row")
+            lengths = torch.as_tensor(stream_lengths, device=x.device)
+        stream_mask = torch.arange(sequence, device=x.device).unsqueeze(0) < lengths.unsqueeze(1)
+
+        def shuffle_valid_stream(values: torch.Tensor) -> torch.Tensor:
+            positions = torch.arange(sequence, device=x.device).unsqueeze(0)
+            reversed_positions = (lengths.unsqueeze(1) - 1 - positions).clamp_min(0)
+            indices = torch.where(positions < lengths.unsqueeze(1), reversed_positions, positions)
+            return values.gather(1, indices.expand_as(values))
+
+        logits = None
+        error_signal = first_features.new_zeros((batch, sequence), dtype=torch.float32)
+        if decoder is not None:
+            logits = decoder(first_features[:, :-1]).float()
+            log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+            target = token_ids[:, 1:]
+            raw = -log_probs.gather(-1, target.unsqueeze(-1)).squeeze(-1)
+            if signal_mode == "surprisal":
+                score = raw
+            elif signal_mode == "excess-surprise":
+                probs = log_probs.exp()
+                entropy = -(probs * log_probs).sum(dim=-1)
+                score = raw - entropy
+            else:
+                raise ValueError("Phase 2 signal must be surprisal or excess-surprise")
+            error_signal[:, 1:] = torch.tanh(score.detach())
+            error_signal = error_signal * stream_mask
+
+        alert_mask = x[..., 16:20].sum(dim=-1).gt(0).to(dtype=error_signal.dtype)
+        if arm == "content":
+            gate_signal = alert_mask
+        elif arm == "oracle":
+            if oracle_flags is None or oracle_flags.shape != (batch, sequence):
+                raise ValueError("oracle arm requires oracle_flags with shape (batch, sequence)")
+            gate_signal = oracle_flags.to(device=x.device, dtype=error_signal.dtype)
+        elif arm == "error":
+            gate_signal = error_signal
+        elif arm == "blend":
+            gate_signal = 0.5 * (error_signal + alert_mask)
+        elif arm == "shuffled":
+            gate_signal = shuffle_valid_stream(error_signal)
+        else:
+            gate_signal = None  # auxiliary-only preserves the ungated backbone
+
+        if gate_override == "zero":
+            gate_signal = None
+        elif gate_override == "shuffle" and gate_signal is not None:
+            gate_signal = shuffle_valid_stream(gate_signal)
+        if gate_signal is not None:
+            # Keep every intervention on the observed stream. In particular,
+            # temporal-shuffle controls must not move signal into query,
+            # answer, or right-padding positions.
+            gate_signal = gate_signal * stream_mask
+            h = self.blocks[1](first_features, prediction_error=gate_signal)
+        else:
+            h = self.blocks[1](first_features)
+        h = self.normalize_output(h)
+        diagnostics = {
+            "prediction_error": error_signal.detach(),
+            "gate_signal": (
+                gate_signal.detach() if gate_signal is not None else error_signal.new_zeros(error_signal.shape)
+            ),
+        }
+        return h, first_features, logits, diagnostics
+
     def normalize_output(self, h: torch.Tensor) -> torch.Tensor:
         """Normalize the final residual stream before exposing backbone features."""
         numeric_observer = getattr(self, "_initium_forward_numeric_observer", None)
@@ -344,7 +552,13 @@ class MambaBackboneParallel(nn.Module):
             numeric_observer("output_norm.output", normalized)
         return normalized
 
-    def forward_with_specialists(self, x: torch.Tensor, *, token_mask: torch.Tensor | None = None):
+    def forward_with_specialists(
+        self,
+        x: torch.Tensor,
+        *,
+        token_mask: torch.Tensor | None = None,
+        intermediate_observer=None,
+    ):
         """Return final MoE candidates and sparse routes for workspace use.
 
         Earlier backbone/MoE blocks remain unchanged. The final MoE block
@@ -366,6 +580,8 @@ class MambaBackboneParallel(nn.Module):
             )
         for i, block in enumerate(self.blocks):
             h = block(h)
+            if i == 0 and intermediate_observer is not None:
+                intermediate_observer(h)
             if numeric_observer is not None:
                 numeric_observer(f"block.{i}.output", h)
             if i == final_index:

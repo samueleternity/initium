@@ -23,6 +23,8 @@ class WorkspaceBroadcast(nn.Module):
     receives the resulting context before the selected deltas are combined.
     """
 
+    _RECONSIDERATION_ERROR_EMA_DECAY = 0.9
+
     def __init__(
         self,
         d_model: int,
@@ -37,6 +39,7 @@ class WorkspaceBroadcast(nn.Module):
         reconsideration_enabled: bool = False,
         reconsideration_surprise_threshold: float = 0.5,
         reconsideration_trigger_mode: str = "innovation",
+        prediction_error_salience_enabled: bool = False,
     ):
         super().__init__()
         if d_model < 1 or num_experts < 1:
@@ -51,10 +54,13 @@ class WorkspaceBroadcast(nn.Module):
             0.0 <= reconsideration_surprise_threshold <= 1.0
         ):
             raise ValueError("reconsideration_surprise_threshold must be finite and in [0, 1]")
-        if reconsideration_trigger_mode not in ("innovation", "random_rate_matched"):
-            raise ValueError(
-                "reconsideration_trigger_mode must be 'innovation' or 'random_rate_matched'"
-            )
+        if reconsideration_trigger_mode not in (
+            "innovation",
+            "random_rate_matched",
+            "prediction_error",
+            "prediction_error_random_rate_matched",
+        ):
+            raise ValueError("unknown workspace reconsideration trigger mode")
         self.d_model = d_model
         self.num_experts = num_experts
         self.num_slots = num_slots
@@ -65,10 +71,14 @@ class WorkspaceBroadcast(nn.Module):
         self.reconsideration_enabled = bool(reconsideration_enabled)
         self.reconsideration_surprise_threshold = float(reconsideration_surprise_threshold)
         self.reconsideration_trigger_mode = reconsideration_trigger_mode
+        self.prediction_error_salience_enabled = bool(prediction_error_salience_enabled)
         self.query = nn.Linear(d_model, d_model, bias=False)
         self.key = nn.Linear(d_model, d_model, bias=False)
         self.value = nn.Linear(d_model, d_model, bias=False)
         self.write_gate = nn.Linear(2 * d_model, d_model)
+        self.prediction_error_to_write_gate = (
+            nn.Linear(1, d_model, bias=False) if self.prediction_error_salience_enabled else None
+        )
         self.read_gate = nn.Parameter(torch.zeros(()))
         self.write_gate_closed = False
         self.bistable_gate = (
@@ -87,6 +97,8 @@ class WorkspaceBroadcast(nn.Module):
         self._bistable_diagnostic_calls = 0
         nn.init.zeros_(self.write_gate.weight)
         nn.init.zeros_(self.write_gate.bias)
+        if self.prediction_error_to_write_gate is not None:
+            nn.init.zeros_(self.prediction_error_to_write_gate.weight)
 
     def init_state(self, batch: int, *, device, dtype) -> torch.Tensor:
         return torch.zeros(batch, self.num_slots, self.d_model, device=device, dtype=dtype)
@@ -104,6 +116,8 @@ class WorkspaceBroadcast(nn.Module):
         bistable_noise_scale: float | None = None,
         bistable_selection_scale: float | None = None,
         deterministic_gate: bool = False,
+        prediction_error: torch.Tensor | None = None,
+        reconsideration_error: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Keep the zero-slot/closed-gate bypass identical to the selection-only
         # MoE path. Active workspace attention and recurrent slot updates use
@@ -120,6 +134,8 @@ class WorkspaceBroadcast(nn.Module):
                 bistable_noise_scale=bistable_noise_scale,
                 bistable_selection_scale=bistable_selection_scale,
                 deterministic_gate=deterministic_gate,
+                prediction_error=prediction_error,
+                reconsideration_error=reconsideration_error,
             )
         if specialist_deltas.is_cuda:
             with torch.autocast(device_type="cuda", enabled=False):
@@ -134,6 +150,8 @@ class WorkspaceBroadcast(nn.Module):
                     bistable_noise_scale=bistable_noise_scale,
                     bistable_selection_scale=bistable_selection_scale,
                     deterministic_gate=deterministic_gate,
+                    prediction_error=prediction_error,
+                    reconsideration_error=reconsideration_error,
                 )
         return self._forward_step(
             specialist_deltas.float(),
@@ -146,6 +164,8 @@ class WorkspaceBroadcast(nn.Module):
             bistable_noise_scale=bistable_noise_scale,
             bistable_selection_scale=bistable_selection_scale,
             deterministic_gate=deterministic_gate,
+            prediction_error=prediction_error,
+            reconsideration_error=reconsideration_error,
         )
 
     def _forward_step(
@@ -161,6 +181,8 @@ class WorkspaceBroadcast(nn.Module):
         bistable_noise_scale: float | None = None,
         bistable_selection_scale: float | None = None,
         deterministic_gate: bool = False,
+        prediction_error: torch.Tensor | None = None,
+        reconsideration_error: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.num_slots == 0 or self.write_gate_closed:
             selected = specialist_deltas.gather(
@@ -219,7 +241,17 @@ class WorkspaceBroadcast(nn.Module):
         slot_proposal = slot_proposal / mass.unsqueeze(-1).clamp_min(1e-6)
         slot_inputs = slot_proposal
         old_inputs = state
-        update = torch.sigmoid(self.write_gate(torch.cat([old_inputs, slot_inputs], dim=-1)))
+        update_logits = self.write_gate(torch.cat([old_inputs, slot_inputs], dim=-1))
+        error_value = None
+        if prediction_error is not None:
+            if prediction_error.numel() not in (1, batch):
+                raise ValueError("prediction_error must be scalar or have one value per batch item")
+            error_value = prediction_error.reshape(batch, 1).float().detach()
+            if self.prediction_error_to_write_gate is not None:
+                update_logits = update_logits + self.prediction_error_to_write_gate(error_value).unsqueeze(1)
+        elif self.prediction_error_salience_enabled:
+            raise ValueError("workspace prediction-error salience requires prediction_error")
+        update = torch.sigmoid(update_logits)
         has_writer = write_weights.sum(dim=-1, keepdim=True).unsqueeze(-1) > 0
         update = update * has_writer.to(update.dtype)
         reconsideration_diag = {}
@@ -236,12 +268,34 @@ class WorkspaceBroadcast(nn.Module):
             innovation = torch.linalg.vector_norm(proposal_probe - old_probe, dim=-1)
             surprise = innovation / (old_norm + proposal_norm).clamp_min(1e-6)
             eligible = (old_norm > 1e-6) & has_writer.squeeze(-1).squeeze(-1).unsqueeze(-1)
-            innovation_trigger = eligible & (surprise >= self.reconsideration_surprise_threshold)
+            if self.reconsideration_trigger_mode in (
+                "prediction_error",
+                "prediction_error_random_rate_matched",
+            ):
+                if reconsideration_error is None:
+                    raise ValueError(
+                        "prediction-error reconsideration requires a per-step prediction_error"
+                    )
+                signal = (
+                    reconsideration_error.reshape(batch, 1)
+                    .float()
+                    .detach()
+                    .clamp(0.0, 1.0)
+                )
+                surprise = signal.expand_as(surprise)
+                innovation_trigger = eligible & (
+                    surprise >= self.reconsideration_surprise_threshold
+                )
+            else:
+                innovation_trigger = eligible & (surprise >= self.reconsideration_surprise_threshold)
             # Draw a fixed-shape random tape in both arms. This gives the
             # rate-matched null an independent choice among eligible slots while
             # keeping global RNG advancement aligned between matched runs.
             random_scores = torch.rand_like(surprise)
-            if self.reconsideration_trigger_mode == "random_rate_matched":
+            if self.reconsideration_trigger_mode in (
+                "random_rate_matched",
+                "prediction_error_random_rate_matched",
+            ):
                 eligible_flat = eligible.reshape(-1)
                 random_scores_flat = random_scores.reshape(-1).masked_fill(~eligible_flat, -1.0)
                 order = torch.argsort(random_scores_flat, descending=True)
@@ -265,6 +319,9 @@ class WorkspaceBroadcast(nn.Module):
                     ).detach(),
                     "reconsideration_trigger_frac": (
                         triggered_count.float() / eligible_count
+                    ).detach(),
+                    "reconsideration_prediction_error_mean": (
+                        (surprise * eligible).sum() / eligible_count
                     ).detach(),
                 }
         bistable_diag = {}
@@ -324,6 +381,24 @@ class WorkspaceBroadcast(nn.Module):
                     "specialist_rms": specialist_deltas.detach().float().square().mean().sqrt(),
                     **reconsideration_diag,
                     **bistable_diag,
+                    **(
+                        {"prediction_error_mean": error_value.mean().detach()}
+                        if error_value is not None
+                        else {}
+                    ),
+                    **(
+                        {
+                            "prediction_error_write_scale_rms": (
+                                self.prediction_error_to_write_gate.weight.detach()
+                                .float()
+                                .square()
+                                .mean()
+                                .sqrt()
+                            )
+                        }
+                        if self.prediction_error_to_write_gate is not None
+                        else {}
+                    ),
                     **({"writer_frequency": writer_frequency} if self.diagnostics_enabled else {}),
                 }
             return (selected_deltas * route_weights.unsqueeze(-1)).sum(dim=1), next_state
@@ -353,6 +428,24 @@ class WorkspaceBroadcast(nn.Module):
                 "specialist_rms": specialist_deltas.detach().float().square().mean().sqrt(),
                 **reconsideration_diag,
                 **bistable_diag,
+                **(
+                    {"prediction_error_mean": error_value.mean().detach()}
+                    if error_value is not None
+                    else {}
+                ),
+                **(
+                    {
+                        "prediction_error_write_scale_rms": (
+                            self.prediction_error_to_write_gate.weight.detach()
+                            .float()
+                            .square()
+                            .mean()
+                            .sqrt()
+                        )
+                    }
+                    if self.prediction_error_to_write_gate is not None
+                    else {}
+                ),
                 **({"writer_frequency": writer_frequency} if self.diagnostics_enabled else {}),
             }
         return (enriched * route_weights.unsqueeze(-1)).sum(dim=1), next_state
@@ -370,17 +463,31 @@ class WorkspaceBroadcast(nn.Module):
         bistable_noise_scale: float | None = None,
         bistable_selection_scale: float | None = None,
         deterministic_gate: bool = False,
+        prediction_error: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Process time-major specialists ``(B,T,E,D)`` sequentially."""
         outputs: list[torch.Tensor] = []
         step_diags: list[dict[str, torch.Tensor]] | None = [] if self.diagnostics_enabled else None
         state_observer = getattr(self, "_initium_recurrent_state_observer", None)
+        smoothed_prediction_error = None
         for step in range(specialist_deltas.shape[1]):
             # Truncate only the gradient carried by persistent slots. Detach
             # preserves the exact forward state and therefore the full write /
             # read trajectory; zero keeps the historical full-sequence BPTT.
             if self.bptt_horizon and step and step % self.bptt_horizon == 0:
                 state = state.detach()
+            step_prediction_error = (
+                prediction_error[:, step] if prediction_error is not None else None
+            )
+            if step_prediction_error is not None:
+                current_error = step_prediction_error.float().detach().clamp(0.0, 1.0)
+                if smoothed_prediction_error is None:
+                    smoothed_prediction_error = current_error
+                else:
+                    decay = self._RECONSIDERATION_ERROR_EMA_DECAY
+                    smoothed_prediction_error = (
+                        decay * smoothed_prediction_error + (1.0 - decay) * current_error
+                    )
             out, state = self.forward_step(
                 specialist_deltas[:, step],
                 route_indices[:, step],
@@ -392,6 +499,8 @@ class WorkspaceBroadcast(nn.Module):
                 bistable_noise_scale=bistable_noise_scale,
                 bistable_selection_scale=bistable_selection_scale,
                 deterministic_gate=deterministic_gate,
+                prediction_error=step_prediction_error,
+                reconsideration_error=smoothed_prediction_error,
             )
             if state_observer is not None:
                 state_observer(state, call_index=step)

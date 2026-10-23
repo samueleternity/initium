@@ -29,7 +29,20 @@ class SurprisePredictionHead(nn.Module):
         self.projection = nn.Linear(hidden_size, vocab_size)
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
-        return self.projection(features)
+        # Decoder inputs are block-0 residual features and can be very large
+        # even when the final backbone output is normalized.  Casting the
+        # projection result to float32 at the call site is too late if CUDA
+        # autocast already overflowed its fp16 output.
+        with torch.autocast(device_type=features.device.type, enabled=False):
+            return F.linear(
+                features.float(),
+                self.projection.weight.float(),
+                (
+                    self.projection.bias.float()
+                    if self.projection.bias is not None
+                    else None
+                ),
+            )
 
 
 def prediction_error_signal(
@@ -76,7 +89,10 @@ def prediction_error_signal(
             raise ValueError("stream_lengths must contain one value per batch row")
         lengths = torch.as_tensor(stream_lengths, device=input_one_hot.device)
     stream_mask = torch.arange(sequence, device=input_one_hot.device).unsqueeze(0) < lengths.unsqueeze(1)
-    return signal * stream_mask, logits
+    # Multiplication does not safely mask NaNs: NaN * 0 remains NaN. Keep
+    # excluded query/answer/padding positions exactly zero.
+    signal = signal.masked_fill(~stream_mask, 0.0)
+    return signal, logits
 
 
 def masked_next_token_loss(
@@ -101,10 +117,13 @@ def masked_next_token_loss(
     positions = torch.arange(1, steps + 1, device=logits.device).unsqueeze(0)
     lengths = torch.as_tensor(stream_lengths, device=logits.device).unsqueeze(1)
     valid = positions < lengths
-    token_losses = F.cross_entropy(
-        logits.reshape(-1, logits.shape[-1]), labels.reshape(-1), reduction="none"
-    ).view(batch_size, steps)
-    return (token_losses * valid.to(token_losses.dtype)).sum() / valid.sum().clamp_min(1)
+    # Evaluate CE only where the target belongs to the stream. Computing CE
+    # on excluded query/answer/padding positions and multiplying by zero
+    # afterward lets a single NaN there poison the whole loss (NaN * 0 = NaN).
+    valid_logits = logits[valid].float()
+    valid_labels = labels[valid]
+    loss_sum = F.cross_entropy(valid_logits, valid_labels, reduction="sum")
+    return loss_sum / valid.sum().clamp_min(1)
 
 
 def _auroc(positive: list[float], negative: list[float]) -> float | None:

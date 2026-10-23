@@ -504,7 +504,9 @@ class MambaBackboneParallel(nn.Module):
             else:
                 raise ValueError("Phase 2 signal must be surprisal or excess-surprise")
             error_signal[:, 1:] = torch.tanh(score.detach())
-            error_signal = error_signal * stream_mask
+            # NaNs on query/answer/padding positions must not leak through a
+            # zero multiplier (NaN * 0 is still NaN).
+            error_signal = error_signal.masked_fill(~stream_mask, 0.0)
 
         alert_mask = x[..., 16:20].sum(dim=-1).gt(0).to(dtype=error_signal.dtype)
         if arm == "content":
@@ -530,7 +532,7 @@ class MambaBackboneParallel(nn.Module):
             # Keep every intervention on the observed stream. In particular,
             # temporal-shuffle controls must not move signal into query,
             # answer, or right-padding positions.
-            gate_signal = gate_signal * stream_mask
+            gate_signal = gate_signal.masked_fill(~stream_mask, 0.0)
             h = self.blocks[1](first_features, prediction_error=gate_signal)
         else:
             h = self.blocks[1](first_features)

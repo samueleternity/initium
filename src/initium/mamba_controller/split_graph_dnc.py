@@ -133,6 +133,19 @@ from initium.workspace.broadcast import WorkspaceBroadcast
 from initium.data.surprise_recall.next_token_prediction import prediction_error_signal
 
 
+class _ModelCapacityMetadata:
+    """Legacy trainer/checkpoint capacity metadata without DNC state."""
+
+    def __init__(self, nr_cells: int):
+        self.nr_cells = int(nr_cells)
+
+    def begin_stage_diagnostics(self) -> None:
+        pass
+
+    def finish_stage_diagnostics(self) -> dict[str, float]:
+        return {}
+
+
 class SplitGraphDNC(nn.Module):
     """Alternate Phase 3, Step 2, Option 5 controller+memory assembly.
     See module docstring for the full design rationale and the explicit
@@ -181,6 +194,7 @@ class SplitGraphDNC(nn.Module):
         combiner_headdim: int = 64,  # mamba2 combiner_variant only
         combiner_ngroups: int = 1,  # mamba2 combiner_variant only
         independent_linears: bool = True,
+        dnc_enabled: bool = True,
         device: torch.device | None = None,
         moe_enabled: bool = False,
         moe_placement: str = "all",
@@ -226,7 +240,7 @@ class SplitGraphDNC(nn.Module):
         sgr_workspace_salience_enabled: bool = False,
     ):
         super().__init__()
-        if not independent_linears:
+        if dnc_enabled and not independent_linears:
             raise ValueError(
                 "SplitGraphDNC requires independent_linears=True, same "
                 "requirement as install_stochastic_write_heads() (Phase 1) "
@@ -243,7 +257,10 @@ class SplitGraphDNC(nn.Module):
         self.w = cell_size
         self.r = read_heads
         self.read_vectors_size = read_heads * cell_size
-        self.nn_output_size = hidden_size + self.read_vectors_size
+        self.dnc_enabled = bool(dnc_enabled)
+        self.nn_output_size = (
+            hidden_size + self.read_vectors_size if self.dnc_enabled else hidden_size
+        )
         self.device = device
         self.mamba_variant = mamba_variant
         self.combine_reads = combine_reads
@@ -260,8 +277,12 @@ class SplitGraphDNC(nn.Module):
         self.moe_backbone_residual_scale = moe_backbone_residual_scale
         if moe_placement not in ("all", "backbone", "combiner"):
             raise ValueError("moe_placement must be 'all', 'backbone', or 'combiner'")
+        if not self.dnc_enabled and moe_placement == "combiner":
+            raise ValueError("MoE placement 'combiner' requires the DNC sequential combiner")
         backbone_moe_enabled = moe_enabled and moe_placement in ("all", "backbone")
-        combiner_moe_enabled = moe_enabled and moe_placement in ("all", "combiner")
+        combiner_moe_enabled = (
+            self.dnc_enabled and moe_enabled and moe_placement in ("all", "combiner")
+        )
         if moe_backbone_block_isolation is not None and not backbone_moe_enabled:
             raise ValueError(
                 "moe_backbone_block_isolation requires active backbone MoE "
@@ -328,6 +349,10 @@ class SplitGraphDNC(nn.Module):
             device=device,
         )
 
+        if not self.dnc_enabled:
+            if combiner_mode != "linear":
+                raise ValueError("A controller combiner requires the DNC sequential path")
+            combine_reads = False
         if combiner_mode not in ("linear", "controller"):
             raise ValueError(
                 f"SplitGraphDNC: unknown combiner_mode {combiner_mode!r}, "
@@ -523,32 +548,36 @@ class SplitGraphDNC(nn.Module):
                 with torch.no_grad():
                     _ad.weight[:, hidden_size:].zero_()
 
-        self.memories = []
-        self.memories.append(
-            build_memory(
-                input_size=self.output_size,
-                nr_cells=self.nr_cells,
-                cell_size=self.w,
-                read_heads=self.r,
-                device=self.device,
-                independent_linears=independent_linears,
-                read_variant=dnc_read_variant,
-                write_variant=dnc_write_variant,
-                read_residual_scale=dnc_read_residual_scale,
-                read_residual_max_ratio=dnc_read_residual_max_ratio,
-                observation_variance=dnc_write_observation_variance,
-                link_sharpness=dnc_link_sharpness,
-                allocation_topk=dnc_allocation_topk,
-                dnc_implementation=dnc_implementation,
-                sgr_write_salience_enabled=sgr_write_salience_enabled,
-            )
-        )
-        # See module docstring's API-compatibility section for why this
-        # setattr (not just the list append above) is required.
-        self.rnn_layer_memory_shared = self.memories[0]
-
-        self.output = nn.Linear(self.nn_output_size, self.input_size, device=device)
-        torch.nn.init.kaiming_uniform_(self.output.weight)
+        if self.dnc_enabled:
+            self.memories = [
+                build_memory(
+                    input_size=self.output_size,
+                    nr_cells=self.nr_cells,
+                    cell_size=self.w,
+                    read_heads=self.r,
+                    device=self.device,
+                    independent_linears=independent_linears,
+                    read_variant=dnc_read_variant,
+                    write_variant=dnc_write_variant,
+                    read_residual_scale=dnc_read_residual_scale,
+                    read_residual_max_ratio=dnc_read_residual_max_ratio,
+                    observation_variance=dnc_write_observation_variance,
+                    link_sharpness=dnc_link_sharpness,
+                    allocation_topk=dnc_allocation_topk,
+                    dnc_implementation=dnc_implementation,
+                    sgr_write_salience_enabled=sgr_write_salience_enabled,
+                )
+            ]
+            # The memory is a registered submodule so optimizers, checkpoint
+            # state, and stochastic write-head installation can discover it.
+            self.rnn_layer_memory_shared = self.memories[0]
+            self.output = nn.Linear(self.nn_output_size, self.input_size, device=device)
+            torch.nn.init.kaiming_uniform_(self.output.weight)
+        else:
+            # This non-module metadata preserves generic trainer reporting;
+            # it owns no DNC state, parameters, or forward computation.
+            self.memories = [_ModelCapacityMetadata(self.nr_cells)]
+            self.output = None
         if workspace_num_slots < 0:
             raise ValueError("workspace_num_slots must be >= 0")
         # Build the optional module last so enabling it leaves the existing
@@ -615,6 +644,7 @@ class SplitGraphDNC(nn.Module):
         combiner_skip_stages=None,
         start_step: int = 0,  # v20: resume the sequential loop mid-sequence (inference caching)
         sequence_valid_mask: torch.Tensor | None = None,
+        timespans: torch.Tensor | None = None,
         return_backbone_features: bool = False,
         return_prediction_logits: bool = False,
     ):
@@ -637,6 +667,9 @@ class SplitGraphDNC(nn.Module):
         sequence_valid_mask: optional (B, T) mask forwarded to backbone MoE
             banks for valid-versus-padding routing diagnostics. It does not
             mask backbone computation, MoE dispatch, or memory execution.
+        timespans: optional CfC elapsed-time deltas with shape (B, T),
+            (1, T), or (T,). Forwarded to CfC backbone stages; other stages
+            ignore it. Omitted spans retain ncps' unit-step behavior.
 
         Returns (output, (chx, mhx, last_read)) with output shaped
         (T, B, input_size) -- see module docstring for why this shape,
@@ -657,12 +690,11 @@ class SplitGraphDNC(nn.Module):
                     B, device=input.device, dtype=input.dtype
                 )
         if start_step:
-            # Backbone still runs over the FULL input (cheap, parallel, stateless across
-            # calls); only the sequential memory loop is skipped for t < start_step.
-            # hx must then carry the state as of step `start_step`.
             if not (0 < start_step < T):
                 raise ValueError(f"start_step={start_step} must be in (0, T={T})")
-            if mhx is None:
+            if self.dnc_enabled and mhx is None:
+                # The DNC path skips the sequential memory loop before this
+                # index and therefore requires its saved memory state.
                 raise ValueError("start_step>0 requires a resumed hx=(chx, mhx, last_read)")
         device = input.device
 
@@ -687,6 +719,12 @@ class SplitGraphDNC(nn.Module):
             elif isinstance(value, (tuple, list)):
                 for index, child in enumerate(value):
                     observe_numeric_tree(f"{label}.{index}", child)
+
+        def run_backbone_stage(stage: nn.Module, stage_input: torch.Tensor) -> torch.Tensor:
+            stage_kwargs = {"token_mask": sequence_valid_mask}
+            if timespans is not None and getattr(stage, "supports_timespans", False):
+                stage_kwargs["timespans"] = timespans
+            return stage(stage_input, **stage_kwargs)
 
         # ---- (a) PARALLEL BACKBONE ------------------------------------
         # Single call, whole sequence, zero dependency on memory state.
@@ -735,7 +773,7 @@ class SplitGraphDNC(nn.Module):
             )
             stage_input = input
             for stage_index, stage in enumerate(backbone_stages[:-1]):
-                stage_input = stage(stage_input, token_mask=sequence_valid_mask)
+                stage_input = run_backbone_stage(stage, stage_input)
                 if stage_index == 0:
                     prediction_features = stage_input
                     if return_backbone_features or self.sgr_write_salience_enabled or workspace_error_consumer:
@@ -746,14 +784,18 @@ class SplitGraphDNC(nn.Module):
                 raise RuntimeError(
                     "workspace requires the final parallel-backbone stage to expose its MoE specialists"
                 )
-            base, specialists, route_indices, route_weights = forward_with_specialists(
-                stage_input,
-                token_mask=sequence_valid_mask,
-                intermediate_observer=(
+            specialist_kwargs = {
+                "token_mask": sequence_valid_mask,
+                "intermediate_observer": (
                     observe_prediction_features
                     if return_backbone_features or self.sgr_write_salience_enabled or workspace_error_consumer
                     else None
                 ),
+            }
+            if timespans is not None and getattr(final_stage, "supports_timespans", False):
+                specialist_kwargs["timespans"] = timespans
+            base, specialists, route_indices, route_weights = forward_with_specialists(
+                stage_input, **specialist_kwargs
             )
             broadcast_delta, workspace_state = self.workspace(
                 specialists[:, start_step:],
@@ -804,7 +846,7 @@ class SplitGraphDNC(nn.Module):
                 )
             else:
                 if not needs_prediction_features and not isinstance(self.backbone, nn.Sequential):
-                    H = self.backbone(input, token_mask=sequence_valid_mask)
+                    H = run_backbone_stage(self.backbone, input)
                 else:
                     backbone_stages = (
                         list(self.backbone)
@@ -813,7 +855,7 @@ class SplitGraphDNC(nn.Module):
                     )
                     H = input
                     for stage_index, stage in enumerate(backbone_stages):
-                        H = stage(H, token_mask=sequence_valid_mask)
+                        H = run_backbone_stage(stage, H)
                         if stage_index == 0 and needs_prediction_features:
                             prediction_features = H
                             compute_prediction_error(prediction_features)
@@ -827,6 +869,26 @@ class SplitGraphDNC(nn.Module):
             # representation. Otherwise use block 0's output, the planned
             # inter-layer source for the later error-injection phase.
             backbone_features = prediction_features if prediction_features is not None else H
+
+        if not self.dnc_enabled:
+            # General-purpose split-graph backbone mode: the parallel
+            # backbone (and optional MoE/workspace path above) is the model.
+            # There is no memory reset, combiner, read/write loop, or DNC
+            # output projection on this path.
+            output = H[:, start_step:].transpose(0, 1)
+            if self.workspace is not None:
+                chx = {"_initium_workspace_state": workspace_state}
+            else:
+                chx = None
+            state = (chx, None, None)
+            if return_backbone_features:
+                assert backbone_features is not None
+                if return_prediction_logits:
+                    return output, state, backbone_features, prediction_logits
+                return output, state, backbone_features
+            if return_prediction_logits:
+                return output, state, prediction_logits
+            return output, state
 
         # ---- memory hidden-state init (byte-identical convention to
         # dnc.DNC._init_hidden / MambaDNC._init_hidden's memory branch) ---

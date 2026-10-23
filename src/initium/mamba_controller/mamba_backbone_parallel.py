@@ -462,7 +462,12 @@ class MambaBackboneParallel(nn.Module):
         if arm in {"aux-only", "error", "blend", "shuffled"} and decoder is None:
             raise ValueError(f"Phase 2 arm {arm!r} requires the prediction decoder")
 
-        h = self.in_adapter(x)
+        # Phase 2's Mamba mixers run in fp32, and its second block can produce
+        # large residuals while the error-to-delta gate is being learned.
+        # Preserve the residual stream in fp32 as well: casting a large mixer
+        # residual back to the autocast input dtype (fp16) can overflow near
+        # 65,504 even when the fp32 computation itself remains finite.
+        h = self.in_adapter(x).float()
         first_features = self.blocks[0](h)
         batch, sequence, _ = first_features.shape
         token_ids = x.argmax(dim=-1)

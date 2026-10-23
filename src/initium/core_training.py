@@ -829,6 +829,7 @@ def run(
     moe_top_k: int = MOE_TOP_K,
     split_graph_combiner_cfc_multi_source_moe: bool = SPLIT_GRAPH_COMBINER_CFC_MULTI_SOURCE_MOE,
     split_graph_enabled: bool = SPLIT_GRAPH_ENABLED,
+    split_graph_backbone_only: bool = False,
     split_graph_variant: str = SPLIT_GRAPH_MAMBA_VARIANT,
     split_graph_num_blocks: int = SPLIT_GRAPH_NUM_BLOCKS,
     split_graph_headdim: int = SPLIT_GRAPH_MAMBA_HEADDIM,
@@ -928,6 +929,19 @@ def run(
             raise ValueError("Phase 1 signal isolation requires MoE and workspace to be disabled")
         if sgr_prediction_eval_episodes < 1:
             raise ValueError("sgr_prediction_eval_episodes must be positive")
+    # Resolve the split-graph Mamba hyperparameters before model selection.
+    # Phase 2 builds its dedicated backbone-only model in the first branch
+    # below, so it does not enter the SplitGraphDNC branch where these values
+    # were previously assigned. Run metadata still serializes them for both
+    # model types, and Phase 2 needs the same variant-matched values.
+    _sg_d_state, _sg_d_conv, _sg_expand = (
+        (MAMBA3_D_STATE, MAMBA_D_CONV, MAMBA3_EXPAND)
+        if split_graph_variant.startswith("mamba3")
+        else (MAMBA2_D_STATE, MAMBA2_D_CONV, MAMBA2_EXPAND)
+        if split_graph_variant.startswith("mamba2")
+        else (MAMBA_D_STATE, MAMBA_D_CONV, MAMBA_EXPAND)
+    )
+
     if sgr_phase2_arm is not None:
         valid_phase2_arms = {"content", "aux-only", "error", "blend", "shuffled", "oracle"}
         if sgr_phase2_arm not in valid_phase2_arms:
@@ -949,6 +963,40 @@ def run(
             raise ValueError(
                 "Phase 2 arms aux-only/error/blend/shuffled require --sgr-pred-loss-weight > 0; "
                 "content/oracle arms require it to be 0"
+            )
+    if split_graph_backbone_only:
+        if not split_graph_enabled:
+            raise ValueError("split_graph_backbone_only requires split_graph_enabled")
+        if sgr_phase2_arm is not None:
+            raise ValueError(
+                "The Phase 2 SGR arms use their dedicated backbone-only model; "
+                "omit split_graph_backbone_only"
+            )
+        if (
+            dynamic_n_mode
+            or link_matrix_mode != "dense"
+            or isolate_link_ablation
+            or dnc_compile_memory
+            or dnc_backward_trace
+            or dnc_read_variant != "cosine"
+            or dnc_write_variant != "learned"
+            or dnc_read_residual_scale != 1.0
+            or dnc_read_residual_max_ratio != 0.5
+            or dnc_write_observation_variance != 1.0
+            or dnc_link_sharpness != 1.0
+            or dnc_allocation_topk is not None
+            or dnc_implementation != "base"
+            or sgr_dnc_write_salience
+        ):
+            raise ValueError(
+                "DNC-specific options (memory sizing, addressing, write/read variants, "
+                "DNC traces/compilation, and DNC write salience) cannot be used with "
+                "split_graph_backbone_only"
+            )
+        if split_graph_combiner_mode != "linear":
+            raise ValueError(
+                "split_graph_backbone_only has no sequential read combiner; "
+                "use split_graph_combiner_mode='linear'"
             )
     if sgr_phase4_enabled:
         if getattr(dataset, "name", None) != "surprise-recall":
@@ -978,6 +1026,7 @@ def run(
             )
         if sgr_phase2_arm is not None:
             raise ValueError("Phase 2 backbone-only arms cannot be combined with Phase 4 consumers")
+    has_dnc = not split_graph_backbone_only and sgr_phase2_arm is None
     periodic_ood_episodes = OOD_EVAL_EPISODES_PERIODIC
     final_ood_episodes = OOD_EVAL_EPISODES
     INPUT_DIM, TRIPLE_DIM = dataset.input_dim, dataset.output_dim
@@ -1200,7 +1249,7 @@ def run(
     track_a_writer = None
     track_b_file = None
     track_b_writer = None
-    if split_graph_enabled and dataset_type == "graph":
+    if has_dnc and split_graph_enabled and dataset_type == "graph":
         track_a_file = open(
             os.path.join(LOG_DIR, f"run_{run_id}_track_a.csv"),
             "a" if resuming else "w",
@@ -1309,22 +1358,25 @@ def run(
     # explicit requirement -- catches rsDNC's silent bypass-path collapse
     # (still trains, still runs, loss curves look fine) that a KL- or
     # loss-only view can't see.
-    mem_check_path = os.path.join(LOG_DIR, f"run_{run_id}_memory_dependency.csv")
-    mem_check_file = open(mem_check_path, "a" if resuming else "w", newline="")
-    mem_check_writer = csv.writer(mem_check_file)
-    if not resuming:
-        mem_check_writer.writerow(
-            [
-                "step",
-                "lesson",
-                "id_triple_acc",
-                "id_perfect_frac",
-                "ablated_triple_acc",
-                "ablated_perfect_frac",
-                "memory_dependency_triple",
-                "memory_dependency_perfect",
-            ]
-        )
+    mem_check_file = None
+    mem_check_writer = None
+    if has_dnc:
+        mem_check_path = os.path.join(LOG_DIR, f"run_{run_id}_memory_dependency.csv")
+        mem_check_file = open(mem_check_path, "a" if resuming else "w", newline="")
+        mem_check_writer = csv.writer(mem_check_file)
+        if not resuming:
+            mem_check_writer.writerow(
+                [
+                    "step",
+                    "lesson",
+                    "id_triple_acc",
+                    "id_perfect_frac",
+                    "ablated_triple_acc",
+                    "ablated_perfect_frac",
+                    "memory_dependency_triple",
+                    "memory_dependency_perfect",
+                ]
+            )
 
     combiner_stage_log_path = os.path.join(LOG_DIR, f"run_{run_id}_combiner_stage_dependency.csv")
     combiner_stage_log_file = open(combiner_stage_log_path, "a" if resuming else "w", newline="")
@@ -1477,15 +1529,19 @@ def run(
         f"[{run_id}] Model config: hidden={hidden_size} nr_cells={nr_cells} "
         f"cell_size={cell_size} read_heads={read_heads} | beta={beta_target} "
         f"| "
-        + _arch_desc(
-            controller,
-            split_graph_enabled,
-            split_graph_variant,
-            split_graph_num_blocks,
-            split_graph_combiner_mode,
-            split_graph_combiner_variant,
-            split_graph_combiner_num_blocks,
-            split_graph_combine_reads,
+        + (
+            f"split-graph[backbone={split_graph_variant}x{split_graph_num_blocks} | DNC=off]"
+            if split_graph_backbone_only
+            else _arch_desc(
+                controller,
+                split_graph_enabled,
+                split_graph_variant,
+                split_graph_num_blocks,
+                split_graph_combiner_mode,
+                split_graph_combiner_variant,
+                split_graph_combiner_num_blocks,
+                split_graph_combine_reads,
+            )
         )
         + (f" | moe={moe_num_experts}e" if moe_enabled else "")
     )
@@ -1638,11 +1694,11 @@ def run(
             print(
                 f"[{run_id}] split-graph MoE placement={split_graph_moe_placement}: "
                 f"backbone={'on' if split_graph_moe_placement in ('all', 'backbone') else 'off'}, "
-                f"combiner={'on' if split_graph_moe_placement in ('all', 'combiner') else 'off'} "
+                f"combiner={'on' if has_dnc and split_graph_moe_placement in ('all', 'combiner') else 'off'} "
                 f"(see split_graph_dnc.py). A combiner_variant='cfc' additionally routes its two "
                 f"natural input sources (backbone output, previous read vector) through "
                 f"per-source specialized experts when active="
-                f"{split_graph_moe_placement in ('all', 'combiner') and split_graph_combiner_cfc_multi_source_moe} "
+                f"{has_dnc and split_graph_moe_placement in ('all', 'combiner') and split_graph_combiner_cfc_multi_source_moe} "
                 f"(see moe_layer.MultiSourceMoEBlock)."
             )
             if split_graph_moe_backbone_block_isolation is not None:
@@ -1665,17 +1721,6 @@ def run(
                     "router, experts, and auxiliary routing loss remain active."
                 )
 
-        # v10: variant-matched hyperparameter defaults instead of always
-        # reusing the Mamba-1 constants here -- harmless previously (any
-        # d_state/headdim is accepted), but not what the SSD paper's own
-        # Mamba-2 defaults are.
-        _sg_d_state, _sg_d_conv, _sg_expand = (
-            (MAMBA3_D_STATE, MAMBA_D_CONV, MAMBA3_EXPAND)
-            if split_graph_variant.startswith("mamba3")
-            else (MAMBA2_D_STATE, MAMBA2_D_CONV, MAMBA2_EXPAND)
-            if split_graph_variant.startswith("mamba2")
-            else (MAMBA_D_STATE, MAMBA_D_CONV, MAMBA_EXPAND)
-        )
         rnn = SplitGraphDNC(
             input_size=INPUT_DIM,
             hidden_size=hidden_size,
@@ -1712,6 +1757,7 @@ def run(
             moe_load_balance_alpha=moe_load_balance_alpha,
             moe_backbone_residual_scale=split_graph_moe_backbone_residual_scale,
             moe_cfc_multi_source=split_graph_combiner_cfc_multi_source_moe,
+            dnc_enabled=not split_graph_backbone_only,
             dnc_read_variant=dnc_read_variant,
             dnc_read_residual_scale=dnc_read_residual_scale,
             dnc_read_residual_max_ratio=dnc_read_residual_max_ratio,
@@ -1846,6 +1892,7 @@ def run(
         target_digits: torch.Tensor,
         answer_mask: torch.Tensor,
         sequence_valid_mask: torch.Tensor | None,
+        timespans: torch.Tensor | None,
     ) -> None:
         """Replay only the batch that tripped a finite check, with detailed tracing."""
         trace = split_graph_forward_trace
@@ -1858,6 +1905,7 @@ def run(
                     (None, None, None),
                     reset_experience=True,
                     sequence_valid_mask=sequence_valid_mask,
+                    timespans=timespans,
                     return_backbone_features=sgr_prediction_decoder is not None,
                 )
                 replay_output = replay_result[0]
@@ -1900,20 +1948,23 @@ def run(
             )
             trace.close()
 
-    print(
-        f"[{run_id}] DNC implementation={dnc_implementation}"
-        + (
-            " | exact allocation path avoids one full usage-permutation sort per step"
-            if dnc_implementation == "optimized"
-            else ""
+    if not has_dnc:
+        print(f"[{run_id}] DNC absent | split-graph backbone-only model")
+    else:
+        print(
+            f"[{run_id}] DNC implementation={dnc_implementation}"
+            + (
+                " | exact allocation path avoids one full usage-permutation sort per step"
+                if dnc_implementation == "optimized"
+                else ""
+            )
+            + (" | compiled memory forward" if dnc_compile_memory else "")
+            + (
+                f" | temporal-link sharpness exponent={dnc_link_sharpness:g}"
+                if dnc_link_sharpness != 1.0
+                else ""
+            )
         )
-        + (" | compiled memory forward" if dnc_compile_memory else "")
-        + (
-            f" | temporal-link sharpness exponent={dnc_link_sharpness:g}"
-            if dnc_link_sharpness != 1.0
-            else ""
-        )
-    )
 
     if split_graph_enabled:
         if workspace_enabled:
@@ -1978,6 +2029,8 @@ def run(
             else None
         ),
         "split_graph_combiner_cfc_multi_source_moe": split_graph_combiner_cfc_multi_source_moe,
+        "split_graph_backbone_only": split_graph_backbone_only,
+        "dnc_enabled": has_dnc,
         "sgr_phase2_arm": sgr_phase2_arm,
         "sgr_phase2_signal": sgr_phase2_signal if sgr_phase2_arm is not None else None,
         "sgr_gate_eval_override": sgr_gate_eval_override if sgr_phase2_arm is not None else None,
@@ -2094,6 +2147,7 @@ def run(
         "moe_load_balance_alpha": moe_load_balance_alpha,
         "moe_top_k": moe_top_k,
         "split_graph_enabled": split_graph_enabled,
+        "split_graph_backbone_only": split_graph_backbone_only,
         "split_graph_variant": split_graph_variant,
         **controller_model_config,
         **extra_model_config,
@@ -2108,7 +2162,10 @@ def run(
         )
 
     output_proj = nn.Linear(
-        hidden_size if sgr_phase2_arm is not None else INPUT_DIM, TRIPLE_DIM
+        hidden_size
+        if sgr_phase2_arm is not None or split_graph_backbone_only
+        else INPUT_DIM,
+        TRIPLE_DIM,
     ).to(device)
     dataset.set_output_proj(output_proj)
     sgr_prediction_decoder = (
@@ -2245,7 +2302,12 @@ def run(
     # step 0 the sampled mean exactly matches Phase 0's write vector.
     # sample=True for all beta in BETAS_TO_SWEEP now that beta=0 is dropped
     # from the sweep (see header note) -- beta_target is always > 0.0 here.
-    if split_graph_enabled and dnc_write_variant == "kanerva-closed-form":
+    if not has_dnc:
+        # Phase 2's dedicated backbone-only model has no DNC Memory modules;
+        # the general split-graph backbone-only mode is identical in this
+        # respect. Keep the shared training/checkpoint code's head list empty.
+        stochastic_heads = []
+    elif split_graph_enabled and dnc_write_variant == "kanerva-closed-form":
         # The Bayesian update consumes a deterministic observation from the
         # DNC write-value projection. Sampling a stochastic write head here
         # would make uncertainty sampling a second, confounded write change.
@@ -2791,11 +2853,28 @@ def run(
             # Anomaly detection must be enabled before this step's forward so
             # PyTorch can retain the originating stack for backward failures.
             torch.autograd.set_detect_anomaly(True, check_nan=True)
-        input_seq, target_digits, answer_mask = dataset.sample_batch(curriculum, batch_size)
+        batch = dataset.sample_batch(curriculum, batch_size)
+        if len(batch) == 3:
+            input_seq, target_digits, answer_mask = batch
+            timespans = None
+        elif len(batch) == 4:
+            input_seq, target_digits, answer_mask, timespans = batch
+        else:
+            raise ValueError(
+                "dataset.sample_batch() must return (inputs, targets, mask) or "
+                "(inputs, targets, mask, timespans)"
+            )
 
         input_seq = input_seq.to(device, non_blocking=True)
         target_digits = target_digits.to(device, non_blocking=True)
         answer_mask = answer_mask.to(device, non_blocking=True)
+        if timespans is not None:
+            timespans = timespans.to(device, non_blocking=True)
+        # The Phase 2 backbone-only route does not enter the split-graph DNC
+        # branch below, where this diagnostic mask is normally initialized.
+        # Keep it defined for all architectures so failure tracing cannot
+        # mask the original non-finite activation with UnboundLocalError.
+        sequence_valid_mask = None
         check_finite_this_step = True
         if check_finite_this_step:
             if not _first_nonfinite_report(input_seq, "input_seq", step):
@@ -2854,6 +2933,7 @@ def run(
                             hidden,
                             reset_experience=True,
                             sequence_valid_mask=sequence_valid_mask,
+                            timespans=timespans,
                             return_backbone_features=True,
                             return_prediction_logits=True,
                         )
@@ -2866,6 +2946,7 @@ def run(
                             hidden,
                             reset_experience=True,
                             sequence_valid_mask=sequence_valid_mask,
+                            timespans=timespans,
                             return_backbone_features=True,
                         )
                 else:
@@ -2874,6 +2955,7 @@ def run(
                         hidden,
                         reset_experience=True,
                         sequence_valid_mask=sequence_valid_mask,
+                        timespans=timespans,
                     )
             else:
                 output, hidden = rnn(input_seq, hidden, reset_experience=True)
@@ -2906,6 +2988,7 @@ def run(
                     target_digits,
                     answer_mask,
                     sequence_valid_mask,
+                    timespans,
                 )
                 raise FloatingPointError(
                     f"[{run_id}] non-finite recurrent output at step {step}; "
@@ -2928,6 +3011,7 @@ def run(
                     target_digits,
                     answer_mask,
                     sequence_valid_mask,
+                    timespans,
                 )
                 raise FloatingPointError(
                     f"[{run_id}] non-finite output logits at step {step}; "
@@ -2958,6 +3042,7 @@ def run(
                 target_digits,
                 answer_mask,
                 sequence_valid_mask,
+                timespans,
             )
             raise FloatingPointError(
                 f"[{run_id}] non-finite task loss at step {step}; "
@@ -2977,6 +3062,7 @@ def run(
                 target_digits,
                 answer_mask,
                 sequence_valid_mask,
+                timespans,
             )
             raise FloatingPointError(
                 f"[{run_id}] non-finite SGR prediction loss at step {step}; stopping."
@@ -3747,7 +3833,8 @@ def run(
                 else {}
             )
             if (
-                relational_probe_writer is not None
+                has_dnc
+                and relational_probe_writer is not None
                 and relational_probe_file is not None
                 and relational_probe_cases is not None
             ):
@@ -3846,7 +3933,7 @@ def run(
                 else {}
             )
             ood_ablated_acc = None
-            if hasattr(dataset, "evaluate_ood_ablated"):
+            if has_dnc and hasattr(dataset, "evaluate_ood_ablated"):
                 ood_ablated_rng = random.Random()
                 ood_ablated_rng.setstate(ood_rng_state)
                 segment_diagnostics.set_channel("eval-ood-memory-off")
@@ -3870,7 +3957,8 @@ def run(
             )
             ood_log_file.flush()
             if (
-                track_a_writer is not None
+                has_dnc
+                and track_a_writer is not None
                 and track_a_file is not None
                 and relational_probe_cases is not None
             ):
@@ -4013,10 +4101,10 @@ def run(
             # whether the model actually used memory. Restore the post-ID
             # stream afterward so the paired evaluation consumes no extra
             # randomness from the run.
-            if isinstance(rnn, SurpriseRecallBackboneOnly):
+            if not has_dnc:
                 print(
-                    f"[{run_id}] Step {step} memory-dependency check: n/a "
-                    "(Phase 2 model contains no DNC memory)."
+                    f"[{run_id}] Step {step} DNC memory-dependency check: n/a "
+                    "(DNC is disabled for this split-graph run)."
                 )
             else:
                 rng_state_after_other_evaluations = _capture_rng_state()
@@ -4195,7 +4283,8 @@ def run(
         else {}
     )
     if (
-        relational_probe_writer is not None
+        has_dnc
+        and relational_probe_writer is not None
         and relational_probe_file is not None
         and relational_probe_cases is not None
     ):
@@ -4247,7 +4336,8 @@ def run(
     ood_offset_perfect = id_perfect_frac - ood_perfect_frac
 
     if (
-        track_a_writer is not None
+        has_dnc
+        and track_a_writer is not None
         and track_a_file is not None
         and relational_probe_cases is not None
     ):
@@ -4350,7 +4440,7 @@ def run(
     )
     ood_log_file.flush()
     final_ood_ablated_acc = None
-    if hasattr(dataset, "evaluate_ood_ablated"):
+    if has_dnc and hasattr(dataset, "evaluate_ood_ablated"):
         final_ood_ablated_rng = random.Random()
         final_ood_ablated_rng.setstate(final_ood_rng_state)
         segment_diagnostics.set_channel("eval-final-ood-memory-off")
@@ -4489,6 +4579,8 @@ def run(
     if track_b_file is not None:
         track_b_file.close()
     ogs_log_file.close()
+    if mem_check_file is not None:
+        mem_check_file.close()
     lesson_log_file.close()
     prior_log_file.close()
     field_log_file.close()  # v16
@@ -4928,6 +5020,16 @@ if __name__ == "__main__":
         "required. Overrides --controller entirely when set.",
     )
     parser.add_argument(
+        "--split-graph-backbone-only",
+        action="store_true",
+        help=(
+            "Build the split-graph backbone without DNC memory or its sequential "
+            "read combiner. Keeps backbone MoE, workspace, task heads, and general "
+            "training/evaluation features. DNC-specific memory/addressing options "
+            "are unavailable. Requires --split-graph."
+        ),
+    )
+    parser.add_argument(
         "--split-graph-variant",
         type=str,
         default=SPLIT_GRAPH_MAMBA_VARIANT,
@@ -5284,6 +5386,41 @@ if __name__ == "__main__":
         parser.error("--dnc-read-residual-scale must be non-negative")
     if args.dnc_read_residual_max_ratio < 0:
         parser.error("--dnc-read-residual-max-ratio must be non-negative")
+    if args.split_graph_backbone_only:
+        if not args.split_graph:
+            parser.error("--split-graph-backbone-only requires --split-graph")
+        if args.split_graph_combiner_mode != "linear":
+            parser.error(
+                "--split-graph-backbone-only has no sequential combiner; "
+                "omit --split-graph-combiner-mode=controller"
+            )
+        if args.moe_placement == "combiner":
+            parser.error("--split-graph-backbone-only supports backbone MoE, not combiner MoE")
+        if (
+            args.dynamic_n_mode
+            or args.link_matrix_mode != "dense"
+            or args.isolate_link_ablation
+            or args.dnc_compile_memory
+            or args.dnc_backward_trace
+            or args.dnc_read_variant != "cosine"
+            or args.dnc_write_variant != "learned"
+            or args.dnc_read_residual_scale != 1.0
+            or args.dnc_read_residual_max_ratio != 0.5
+            or args.dnc_write_observation_variance != 1.0
+            or args.dnc_link_sharpness != 1.0
+            or args.dnc_allocation_topk is not None
+            or args.dnc_implementation != "base"
+            or args.sgr_dnc_write_salience
+        ):
+            parser.error(
+                "--split-graph-backbone-only cannot be combined with DNC-specific "
+                "memory, addressing, tracing, or write-salience options"
+            )
+        if args.sgr_phase2_arm is not None:
+            parser.error(
+                "Phase 2 SGR arms already use their dedicated backbone-only model; "
+                "omit --split-graph-backbone-only"
+            )
     if not args.split_graph and (
         args.dnc_read_variant != "cosine" or args.dnc_write_variant != "learned"
     ):
@@ -5579,6 +5716,8 @@ if __name__ == "__main__":
                 run_id += "_resetstep"
         if args.split_graph:
             run_id = f"{run_id}_splitgraph_{args.split_graph_variant.replace('+', '')}"
+            if args.split_graph_backbone_only:
+                run_id += "_backboneonly"
             if args.dnc_backward_trace:
                 run_id += "_dncbacktrace"
             if args.dnc_read_variant != "cosine" or args.dnc_write_variant != "learned":
@@ -5651,6 +5790,7 @@ if __name__ == "__main__":
             moe_load_balance_alpha=args.moe_load_balance_alpha,
             moe_top_k=args.moe_top_k,
             split_graph_enabled=args.split_graph,
+            split_graph_backbone_only=args.split_graph_backbone_only,
             split_graph_variant=args.split_graph_variant,
             split_graph_num_blocks=args.split_graph_num_blocks,
             split_graph_headdim=args.split_graph_headdim,

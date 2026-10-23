@@ -190,6 +190,10 @@ def _build_split_graph(c: _Cfg, input_dim, hidden, nr_cells, cell_size, read_hea
         dnc_link_sharpness=c.get("dnc_link_sharpness", 1.0),
         dnc_allocation_topk=c.get("dnc_allocation_topk", None),
         dnc_implementation=c.get("dnc_implementation", "base"),
+        dnc_enabled=c.get(
+            "dnc_enabled",
+            not c.get("split_graph_backbone_only", False),
+        ),
         independent_linears=True,
         moe_enabled=_moe["moe_enabled"],
         moe_placement=c.get("split_graph_moe_placement", "all"),
@@ -265,7 +269,11 @@ def load_model(ckpt: dict, device: torch.device, deterministic_write: bool = Fal
     output_proj = nn.Linear(w.shape[1], w.shape[0]).to(device)
 
     beta = float(ckpt.get("beta_target", 0.0) or 0.0)
-    heads = install_stochastic_write_heads(rnn, device=device, sample=(beta > 0.0))
+    heads = (
+        install_stochastic_write_heads(rnn, device=device, sample=(beta > 0.0))
+        if getattr(rnn, "dnc_enabled", True)
+        else []
+    )
 
     if c.defaulted:
         print(

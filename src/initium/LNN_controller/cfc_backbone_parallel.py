@@ -69,17 +69,55 @@ class _CfCParallelBlock(nn.Module):
         if device is not None or dtype is not None:
             self.cfc.to(device=device, dtype=dtype)
 
-    def forward(self, x):  # x: (B, L, D)
+    def _forward_with_timespans(self, x: torch.Tensor, timespans: torch.Tensor) -> torch.Tensor:
+        """Run the ncps cell with batch-safe per-example elapsed times.
+
+        ncps' sequence wrapper squeezes each ``(B,)`` time slice before
+        passing it to CfCCell, which does not broadcast that shape against
+        ``(B, H)`` for batches larger than one. Calling the same registered
+        cell directly with ``(B, 1)`` spans avoids that upstream shape bug
+        while preserving the package's recurrence and learned parameters.
+        """
+        batch, sequence, _ = x.shape
+        h_state = x.new_zeros((batch, self.cfc.state_size), dtype=torch.float32)
+        c_state = (
+            torch.zeros_like(h_state) if self.cfc.use_mixed else None
+        )
+        outputs = []
+        for step in range(sequence):
+            step_input = x[:, step]
+            if self.cfc.use_mixed:
+                assert c_state is not None
+                h_state, c_state = self.cfc.lstm(step_input, (h_state, c_state))
+            step_output, h_state = self.cfc.rnn_cell(
+                step_input,
+                h_state,
+                timespans[:, step : step + 1],
+            )
+            outputs.append(self.cfc.fc(step_output))
+        return torch.stack(outputs, dim=1)
+
+    def forward(self, x, *, timespans: torch.Tensor | None = None):  # x: (B, L, D)
         if self.force_fp32:
             with torch.autocast(device_type=x.device.type, enabled=False):
-                out, _ = self.cfc(self.norm(x.float()))
+                normalized = self.norm(x.float())
+                if timespans is None:
+                    out, _ = self.cfc(normalized)
+                else:
+                    out = self._forward_with_timespans(normalized, timespans)
         else:
-            out, _ = self.cfc(self.norm(x))
+            normalized = self.norm(x)
+            if timespans is None:
+                out, _ = self.cfc(normalized)
+            else:
+                out = self._forward_with_timespans(normalized, timespans)
         out = out.to(x.dtype)
         return x + out if self.residual else out
 
 
 class CfCBackboneParallel(nn.Module):
+    supports_timespans = True
+
     def __init__(
         self,
         in_dim,
@@ -164,20 +202,62 @@ class CfCBackboneParallel(nn.Module):
             )
 
     def forward(
-        self, x, *, token_mask: torch.Tensor | None = None
+        self,
+        x,
+        *,
+        token_mask: torch.Tensor | None = None,
+        timespans: torch.Tensor | None = None,
     ):  # (B, L, in_dim) -> (B, L, d_model), called ONCE per training step
+        timespans = self._normalize_timespans(timespans, x)
         h = self.in_adapter(x)
         moe_blocks = self.moe_blocks
         for i, block in enumerate(self.blocks):
-            h = block(h)
+            h = block(h, timespans=timespans)
             if moe_blocks is not None and isinstance(moe_blocks[i], MoEBlock):
                 h = moe_blocks[i](h, token_mask=token_mask)
         return h
 
-    def forward_with_specialists(self, x: torch.Tensor, *, token_mask: torch.Tensor | None = None):
+    @staticmethod
+    def _normalize_timespans(
+        timespans: torch.Tensor | None, x: torch.Tensor
+    ) -> torch.Tensor | None:
+        if timespans is None:
+            return None
+        timespans = torch.as_tensor(timespans, device=x.device, dtype=torch.float32)
+        batch, sequence = x.shape[:2]
+        if timespans.ndim == 1 and timespans.shape[0] == sequence:
+            timespans = timespans.unsqueeze(0).expand(batch, -1)
+        elif timespans.ndim == 2 and timespans.shape == (1, sequence):
+            timespans = timespans.expand(batch, -1)
+        elif timespans.ndim != 2 or timespans.shape != (batch, sequence):
+            raise ValueError(
+                "CfC timespans must have shape (sequence,), (1, sequence), "
+                f"or (batch, sequence); got {tuple(timespans.shape)} for input {tuple(x.shape[:2])}"
+            )
+        return timespans
+
+    def forward_with_timespans(
+        self,
+        x: torch.Tensor,
+        timespans: torch.Tensor,
+        *,
+        token_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Explicit elapsed-time entry point for composing mixed backbones."""
+        return self.forward(x, token_mask=token_mask, timespans=timespans)
+
+    def forward_with_specialists(
+        self,
+        x: torch.Tensor,
+        *,
+        token_mask: torch.Tensor | None = None,
+        timespans: torch.Tensor | None = None,
+        intermediate_observer=None,
+    ):
         """Return final MoE candidates and routes for shared-workspace use."""
         if not self.moe_enabled or self.moe_blocks is None:
             raise RuntimeError("workspace broadcast requires an enabled MoE expert pool")
+        timespans = self._normalize_timespans(timespans, x)
         h = self.in_adapter(x)
         final_index = len(self.blocks) - 1
         if not isinstance(self.moe_blocks[final_index], MoEBlock):
@@ -185,7 +265,9 @@ class CfCBackboneParallel(nn.Module):
                 "workspace broadcast requires the final backbone block to have an active MoE bank"
             )
         for i, block in enumerate(self.blocks):
-            h = block(h)
+            h = block(h, timespans=timespans)
+            if i == 0 and intermediate_observer is not None:
+                intermediate_observer(h)
             if i == final_index:
                 base = h
                 _, experts, indices, weights = self.moe_blocks[i](

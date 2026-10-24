@@ -15,6 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from initium.mamba_controller.mamba2_controller import Mamba2ControllerWrapper
+from initium.mamba_controller.numerical_stability import limit_mixer_residual_rms
 from initium.MoE.moe_layer import MoEBlock
 
 _MAMBA3_IMPORT_ERROR: str | None
@@ -106,7 +107,6 @@ class Mamba3ControllerCell(nn.Module):
         angle_state, ssm_state, k_prev, v_prev = state
         m = self.mamba3
         H, P, N, S = self.nheads, self.headdim, self.d_state, self.num_rope_angles
-        dtype = u.dtype
         with torch.autocast(device_type=u.device.type, enabled=False):
             zxb = F.linear(u.float(), m.in_proj.weight.float())
             z, x, B, C, dd_dt, dd_A, trap_proj, ang_proj = torch.split(
@@ -137,7 +137,11 @@ class Mamba3ControllerCell(nn.Module):
             new_ssm = new_ssm.clamp(min=-1e4, max=1e4)  # same hard stop as Mamba-1/2 cells
             y = torch.einsum("bhpn,bhn->bhp", new_ssm, C) + m.D.float().view(1, H, 1) * x
             y = (y * F.silu(z)).reshape(-1, self.d_inner).clamp(min=-1e4, max=1e4)
-        out = m.out_proj(y.to(dtype))  # back under ambient autocast
+            out = F.linear(
+                y,
+                m.out_proj.weight.float(),
+                None if m.out_proj.bias is None else m.out_proj.bias.float(),
+            )
         return out, (angle_new, new_ssm, B, x)
 
 
@@ -172,8 +176,9 @@ class Mamba3ControllerBlock(nn.Module):
         return self.cell.init_state(batch_size, device=device, dtype=dtype)
 
     def step(self, x, state):
-        out, new_state = self.cell.step(self.norm(x), state)
-        return x + out, new_state
+        out, new_state = self.cell.step(self.norm(x.float()), state)
+        residual = limit_mixer_residual_rms(out)
+        return x.float() + residual, new_state
 
 
 class Mamba3ControllerWrapper(Mamba2ControllerWrapper):

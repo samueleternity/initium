@@ -83,7 +83,7 @@ LESSON_NR_CELLS = [
 ]
 assert len(LESSON_NR_CELLS) == len(TRAVERSAL_CURRICULUM)
 
-ADVANCE_THRESHOLD = 0.85  # 85% per-triple accuracy
+ADVANCE_THRESHOLD = 0.80  # 80% per-triple accuracy
 OLD_LESSON_MIX_RATE = 0.10  # 10% of exemplars drawn from earlier lessons
 EVAL_BATCH_SIZE = 100  # episodes per lesson-completion check
 OOD_PATH_LENGTH_RANGE = (3, 5)

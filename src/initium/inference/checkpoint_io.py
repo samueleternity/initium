@@ -42,6 +42,7 @@ def describe_checkpoint(ckpt: dict) -> str:
         f"link_matrix={c.get('link_matrix_mode', 'dense')} moe={c.get('moe_enabled', False)} "
         f"split_graph={c.get('split_graph_enabled', False)}"
         + (f"({c.get('split_graph_variant')})" if c.get("split_graph_enabled") else "")
+        + f" dnc={('on' if c.get('dnc_enabled', True) else 'off')}"
         + f" dynamic_n={c.get('dynamic_n_mode', False)}",
     ]
     combiner_variant = c.get("split_graph_combiner_variant")

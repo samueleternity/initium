@@ -70,6 +70,7 @@ import torch
 import torch.nn as nn
 
 from initium.MoE.moe_layer import MoEBlock
+from initium.mamba_controller.numerical_stability import limit_mixer_residual_rms
 
 try:
     from einops import rearrange
@@ -221,10 +222,15 @@ class _ParallelBlock(nn.Module):
                 out = self.mixer(normed)
         if numeric_observer is not None:
             numeric_observer("mixer_output", out)
-        residual = out.to(x.dtype)
+            numeric_observer("residual_branch_before_rms_limit", out)
+        # Keep the residual stream in fp32. Mamba's mixer runs outside
+        # autocast and can produce values beyond fp16's finite range; casting
+        # its output back to an autocast fp16 input can turn a finite mixer
+        # result into inf before the next block or the final normalization.
+        residual = limit_mixer_residual_rms(out)
         if numeric_observer is not None:
-            numeric_observer("residual_branch_cast", residual)
-        result = x + residual
+            numeric_observer("residual_branch_after_rms_limit", residual)
+        result = x.float() + residual
         if numeric_observer is not None:
             numeric_observer("residual_output", result)
         return result
@@ -283,9 +289,18 @@ class _ParallelBlock(nn.Module):
                 delta_softplus=True,
             )
             y = rearrange(y, "b d l -> b l d")
-            mixer_output = mixer.out_proj(y)
-        residual = mixer_output.to(dtype=x.dtype)
-        return x + residual
+            mixer_output = torch.nn.functional.linear(
+                y,
+                mixer.out_proj.weight.float(),
+                None if mixer.out_proj.bias is None else mixer.out_proj.bias.float(),
+            )
+        # Match the standard block path: retain fp32 residual state rather
+        # than narrowing a potentially large mixer output to the input dtype.
+        residual = limit_mixer_residual_rms(mixer_output)
+        if numeric_observer is not None:
+            numeric_observer("mixer_output", mixer_output)
+            numeric_observer("residual_branch_after_rms_limit", residual)
+        return x.float() + residual
 
 
 class MambaBackboneParallel(nn.Module):

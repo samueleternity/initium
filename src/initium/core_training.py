@@ -209,7 +209,7 @@ def _arch_desc(
 
 def _first_nonfinite_report(tensor, name, step):
     """Silent when finite; prints once when not. Exists to bisect WHICH
-    pipeline stage a NaN/Inf first appears at, since the LOG_EVERY-averaged
+    pipeline stage a NaN/Inf first appears at, since the interval-averaged
     training log only shows the aggregate, not the originating stage."""
     ok = torch.isfinite(tensor).all()
     if not ok:
@@ -808,6 +808,7 @@ def run(
     beta_mode: str = BETA_MODE,  # dynamic-beta toggle: "static" or "dynamic"
     total_steps: int = TOTAL_STEPS,  # see --total-steps.
     checkpoint_every: int = CHECKPOINT_EVERY,  # see --checkpoint-every.
+    log_every: int = LOG_EVERY,  # see --log-every.
     link_matrix_mode: str = LINK_MATRIX_MODE,  # Static Option 1
     link_matrix_topk: int | None = LINK_MATRIX_TOPK,  # Static Option 1
     isolate_link_ablation: bool = ISOLATE_LINK_ABLATION,  # Static Option 1
@@ -886,6 +887,8 @@ def run(
     sgr_dnc_write_salience: bool = False,
     sgr_workspace_write_salience: bool = False,
 ):
+    if log_every <= 0:
+        raise ValueError("log_every must be positive")
     # Deliberately does NOT touch LR_DECAY_STEPS - that's a separate
     # module-level constant, fixed at import time from the *original*
     # TOTAL_STEPS, and lr_at_step()/set_lr() below read it directly by
@@ -2783,6 +2786,7 @@ def run(
     # (potentially still reflecting the old buggy drifted value).
     running_task_loss, running_kl_loss, running_div, running_grad_norm = 0.0, 0.0, 0, 0.0
     running_sgr_prediction_loss = 0.0
+    running_log_steps = 0
     last_train_sgr_signal_diagnostics: dict[str, torch.Tensor] = {}
     running_postclip_grad_norm = 0.0
     running_finite_grad_steps = 0
@@ -3076,7 +3080,9 @@ def run(
         moe_aux_loss, moe_diag = (
             pop_total_moe_aux_loss(
                 rnn.moe_layers,
-                include_diagnostics=(moe_diagnostics_enabled and (step + 1) % LOG_EVERY == 0),
+                include_diagnostics=(
+                    moe_diagnostics_enabled and running_log_steps + 1 >= log_every
+                ),
             )
             if moe_enabled
             else (torch.zeros((), device=device), {})
@@ -3386,6 +3392,7 @@ def run(
             if grad_norm_value > max_grad_norm:
                 running_clipped_grad_steps += 1
         step += 1
+        running_log_steps += 1
         current_lr = set_lr(step)  # Phase 1 FIX: clamped manual LR, replaces scheduler.step()
 
         # Dynamic-N (usage-triggered), macro-scale: record this just-finished
@@ -3447,7 +3454,8 @@ def run(
                 )
                 dynamic_n_log_file.flush()
 
-        if step % LOG_EVERY == 0:
+        if running_log_steps >= log_every:
+            window_steps = running_log_steps
             elapsed = time.time() - t0
             t0 = time.time()
             total_elapsed = time.time() - t_run_start  # log addition #5
@@ -3455,14 +3463,14 @@ def run(
                 running_task_loss.item()
                 if torch.is_tensor(running_task_loss)
                 else running_task_loss
-            ) / LOG_EVERY
+            ) / window_steps
             avg_sgr_prediction_loss = (
                 (
                     running_sgr_prediction_loss.item()
                     if torch.is_tensor(running_sgr_prediction_loss)
                     else running_sgr_prediction_loss
                 )
-                / LOG_EVERY
+                / window_steps
                 if sgr_prediction_decoder is not None
                 else None
             )
@@ -3476,8 +3484,8 @@ def run(
                 )
             avg_kl = (
                 running_kl_loss.item() if torch.is_tensor(running_kl_loss) else running_kl_loss
-            ) / LOG_EVERY
-            avg_div = running_div / LOG_EVERY
+            ) / window_steps
+            avg_div = running_div / window_steps
             avg_grad_norm = running_grad_norm / max(running_finite_grad_steps, 1)
             avg_postclip_grad_norm = running_postclip_grad_norm / max(running_finite_grad_steps, 1)
             kl_contrib = (
@@ -3528,7 +3536,7 @@ def run(
                 ]
             parts += [
                 f"diversity {avg_div:.2f}",
-                f"{LOG_EVERY / elapsed:.2f} steps/s",
+                f"{window_steps / elapsed:.2f} steps/s",
                 f"LR {current_lr:.6f}",
                 f"grad_norm {avg_grad_norm:.4g}",
                 f"postclip_grad_norm {avg_postclip_grad_norm:.4g}",
@@ -3751,6 +3759,7 @@ def run(
             log_file.flush()
             running_task_loss, running_kl_loss, running_div, running_grad_norm = 0.0, 0.0, 0, 0.0
             running_sgr_prediction_loss = 0.0
+            running_log_steps = 0
             running_postclip_grad_norm = 0.0
             running_finite_grad_steps = 0
             running_nonfinite_grad_steps = 0
@@ -4721,6 +4730,13 @@ if __name__ == "__main__":
         "if omitted.",
     )
     parser.add_argument(
+        "--log-every",
+        type=int,
+        default=LOG_EVERY,
+        metavar="N",
+        help=f"print the training summary and emit grouped training diagnostics every N steps (default: {LOG_EVERY}).",
+    )
+    parser.add_argument(
         "--link-matrix-mode",
         type=str,
         default=LINK_MATRIX_MODE,
@@ -5359,6 +5375,8 @@ if __name__ == "__main__":
         parser.error("--dnc-allocation-topk requires --split-graph")
     if args.batch_size <= 0:
         parser.error("--batch-size must be positive")
+    if args.log_every <= 0:
+        parser.error("--log-every must be positive")
     if args.dnc_link_sharpness != 1.0 and not args.split_graph:
         parser.error("--dnc-link-sharpness requires --split-graph")
     if args.dnc_backward_trace and not args.split_graph:
@@ -5770,6 +5788,7 @@ if __name__ == "__main__":
             checkpoint_every=(
                 args.checkpoint_every if args.checkpoint_every is not None else CHECKPOINT_EVERY
             ),
+            log_every=args.log_every,
             link_matrix_mode=args.link_matrix_mode,
             link_matrix_topk=args.link_matrix_topk,
             isolate_link_ablation=args.isolate_link_ablation,

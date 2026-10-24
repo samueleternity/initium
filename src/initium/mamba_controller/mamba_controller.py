@@ -170,6 +170,7 @@ from dnc.util import cuda
 
 from initium.memory_manipulation.dnc_mechanisms import OptimizedMemory
 from initium.MoE.moe_layer import MoEBlock, MoERNNWrapper
+from initium.mamba_controller.numerical_stability import limit_mixer_residual_rms
 
 _MAMBA_IMPORT_ERROR: str | None
 
@@ -346,22 +347,18 @@ class MambaControllerCell(nn.Module):
             new_ssm_state32 = new_ssm_state32.clamp(
                 min=-1e4, max=1e4
             )  # hard stop on undamped growth
-            if new_ssm_state32.abs().max() > 9999.0:
-                print(
-                    "[clamp-hit] ssm_state clamped, pre-clamp max would have exceeded bound"
-                )  # If you see [clamp-hit] printed and NaNs still occur afterward in the same run, that proves the overflow is happening in the backward pass, not the forward activations — i.e., gradients blowing up through the dA = exp(dt·A) term over the ~250-step unroll even though forward values are now bounded. clamp() zeroes the gradient outside its range, so that specific tensor can't be the source once clamped; the remaining unclamped path (particularly dt32 and A32 before the einsum) is the next suspect, since gradients through exp() compounded across hundreds of BPTT steps can still explode independent of forward-value magnitude.
             y32 = torch.einsum("bdn,bn->bd", new_ssm_state32, C32)
             y32 = y32 + m.D.float() * x_conv32
             y32 = y32 * m.act(z).float()  # gated output
             y32 = y32.clamp(
                 min=-1e4, max=1e4
             )  # stay well inside fp16 range before out_proj re-enters autocast
+            out = F.linear(
+                y32,
+                m.out_proj.weight.float(),
+                None if m.out_proj.bias is None else m.out_proj.bias.float(),
+            )
         new_ssm_state = new_ssm_state32.to(dtype)
-        y = y32.to(dtype)
-
-        out = m.out_proj(
-            y
-        )  # (B, d_model) -- back under ambient autocast, safe now that y is bounded
         return out, new_conv_state, new_ssm_state
 
 
@@ -404,8 +401,11 @@ class MambaControllerBlock(nn.Module):
 
     def step(self, x: torch.Tensor, state: tuple[torch.Tensor, torch.Tensor]):
         conv_state, ssm_state = state
-        out, new_conv_state, new_ssm_state = self.cell.step(self.norm(x), conv_state, ssm_state)
-        return x + out, (new_conv_state, new_ssm_state)
+        out, new_conv_state, new_ssm_state = self.cell.step(
+            self.norm(x.float()), conv_state, ssm_state
+        )
+        residual = limit_mixer_residual_rms(out)
+        return x.float() + residual, (new_conv_state, new_ssm_state)
 
 
 # ==========================================================================

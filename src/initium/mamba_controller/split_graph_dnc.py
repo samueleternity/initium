@@ -797,8 +797,15 @@ class SplitGraphDNC(nn.Module):
             base, specialists, route_indices, route_weights = forward_with_specialists(
                 stage_input, **specialist_kwargs
             )
+            # Workspace mode bypasses MoEBlock's ordinary residual add, so
+            # apply its configured residual scale to specialist candidates
+            # before they are used for slot writes or workspace readback.
+            # Scaling only broadcast_delta below leaves the recurrent slot
+            # state exposed to unscaled expert outputs and defeats this
+            # stability control on the write path.
+            specialists = specialists[:, start_step:] * self.moe_backbone_residual_scale
             broadcast_delta, workspace_state = self.workspace(
-                specialists[:, start_step:],
+                specialists,
                 route_indices[:, start_step:],
                 route_weights[:, start_step:],
                 workspace_state,
@@ -815,13 +822,10 @@ class SplitGraphDNC(nn.Module):
                 ),
             )
             H = base.clone()
-            # The workspace returns the selected, broadcast-enriched MoE
-            # delta. Apply the same residual scale as the ordinary final MoE
-            # block to the complete delta so workspace and selection-only
-            # runs share a matched backbone residual setting.
-            H[:, start_step:] = base[:, start_step:] + (
-                self.moe_backbone_residual_scale * broadcast_delta
-            )
+            # The workspace returns a selected, broadcast-enriched MoE delta
+            # whose candidate inputs have already been residual-scaled, just
+            # like the ordinary final MoE block's routed delta.
+            H[:, start_step:] = base[:, start_step:] + broadcast_delta
             normalize_backbone_output = getattr(final_stage, "normalize_output", None)
             if callable(normalize_backbone_output):
                 # forward_with_specialists exposes the pre-normalized final

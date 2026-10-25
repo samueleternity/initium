@@ -134,4 +134,4 @@ Short end-to-end paths intended to catch wiring/configuration failures.
 - The standard test job has no CUDA device and intentionally omits GPU wheel installation; GPU-only coverage requires a GPU-enabled runner.
 - Mamba CPU support is not established by this suite. In the attempted CPU probe, the pinned `mamba-ssm==2.3.2.post1` package lacked `selective_scan_cuda` and failed before its controller tests could execute.
 - Mypy is currently configured for `src/initium`, not the tests. Pytest runs the tests, while repository-wide Ruff commands lint and format-check them.
-- Production modules use package-qualified imports from `initium`.
+- Production modules use package-qualified imports from `initium`

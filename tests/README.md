@@ -62,6 +62,12 @@ Fast tests of an individual component or contract.
   - `test_switch_moe_validation_routing_and_aux_gradient` checks expert-count validation, routing records, and gradient flow from the load-balancing auxiliary loss.
   - `test_capacity_drop_zeros_overflow_token_output` checks that tokens beyond expert capacity are dropped as zero outputs.
   - `test_multisource_moe_preserves_source_shapes` checks per-source shape preservation and routing diagnostics from a shared expert bank.
+- `test_numerical_stability.py`
+  - Checks that the shared Mamba mixer-branch limiter preserves ordinary values, bounds extreme token-wise residuals without overflow, promotes half precision to FP32, retains finite gradients, rejects invalid limits, and leaves non-finite inputs visible to diagnostics. These are CPU tensor-math tests; they do not import or execute Mamba kernels.
+- `test_surprise_recall.py`
+  - Checks episode labels against the generator oracle for every curriculum lesson, the dataset's one-hot/answer-mask contract, and answer-only loss behavior when excluded positions contain non-finite logits.
+- `test_next_token_prediction.py`
+  - Checks bounded detached prediction-error signals, query/padding masking, input alignment validation, NaN-safe stream-only next-token loss, deterministic signal evaluation, and model-mode restoration.
 - `test_nvrtc_compat.py`
   - `test_patch_is_idempotent_and_cpu_parity` checks the NVRTC compatibility patch is idempotent and preserves CPU `prod`/`cumprod` behavior. The CUDA log-space branch is not covered here.
 - `test_real_data_pipeline.py`
@@ -71,7 +77,7 @@ Fast tests of an individual component or contract.
   - `test_resized_cell_count_is_checkpointed_and_reloaded` checks that a resized cell count is saved and reconstructed when loading a checkpoint.
 - `test_stochastic_write_head.py`
   - `test_deterministic_forward_has_no_kl` checks deterministic writes return the mean projection and accumulate no KL loss.
-  - `test_phase_one_and_general_kl_are_same_for_standard_prior` checks the general diagonal-Gaussian KL reduces to the original standard-normal formula and prior buffers receive no gradients.
+  - `test_standard_prior_kl_matches_general_diagonal_gaussian_formula` checks the general diagonal-Gaussian KL reduces to the original standard-normal formula and prior buffers receive no gradients.
   - `test_learned_prior_kl_matches_diagonal_gaussian_formula` checks KL values against a hand-computed nonstandard prior.
   - `test_snapshot_uses_controlled_sample_mean_and_clamped_variance` checks prior snapshot fitting, variance clamping, sample counts, and snapshot-step tracking.
   - `test_snapshot_refit_and_free_bits` checks free-bits behavior, snapshot refitting, finite prior variance, and prior-state roundtripping.
@@ -131,6 +137,7 @@ Short end-to-end paths intended to catch wiring/configuration failures.
 ## Current scope limits
 
 - These tests validate small synthetic workloads and implementation contracts. They do not establish model quality or performance on full research datasets.
+- The task-loss regression test enforces selection of answer positions before cross-entropy. Applying a zero mask after CE is unsafe because non-finite query/padding logits can still contaminate the scalar loss (`NaN * 0` remains NaN).
 - The standard test job has no CUDA device and intentionally omits GPU wheel installation; GPU-only coverage requires a GPU-enabled runner.
 - Mamba CPU support is not established by this suite. In the attempted CPU probe, the pinned `mamba-ssm==2.3.2.post1` package lacked `selective_scan_cuda` and failed before its controller tests could execute.
 - Mypy is currently configured for `src/initium`, not the tests. Pytest runs the tests, while repository-wide Ruff commands lint and format-check them.

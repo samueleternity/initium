@@ -96,6 +96,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from initium.mamba_controller.numerical_stability import limit_mixer_residual_rms
 from initium.MoE.moe_layer import MoEBlock
 
 _MAMBA2_IMPORT_ERROR: str | None
@@ -271,10 +272,12 @@ class Mamba2ControllerCell(nn.Module):
             y32 = y32.reshape(y32.shape[0], self.d_ssm)  # (B, d_ssm)
             y32 = y32 * m.act(z).float()  # rmsnorm=False -> plain silu gate
             y32 = y32.clamp(min=-1e4, max=1e4)  # stay in fp16 range before out_proj
+            out = F.linear(
+                y32,
+                m.out_proj.weight.float(),
+                None if m.out_proj.bias is None else m.out_proj.bias.float(),
+            )
         new_ssm_state = new_ssm_state32.to(dtype)
-        y = y32.to(dtype)
-
-        out = m.out_proj(y)  # (B, d_model) -- back under ambient autocast
         return out, new_conv_state, new_ssm_state
 
 
@@ -318,8 +321,11 @@ class Mamba2ControllerBlock(nn.Module):
 
     def step(self, x: torch.Tensor, state: tuple[torch.Tensor, torch.Tensor]):
         conv_state, ssm_state = state
-        out, new_conv_state, new_ssm_state = self.cell.step(self.norm(x), conv_state, ssm_state)
-        return x + out, (new_conv_state, new_ssm_state)
+        out, new_conv_state, new_ssm_state = self.cell.step(
+            self.norm(x.float()), conv_state, ssm_state
+        )
+        residual = limit_mixer_residual_rms(out)
+        return x.float() + residual, (new_conv_state, new_ssm_state)
 
 
 # ==========================================================================

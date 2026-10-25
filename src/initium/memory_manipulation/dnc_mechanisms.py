@@ -118,6 +118,7 @@ class MechanismMemory(Memory):
         observation_variance: float = 1.0,
         link_sharpness: float = 1.0,
         allocation_topk: int | None = None,
+        sgr_write_salience_enabled: bool = False,
         **kwargs,
     ):
         if read_variant not in READ_VARIANTS:
@@ -142,6 +143,12 @@ class MechanismMemory(Memory):
         self.observation_variance = float(observation_variance)
         self.link_sharpness = float(link_sharpness)
         self.allocation_topk = allocation_topk
+        self.sgr_write_salience_enabled = bool(sgr_write_salience_enabled)
+        if self.sgr_write_salience_enabled:
+            # Additive, zero-initialized coefficient on the DNC write-strength
+            # pre-activation. Existing Phase 0/1 checkpoints retain their exact
+            # parameter schema when this consumer is disabled.
+            self.sgr_error_to_write_strength = nn.Parameter(torch.zeros(()))
         self._collect_stage_diagnostics = False
         self._stage_diagnostic_sums: dict[str, torch.Tensor] = {}
         self._stage_diagnostic_counts: dict[str, int] = {}
@@ -229,6 +236,65 @@ class MechanismMemory(Memory):
             with torch.autocast(device_type="cuda", enabled=False):
                 return super().forward(xi.float(), fp32_hidden)
         return super().forward(xi.float(), fp32_hidden)
+
+    def forward_with_prediction_error(
+        self,
+        xi: torch.Tensor,
+        hidden: dict[str, torch.Tensor],
+        prediction_error: torch.Tensor,
+    ):
+        """DNC forward with additive SGR salience on write-strength logits."""
+        if not self.sgr_write_salience_enabled:
+            raise RuntimeError("DNC prediction-error salience was not enabled at construction")
+        if not self.independent_linears:
+            raise RuntimeError("DNC prediction-error salience requires independent linears")
+        if prediction_error.shape not in {(xi.shape[0],), (xi.shape[0], 1)}:
+            raise ValueError("prediction_error must have shape (batch,) or (batch, 1)")
+        if xi.is_cuda:
+            with torch.autocast(device_type="cuda", enabled=False):
+                xi = xi.float()
+                fp32_hidden = {
+                    name: value.float() if value.is_floating_point() else value
+                    for name, value in hidden.items()
+                }
+                error = prediction_error.reshape(xi.shape[0], 1).float().detach()
+                return self._forward_with_prediction_error_fp32(xi, fp32_hidden, error)
+        fp32_hidden = {
+            name: value.float() if value.is_floating_point() else value
+            for name, value in hidden.items()
+        }
+        error = prediction_error.reshape(xi.shape[0], 1).float().detach()
+        return self._forward_with_prediction_error_fp32(xi.float(), fp32_hidden, error)
+
+    def _forward_with_prediction_error_fp32(self, xi, hidden, prediction_error):
+        (batch,) = xi.shape[:1]
+        read_heads = self.read_heads
+        cell_size = self.cell_size
+        read_keys = torch.tanh(self.read_keys_transform(xi).view(batch, read_heads, cell_size))
+        read_strengths = F.softplus(self.read_strengths_transform(xi).view(batch, read_heads))
+        write_key = torch.tanh(self.write_key_transform(xi).view(batch, 1, cell_size))
+        write_strength_logits = self.write_strength_transform(xi).view(batch, 1)
+        write_strength = F.softplus(
+            write_strength_logits + self.sgr_error_to_write_strength * prediction_error
+        )
+        erase_vector = torch.sigmoid(self.erase_vector_transform(xi).view(batch, 1, cell_size))
+        write_vector = torch.tanh(self.write_vector_transform(xi).view(batch, 1, cell_size))
+        free_gates = torch.sigmoid(self.free_gates_transform(xi).view(batch, read_heads))
+        allocation_gate = torch.sigmoid(self.allocation_gate_transform(xi).view(batch, 1))
+        write_gate = torch.sigmoid(self.write_gate_transform(xi).view(batch, 1))
+        read_modes = self.read_modes_transform(xi).view(batch, read_heads, 3).softmax(dim=-1)
+        hidden = self.write(
+            write_key,
+            write_vector,
+            erase_vector,
+            free_gates,
+            read_strengths,
+            write_strength,
+            write_gate,
+            allocation_gate,
+            hidden,
+        )
+        return self.read(read_keys, read_strengths, read_modes, hidden)
 
     def begin_stage_diagnostics(self) -> None:
         """Collect lightweight read/write statistics until finish is called."""
@@ -755,6 +821,7 @@ def build_memory(
     link_sharpness: float = 1.0,
     allocation_topk: int | None = None,
     dnc_implementation: str = "base",
+    sgr_write_salience_enabled: bool = False,
 ):
     """Construct a stock-compatible memory for the selected mechanism pair."""
     if dnc_implementation not in DNC_IMPLEMENTATIONS:
@@ -783,4 +850,5 @@ def build_memory(
         observation_variance=observation_variance,
         link_sharpness=link_sharpness,
         allocation_topk=allocation_topk,
+        sgr_write_salience_enabled=sgr_write_salience_enabled,
     )

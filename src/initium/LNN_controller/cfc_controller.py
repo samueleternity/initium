@@ -105,13 +105,26 @@ class CfCControllerBlock(nn.Module):
         return (h, torch.zeros_like(h)) if self.mixed_memory else h
 
     def step(self, x, state):
+        numeric_observer = getattr(self, "_initium_forward_numeric_observer", None)
+        if numeric_observer is not None:
+            numeric_observer("input", x)
         with torch.autocast(device_type=x.device.type, enabled=False):
             out, new_state = self.cfc(
                 self.norm(x.float()).unsqueeze(1),
                 _state_to_fp32(state) if state is not None else None,
             )
+        if numeric_observer is not None:
+            numeric_observer("cell_output", out)
         out = out.squeeze(1).clamp(min=-1e4, max=1e4)
+        if numeric_observer is not None:
+            numeric_observer("clamped_update", out)
         y = x + out.to(x.dtype) if self.residual else out.to(x.dtype)
+        if numeric_observer is not None:
+            numeric_observer("residual_output", y)
+            state_tensors = new_state if isinstance(new_state, tuple | list) else (new_state,)
+            for index, state_tensor in enumerate(state_tensors):
+                if isinstance(state_tensor, torch.Tensor):
+                    numeric_observer(f"state.{index}", state_tensor)
         return y, _state_to_fp32(new_state)
 
     def forward(self, x, state):
@@ -279,7 +292,13 @@ class CfCControllerWrapper(nn.Module):
                 "CfCControllerWrapper was configured with moe_source_dims -- "
                 "call forward_multi_source(sources, hx) instead of forward()."
             )
-        x = self.in_adapter(input.squeeze(1))
+        numeric_observer = getattr(self, "_initium_forward_numeric_observer", None)
+        adapter_input = input.squeeze(1)
+        if numeric_observer is not None:
+            numeric_observer("adapter.input", adapter_input)
+        x = self.in_adapter(adapter_input)
+        if numeric_observer is not None:
+            numeric_observer("adapter.output", x)
         if hx is None:
             hx = self.init_state(x.size(0), device=x.device)
         new_hx = []

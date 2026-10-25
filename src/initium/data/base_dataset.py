@@ -26,7 +26,13 @@ class BaseDataset:
         raise NotImplementedError
 
     def sample_batch(self, curriculum, batch_size):
-        """-> (inputs, targets, mask) tensors, batch-first."""
+        """Return batch-first tensors.
+
+        Standard datasets return ``(inputs, targets, mask)``. A dataset with
+        elapsed-time metadata may additionally return ``timespans`` as a
+        fourth tensor of shape ``(batch, sequence)`` for CfC split-graph
+        stages. Time spans are finite, non-negative elapsed-time deltas.
+        """
         raise NotImplementedError
 
     def loss(self, output, target, mask):

@@ -1862,7 +1862,7 @@ def run(
             split_graph_numeric_trace_step,
             trigger_on_error=split_graph_numeric_trace_on_error,
         )
-        rnn._initium_forward_numeric_context = split_graph_forward_trace
+        setattr(rnn, "_initium_forward_numeric_context", split_graph_forward_trace)
         for module_name, module in rnn.named_modules():
             if module is rnn:
                 prefix = "split_graph"
@@ -1931,6 +1931,7 @@ def run(
                 replay_task_loss = dataset.loss(replay_logits, target_digits, answer_mask)
                 trace.observe("task_output.loss", replay_task_loss)
                 if sgr_prediction_decoder is not None:
+                    assert isinstance(replay_features, torch.Tensor)
                     replay_prediction_logits = sgr_prediction_decoder(replay_features[:, :-1])
                     trace.observe("sgr_prediction.logits", replay_prediction_logits)
                     replay_prediction_loss = masked_next_token_loss(
@@ -2195,7 +2196,7 @@ def run(
     if workspace_train_scope == "gate" and isinstance(rnn, SplitGraphDNC):
         # PyTorch's Module __setattr__ typing only accepts parameters, buffers,
         # and submodules; this runtime diagnostic hook is a plain callback.
-        rnn._initium_segment_observer = segment_diagnostics.observe_tensor
+        setattr(rnn, "_initium_segment_observer", segment_diagnostics.observe_tensor)
     segment_diagnostics.add_module(output_proj, "task_output")
     if segment_diagnostics_enabled and isinstance(rnn, SplitGraphDNC):
         combiner = rnn.combiner_wrapper
@@ -2263,8 +2264,10 @@ def run(
         rnn.workspace_bistable_deterministic = workspace_bistable_deterministic
         if workspace_train_scope == "gate":
             # PyTorch's Module __setattr__ typing rejects runtime callback hooks.
-            rnn.workspace._initium_recurrent_state_observer = (
-                segment_diagnostics.observe_recurrent_state
+            setattr(
+                rnn.workspace,
+                "_initium_recurrent_state_observer",
+                segment_diagnostics.observe_recurrent_state,
             )
 
     def emit_failure_diagnostics(channel: str, *, include_gradients: bool = False) -> None:
@@ -4316,6 +4319,7 @@ def run(
                     _restore_rng_state(rng_state_after_other_evaluations)
                 segment_diagnostics.emit("eval-id-memory-off")
 
+                assert mem_check_writer is not None and mem_check_file is not None
                 mem_check_writer.writerow(
                     [
                         step,

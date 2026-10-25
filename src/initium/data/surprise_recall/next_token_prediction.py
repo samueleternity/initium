@@ -243,8 +243,9 @@ def evaluate_prediction_signals(
                     feature_holder: dict[str, torch.Tensor] = {}
                     forward_with_intermediate(
                         one_hot,
-                        intermediate_observer=lambda value,
-                        holder=feature_holder: holder.setdefault("features", value),
+                        intermediate_observer=lambda value, holder=feature_holder: (
+                            holder.setdefault("features", value)
+                        ),
                     )
                     features = feature_holder.get("features")
                     if features is None:

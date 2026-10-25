@@ -1862,9 +1862,7 @@ def run(
     if workspace_train_scope == "gate" and isinstance(rnn, SplitGraphDNC):
         # PyTorch's Module __setattr__ typing only accepts parameters, buffers,
         # and submodules; this runtime diagnostic hook is a plain callback.
-        rnn._initium_segment_observer = (
-            segment_diagnostics.observe_tensor  # type: ignore[assignment]
-        )
+        rnn._initium_segment_observer = segment_diagnostics.observe_tensor  # type: ignore[assignment]
     segment_diagnostics.add_module(output_proj, "task_output")
     if segment_diagnostics_enabled and isinstance(rnn, SplitGraphDNC):
         combiner = rnn.combiner_wrapper

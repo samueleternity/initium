@@ -545,6 +545,134 @@ def evaluate_traversal(
     return triple_acc, perfect_frac
 
 
+def evaluate_traversal_batched(
+    model,
+    device,
+    episodes,
+    *,
+    batch_size=8,
+    ablate_memory=False,
+    shuffle_memory=False,
+    memory_read_lag=None,
+    inter_layer_read=None,
+):
+    """Evaluate fixed graph episodes in genuine multi-episode batches.
+
+    This evaluator exists for paired memory diagnostics. The ordinary graph
+    evaluator intentionally calls the model once per episode, which makes a
+    batch-axis shuffle a no-op. Fixed episodes and padded trailing positions
+    keep every counterfactual condition paired and deterministic.
+    """
+    if batch_size < 2:
+        raise ValueError("batched graph memory diagnostics require batch_size >= 2")
+    if not episodes:
+        raise ValueError("batched graph memory diagnostics require at least one episode")
+    if shuffle_memory and not getattr(model, "memories", None):
+        raise ValueError("memory-read shuffle requires model memory modules")
+
+    was_training = model.training
+    prior_lag = getattr(model, "memory_read_lag", None)
+    missing = object()
+    prior_inter_layer = getattr(model, "_initium_eval_inter_layer_read", missing)
+    if memory_read_lag is not None:
+        if prior_lag is None:
+            raise ValueError("model does not expose a configurable memory_read_lag")
+
+    handles = []
+    total_triples = correct_triples = perfect_episodes = 0
+    try:
+        if memory_read_lag is not None:
+            model.memory_read_lag = int(memory_read_lag)
+        if inter_layer_read is not None:
+            model._initium_eval_inter_layer_read = bool(inter_layer_read)
+        if shuffle_memory:
+            seen = set()
+
+            def shuffle_read(_module, _inputs, output):
+                if not isinstance(output, tuple) or not output or not torch.is_tensor(output[0]):
+                    return output
+                read = output[0]
+                if read.ndim == 0 or read.shape[0] < 2:
+                    raise RuntimeError(
+                        "batched graph shuffle received a singleton memory read; "
+                        "refusing identity intervention"
+                    )
+                return (torch.roll(read, shifts=1, dims=0), *output[1:])
+
+            for memory in getattr(model, "memories", ()):
+                if isinstance(memory, torch.nn.Module) and id(memory) not in seen:
+                    seen.add(id(memory))
+                    handles.append(memory.register_forward_hook(shuffle_read))
+            if not handles:
+                raise RuntimeError("model exposes no memory module to shuffle")
+
+        model.eval()
+        with torch.no_grad():
+            for offset in range(0, len(episodes), batch_size):
+                batch = episodes[offset : offset + batch_size]
+                max_length = max(item[0].shape[0] for item in batch)
+                input_dim = batch[0][0].shape[-1]
+                inputs = batch[0][0].new_zeros((len(batch), max_length, input_dim))
+                valid_mask = torch.zeros((len(batch), max_length), dtype=torch.bool)
+                for row, (input_seq, _targets, _answer_mask) in enumerate(batch):
+                    length = input_seq.shape[0]
+                    inputs[row, :length] = input_seq
+                    valid_mask[row, :length] = True
+                inputs = inputs.to(device)
+                valid_mask = valid_mask.to(device)
+                output, _ = model(
+                    inputs,
+                    (None, None, None),
+                    reset_experience=True,
+                    pass_through_memory=not ablate_memory,
+                    sequence_valid_mask=valid_mask,
+                )
+                logits = output_proj_current(output)
+                for row, (_input_seq, target_digits, answer_mask) in enumerate(batch):
+                    sequence_length = target_digits.shape[0]
+                    row_logits = logits[:sequence_length, row]
+                    answer_idx = (answer_mask == 1).nonzero(as_tuple=True)[0]
+                    episode_perfect = True
+                    for index in answer_idx.tolist():
+                        prediction = _decode_prediction(row_logits[index])
+                        target_row = target_digits[index].tolist()
+                        target = (
+                            int("".join(map(str, target_row[0:3]))),
+                            int("".join(map(str, target_row[3:6]))),
+                            int("".join(map(str, target_row[6:9]))),
+                        )
+                        correct = prediction == target
+                        total_triples += 1
+                        correct_triples += int(correct)
+                        episode_perfect = episode_perfect and correct
+                    perfect_episodes += int(episode_perfect)
+    finally:
+        for handle in handles:
+            handle.remove()
+        if prior_lag is not None:
+            model.memory_read_lag = prior_lag
+        if prior_inter_layer is missing:
+            if hasattr(model, "_initium_eval_inter_layer_read"):
+                delattr(model, "_initium_eval_inter_layer_read")
+        else:
+            model._initium_eval_inter_layer_read = prior_inter_layer
+        model.train(was_training)
+
+    return (
+        correct_triples / max(total_triples, 1) * 100,
+        perfect_episodes / max(len(episodes), 1) * 100,
+    )
+
+
+def _decode_prediction(logits):
+    digit_preds = logits.reshape(-1, 10).argmax(dim=1).tolist()
+    return (
+        int("".join(str(d) for d in digit_preds[0:3])),
+        int("".join(str(d) for d in digit_preds[3:6])),
+        int("".join(str(d) for d in digit_preds[6:9])),
+    )
+
+
 def write_field_log(writer, file, step, lesson, eval_type, field_log):
     """Dump one evaluate_traversal(field_log=...) dict to the field-breakdown
     CSV and print a compact console summary (hop positions 1-4).
@@ -720,6 +848,135 @@ class GraphTraversalDataset(BaseDataset):
             ablate_memory=True,
             **self._lesson_eval_graph_kwargs(curriculum, lesson_idx),
         )
+
+    def sample_id_eval_episodes(self, curriculum, lesson_idx, num_episodes, rng):
+        """Build one deterministic ID episode set for paired memory probes."""
+        nodes_range, k_range, path_length_range = curriculum.table[lesson_idx]
+        episodes = []
+        py_state = random.getstate()
+        np_state = np.random.get_state()
+        try:
+            # ID graph generation currently draws from global Python/NumPy
+            # streams. Seed them locally for this diagnostic, then restore
+            # them so instrumentation cannot perturb training or later evals.
+            random.seed(rng.getrandbits(32))
+            np.random.seed(rng.getrandbits(32))
+            for _ in range(num_episodes):
+                if self._custom_graph is not None:
+                    edges, labels, adjacency = self._custom_graph
+                    episode = build_traversal_episode_from_graph(
+                        edges,
+                        labels,
+                        adjacency,
+                        len(labels),
+                        path_length_range,
+                        rng=rng,
+                    )
+                else:
+                    node_count = rng.randint(*nodes_range)
+                    episode = build_traversal_episode(
+                        node_count,
+                        k_range,
+                        path_length_range,
+                        rng=rng,
+                    )
+                if episode is None:
+                    raise RuntimeError("graph episode sampler returned an empty ID episode")
+                episodes.append(episode)
+        finally:
+            random.setstate(py_state)
+            np.random.set_state(np_state)
+        return episodes
+
+    def evaluate_memory_path_conditions(
+        self,
+        model,
+        device,
+        curriculum,
+        lesson_idx,
+        *,
+        seed,
+        num_episodes=100,
+        batch_size=8,
+        include_inter_layer=True,
+    ):
+        """Compare memory-off, true batch-shuffle, read lag, and layer placement.
+
+        Every condition sees the same deterministic graph episodes. The
+        inter-layer result is an inference-time counterfactual unless the run
+        itself was trained with ``--memory-inter-layer-read``; the run config
+        should be retained with this CSV when interpreting that row.
+        """
+        episodes = self.sample_id_eval_episodes(
+            curriculum,
+            lesson_idx,
+            num_episodes,
+            random.Random(seed),
+        )
+        ood_graph = self._custom_test_graph or build_london_underground_eval()
+        ood_edges, ood_labels, ood_adjacency = ood_graph
+        ood_rng = random.Random((int(seed) ^ 0x5EED5EED) % (2**32))
+        ood_episodes = []
+        while len(ood_episodes) < max(50, num_episodes // 2):
+            episode = build_traversal_episode_from_graph(
+                ood_edges,
+                ood_labels,
+                ood_adjacency,
+                len(ood_labels),
+                OOD_PATH_LENGTH_RANGE,
+                rng=ood_rng,
+            )
+            if episode is not None:
+                ood_episodes.append(episode)
+        configured_lag = getattr(model, "memory_read_lag", None)
+        if configured_lag not in (0, 1):
+            raise ValueError("memory path diagnostics require a model with read lag 0 or 1")
+        configured_inter_layer = bool(getattr(model, "memory_inter_layer_read", False))
+        conditions = [
+            ("configured", dict(memory_read_lag=configured_lag,
+                                 inter_layer_read=configured_inter_layer)),
+            ("memory_off", dict(memory_read_lag=configured_lag,
+                                 inter_layer_read=configured_inter_layer,
+                                 ablate_memory=True)),
+            ("memory_shuffled", dict(memory_read_lag=configured_lag,
+                                      inter_layer_read=configured_inter_layer,
+                                      shuffle_memory=True)),
+            ("read_lag_0", dict(memory_read_lag=0,
+                                 inter_layer_read=configured_inter_layer)),
+            ("read_lag_1", dict(memory_read_lag=1,
+                                 inter_layer_read=configured_inter_layer)),
+        ]
+        if include_inter_layer:
+            conditions.extend(
+                [
+                    ("final_layer_read", dict(memory_read_lag=configured_lag,
+                                               inter_layer_read=False)),
+                    ("inter_layer_read", dict(memory_read_lag=configured_lag,
+                                              inter_layer_read=True)),
+                ]
+            )
+        results = []
+        for name, options in conditions:
+            for eval_split, split_episodes in (("id", episodes), ("ood", ood_episodes)):
+                triple_acc, perfect_frac = evaluate_traversal_batched(
+                    model,
+                    device,
+                    split_episodes,
+                    batch_size=batch_size,
+                    **options,
+                )
+                results.append(
+                    {
+                        "condition": name,
+                        "eval_split": eval_split,
+                        "triple_acc": triple_acc,
+                        "perfect_frac": perfect_frac,
+                        "episodes": len(split_episodes),
+                        "configured_lag": configured_lag,
+                        "configured_inter_layer": int(configured_inter_layer),
+                    }
+                )
+        return results
 
     def evaluate_id_combiner_stage_ablated(
         self, model, device, curriculum, lesson_idx, skip_stages

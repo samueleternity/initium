@@ -455,6 +455,44 @@ class MambaBackboneParallel(nn.Module):
                     numeric_observer(f"block.{index}.moe_output", h)
         return self.normalize_output(h)
 
+    def forward_with_inter_layer_memory(
+        self,
+        x: torch.Tensor,
+        *,
+        inter_layer_read,
+        token_mask: torch.Tensor | None = None,
+        intermediate_observer=None,
+    ) -> torch.Tensor:
+        """Inject one sequence-memory read after block 0 and before block 1.
+
+        This is an explicit graph-traversal ablation arm. The callback receives
+        block-0 features after that block's MoE residual and returns features
+        of the same shape. It is deliberately separate from ``forward`` so
+        the default split-graph path remains unchanged.
+        """
+        if len(self.blocks) < 2:
+            raise ValueError("inter-layer memory requires at least two backbone blocks")
+        h = self.in_adapter(x)
+        numeric_observer = getattr(self, "_initium_forward_numeric_observer", None)
+        if numeric_observer is not None:
+            numeric_observer("input_adapter.output", h)
+        moe_blocks = self.moe_blocks
+        for index, block in enumerate(self.blocks):
+            h = block(h)
+            if numeric_observer is not None:
+                numeric_observer(f"block.{index}.output", h)
+            if moe_blocks is not None and isinstance(moe_blocks[index], MoEBlock):
+                h = moe_blocks[index](h, token_mask=token_mask)
+                if numeric_observer is not None:
+                    numeric_observer(f"block.{index}.moe_output", h)
+            if index == 0:
+                if intermediate_observer is not None:
+                    intermediate_observer(h)
+                h = inter_layer_read(h)
+                if numeric_observer is not None:
+                    numeric_observer("inter_layer_memory.output", h)
+        return self.normalize_output(h)
+
     def forward_sgr(
         self,
         x: torch.Tensor,

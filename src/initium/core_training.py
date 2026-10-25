@@ -978,6 +978,7 @@ def run(
     memory_dk: int = 64,
     memory_dv: int = 64,
     memory_read_lag: int = 1,
+    memory_inter_layer_read: bool = False,
     memory_topk: int | None = None,
     memory_position: str = "none",
     delta_gate: bool = True,
@@ -1012,6 +1013,17 @@ def run(
         raise ValueError("memory_position must be none or rope")
     if memory_position != "none" and memory_type != "kv":
         raise ValueError("memory_position is only supported by KV memory")
+    if memory_inter_layer_read and (
+        memory_type not in {"kv", "delta"}
+        or not split_graph_enabled
+        or split_graph_variant != "mamba1"
+        or split_graph_num_blocks < 2
+    ):
+        raise ValueError(
+            "inter-layer memory requires KV/delta with split-graph Mamba-1 and at least two blocks"
+        )
+    if memory_inter_layer_read and workspace_enabled:
+        raise ValueError("inter-layer sequence memory currently requires workspace to be disabled")
     if memory_type != "dnc" and not split_graph_enabled:
         raise ValueError("non-DNC memory types require --split-graph")
     if split_graph_backbone_only and memory_type != "dnc":
@@ -1552,6 +1564,40 @@ def run(
                 ["step", "lesson", "eval_split", "memory_type", "metric", "value"]
             )
 
+    memory_path_file: TextIO | None = None
+    memory_path_writer: Any | None = None
+    memory_path_probe_steps: set[int] = set()
+    paired_graph_memory_diagnostics = (
+        split_graph_enabled
+        and memory_type in {"kv", "delta"}
+        and callable(getattr(dataset, "sample_id_eval_episodes", None))
+    )
+    if paired_graph_memory_diagnostics:
+        memory_path_path = os.path.join(LOG_DIR, f"run_{run_id}_memory_path_ablation.csv")
+        memory_path_header = [
+            "step",
+            "lesson",
+            "eval_split",
+            "condition",
+            "configured_lag",
+            "configured_inter_layer",
+            "triple_acc",
+            "perfect_frac",
+            "episodes",
+            "evaluation_seed",
+        ]
+        if resuming and os.path.exists(memory_path_path):
+            with open(memory_path_path, newline="") as existing_file:
+                existing_header = next(csv.reader(existing_file), [])
+            if existing_header != memory_path_header:
+                memory_path_path = os.path.join(
+                    LOG_DIR, f"run_{run_id}_memory_path_ablation_v2.csv"
+                )
+        memory_path_file = open(memory_path_path, "a" if resuming else "w", newline="")
+        memory_path_writer = csv.writer(memory_path_file)
+        if not resuming or os.path.getsize(memory_path_path) == 0:
+            memory_path_writer.writerow(memory_path_header)
+
     def write_memory_usage(step_value, lesson_value, eval_split, diagnostics):
         if memory_usage_writer is None or memory_usage_file is None:
             return
@@ -1560,6 +1606,53 @@ def run(
                 [step_value, lesson_value, eval_split, memory_type, metric, value]
             )
         memory_usage_file.flush()
+
+    def write_paired_graph_memory_diagnostics(step_value, lesson_idx):
+        if memory_path_writer is None or memory_path_file is None:
+            return
+        diagnostic_seed = (int(seed) * 1_000_003 + int(step_value)) % (2**32)
+        include_inter_layer = (
+            split_graph_variant == "mamba1"
+            and split_graph_num_blocks >= 2
+            and not workspace_enabled
+        )
+        path_results = dataset.evaluate_memory_path_conditions(
+            rnn,
+            device,
+            curriculum,
+            lesson_idx,
+            seed=diagnostic_seed,
+            num_episodes=100,
+            batch_size=8,
+            include_inter_layer=include_inter_layer,
+        )
+        configured_inter_layer = int(memory_inter_layer_read)
+        for result in path_results:
+            memory_path_writer.writerow(
+                [
+                    step_value,
+                    lesson_idx + 1,
+                    result["eval_split"],
+                    result["condition"],
+                    result["configured_lag"],
+                    result["configured_inter_layer"],
+                    result["triple_acc"],
+                    result["perfect_frac"],
+                    result["episodes"],
+                    diagnostic_seed,
+                ]
+            )
+            print(
+                f"[{run_id}] Step {step_value} paired memory-path "
+                f"{result['condition']} ({result['eval_split']}): "
+                f"triple accuracy {result['triple_acc']:.2f}% | "
+                f"perfect {result['perfect_frac']:.2f}% "
+                f"({result['episodes']} episodes; "
+                f"configured lag={result['configured_lag']}, "
+                f"inter-layer={configured_inter_layer})"
+            )
+        memory_path_file.flush()
+        memory_path_probe_steps.add(int(step_value))
 
     combiner_stage_log_path = os.path.join(LOG_DIR, f"run_{run_id}_combiner_stage_dependency.csv")
     combiner_stage_log_file = open(combiner_stage_log_path, "a" if resuming else "w", newline="")
@@ -1571,8 +1664,8 @@ def run(
                 "lesson",
                 "stage_index",
                 "stage_kind",
-                "id_triple_acc",
-                "id_perfect_frac",
+            "triple_acc",
+            "perfect_frac",
                 "ablated_triple_acc",
                 "ablated_perfect_frac",
                 "stage_dependency_triple",
@@ -1957,6 +2050,7 @@ def run(
             memory_dk=memory_dk,
             memory_dv=memory_dv,
             memory_read_lag=memory_read_lag,
+            memory_inter_layer_read=memory_inter_layer_read,
             memory_topk=memory_topk,
             memory_position=memory_position,
             delta_gate=delta_gate,
@@ -2150,8 +2244,20 @@ def run(
     if memory_type in {"kv", "delta"}:
         print(
             f"[{run_id}] memory={memory_type} | heads={memory_heads} d_k={memory_dk} "
-            f"d_v={memory_dv} read_lag={memory_read_lag} | sequence-parallel read path"
+            f"d_v={memory_dv} read_lag={memory_read_lag} | "
+            f"read_path={'block0->memory->block1' if memory_inter_layer_read else 'final-backbone'}"
         )
+        if paired_graph_memory_diagnostics:
+            inter_layer_probe = (
+                split_graph_variant == "mamba1"
+                and split_graph_num_blocks >= 2
+                and not workspace_enabled
+            )
+            print(
+                f"[{run_id}] paired graph memory-path probes every "
+                f"{max(EVAL_EVERY * 10, 1)} steps: shuffle + read-lag 0/1; "
+                f"inter-layer probe={'enabled' if inter_layer_probe else 'unavailable for this config'}"
+            )
     elif not has_dnc:
         print(f"[{run_id}] DNC absent | split-graph backbone-only model")
     else:
@@ -2350,6 +2456,8 @@ def run(
         else {}
     )
     extra_model_config.update(memory_model_config)
+    if memory_inter_layer_read:
+        extra_model_config["memory_inter_layer_read"] = True
     expected_resume_model_config: dict[str, Any] = {
         "input_size": INPUT_DIM,
         "hidden_size": hidden_size,
@@ -4539,40 +4647,47 @@ def run(
                     segment_diagnostics.emit("eval-id-memory-off")
 
                     _restore_rng_state(id_eval_rng_state)
-                    segment_diagnostics.set_channel("eval-id-memory-shuffled")
-                    saved_lesson = curriculum.lesson
-                    saved_writers = {
-                        name: getattr(curriculum, name, None)
-                        for name in ("hop_log_writer", "field_log_writer")
-                    }
-                    try:
-                        curriculum.lesson = pre_advance_lesson
-                        for name in saved_writers:
-                            if hasattr(curriculum, name):
-                                setattr(curriculum, name, None)
-                        with _shuffle_memory_reads_across_batch(rnn):
-                            _, shuffled_triple_acc, shuffled_perfect_frac = (
-                                curriculum.maybe_advance(
-                                    rnn,
-                                    device,
-                                    step=step,
-                                    optimizer=optimizer,
-                                    allow_advance=False,
+                    if paired_graph_memory_diagnostics:
+                        # Graph traversal evaluates one episode per forward,
+                        # so the old batch-row hook could only return the
+                        # unmodified read. A real shuffle is logged below by
+                        # the fixed-episode batched diagnostic.
+                        shuffled_triple_acc = shuffled_perfect_frac = None
+                    else:
+                        segment_diagnostics.set_channel("eval-id-memory-shuffled")
+                        saved_lesson = curriculum.lesson
+                        saved_writers = {
+                            name: getattr(curriculum, name, None)
+                            for name in ("hop_log_writer", "field_log_writer")
+                        }
+                        try:
+                            curriculum.lesson = pre_advance_lesson
+                            for name in saved_writers:
+                                if hasattr(curriculum, name):
+                                    setattr(curriculum, name, None)
+                            with _shuffle_memory_reads_across_batch(rnn):
+                                _, shuffled_triple_acc, shuffled_perfect_frac = (
+                                    curriculum.maybe_advance(
+                                        rnn,
+                                        device,
+                                        step=step,
+                                        optimizer=optimizer,
+                                        allow_advance=False,
+                                    )
                                 )
-                            )
-                        if surprise_recall_logger is not None:
-                            surprise_recall_logger.write_evaluation(
-                                step,
-                                pre_advance_lesson + 1,
-                                "id-memory-shuffled",
-                                dataset.last_eval_diagnostics,
-                            )
-                    finally:
-                        curriculum.lesson = saved_lesson
-                        for name, value in saved_writers.items():
-                            if hasattr(curriculum, name):
-                                setattr(curriculum, name, value)
-                    segment_diagnostics.emit("eval-id-memory-shuffled")
+                            if surprise_recall_logger is not None:
+                                surprise_recall_logger.write_evaluation(
+                                    step,
+                                    pre_advance_lesson + 1,
+                                    "id-memory-shuffled",
+                                    dataset.last_eval_diagnostics,
+                                )
+                        finally:
+                            curriculum.lesson = saved_lesson
+                            for name, value in saved_writers.items():
+                                if hasattr(curriculum, name):
+                                    setattr(curriculum, name, value)
+                        segment_diagnostics.emit("eval-id-memory-shuffled")
                 finally:
                     _restore_rng_state(rng_state_after_other_evaluations)
 
@@ -4603,13 +4718,25 @@ def run(
                     ]
                 )
                 mem_check_file.flush()
+                shuffle_summary = (
+                    "shuffled pending paired batch diagnostic"
+                    if shuffled_triple_acc is None
+                    else f"shuffled {shuffled_triple_acc:.2f}% "
+                    f"(drop {id_triple_acc - shuffled_triple_acc:.2f})"
+                )
                 print(
                     f"[{run_id}] Step {step} memory-dependency check ({memory_type}): "
                     f"on {id_triple_acc:.2f}% | off {ablated_triple_acc:.2f}% "
                     f"(drop {id_triple_acc - ablated_triple_acc:.2f}) | "
-                    f"shuffled {shuffled_triple_acc:.2f}% "
-                    f"(drop {id_triple_acc - shuffled_triple_acc:.2f})"
+                    f"{shuffle_summary}"
                 )
+
+            if (
+                paired_graph_memory_diagnostics
+                and memory_path_writer is not None
+                and step % max(EVAL_EVERY * 10, 1) == 0
+            ):
+                write_paired_graph_memory_diagnostics(step, pre_advance_lesson)
 
             if combiner_stage_kinds is not None:
                 # Same pattern as the memory-dependency check above, but
@@ -4810,6 +4937,13 @@ def run(
 
     ood_offset_triple = id_triple_acc - ood_triple_acc
     ood_offset_perfect = id_perfect_frac - ood_perfect_frac
+
+    if (
+        paired_graph_memory_diagnostics
+        and memory_path_writer is not None
+        and int(step) not in memory_path_probe_steps
+    ):
+        write_paired_graph_memory_diagnostics(step, curriculum.lesson)
 
     if (
         has_dnc
@@ -5057,6 +5191,8 @@ def run(
         mem_check_file.close()
     if memory_usage_file is not None:
         memory_usage_file.close()
+    if memory_path_file is not None:
+        memory_path_file.close()
     lesson_log_file.close()
     prior_log_file.close()
     field_log_file.close()  # v16
@@ -5598,6 +5734,14 @@ if __name__ == "__main__":
     parser.add_argument("--memory-dk", type=int, default=64)
     parser.add_argument("--memory-dv", type=int, default=64)
     parser.add_argument("--memory-read-lag", type=int, choices=(0, 1), default=1)
+    parser.add_argument(
+        "--memory-inter-layer-read",
+        action="store_true",
+        help=(
+            "roadmap ablation: read KV/delta memory after Mamba-1 block 0 and add it "
+            "before block 1; requires split-graph Mamba-1 with at least two blocks and no workspace"
+        ),
+    )
     parser.add_argument("--memory-topk", type=int, default=None)
     parser.add_argument("--memory-position", choices=("none", "rope"), default="none")
     parser.add_argument(
@@ -5862,6 +6006,17 @@ if __name__ == "__main__":
         parser.error("--dnc-allocation-topk requires --split-graph")
     if args.memory_type != "dnc" and not args.split_graph:
         parser.error("non-DNC memory types require --split-graph")
+    if args.memory_inter_layer_read and (
+        args.memory_type not in {"kv", "delta"}
+        or not args.split_graph
+        or args.split_graph_variant != "mamba1"
+        or args.split_graph_num_blocks < 2
+    ):
+        parser.error(
+            "--memory-inter-layer-read requires KV/delta and split-graph Mamba-1 with at least two blocks"
+        )
+    if args.memory_inter_layer_read and args.workspace:
+        parser.error("--memory-inter-layer-read currently requires workspace to be disabled")
     if args.split_graph_backbone_only and args.memory_type != "dnc":
         parser.error("--split-graph-backbone-only cannot be combined with --memory-type")
     if args.memory_type != "dnc" and args.dynamic_n_mode:
@@ -6227,6 +6382,8 @@ if __name__ == "__main__":
                 run_id += f"_chunk{args.delta_chunk}_{'gate' if args.delta_gate else 'nogate'}"
                 if args.delta_use_fla:
                     run_id += "_fla"
+            if args.memory_inter_layer_read:
+                run_id += "_interlayer"
         if args.controller == "mamba":
             run_id = f"{run_id}_mambactrl"
         elif args.controller == "mamba2":
@@ -6408,6 +6565,7 @@ if __name__ == "__main__":
             memory_dk=args.memory_dk,
             memory_dv=args.memory_dv,
             memory_read_lag=args.memory_read_lag,
+            memory_inter_layer_read=args.memory_inter_layer_read,
             memory_topk=args.memory_topk,
             memory_position=args.memory_position,
             delta_gate=args.delta_gate,

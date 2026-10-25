@@ -121,7 +121,7 @@ class CfCControllerBlock(nn.Module):
         y = x + out.to(x.dtype) if self.residual else out.to(x.dtype)
         if numeric_observer is not None:
             numeric_observer("residual_output", y)
-            state_tensors = new_state if isinstance(new_state, (tuple, list)) else (new_state,)
+            state_tensors = new_state if isinstance(new_state, tuple | list) else (new_state,)
             for index, state_tensor in enumerate(state_tensors):
                 if isinstance(state_tensor, torch.Tensor):
                     numeric_observer(f"state.{index}", state_tensor)

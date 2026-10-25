@@ -54,9 +54,7 @@ class SurpriseRecallLogger:
                 ]
             )
 
-        self.position_file = open(
-            f"{prefix}_positions.csv", mode, newline="", encoding="utf-8"
-        )
+        self.position_file = open(f"{prefix}_positions.csv", mode, newline="", encoding="utf-8")
         self.position_writer = csv.writer(self.position_file)
         self._files.append(self.position_file)
         if os.path.getsize(f"{prefix}_positions.csv") == 0:
@@ -101,9 +99,7 @@ class SurpriseRecallLogger:
         self.phase1_file = None
         self.phase1_writer = None
         if phase1_enabled:
-            self.phase1_file = open(
-                f"{prefix}_phase1.csv", mode, newline="", encoding="utf-8"
-            )
+            self.phase1_file = open(f"{prefix}_phase1.csv", mode, newline="", encoding="utf-8")
             self.phase1_writer = csv.writer(self.phase1_file)
             self._files.append(self.phase1_file)
             if os.path.getsize(f"{prefix}_phase1.csv") == 0:
@@ -187,8 +183,7 @@ class SurpriseRecallLogger:
 
         episode_type_counts = [
             sum(
-                (kind in example.anomaly_types)
-                or (kind == "A6" and bool(example.noise_positions))
+                (kind in example.anomaly_types) or (kind == "A6" and bool(example.noise_positions))
                 for example in examples
             )
             for kind in ANOMALY_TYPES
@@ -244,9 +239,7 @@ class SurpriseRecallLogger:
             jitter_positions = set(example.noise_positions)
             position_descriptors = []
             for position, token in enumerate(example.inputs[: example.answer_start - 1]):
-                kind = event_map.get(
-                    position, "A6" if position in jitter_positions else "normal"
-                )
+                kind = event_map.get(position, "A6" if position in jitter_positions else "normal")
                 pattern_token = example.pattern[position % len(example.pattern)]
                 position_descriptors.append(
                     f"p{position}:t{token}/pat{pattern_token}/{kind}/"
@@ -257,34 +250,43 @@ class SurpriseRecallLogger:
                 )
             position_trace.append(f"ep{batch_episode}[" + ";".join(position_descriptors) + "]")
         print(
-            f"[{self.run_id}] [SGR train positions] step={step} "
-            + " | ".join(position_trace),
+            f"[{self.run_id}] [SGR train positions] step={step} " + " | ".join(position_trace),
             flush=True,
         )
         self._flush()
 
-    def write_phase1_evaluation(
-        self, step: int, eval_type: str, summary: dict | None
-    ) -> None:
+    def write_phase1_evaluation(self, step: int, eval_type: str, summary: dict | None) -> None:
         if not summary or self.phase1_writer is None:
             return
         lesson_scope = ",".join(str(index + 1) for index in summary.get("lessons", []))
         for kind, values in summary.get("per_type", {}).items():
             self.phase1_writer.writerow(
                 [
-                    step, eval_type, lesson_scope, "type_vs_clean_normal_auroc", kind,
-                    values.get("count", 0), values.get("raw_auroc_vs_clean_normal"),
+                    step,
+                    eval_type,
+                    lesson_scope,
+                    "type_vs_clean_normal_auroc",
+                    kind,
+                    values.get("count", 0),
+                    values.get("raw_auroc_vs_clean_normal"),
                     values.get("excess_auroc_vs_clean_normal"),
-                    values.get("mean_raw_surprisal"), values.get("mean_excess_surprise"),
-                    None, None,
+                    values.get("mean_raw_surprisal"),
+                    values.get("mean_excess_surprise"),
+                    None,
+                    None,
                 ]
             )
         a6 = summary.get("a6_vs_true_anomalies", {})
         self.phase1_writer.writerow(
             [
-                step, eval_type, lesson_scope, "true_anomaly_vs_a6_jitter_auroc", "A1+A2+A4+A5 vs A6",
+                step,
+                eval_type,
+                lesson_scope,
+                "true_anomaly_vs_a6_jitter_auroc",
+                "A1+A2+A4+A5 vs A6",
                 a6.get("a6_jitter_count", 0) + a6.get("true_anomaly_count", 0),
-                a6.get("raw_auroc"), a6.get("excess_auroc"),
+                a6.get("raw_auroc"),
+                a6.get("excess_auroc"),
                 a6.get("mean_true_anomaly_raw_surprisal"),
                 a6.get("mean_true_anomaly_excess_surprise"),
                 a6.get("mean_a6_raw_surprisal"),
@@ -294,8 +296,16 @@ class SurpriseRecallLogger:
         calibration = summary.get("calibration", {})
         self.phase1_writer.writerow(
             [
-                step, eval_type, lesson_scope, "next_token_calibration", "ALL",
-                calibration.get("count", 0), None, None, None, None,
+                step,
+                eval_type,
+                lesson_scope,
+                "next_token_calibration",
+                "ALL",
+                calibration.get("count", 0),
+                None,
+                None,
+                None,
+                None,
                 calibration.get("ece"),
                 f"accuracy_pct={calibration.get('accuracy_pct')}; brier={calibration.get('brier')}",
             ]
@@ -303,9 +313,17 @@ class SurpriseRecallLogger:
         recovery = summary.get("a5_recovery", {})
         self.phase1_writer.writerow(
             [
-                step, eval_type, lesson_scope, "a5_recovery_tokens", "A5",
+                step,
+                eval_type,
+                lesson_scope,
+                "a5_recovery_tokens",
+                "A5",
                 recovery.get("recovered_episodes", 0) + recovery.get("censored_episodes", 0),
-                None, None, None, None, recovery.get("mean_tokens_to_recovery"),
+                None,
+                None,
+                None,
+                None,
+                recovery.get("mean_tokens_to_recovery"),
                 f"recovered={recovery.get('recovered_episodes')}; "
                 f"censored={recovery.get('censored_episodes')}; {recovery.get('window_rule')}",
             ]
@@ -408,11 +426,33 @@ class SurpriseRecallLogger:
             )
         for kind, count in summary.get("event_counts", {}).items():
             self.eval_writer.writerow(
-                [step, lesson, eval_type, "event_prevalence", kind, count, None, None, None, *common]
+                [
+                    step,
+                    lesson,
+                    eval_type,
+                    "event_prevalence",
+                    kind,
+                    count,
+                    None,
+                    None,
+                    None,
+                    *common,
+                ]
             )
         for kind, count in summary.get("event_episode_counts", {}).items():
             self.eval_writer.writerow(
-                [step, lesson, eval_type, "episodes_with_event_type", kind, count, None, None, None, *common]
+                [
+                    step,
+                    lesson,
+                    eval_type,
+                    "episodes_with_event_type",
+                    kind,
+                    count,
+                    None,
+                    None,
+                    None,
+                    *common,
+                ]
             )
         for kind, values in summary.get("event_detector_counts", {}).items():
             count = values.get("count", 0)
@@ -422,9 +462,19 @@ class SurpriseRecallLogger:
             ):
                 self.eval_writer.writerow(
                     [
-                        step, lesson, eval_type, f"{detector_key}_flag_rate_at_event", kind,
-                        count, flagged, 100.0 * flagged / max(count, 1), None,
-                        None, None, None, None,
+                        step,
+                        lesson,
+                        eval_type,
+                        f"{detector_key}_flag_rate_at_event",
+                        kind,
+                        count,
+                        flagged,
+                        100.0 * flagged / max(count, 1),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
                     ]
                 )
         for detector_name, values in summary.get("detectors", {}).items():
@@ -434,21 +484,39 @@ class SurpriseRecallLogger:
                     count = values.get("count", 0)
                     self.eval_writer.writerow(
                         [
-                            step, lesson, eval_type,
-                            f"a6_{detector_key}_false_alarm_rate", "A6",
-                            count, false_alarms, 100.0 * false_alarms / max(count, 1), None,
-                            None, None, None, None,
+                            step,
+                            lesson,
+                            eval_type,
+                            f"a6_{detector_key}_false_alarm_rate",
+                            "A6",
+                            count,
+                            false_alarms,
+                            100.0 * false_alarms / max(count, 1),
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
                         ]
                     )
                 continue
             self.eval_writer.writerow(
                 [
-                    step, lesson, eval_type, f"{detector_name}_confusion", "ALL",
-                    sum(values.values()), values.get("tp", 0),
-                    100.0 * (values.get("tp", 0) + values.get("tn", 0))
-                    / max(sum(values.values()), 1), None,
-                    values.get("tp", 0), values.get("fp", 0),
-                    values.get("fn", 0), values.get("tn", 0),
+                    step,
+                    lesson,
+                    eval_type,
+                    f"{detector_name}_confusion",
+                    "ALL",
+                    sum(values.values()),
+                    values.get("tp", 0),
+                    100.0
+                    * (values.get("tp", 0) + values.get("tn", 0))
+                    / max(sum(values.values()), 1),
+                    None,
+                    values.get("tp", 0),
+                    values.get("fp", 0),
+                    values.get("fn", 0),
+                    values.get("tn", 0),
                 ]
             )
         self.eval_writer.writerow(
@@ -523,8 +591,7 @@ class SurpriseRecallLogger:
             else:
                 detector_total = sum(values.values())
                 detector_accuracy = (
-                    100.0 * (values.get("tp", 0) + values.get("tn", 0))
-                    / max(detector_total, 1)
+                    100.0 * (values.get("tp", 0) + values.get("tn", 0)) / max(detector_total, 1)
                 )
                 detector_parts.append(
                     f"{name}[tp={values.get('tp', 0)} fp={values.get('fp', 0)} "
@@ -533,8 +600,7 @@ class SurpriseRecallLogger:
                 )
         print(
             f"[{self.run_id}] [SGR eval event-detectors] step={step} lesson={lesson} "
-            f"eval={eval_type} "
-            + " ".join(event_detector_parts + detector_parts),
+            f"eval={eval_type} " + " ".join(event_detector_parts + detector_parts),
             flush=True,
         )
         self._flush()
@@ -555,4 +621,3 @@ class SurpriseRecallLogger:
     def close(self) -> None:
         for file in self._files:
             file.close()
-

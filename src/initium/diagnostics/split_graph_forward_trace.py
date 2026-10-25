@@ -111,9 +111,7 @@ class SplitGraphForwardTrace:
     def set_time_index(self, time_index: int | None) -> None:
         self.current_time_index = time_index
 
-    def observe(
-        self, boundary: str, tensor: torch.Tensor, time_index: int | None = None
-    ) -> None:
+    def observe(self, boundary: str, tensor: torch.Tensor, time_index: int | None = None) -> None:
         if not self.active:
             return
         if not isinstance(tensor, torch.Tensor):
@@ -171,9 +169,7 @@ class SplitGraphForwardTrace:
             )
             self.active = False
             self.close()
-            raise FloatingPointError(
-                failure
-            )
+            raise FloatingPointError(failure)
 
     def end_step(self, step: int) -> None:
         if self.active:

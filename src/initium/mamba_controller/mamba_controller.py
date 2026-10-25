@@ -168,9 +168,9 @@ from dnc import DNC
 from dnc.memory import Memory
 from dnc.util import cuda
 
+from initium.mamba_controller.numerical_stability import limit_mixer_residual_rms
 from initium.memory_manipulation.dnc_mechanisms import OptimizedMemory
 from initium.MoE.moe_layer import MoEBlock, MoERNNWrapper
-from initium.mamba_controller.numerical_stability import limit_mixer_residual_rms
 
 _MAMBA_IMPORT_ERROR: str | None
 

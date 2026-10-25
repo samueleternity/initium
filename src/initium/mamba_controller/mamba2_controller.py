@@ -96,8 +96,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from initium.MoE.moe_layer import MoEBlock
 from initium.mamba_controller.numerical_stability import limit_mixer_residual_rms
+from initium.MoE.moe_layer import MoEBlock
 
 _MAMBA2_IMPORT_ERROR: str | None
 

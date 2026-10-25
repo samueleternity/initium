@@ -267,7 +267,7 @@ class MechanismMemory(Memory):
         return self._forward_with_prediction_error_fp32(xi.float(), fp32_hidden, error)
 
     def _forward_with_prediction_error_fp32(self, xi, hidden, prediction_error):
-        batch, = xi.shape[:1]
+        (batch,) = xi.shape[:1]
         read_heads = self.read_heads
         cell_size = self.cell_size
         read_keys = torch.tanh(self.read_keys_transform(xi).view(batch, read_heads, cell_size))

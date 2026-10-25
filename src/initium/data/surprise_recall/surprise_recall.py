@@ -106,9 +106,7 @@ def build_episode(
     if "A2" in lesson.anomaly_types:
         event_types.extend(["A2"] * n_anomalies)
     else:
-        event_types.extend(
-            kind for kind in lesson.anomaly_types if kind not in {"A3", "A6"}
-        )
+        event_types.extend(kind for kind in lesson.anomaly_types if kind not in {"A3", "A6"})
     if "A4" in lesson.anomaly_types and n_anomalies >= 2:
         event_types.append("A4")
     if "A5" in lesson.anomaly_types and n_anomalies >= 3:
@@ -124,9 +122,7 @@ def build_episode(
     for anomaly_type in event_types:
         if not candidates:
             break
-        position = next(
-            (p for p in candidates if all(abs(p - q) > 1 for q in positions)), None
-        )
+        position = next((p for p in candidates if all(abs(p - q) > 1 for q in positions)), None)
         if position is None:
             break
         candidates.remove(position)
@@ -151,10 +147,7 @@ def build_episode(
             # Change the latent regime after the change point; the change point
             # is the sole event recalled in this Phase 0 task.
             new_pattern = rng.sample(range(PATTERN_VOCAB_SIZE), period)
-            while (
-                new_pattern == pattern
-                or new_pattern[position % period] == expected_token
-            ):
+            while new_pattern == pattern or new_pattern[position % period] == expected_token:
                 new_pattern = rng.sample(range(PATTERN_VOCAB_SIZE), period)
             observed_token = new_pattern[position % period]
             for j in range(position, length):
@@ -163,9 +156,7 @@ def build_episode(
             continue
         else:  # A2: silent replacement with a different ordinary token.
             alternatives = [
-                token
-                for token in pattern
-                if token not in ALERT_TOKENS and token != expected_token
+                token for token in pattern if token not in ALERT_TOKENS and token != expected_token
             ]
             observed_token = rng.choice(alternatives)
         if anomaly_type != "A6":
@@ -252,7 +243,7 @@ def verify_labels(example: SGRExample) -> bool:
 
 
 class SGRCurriculum:
-    def __init__(self, dataset: "SurpriseRecallDataset"):
+    def __init__(self, dataset: SurpriseRecallDataset):
         self.dataset = dataset
         self.table = list(LESSONS)
         self.lesson = 0
@@ -260,7 +251,11 @@ class SGRCurriculum:
 
     def maybe_advance(self, model, device, step=None, optimizer=None, *, allow_advance=True):
         accuracy, perfect, _ = self.dataset.evaluate_episodes(
-            model, device, EVAL_BATCH_SIZE, lesson_idx=self.lesson, rng=random.Random(31_000 + self.lesson)
+            model,
+            device,
+            EVAL_BATCH_SIZE,
+            lesson_idx=self.lesson,
+            rng=random.Random(31_000 + self.lesson),
         )
         if (
             allow_advance
@@ -308,7 +303,7 @@ class SurpriseRecallDataset(BaseDataset):
             n = len(ep.inputs)
             inputs[i, torch.arange(n), torch.tensor(ep.inputs)] = 1.0
             targets[i, :n] = torch.tensor(ep.targets)
-            mask[i, ep.answer_start:n] = 1.0
+            mask[i, ep.answer_start : n] = 1.0
         return inputs, targets, mask
 
     def loss(self, output, target, mask):
@@ -357,8 +352,10 @@ class SurpriseRecallDataset(BaseDataset):
             kind: {"count": 0, "alert_flagged": 0, "pattern_mismatch_flagged": 0}
             for kind in event_counts
         }
-        detector = {"alert": {"tp": 0, "fp": 0, "fn": 0, "tn": 0},
-                    "pattern_mismatch": {"tp": 0, "fp": 0, "fn": 0, "tn": 0}}
+        detector = {
+            "alert": {"tp": 0, "fp": 0, "fn": 0, "tn": 0},
+            "pattern_mismatch": {"tp": 0, "fp": 0, "fn": 0, "tn": 0},
+        }
         event_positive = {"A1", "A2", "A4", "A5"}
         with torch.no_grad():
             for _ in range(num_episodes):
@@ -403,7 +400,8 @@ class SurpriseRecallDataset(BaseDataset):
                 # Answer events are emitted in sorted stream order; EOS and
                 # clean-continuation tokens are excluded from anomaly recall.
                 answer_events = [
-                    (kind, token) for kind, token in zip(ep.anomaly_types, ep.observed_tokens)
+                    (kind, token)
+                    for kind, token in zip(ep.anomaly_types, ep.observed_tokens)
                     if kind != "A3"
                 ]
                 episode_type_correct = {kind: True for kind, _ in answer_events}
@@ -431,12 +429,22 @@ class SurpriseRecallDataset(BaseDataset):
                         ("alert", token in ALERT_TOKENS),
                         ("pattern_mismatch", token != ep.pattern[position % len(ep.pattern)]),
                     ):
-                        bucket = "tp" if truth and detected else "fn" if truth else "fp" if detected else "tn"
+                        bucket = (
+                            "tp"
+                            if truth and detected
+                            else "fn"
+                            if truth
+                            else "fp"
+                            if detected
+                            else "tn"
+                        )
                         detector[detector_name][bucket] += 1
                     if position in jitter_positions:
                         # Track benign jitter explicitly: it is a key negative
                         # control for pattern-mismatch detectors.
-                        detector.setdefault("a6_jitter", {"count": 0, "pattern_mismatch": 0, "alert": 0})
+                        detector.setdefault(
+                            "a6_jitter", {"count": 0, "pattern_mismatch": 0, "alert": 0}
+                        )
                         detector["a6_jitter"]["count"] += 1
                         detector["a6_jitter"]["pattern_mismatch"] += int(
                             token != ep.pattern[position % len(ep.pattern)]
@@ -455,7 +463,9 @@ class SurpriseRecallDataset(BaseDataset):
                 kind: {
                     **values,
                     "accuracy_pct": 100.0 * values["correct"] / max(values["count"], 1),
-                    "exact_episode_pct": 100.0 * values["exact_episodes"] / max(values["episodes"], 1),
+                    "exact_episode_pct": 100.0
+                    * values["exact_episodes"]
+                    / max(values["episodes"], 1),
                 }
                 for kind, values in by_type.items()
             },
@@ -464,7 +474,8 @@ class SurpriseRecallDataset(BaseDataset):
             "event_detector_counts": event_detector_counts,
             "content_detector": {
                 **detector["alert"],
-                "accuracy_pct": 100.0 * (detector["alert"]["tp"] + detector["alert"]["tn"])
+                "accuracy_pct": 100.0
+                * (detector["alert"]["tp"] + detector["alert"]["tn"])
                 / max(sum(detector["alert"].values()), 1),
             },
             "detectors": detector,
@@ -490,16 +501,22 @@ class SurpriseRecallDataset(BaseDataset):
                 return build_episode(lesson, episode_rng)
             if suite == 3:  # vocabulary remap; token identities carry no label meaning
                 ep = build_episode(LESSONS[3], episode_rng)
+
                 def remap(token):
                     return (7 * token + 3) % PATTERN_VOCAB_SIZE
 
                 inputs = tuple(remap(x) if x < PATTERN_VOCAB_SIZE else x for x in ep.inputs)
                 targets = tuple(remap(x) if x < PATTERN_VOCAB_SIZE else x for x in ep.targets)
                 return SGRExample(
-                    inputs, targets, ep.answer_start,
-                    tuple(remap(x) for x in ep.pattern), ep.anomaly_positions,
-                    ep.anomaly_types, tuple(remap(x) for x in ep.expected_tokens),
-                    tuple(remap(x) for x in ep.observed_tokens), ep.noise_positions,
+                    inputs,
+                    targets,
+                    ep.answer_start,
+                    tuple(remap(x) for x in ep.pattern),
+                    ep.anomaly_positions,
+                    ep.anomaly_types,
+                    tuple(remap(x) for x in ep.expected_tokens),
+                    tuple(remap(x) for x in ep.observed_tokens),
+                    ep.noise_positions,
                 )
             # A novel interaction: predictable alert decoy followed by a phase slip.
             lesson = Lesson("ood-slip-plus-decoy", 80, ("A3", "A4"), (2, 2), gap=12)
@@ -531,4 +548,3 @@ class SurpriseRecallDataset(BaseDataset):
         for anomaly_type, (n, correct) in sorted(field_log.items()):
             writer.writerow([step, lesson, eval_type, anomaly_type, n, correct / max(n, 1)])
         file.flush()
-

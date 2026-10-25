@@ -37,11 +37,7 @@ class SurprisePredictionHead(nn.Module):
             return F.linear(
                 features.float(),
                 self.projection.weight.float(),
-                (
-                    self.projection.bias.float()
-                    if self.projection.bias is not None
-                    else None
-                ),
+                (self.projection.bias.float() if self.projection.bias is not None else None),
             )
 
 
@@ -88,7 +84,9 @@ def prediction_error_signal(
         if len(stream_lengths) != batch:
             raise ValueError("stream_lengths must contain one value per batch row")
         lengths = torch.as_tensor(stream_lengths, device=input_one_hot.device)
-    stream_mask = torch.arange(sequence, device=input_one_hot.device).unsqueeze(0) < lengths.unsqueeze(1)
+    stream_mask = torch.arange(sequence, device=input_one_hot.device).unsqueeze(
+        0
+    ) < lengths.unsqueeze(1)
     # Multiplication does not safely mask NaNs: NaN * 0 remains NaN. Keep
     # excluded query/answer/padding positions exactly zero.
     signal = signal.masked_fill(~stream_mask, 0.0)
@@ -144,8 +142,7 @@ def _auroc(positive: list[float], negative: list[float]) -> float | None:
     positive_count = len(positive)
     rank_sum = ranks[:positive_count].sum()
     return float(
-        (rank_sum - positive_count * (positive_count + 1) / 2)
-        / (positive_count * len(negative))
+        (rank_sum - positive_count * (positive_count + 1) / 2) / (positive_count * len(negative))
     )
 
 
@@ -167,7 +164,9 @@ def _calibration_summary(
             confidence <= upper if index == bin_count - 1 else confidence < upper
         )
         if in_bin.any():
-            ece += float(in_bin.mean()) * abs(float(correct[in_bin].mean()) - float(confidence[in_bin].mean()))
+            ece += float(in_bin.mean()) * abs(
+                float(correct[in_bin].mean()) - float(confidence[in_bin].mean())
+            )
     one_hot = np.zeros_like(probs)
     one_hot[np.arange(targets.size), targets] = 1.0
     return {
@@ -240,7 +239,7 @@ def evaluate_prediction_signals(
                     feature_holder = {}
                     forward_with_intermediate(
                         one_hot,
-                        intermediate_observer=lambda value: feature_holder.setdefault(
+                        intermediate_observer=lambda value, holder=feature_holder: holder.setdefault(
                             "features", value
                         ),
                     )
@@ -280,9 +279,7 @@ def evaluate_prediction_signals(
                         recovery_start = change_position + 1
                         window_size = len(example.pattern)
                         found_recovery = False
-                        for window_start in range(
-                            recovery_start, stream_length - window_size + 1
-                        ):
+                        for window_start in range(recovery_start, stream_length - window_size + 1):
                             window = correct_cpu[
                                 row, window_start - 1 : window_start - 1 + window_size
                             ]
@@ -292,16 +289,13 @@ def evaluate_prediction_signals(
                                 break
                         if not found_recovery:
                             a5_recovery_censored += 1
-                    calibration_probabilities.append(
-                        probs_cpu[row, : stream_length - 1]
-                    )
+                    calibration_probabilities.append(probs_cpu[row, : stream_length - 1])
                     calibration_labels.extend(streams[row][1:])
                     for position in range(1, stream_length):
                         score_index = position - 1
                         raw = float(raw_cpu[row, score_index])
                         excess = float(excess_cpu[row, score_index])
                         entropy_value = float(entropy_cpu[row, score_index])
-                        token = streams[row][position]
                         kind = event_map.get(position)
                         if kind is not None:
                             event_counts[kind] += 1
@@ -331,9 +325,7 @@ def evaluate_prediction_signals(
         per_type[kind] = {
             "count": event_counts[kind],
             "raw_auroc_vs_clean_normal": _auroc(type_scores["raw"], normal_scores["raw"]),
-            "excess_auroc_vs_clean_normal": _auroc(
-                type_scores["excess"], normal_scores["excess"]
-            ),
+            "excess_auroc_vs_clean_normal": _auroc(type_scores["excess"], normal_scores["excess"]),
             "mean_raw_surprisal": (
                 float(np.mean(type_scores["raw"])) if type_scores["raw"] else None
             ),
@@ -359,12 +351,12 @@ def evaluate_prediction_signals(
                 float(np.mean(jitter_scores["excess"])) if jitter_scores["excess"] else None
             ),
             "mean_true_anomaly_raw_surprisal": (
-                float(np.mean(true_anomaly_scores["raw"]))
-                if true_anomaly_scores["raw"] else None
+                float(np.mean(true_anomaly_scores["raw"])) if true_anomaly_scores["raw"] else None
             ),
             "mean_true_anomaly_excess_surprise": (
                 float(np.mean(true_anomaly_scores["excess"]))
-                if true_anomaly_scores["excess"] else None
+                if true_anomaly_scores["excess"]
+                else None
             ),
         },
         "calibration": _calibration_summary(calibration_probabilities, calibration_labels),

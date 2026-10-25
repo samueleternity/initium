@@ -69,8 +69,8 @@ import os as _os
 import torch
 import torch.nn as nn
 
-from initium.MoE.moe_layer import MoEBlock
 from initium.mamba_controller.numerical_stability import limit_mixer_residual_rms
+from initium.MoE.moe_layer import MoEBlock
 
 try:
     from einops import rearrange
@@ -555,7 +555,9 @@ class MambaBackboneParallel(nn.Module):
         diagnostics = {
             "prediction_error": error_signal.detach(),
             "gate_signal": (
-                gate_signal.detach() if gate_signal is not None else error_signal.new_zeros(error_signal.shape)
+                gate_signal.detach()
+                if gate_signal is not None
+                else error_signal.new_zeros(error_signal.shape)
             ),
         }
         return h, first_features, logits, diagnostics

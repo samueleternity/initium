@@ -13,7 +13,6 @@ import math
 
 import torch
 
-
 # A token-wise RMS limit leaves ordinary activations unchanged while preventing
 # a single learned mixer branch from overwhelming the residual stream. This
 # is intentionally an architectural safety bound, not a training-time clamp

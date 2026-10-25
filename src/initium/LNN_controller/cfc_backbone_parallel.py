@@ -80,9 +80,7 @@ class _CfCParallelBlock(nn.Module):
         """
         batch, sequence, _ = x.shape
         h_state = x.new_zeros((batch, self.cfc.state_size), dtype=torch.float32)
-        c_state = (
-            torch.zeros_like(h_state) if self.cfc.use_mixed else None
-        )
+        c_state = torch.zeros_like(h_state) if self.cfc.use_mixed else None
         outputs = []
         for step in range(sequence):
             step_input = x[:, step]

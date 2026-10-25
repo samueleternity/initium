@@ -116,6 +116,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from initium.data.surprise_recall.next_token_prediction import prediction_error_signal
 from initium.LNN_controller.cfc_backbone_parallel import (
     build_parallel_backbone,
     collect_backbone_moe_layers,
@@ -130,7 +131,6 @@ from initium.mamba_controller.mamba3_controller import Mamba3ControllerWrapper
 from initium.mamba_controller.mamba_controller import MambaControllerWrapper
 from initium.memory_manipulation.dnc_mechanisms import build_memory
 from initium.workspace.broadcast import WorkspaceBroadcast
-from initium.data.surprise_recall.next_token_prediction import prediction_error_signal
 
 
 class _ModelCapacityMetadata:
@@ -716,7 +716,7 @@ class SplitGraphDNC(nn.Module):
             elif isinstance(value, dict):
                 for key, child in value.items():
                     observe_numeric_tree(f"{label}.{key}", child)
-            elif isinstance(value, (tuple, list)):
+            elif isinstance(value, tuple | list):
                 for index, child in enumerate(value):
                     observe_numeric_tree(f"{label}.{index}", child)
 
@@ -776,7 +776,11 @@ class SplitGraphDNC(nn.Module):
                 stage_input = run_backbone_stage(stage, stage_input)
                 if stage_index == 0:
                     prediction_features = stage_input
-                    if return_backbone_features or self.sgr_write_salience_enabled or workspace_error_consumer:
+                    if (
+                        return_backbone_features
+                        or self.sgr_write_salience_enabled
+                        or workspace_error_consumer
+                    ):
                         compute_prediction_error(prediction_features)
             final_stage = backbone_stages[-1]
             forward_with_specialists = getattr(final_stage, "forward_with_specialists", None)
@@ -788,7 +792,9 @@ class SplitGraphDNC(nn.Module):
                 "token_mask": sequence_valid_mask,
                 "intermediate_observer": (
                     observe_prediction_features
-                    if return_backbone_features or self.sgr_write_salience_enabled or workspace_error_consumer
+                    if return_backbone_features
+                    or self.sgr_write_salience_enabled
+                    or workspace_error_consumer
                     else None
                 ),
             }

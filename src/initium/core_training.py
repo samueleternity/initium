@@ -866,6 +866,16 @@ def run(
     dnc_link_sharpness: float = 1.0,
     dnc_allocation_topk: int | None = None,
     dnc_implementation: str = "base",
+    memory_type: str = "dnc",
+    memory_heads: int = 4,
+    memory_dk: int = 64,
+    memory_dv: int = 64,
+    memory_read_lag: int = 1,
+    memory_topk: int | None = None,
+    memory_position: str = "none",
+    delta_gate: bool = True,
+    delta_chunk: int = 64,
+    delta_use_fla: bool = False,
     dnc_compile_memory: bool = False,
     dnc_backward_trace: bool = False,
     dnc_backward_trace_step: int | None = None,
@@ -887,6 +897,20 @@ def run(
 ):
     if log_every <= 0:
         raise ValueError("log_every must be positive")
+    if memory_type not in {"none", "dnc", "kv", "delta"}:
+        raise ValueError("memory_type must be none, dnc, kv, or delta")
+    if memory_read_lag not in (0, 1):
+        raise ValueError("memory_read_lag must be 0 or 1")
+    if memory_position not in {"none", "rope"}:
+        raise ValueError("memory_position must be none or rope")
+    if memory_position != "none" and memory_type != "kv":
+        raise ValueError("memory_position is only supported by KV memory")
+    if memory_type != "dnc" and not split_graph_enabled:
+        raise ValueError("non-DNC memory types require --split-graph")
+    if split_graph_backbone_only and memory_type != "dnc":
+        raise ValueError("--split-graph-backbone-only cannot be combined with a memory module")
+    if memory_type != "dnc" and dynamic_n_mode:
+        raise ValueError("--dynamic-n-mode applies only to DNC memory")
     # Deliberately does NOT touch LR_DECAY_STEPS - that's a separate
     # module-level constant, fixed at import time from the *original*
     # TOTAL_STEPS, and lr_at_step()/set_lr() below read it directly by
@@ -1040,7 +1064,9 @@ def run(
             )
         if sgr_phase2_arm is not None:
             raise ValueError("Phase 2 backbone-only arms cannot be combined with Phase 4 consumers")
-    has_dnc = not split_graph_backbone_only and sgr_phase2_arm is None
+    has_dnc = (
+        not split_graph_backbone_only and sgr_phase2_arm is None and memory_type == "dnc"
+    )
     periodic_ood_episodes = OOD_EVAL_EPISODES_PERIODIC
     final_ood_episodes = OOD_EVAL_EPISODES
     INPUT_DIM, TRIPLE_DIM = dataset.input_dim, dataset.output_dim
@@ -1602,6 +1628,17 @@ def run(
                 f"actually what you meant to measure per Concept 16/SP-10."
             )
 
+    if memory_type != "dnc":
+        # Dataset curricula carry DNC cell-count schedules even when their
+        # task is being run against a fixed-size/sequence memory. Prevent the
+        # curriculum's generic advance hook from calling resize_memory on a
+        # non-DNC module.
+        curriculum.lesson_nr_cells = [nr_cells] * len(curriculum.table)
+        print(
+            f"[{run_id}] memory={memory_type}: DNC cell-resize schedule disabled; "
+            f"reported nr_cells metadata held at {nr_cells}"
+        )
+
     mamba_kwargs: dict[str, Any] = {}
     if controller == "mamba":
         mamba_kwargs = dict(
@@ -1772,6 +1809,16 @@ def run(
             moe_backbone_residual_scale=split_graph_moe_backbone_residual_scale,
             moe_cfc_multi_source=split_graph_combiner_cfc_multi_source_moe,
             dnc_enabled=not split_graph_backbone_only,
+            memory_type=memory_type,
+            memory_heads=memory_heads,
+            memory_dk=memory_dk,
+            memory_dv=memory_dv,
+            memory_read_lag=memory_read_lag,
+            memory_topk=memory_topk,
+            memory_position=memory_position,
+            delta_gate=delta_gate,
+            delta_chunk=delta_chunk,
+            delta_use_fla=delta_use_fla,
             dnc_read_variant=dnc_read_variant,
             dnc_read_residual_scale=dnc_read_residual_scale,
             dnc_read_residual_max_ratio=dnc_read_residual_max_ratio,
@@ -1957,7 +2004,12 @@ def run(
             )
             trace.close()
 
-    if not has_dnc:
+    if memory_type in {"kv", "delta"}:
+        print(
+            f"[{run_id}] memory={memory_type} | heads={memory_heads} d_k={memory_dk} "
+            f"d_v={memory_dv} read_lag={memory_read_lag} | sequence-parallel read path"
+        )
+    elif not has_dnc:
         print(f"[{run_id}] DNC absent | split-graph backbone-only model")
     else:
         print(
@@ -2138,6 +2190,23 @@ def run(
             "cfc_residual": CFC_RESIDUAL,
             "hybrid_cfc_num_blocks": HYBRID_CFC_NUM_BLOCKS,
         }
+    memory_model_config = (
+        {
+            "memory_type": memory_type,
+            "memory_heads": memory_heads,
+            "memory_dk": memory_dk,
+            "memory_dv": memory_dv,
+            "memory_read_lag": memory_read_lag,
+            "memory_topk": memory_topk,
+            "memory_position": memory_position,
+            "delta_gate": delta_gate,
+            "delta_chunk": delta_chunk,
+            "delta_use_fla": delta_use_fla,
+        }
+        if memory_type != "dnc"
+        else {}
+    )
+    extra_model_config.update(memory_model_config)
     expected_resume_model_config: dict[str, Any] = {
         "input_size": INPUT_DIM,
         "hidden_size": hidden_size,
@@ -2158,6 +2227,7 @@ def run(
         "split_graph_enabled": split_graph_enabled,
         "split_graph_backbone_only": split_graph_backbone_only,
         "split_graph_variant": split_graph_variant,
+        **memory_model_config,
         **controller_model_config,
         **extra_model_config,
     }
@@ -2171,7 +2241,7 @@ def run(
         )
 
     output_proj = nn.Linear(
-        hidden_size if sgr_phase2_arm is not None or split_graph_backbone_only else INPUT_DIM,
+        hidden_size if not has_dnc else INPUT_DIM,
         TRIPLE_DIM,
     ).to(device)
     dataset.set_output_proj(output_proj)
@@ -5301,6 +5371,26 @@ if __name__ == "__main__":
         "by default -- this step is meant to stay cheap.",
     )
     parser.add_argument(
+        "--memory-type",
+        choices=("none", "dnc", "kv", "delta"),
+        default="dnc",
+        help=(
+            "Memory module for split-graph controllers. KV and delta operate in parallel over "
+            "controller features; DNC preserves the recurrent read/write path."
+        ),
+    )
+    parser.add_argument("--memory-heads", type=int, default=4)
+    parser.add_argument("--memory-dk", type=int, default=64)
+    parser.add_argument("--memory-dv", type=int, default=64)
+    parser.add_argument("--memory-read-lag", type=int, choices=(0, 1), default=1)
+    parser.add_argument("--memory-topk", type=int, default=None)
+    parser.add_argument("--memory-position", choices=("none", "rope"), default="none")
+    parser.add_argument(
+        "--delta-gate", action=argparse.BooleanOptionalAction, default=True
+    )
+    parser.add_argument("--delta-chunk", type=int, default=64)
+    parser.add_argument("--delta-use-fla", action="store_true")
+    parser.add_argument(
         "--dnc-read-variant",
         choices=["cosine", "relational-mlp", "relational-residual"],
         default=DNC_READ_VARIANT,
@@ -5555,6 +5645,42 @@ if __name__ == "__main__":
         parser.error("--dnc-allocation-topk must be positive")
     if args.dnc_allocation_topk is not None and not args.split_graph:
         parser.error("--dnc-allocation-topk requires --split-graph")
+    if args.memory_type != "dnc" and not args.split_graph:
+        parser.error("non-DNC memory types require --split-graph")
+    if args.split_graph_backbone_only and args.memory_type != "dnc":
+        parser.error("--split-graph-backbone-only cannot be combined with --memory-type")
+    if args.memory_type != "dnc" and args.dynamic_n_mode:
+        parser.error("--dynamic-n-mode is only supported with DNC memory")
+    if min(args.memory_heads, args.memory_dk, args.memory_dv, args.delta_chunk) <= 0:
+        parser.error("memory dimensions and --delta-chunk must be positive")
+    if args.memory_topk is not None and args.memory_topk <= 0:
+        parser.error("--memory-topk must be positive")
+    if args.memory_topk is not None and args.memory_type != "kv":
+        parser.error("--memory-topk requires --memory-type kv")
+    if args.delta_use_fla and args.memory_type != "delta":
+        parser.error("--delta-use-fla requires --memory-type delta")
+    if args.delta_use_fla and args.delta_chunk not in {16, 32, 64}:
+        parser.error("--delta-use-fla requires --delta-chunk 16, 32, or 64")
+    if args.memory_type != "dnc" and (
+        args.dnc_compile_memory or args.dnc_backward_trace or args.dnc_implementation != "base"
+    ):
+        parser.error(
+            "DNC compilation, tracing, and implementation flags require --memory-type dnc"
+        )
+    if args.memory_type != "dnc" and (
+        args.link_matrix_mode != "dense"
+        or args.isolate_link_ablation
+        or args.dnc_allocation_topk is not None
+        or args.dnc_read_variant != "cosine"
+        or args.dnc_write_variant != "learned"
+        or args.dnc_read_residual_scale != 1.0
+        or args.dnc_read_residual_max_ratio != 0.5
+        or args.dnc_write_observation_variance != 1.0
+        or args.dnc_link_sharpness != 1.0
+        or args.dnc_backward_trace_step is not None
+        or args.sgr_dnc_write_salience
+    ):
+        parser.error("DNC addressing and write-salience options require --memory-type dnc")
     if args.batch_size <= 0:
         parser.error("--batch-size must be positive")
     if args.log_every <= 0:
@@ -5873,6 +5999,19 @@ if __name__ == "__main__":
     for beta in betas_to_run:
         # These are made to avoid checkpoint collisions between different types of runs.
         run_id = f"beta_{beta}_seed{args.seed}_learnedprior".replace(".", "p")
+        if args.memory_type != "dnc":
+            run_id = (
+                f"{run_id}_mem{args.memory_type}_h{args.memory_heads}"
+                f"_dk{args.memory_dk}_dv{args.memory_dv}_lag{args.memory_read_lag}"
+            )
+            if args.memory_type == "kv":
+                run_id += f"_{args.memory_position}"
+                if args.memory_topk is not None:
+                    run_id += f"_topk{args.memory_topk}"
+            if args.memory_type == "delta":
+                run_id += f"_chunk{args.delta_chunk}_{'gate' if args.delta_gate else 'nogate'}"
+                if args.delta_use_fla:
+                    run_id += "_fla"
         if args.controller == "mamba":
             run_id = f"{run_id}_mambactrl"
         elif args.controller == "mamba2":
@@ -6049,6 +6188,16 @@ if __name__ == "__main__":
             dnc_link_sharpness=args.dnc_link_sharpness,
             dnc_allocation_topk=args.dnc_allocation_topk,
             dnc_implementation=args.dnc_implementation,
+            memory_type=args.memory_type,
+            memory_heads=args.memory_heads,
+            memory_dk=args.memory_dk,
+            memory_dv=args.memory_dv,
+            memory_read_lag=args.memory_read_lag,
+            memory_topk=args.memory_topk,
+            memory_position=args.memory_position,
+            delta_gate=args.delta_gate,
+            delta_chunk=args.delta_chunk,
+            delta_use_fla=args.delta_use_fla,
             dnc_compile_memory=args.dnc_compile_memory,
             dnc_backward_trace=args.dnc_backward_trace,
             dnc_backward_trace_step=args.dnc_backward_trace_step,

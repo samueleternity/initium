@@ -130,6 +130,7 @@ from initium.mamba_controller.mamba2_controller import Mamba2ControllerWrapper
 from initium.mamba_controller.mamba3_controller import Mamba3ControllerWrapper
 from initium.mamba_controller.mamba_controller import MambaControllerWrapper
 from initium.memory_manipulation.dnc_mechanisms import build_memory
+from initium.memory_manipulation.sequence_memories import CausalKVMemory, GatedDeltaMemory
 from initium.workspace.broadcast import WorkspaceBroadcast
 
 
@@ -195,6 +196,16 @@ class SplitGraphDNC(nn.Module):
         combiner_ngroups: int = 1,  # mamba2 combiner_variant only
         independent_linears: bool = True,
         dnc_enabled: bool = True,
+        memory_type: str = "dnc",
+        memory_heads: int = 4,
+        memory_dk: int = 64,
+        memory_dv: int = 64,
+        memory_read_lag: int = 1,
+        memory_topk: int | None = None,
+        memory_position: str = "none",
+        delta_gate: bool = True,
+        delta_chunk: int = 64,
+        delta_use_fla: bool = False,
         device: torch.device | None = None,
         moe_enabled: bool = False,
         moe_placement: str = "all",
@@ -258,7 +269,44 @@ class SplitGraphDNC(nn.Module):
         self.w = cell_size
         self.r = read_heads
         self.read_vectors_size = read_heads * cell_size
-        self.dnc_enabled = bool(dnc_enabled)
+        if memory_type not in {"none", "dnc", "kv", "delta"}:
+            raise ValueError("memory_type must be one of none, dnc, kv, delta")
+        if memory_read_lag not in (0, 1):
+            raise ValueError("memory_read_lag must be 0 or 1")
+        if memory_type == "kv" and memory_topk is not None and memory_topk <= 0:
+            raise ValueError("memory_topk must be positive")
+        if memory_position not in {"none", "rope"}:
+            raise ValueError("memory_position must be 'none' or 'rope'")
+        if memory_position != "none" and memory_type != "kv":
+            raise ValueError("memory_position is only supported by KV memory")
+        self.memory_type = memory_type
+        self.memory_read_lag = int(memory_read_lag)
+        self.sequence_memory = None
+        if memory_type in {"kv", "delta"}:
+            rng_state = torch.random.get_rng_state()
+            try:
+                if memory_type == "kv":
+                    self.sequence_memory = CausalKVMemory(
+                        hidden_size, memory_heads, memory_dk, memory_dv,
+                        topk=memory_topk, position_mode=memory_position,
+                    )
+                else:
+                    self.sequence_memory = GatedDeltaMemory(
+                        hidden_size, memory_heads, memory_dk, memory_dv,
+                        chunk_size=delta_chunk, gate=delta_gate,
+                        use_fla=delta_use_fla,
+                    )
+            finally:
+                torch.random.set_rng_state(rng_state)
+        self.dnc_enabled = bool(dnc_enabled and memory_type in {"dnc", "none"})
+        if memory_type == "none":
+            self.dnc_enabled = False
+        self.sequence_memory_enabled = self.sequence_memory is not None
+        if self.sequence_memory is not None:
+            # Trainer/checkpoint metadata historically reports this field for
+            # every configured memory, although sequence memories do not use
+            # a cell capacity.
+            self.sequence_memory.nr_cells = int(nr_cells)
         self.nn_output_size = (
             hidden_size + self.read_vectors_size if self.dnc_enabled else hidden_size
         )
@@ -574,6 +622,9 @@ class SplitGraphDNC(nn.Module):
             self.rnn_layer_memory_shared = self.memories[0]
             self.output = nn.Linear(self.nn_output_size, self.input_size, device=device)
             torch.nn.init.kaiming_uniform_(self.output.weight)
+        elif self.sequence_memory_enabled:
+            self.memories = [self.sequence_memory]
+            self.output = None
         else:
             # This non-module metadata preserves generic trainer reporting;
             # it owns no DNC state, parameters, or forward computation.
@@ -693,7 +744,7 @@ class SplitGraphDNC(nn.Module):
         if start_step:
             if not (0 < start_step < T):
                 raise ValueError(f"start_step={start_step} must be in (0, T={T})")
-            if self.dnc_enabled and mhx is None:
+            if (self.dnc_enabled or self.sequence_memory_enabled) and mhx is None:
                 # The DNC path skips the sequential memory loop before this
                 # index and therefore requires its saved memory state.
                 raise ValueError("start_step>0 requires a resumed hx=(chx, mhx, last_read)")
@@ -882,6 +933,38 @@ class SplitGraphDNC(nn.Module):
             backbone_features = prediction_features if prediction_features is not None else H
 
         state: tuple[Any, Any, Any]
+        if self.sequence_memory_enabled:
+            assert self.sequence_memory is not None
+            memory_state = None
+            if mhx is not None and len(mhx) > 0:
+                memory_state = mhx[0]
+            if memory_state is None or reset_experience:
+                memory_state = self.sequence_memory.reset_state(B, device=device)
+            memory_features = H[:, start_step:]
+            if pass_through_memory:
+                memory_read, memory_state, _aux = self.sequence_memory(
+                    memory_features, state=memory_state, lag=self.memory_read_lag
+                )
+            else:
+                memory_read = torch.zeros_like(memory_features)
+            # The adapter in each sequence memory is zero-initialized, so the
+            # initial output is exactly the backbone-only path. Reads are
+            # applied after the parallel controller and never fed back into
+            # its timestep recurrence.
+            output = (memory_features + memory_read).transpose(0, 1)
+            last_read = memory_read[:, -1] if memory_read.shape[1] else None
+            if self.workspace is not None:
+                chx = {"_initium_workspace_state": workspace_state}
+            state = (chx, [memory_state], last_read)
+            if return_backbone_features:
+                assert backbone_features is not None
+                if return_prediction_logits:
+                    return output, state, backbone_features, prediction_logits
+                return output, state, backbone_features
+            if return_prediction_logits:
+                return output, state, prediction_logits
+            return output, state
+
         if not self.dnc_enabled:
             # General-purpose split-graph backbone mode: the parallel
             # backbone (and optional MoE/workspace path above) is the model.

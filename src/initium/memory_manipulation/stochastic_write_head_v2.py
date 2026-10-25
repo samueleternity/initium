@@ -395,10 +395,12 @@ def install_stochastic_write_heads(
     device: torch.device | None = None,
     sample: bool = True,
 ) -> list[StochasticWriteHead]:
-    """Replace every Memory.write_vector_transform found on `model` with a
-    StochasticWriteHead, initializing mu_transform from the original Linear's
-    weights (so, before any training, the sampled mean matches Phase 0's
-    deterministic write vector exactly).
+    """Replace supported DNC or sequence-memory write projections.
+
+    DNC memories replace ``write_vector_transform``; KV and delta memories
+    replace their ``value`` projection. In both cases the stochastic mean is
+    initialized from the original Linear weights, preserving its deterministic
+    write values when sampling is disabled.
 
     Call this AFTER model construction (and after model.to(device)) and
     BEFORE constructing the optimizer, so the new parameters are included in
@@ -406,11 +408,9 @@ def install_stochastic_write_heads(
     are buffers, not parameters, so this ordering requirement is unaffected
     by them -- they're never in optimizer.parameters() regardless.)
 
-    Raises if no dnc.memory.Memory submodule is found, or if a Memory module
-    doesn't have write_vector_transform (i.e. was built with
-    independent_linears=False) -- this patch specifically targets the
-    independent_linears=True path, which is pytorch-dnc's default and what
-    the training script uses.
+    Raises if no supported memory write projection is found, or if a DNC
+    Memory lacks ``write_vector_transform`` (the independent-linears path
+    used by this project).
     """
     from dnc.memory import Memory  # local import: only required when patching
 
@@ -432,11 +432,22 @@ def install_stochastic_write_heads(
                 stochastic.mu_transform.bias.copy_(orig.bias)
             module.write_vector_transform = stochastic  # submodule swap
             heads.append(stochastic)
+        elif module.__class__.__name__ in {"GatedDeltaMemory", "CausalKVMemory"}:
+            orig = getattr(module, "value", None)
+            if not isinstance(orig, nn.Linear):
+                raise RuntimeError(f"Sequence memory '{name}' has no linear value projection")
+            stochastic = StochasticWriteHead(
+                orig.in_features, orig.out_features, device=device, sample=sample
+            )
+            with torch.no_grad():
+                stochastic.mu_transform.weight.copy_(orig.weight)
+                stochastic.mu_transform.bias.copy_(orig.bias)
+            module.value = stochastic
+            heads.append(stochastic)
 
     if not heads:
         raise RuntimeError(
-            "No dnc.memory.Memory submodule found on model; cannot install "
-            "stochastic write head. Is `model` really a dnc.DNC instance?"
+            "No supported DNC or sequence-memory write projection found on model."
         )
     return heads
 

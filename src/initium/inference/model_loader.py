@@ -194,6 +194,16 @@ def _build_split_graph(c: _Cfg, input_dim, hidden, nr_cells, cell_size, read_hea
             "dnc_enabled",
             not c.get("split_graph_backbone_only", False),
         ),
+        memory_type=c.get("memory_type", "dnc"),
+        memory_heads=c.get("memory_heads", 4),
+        memory_dk=c.get("memory_dk", 64),
+        memory_dv=c.get("memory_dv", 64),
+        memory_read_lag=c.get("memory_read_lag", 1),
+        memory_topk=c.get("memory_topk"),
+        memory_position=c.get("memory_position", "none"),
+        delta_gate=c.get("delta_gate", True),
+        delta_chunk=c.get("delta_chunk", 64),
+        delta_use_fla=c.get("delta_use_fla", False),
         independent_linears=True,
         moe_enabled=_moe["moe_enabled"],
         moe_placement=c.get("split_graph_moe_placement", "all"),
@@ -271,7 +281,7 @@ def load_model(ckpt: dict, device: torch.device, deterministic_write: bool = Fal
     beta = float(ckpt.get("beta_target", 0.0) or 0.0)
     heads = (
         install_stochastic_write_heads(rnn, device=device, sample=(beta > 0.0))
-        if getattr(rnn, "dnc_enabled", True)
+        if getattr(rnn, "dnc_enabled", True) or getattr(rnn, "sequence_memory_enabled", False)
         else []
     )
 

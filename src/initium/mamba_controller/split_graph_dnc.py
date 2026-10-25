@@ -251,6 +251,7 @@ class SplitGraphDNC(nn.Module):
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.output_size = hidden_size
+        self.output: nn.Linear | None = None
         self.nr_cells = nr_cells
         self.cell_size = cell_size
         self.read_heads = read_heads
@@ -880,6 +881,7 @@ class SplitGraphDNC(nn.Module):
             # inter-layer source for the later error-injection phase.
             backbone_features = prediction_features if prediction_features is not None else H
 
+        state: tuple[Any, Any, Any]
         if not self.dnc_enabled:
             # General-purpose split-graph backbone mode: the parallel
             # backbone (and optional MoE/workspace path above) is the model.
@@ -1006,6 +1008,7 @@ class SplitGraphDNC(nn.Module):
                 # controller's ablate_memory contract in this project.
                 read_vec = torch.zeros(B, self.w * self.r, device=device, dtype=H.dtype)
 
+            assert self.output is not None
             step_out = self.output(torch.cat([xi_t, read_vec], dim=-1))  # (B, input_size)
             observe_numeric_tree("model.step_output", step_out)
             outputs.append(step_out)

@@ -136,7 +136,7 @@ class SurpriseRecallLogger:
         periods = [len(example.pattern) for example in examples]
         stream_lengths = [example.answer_start - 1 for example in examples]
         answer_lengths = [len(example.targets) - example.answer_start for example in examples]
-        event_gaps = []
+        event_gaps: list[int] = []
         for batch_episode, example in enumerate(examples):
             event_map = dict(zip(example.anomaly_positions, example.anomaly_types))
             event_counts.update(example.anomaly_types)

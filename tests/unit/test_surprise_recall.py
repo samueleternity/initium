@@ -19,7 +19,7 @@ def test_generated_episode_labels_and_answer_match_oracle(lesson_index):
 
     assert verify_labels(episode)
     assert episode.inputs[episode.answer_start - 1] == 20  # query precedes answer
-    assert episode.inputs[episode.answer_start :] == oracle_answer(episode)
+    assert set(episode.inputs[episode.answer_start :]) == {21}  # answer marker only
     assert episode.targets[episode.answer_start :] == oracle_answer(episode)
     assert len(episode.inputs) == len(episode.targets)
 
@@ -29,7 +29,8 @@ def test_dataset_batch_has_one_hot_inputs_and_answer_only_loss_mask():
     curriculum = dataset.make_curriculum()
     inputs, targets, loss_mask = dataset.sample_batch(curriculum, batch_size=3)
 
-    assert inputs.ndim == targets.ndim == loss_mask.ndim == 2
+    assert inputs.ndim == 3
+    assert targets.ndim == loss_mask.ndim == 2
     assert inputs.shape[:2] == targets.shape == loss_mask.shape
     assert inputs.shape[-1] == VOCAB_SIZE
     torch.testing.assert_close(inputs.sum(dim=-1), (inputs.sum(dim=-1) > 0).float())

@@ -9,13 +9,14 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass
+from typing import Any
 
 try:
     import torch
     import torch.nn.functional as F
 except ImportError:  # generator/oracle checks are intentionally dependency-light
-    torch = None
-    F = None
+    torch = None  # type: ignore[assignment]
+    F = None  # type: ignore[assignment]
 
 from initium.data.base_dataset import BaseDataset
 
@@ -73,7 +74,8 @@ def build_episode(
     stream_multiplier: int = 1,
 ) -> SGRExample:
     """Create one causal sequence episode with oracle-verified labels."""
-    rng = rng or random
+    rng_source: Any = rng if rng is not None else random
+    rng = rng_source
     lesson = LESSONS[lesson] if isinstance(lesson, int) else lesson
     period = rng.randint(*period_range)
     pattern = list(rng.sample(range(PATTERN_VOCAB_SIZE), period))

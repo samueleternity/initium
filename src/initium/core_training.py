@@ -35,7 +35,7 @@ import shutil
 import sys
 import time
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, TextIO
 
 # Support both ``python -m initium.core_training`` and direct execution of
 # ``src/initium/core_training.py`` from a source checkout.
@@ -945,6 +945,9 @@ def run(
         else (MAMBA_D_STATE, MAMBA_D_CONV, MAMBA_EXPAND)
     )
 
+    # The selected architecture is configured through the CLI and may be a
+    # DNC, SplitGraphDNC, or a backbone-only module with different attributes.
+    rnn: Any
     if sgr_phase2_arm is not None:
         valid_phase2_arms = {"content", "aux-only", "error", "blend", "shuffled", "oracle"}
         if sgr_phase2_arm not in valid_phase2_arms:
@@ -1369,8 +1372,8 @@ def run(
     # explicit requirement -- catches rsDNC's silent bypass-path collapse
     # (still trains, still runs, loss curves look fine) that a KL- or
     # loss-only view can't see.
-    mem_check_file = None
-    mem_check_writer = None
+    mem_check_file: TextIO | None = None
+    mem_check_writer: Any | None = None
     if has_dnc:
         mem_check_path = os.path.join(LOG_DIR, f"run_{run_id}_memory_dependency.csv")
         mem_check_file = open(mem_check_path, "a" if resuming else "w", newline="")
@@ -2192,9 +2195,7 @@ def run(
     if workspace_train_scope == "gate" and isinstance(rnn, SplitGraphDNC):
         # PyTorch's Module __setattr__ typing only accepts parameters, buffers,
         # and submodules; this runtime diagnostic hook is a plain callback.
-        rnn._initium_segment_observer = (
-            segment_diagnostics.observe_tensor  # type: ignore[assignment]
-        )
+        rnn._initium_segment_observer = segment_diagnostics.observe_tensor
     segment_diagnostics.add_module(output_proj, "task_output")
     if segment_diagnostics_enabled and isinstance(rnn, SplitGraphDNC):
         combiner = rnn.combiner_wrapper
@@ -2218,8 +2219,8 @@ def run(
         and rnn.workspace is not None
         and (workspace_reconsideration_enabled or sgr_workspace_write_salience)
     )
-    workspace_telemetry_log_file = None
-    workspace_telemetry_log_writer = None
+    workspace_telemetry_log_file: TextIO | None = None
+    workspace_telemetry_log_writer: Any | None = None
     if workspace_telemetry_enabled and not eval_only:
         workspace_telemetry_log_path = os.path.join(
             LOG_DIR, f"run_{run_id}_workspace_telemetry.csv"
@@ -2263,7 +2264,7 @@ def run(
         if workspace_train_scope == "gate":
             # PyTorch's Module __setattr__ typing rejects runtime callback hooks.
             rnn.workspace._initium_recurrent_state_observer = (
-                segment_diagnostics.observe_recurrent_state  # type: ignore[assignment]
+                segment_diagnostics.observe_recurrent_state
             )
 
     def emit_failure_diagnostics(channel: str, *, include_gradients: bool = False) -> None:
@@ -2353,7 +2354,7 @@ def run(
         # Phase 2's dedicated backbone-only model has no DNC Memory modules;
         # the general split-graph backbone-only mode is identical in this
         # respect. Keep the shared training/checkpoint code's head list empty.
-        stochastic_heads = []
+        stochastic_heads: list[Any] = []
     elif split_graph_enabled and dnc_write_variant == "kanerva-closed-form":
         # The Bayesian update consumes a deterministic observation from the
         # DNC write-value projection. Sampling a stochastic write head here
@@ -2828,7 +2829,7 @@ def run(
     # whatever LR was saved inside optimizer_state_dict at checkpoint time
     # (potentially still reflecting the old buggy drifted value).
     running_task_loss, running_kl_loss, running_div, running_grad_norm = 0.0, 0.0, 0, 0.0
-    running_sgr_prediction_loss = 0.0
+    running_sgr_prediction_loss: Any = 0.0
     running_log_steps = 0
     last_train_sgr_signal_diagnostics: dict[str, torch.Tensor] = {}
     workspace_reconsideration_window: dict[str, torch.Tensor] | None = None
@@ -2940,7 +2941,7 @@ def run(
                 raise FloatingPointError(
                     f"[{run_id}] non-finite training input at step {step}; stopping."
                 )
-        hidden = (None, None, None)
+        hidden: Any = (None, None, None)
         optimizer.zero_grad(set_to_none=True)
 
         segment_diagnostics.set_channel("train")
@@ -3617,7 +3618,7 @@ def run(
                     f"moe_capacity_drop {moe_diag.get('moe_capacity_drop_frac', 0.0):.1%}",
                 ]
                 parts.extend(_format_moe_layer_reports(moe_diag))
-            workspace_diag = {}
+            workspace_diag: dict[str, Any] = {}
             if workspace_enabled and isinstance(rnn, SplitGraphDNC):
                 if rnn.workspace is None:
                     parts.append("workspace[bypassed: slots=0]")
@@ -3839,6 +3840,7 @@ def run(
                             bias_rms,
                         ]
                     )
+                    assert workspace_telemetry_log_file is not None
                     workspace_telemetry_log_file.flush()
             if not workspace_bistable_debug:
                 segment_diagnostics.emit("train", include_gradients=True)

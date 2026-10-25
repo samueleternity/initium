@@ -121,7 +121,9 @@ def masked_next_token_loss(
     valid_logits = logits[valid].float()
     valid_labels = labels[valid]
     if valid_logits.shape[0] == 0:
-        return logits.new_zeros((), requires_grad=logits.requires_grad)
+        # Summing the empty selection yields a differentiable exact zero,
+        # without touching excluded NaN logits.
+        return valid_logits.sum()
     loss_sum = F.cross_entropy(valid_logits, valid_labels, reduction="sum")
     return loss_sum / valid.sum().clamp_min(1)
 
@@ -238,7 +240,7 @@ def evaluate_prediction_signals(
                 # predictions from block 0, before any later backbone block.
                 forward_with_intermediate = getattr(backbone, "forward_with_intermediate", None)
                 if callable(forward_with_intermediate):
-                    feature_holder = {}
+                    feature_holder: dict[str, torch.Tensor] = {}
                     forward_with_intermediate(
                         one_hot,
                         intermediate_observer=lambda value,

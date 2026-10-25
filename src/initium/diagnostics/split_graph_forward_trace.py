@@ -11,6 +11,7 @@ from __future__ import annotations
 import csv
 import os
 from datetime import datetime, timezone
+from typing import Any, TextIO
 
 import torch
 
@@ -36,14 +37,15 @@ class SplitGraphForwardTrace:
         self._session = datetime.now(timezone.utc).isoformat(timespec="seconds")
         path = os.path.join(log_dir, f"run_{run_id}_splitgraph_forward_trace.csv")
         self.path = path
-        self._file = None
-        self._writer = None
+        self._file: TextIO | None = None
+        self._writer: Any | None = None
 
     def _ensure_writer(self) -> None:
         if self._file is not None:
             return
         self._file = open(self.path, "a", newline="", encoding="utf-8")
         self._writer = csv.writer(self._file)
+        assert self._writer is not None
         if os.path.getsize(self.path) == 0:
             self._writer.writerow(
                 [
@@ -120,13 +122,15 @@ class SplitGraphForwardTrace:
         value = tensor.detach()
         if time_index is None:
             time_index = self.current_time_index
+        self._ensure_writer()
+        assert self._file is not None and self._writer is not None
         finite_mask = torch.isfinite(value)
         safe_abs = value.float().abs().masked_fill(~finite_mask, 0.0)
         packed = torch.stack((finite_mask.sum().float(), safe_abs.amax())).cpu().tolist()
         finite_count, max_abs_finite = int(packed[0]), float(packed[1])
         element_count = value.numel()
         nonfinite_count = element_count - finite_count
-        first_bad = ""
+        first_bad: str | tuple[int, ...] = ""
         if nonfinite_count:
             coordinates = torch.nonzero(~finite_mask, as_tuple=False)
             first_bad = tuple(int(index) for index in coordinates[0].cpu().tolist())

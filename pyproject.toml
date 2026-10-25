@@ -112,7 +112,7 @@ pretty = true
 [[tool.mypy.overrides]]
 module = [
   "dnc", "dnc.*", "mamba_ssm", "mamba_ssm.*", "causal_conv1d", "causal_conv1d.*",
-  "ncps", "ncps.*", "tokenizers", "tokenizers.*", "cv2",
+  "ncps", "ncps.*", "einops", "einops.*", "tokenizers", "tokenizers.*", "cv2",
 ]
 ignore_missing_imports = true
 

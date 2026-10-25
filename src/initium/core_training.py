@@ -1862,7 +1862,7 @@ def run(
             split_graph_numeric_trace_step,
             trigger_on_error=split_graph_numeric_trace_on_error,
         )
-        setattr(rnn, "_initium_forward_numeric_context", split_graph_forward_trace)
+        rnn._initium_forward_numeric_context = split_graph_forward_trace
         for module_name, module in rnn.named_modules():
             if module is rnn:
                 prefix = "split_graph"
@@ -2196,7 +2196,7 @@ def run(
     if workspace_train_scope == "gate" and isinstance(rnn, SplitGraphDNC):
         # PyTorch's Module __setattr__ typing only accepts parameters, buffers,
         # and submodules; this runtime diagnostic hook is a plain callback.
-        setattr(rnn, "_initium_segment_observer", segment_diagnostics.observe_tensor)
+        rnn._initium_segment_observer = segment_diagnostics.observe_tensor
     segment_diagnostics.add_module(output_proj, "task_output")
     if segment_diagnostics_enabled and isinstance(rnn, SplitGraphDNC):
         combiner = rnn.combiner_wrapper
@@ -2264,11 +2264,7 @@ def run(
         rnn.workspace_bistable_deterministic = workspace_bistable_deterministic
         if workspace_train_scope == "gate":
             # PyTorch's Module __setattr__ typing rejects runtime callback hooks.
-            setattr(
-                rnn.workspace,
-                "_initium_recurrent_state_observer",
-                segment_diagnostics.observe_recurrent_state,
-            )
+            rnn.workspace._initium_recurrent_state_observer = segment_diagnostics.observe_recurrent_state
 
     def emit_failure_diagnostics(channel: str, *, include_gradients: bool = False) -> None:
         segment_diagnostics.emit(channel, include_gradients=include_gradients)

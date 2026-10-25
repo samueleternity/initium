@@ -120,6 +120,8 @@ def masked_next_token_loss(
     # afterward lets a single NaN there poison the whole loss (NaN * 0 = NaN).
     valid_logits = logits[valid].float()
     valid_labels = labels[valid]
+    if valid_logits.shape[0] == 0:
+        return logits.new_zeros((), requires_grad=logits.requires_grad)
     loss_sum = F.cross_entropy(valid_logits, valid_labels, reduction="sum")
     return loss_sum / valid.sum().clamp_min(1)
 
@@ -239,9 +241,8 @@ def evaluate_prediction_signals(
                     feature_holder = {}
                     forward_with_intermediate(
                         one_hot,
-                        intermediate_observer=lambda value, holder=feature_holder: holder.setdefault(
-                            "features", value
-                        ),
+                        intermediate_observer=lambda value,
+                        holder=feature_holder: holder.setdefault("features", value),
                     )
                     features = feature_holder.get("features")
                     if features is None:

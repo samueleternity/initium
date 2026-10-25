@@ -15,7 +15,7 @@ def test_deterministic_forward_has_no_kl():
     assert loss.item() == 0
 
 
-def test_phase_one_and_general_kl_are_same_for_standard_prior():
+def test_standard_prior_kl_matches_general_diagonal_gaussian_formula():
     head = StochasticWriteHead(2, 2, sample=True)
     with torch.no_grad():
         head.mu_transform.weight.zero_()

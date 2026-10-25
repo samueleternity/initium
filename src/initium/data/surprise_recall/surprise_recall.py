@@ -307,13 +307,14 @@ class SurpriseRecallDataset(BaseDataset):
         return inputs, targets, mask
 
     def loss(self, output, target, mask):
-        losses = F.cross_entropy(
-            output.reshape(-1, self.output_dim),
-            target.reshape(-1),
-            reduction="none",
-        )
-        weights = mask.reshape(-1).to(losses.dtype)
-        return (losses * weights).sum() / weights.sum().clamp_min(1.0)
+        if output.shape[:-1] != target.shape or target.shape != mask.shape:
+            raise ValueError("output, target, and mask batch/time dimensions must match")
+        valid = mask.bool()
+        if not valid.any():
+            return output.new_zeros((), requires_grad=output.requires_grad)
+        valid_logits = output[valid].float()
+        valid_targets = target[valid]
+        return F.cross_entropy(valid_logits, valid_targets)
 
     def diversity(self, output, target, mask):
         valid = mask.bool()

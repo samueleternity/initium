@@ -39,6 +39,10 @@ def test_reconsideration_reopens_gate_and_replaces_occupied_slot_content():
     diagnostics = workspace.last_diagnostics()
     assert float(diagnostics["reconsideration_trigger_frac"]) == pytest.approx(1.0)
     assert float(diagnostics["reconsideration_changed_frac"]) == pytest.approx(1.0)
+    assert float(diagnostics["reconsideration_eligible_count"]) == pytest.approx(2.0)
+    assert float(diagnostics["reconsideration_trigger_count"]) == pytest.approx(2.0)
+    assert float(diagnostics["reconsideration_changed_count"]) == pytest.approx(2.0)
+    assert float(diagnostics["reconsideration_state_delta_rms"]) > 0.0
 
 
 def test_base_gate_control_does_not_reconsider_the_same_surprising_input():

@@ -239,7 +239,7 @@ class SegmentDiagnostics:
                                 context=context,
                             )
                         )
-                    )
+                    )  # fmt: skip
 
             # CfC's recurrent state is a separate input/output path. Keep its
             # hidden-state gradients visible so BPTT spikes are not hidden by
@@ -256,7 +256,7 @@ class SegmentDiagnostics:
                                     target, prefix, grad, location=call_location
                                 )
                             )
-                        )
+                        )  # fmt: skip
 
             # Structured recurrent modules can return a large persistent state
             # alongside their visible output. Keep these gradients separate so
@@ -281,7 +281,7 @@ class SegmentDiagnostics:
                                 context=context,
                             )
                         )
-                    )
+                    )  # fmt: skip
 
         self._handles.append(module.register_forward_hook(hook))
 

@@ -27,6 +27,83 @@ class DeltaState(NamedTuple):
 class SequenceMemory(nn.Module):
     """Common interface for memories driven by ``[B, T, D]`` features."""
 
+    def __init__(self):
+        super().__init__()
+        self._collect_memory_usage = False
+        self._usage_head_sums: dict[str, torch.Tensor] = {}
+        self._usage_scalar_sums: dict[str, torch.Tensor] = {}
+        self._usage_counts: dict[str, int] = {}
+
+    def begin_stage_diagnostics(self) -> None:
+        self._collect_memory_usage = True
+        self._usage_head_sums = {}
+        self._usage_scalar_sums = {}
+        self._usage_counts = {}
+
+    def _record_head_usage(self, name: str, values: torch.Tensor) -> None:
+        if not self._collect_memory_usage:
+            return
+        values = values.detach().float()
+        if values.ndim < 2 or values.shape[1] != getattr(self, "heads", values.shape[1]):
+            raise ValueError(f"{name} must have head dimension at axis 1")
+        reduce_dims = (0, *range(2, values.ndim))
+        per_head = values.mean(dim=reduce_dims) if reduce_dims else values
+        if name in self._usage_head_sums:
+            self._usage_head_sums[name] = self._usage_head_sums[name] + per_head
+        else:
+            self._usage_head_sums[name] = per_head
+        self._usage_counts[name] = self._usage_counts.get(name, 0) + 1
+
+    def _record_usage_scalar(self, name: str, value: torch.Tensor | float) -> None:
+        if not self._collect_memory_usage:
+            return
+        value = torch.as_tensor(value).detach().float().mean()
+        if name in self._usage_scalar_sums:
+            self._usage_scalar_sums[name] = self._usage_scalar_sums[name] + value
+        else:
+            self._usage_scalar_sums[name] = value
+        self._usage_counts[name] = self._usage_counts.get(name, 0) + 1
+
+    def finish_stage_diagnostics(self) -> dict[str, float]:
+        self._collect_memory_usage = False
+        result: dict[str, float] = {}
+        for name, total in self._usage_head_sums.items():
+            means = total / max(self._usage_counts[name], 1)
+            values = means.detach().cpu().tolist()
+            for head, value in enumerate(values):
+                result[f"{name}_head_{head}_mean"] = float(value)
+            if values:
+                result[f"{name}_highest_mean_head"] = float(
+                    max(range(len(values)), key=values.__getitem__)
+                )
+                result[f"{name}_lowest_mean_head"] = float(
+                    min(range(len(values)), key=values.__getitem__)
+                )
+        for name, total in self._usage_scalar_sums.items():
+            result[f"{name}_mean"] = float((total / max(self._usage_counts[name], 1)).cpu().item())
+        if hasattr(self, "heads"):
+            for head in range(self.heads):
+                prefix = f"kv_head_{head}_relative_position_bin_"
+                bin_keys = sorted(
+                    name
+                    for name in self._usage_scalar_sums
+                    if name.startswith(prefix) and name.endswith("_mass")
+                )
+                if bin_keys:
+                    indices = [int(name[len(prefix) : len(prefix) + 2]) for name in bin_keys]
+                    masses = [result[f"{name}_mean"] for name in bin_keys]
+                    result[f"kv_head_{head}_most_used_relative_position_bin"] = float(
+                        indices[max(range(len(masses)), key=masses.__getitem__)]
+                    )
+                    result[f"kv_head_{head}_least_used_relative_position_bin"] = float(
+                        indices[min(range(len(masses)), key=masses.__getitem__)]
+                    )
+        result["diagnostic_steps"] = float(max(self._usage_counts.values(), default=0))
+        self._usage_head_sums = {}
+        self._usage_scalar_sums = {}
+        self._usage_counts = {}
+        return result
+
     def forward(self, h_seq: torch.Tensor, state=None, lag: int = 1):
         raise NotImplementedError
 
@@ -35,12 +112,6 @@ class SequenceMemory(nn.Module):
 
     def reset_state(self, batch_size: int, *, device=None) -> KVState | DeltaState:
         raise NotImplementedError
-
-    def begin_stage_diagnostics(self) -> None:
-        pass
-
-    def finish_stage_diagnostics(self) -> dict[str, float]:
-        return {}
 
     def pop_numerical_diagnostics(self) -> dict[str, float]:
         return {}
@@ -150,6 +221,19 @@ class GatedDeltaMemory(SequenceMemory):
         )
         if fast_result is not None:
             reads, state = fast_result
+            if self._collect_memory_usage:
+                shaped_reads = reads.float().reshape(
+                    b, h_seq.shape[1], self.heads, self.value_size
+                ).transpose(1, 2)
+                self._record_head_usage("delta_read_rms", shaped_reads.square().mean(dim=(-1, -2)).sqrt())
+                self._record_head_usage("delta_write_strength", beta.squeeze(-1))
+                self._record_head_usage("delta_decay_alpha", alpha.squeeze(-1))
+                self._record_head_usage(
+                    "delta_state_rms", state.matrix.square().mean(dim=(-1, -2)).sqrt()
+                )
+                self._record_usage_scalar(
+                    "delta_state_elements", self.heads * self.value_size * self.key_size
+                )
             return self.output(reads.flatten(-2).to(h_seq.dtype)), state, {}
         read_sequence = []
         for start in range(0, h_seq.shape[1], self.chunk_size):
@@ -171,6 +255,19 @@ class GatedDeltaMemory(SequenceMemory):
         if not read_sequence:
             return h_seq.new_zeros(b, 0, self.input_size), state, {}
         reads = torch.stack(read_sequence, dim=1)
+        if self._collect_memory_usage:
+            shaped_reads = reads.float().reshape(
+                b, h_seq.shape[1], self.heads, self.value_size
+            ).transpose(1, 2)
+            self._record_head_usage("delta_read_rms", shaped_reads.square().mean(dim=(-1, -2)).sqrt())
+            self._record_head_usage("delta_write_strength", beta.squeeze(-1))
+            self._record_head_usage("delta_decay_alpha", alpha.squeeze(-1))
+            self._record_head_usage(
+                "delta_state_rms", state.matrix.square().mean(dim=(-1, -2)).sqrt()
+            )
+            self._record_usage_scalar(
+                "delta_state_elements", self.heads * self.value_size * self.key_size
+            )
         return self.output(reads), state, {}
 
     def _fla_forward(self, q, k, v, beta, alpha, state, lag: int):
@@ -303,6 +400,40 @@ class CausalKVMemory(SequenceMemory):
         # softmax behavior (including NaNs on some implementations).
         has_allowed_key = allowed.any(dim=-1, keepdim=True)
         out = F.scaled_dot_product_attention(q, keys, values, attn_mask=allowed)
+        if self._collect_memory_usage:
+            self._record_usage_scalar("kv_history_tokens", keys.shape[-2])
+            query_count = min(q.shape[-2], 16)
+            query_indices = torch.linspace(
+                0, max(q.shape[-2] - 1, 0), steps=query_count, device=q.device
+            ).round().long().unique()
+            diagnostic_q = q.index_select(-2, query_indices).float()
+            diagnostic_allowed = allowed.index_select(-2, query_indices)
+            scores = torch.matmul(diagnostic_q, keys.float().transpose(-2, -1))
+            scores.mul_(self.key_size**-0.5)
+            scores.masked_fill_(~diagnostic_allowed, torch.finfo(scores.dtype).min)
+            probabilities = torch.softmax(scores, dim=-1)
+            probabilities = torch.where(
+                diagnostic_allowed, probabilities, torch.zeros_like(probabilities)
+            )
+            probabilities = probabilities / probabilities.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+            entropy = -(probabilities * probabilities.clamp_min(1e-12).log()).sum(dim=-1)
+            self._record_head_usage("kv_attention_entropy", entropy)
+            self._record_head_usage("kv_attention_max_weight", probabilities.amax(dim=-1))
+            position_mass = probabilities.sum(dim=(0, 2))
+            position_mass = position_mass / position_mass.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+            bins = min(16, keys.shape[-2])
+            if bins:
+                positions = torch.arange(keys.shape[-2], device=keys.device)
+                bin_indices = torch.div(positions * bins, keys.shape[-2], rounding_mode="floor")
+                bin_mass = torch.zeros(
+                    self.heads, bins, device=keys.device, dtype=position_mass.dtype
+                ).scatter_add_(1, bin_indices.expand(self.heads, -1), position_mass)
+                for head in range(self.heads):
+                    for index in range(bins):
+                        self._record_usage_scalar(
+                            f"kv_head_{head}_relative_position_bin_{index:02d}_mass",
+                            bin_mass[head, index],
+                        )
         return torch.where(has_allowed_key, out, torch.zeros_like(out))
 
     def step(self, h_t: torch.Tensor, state=None, lag: int = 1):
@@ -341,5 +472,11 @@ class CausalKVMemory(SequenceMemory):
         allowed = key_positions <= positions if lag == 0 else key_positions < positions
         allowed = allowed[None, None, :, :].expand(b, 1, -1, -1)
         reads = self._attention(q, keys, values, allowed)
+        if self._collect_memory_usage:
+            self._record_head_usage("kv_key_rms", keys.square().mean(dim=(-1, -2)).sqrt())
+            self._record_head_usage("kv_value_rms", values.square().mean(dim=(-1, -2)).sqrt())
+            self._record_head_usage(
+                "kv_read_rms", reads.square().mean(dim=(-1, -2)).sqrt()
+            )
         reads = reads.transpose(1, 2).reshape(b, t, -1)
         return self.output(reads), KVState(keys, values), {}

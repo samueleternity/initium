@@ -243,6 +243,113 @@ def _restore_rng_state(state):
         torch.cuda.set_rng_state_all(state["torch_cuda"])
 
 
+@contextmanager
+def _shuffle_memory_reads_across_batch(model):
+    """Rotate each memory module's read output across batch rows temporarily.
+
+    Forward hooks keep this intervention independent of the memory API:
+    DNC returns (read, state), while sequence memories return
+    (read_sequence, state, aux). Memory state itself remains unshuffled.
+    """
+    handles = []
+    seen = set()
+
+    def shuffle_read(_module, _inputs, output):
+        if not isinstance(output, tuple) or not output or not torch.is_tensor(output[0]):
+            return output
+        read = output[0]
+        if read.ndim == 0 or read.shape[0] < 2:
+            return output
+        return (torch.roll(read, shifts=1, dims=0), *output[1:])
+
+    for memory in getattr(model, "memories", ()):
+        if isinstance(memory, nn.Module) and id(memory) not in seen:
+            seen.add(id(memory))
+            handles.append(memory.register_forward_hook(shuffle_read))
+    if not handles:
+        raise RuntimeError("memory-read shuffle requested but model exposes no memory modules")
+    try:
+        yield
+    finally:
+        for handle in handles:
+            handle.remove()
+
+
+def _attach_memory_usage_hooks(model):
+    """Capture a small common usage profile for every memory implementation."""
+    handles = []
+    stats: dict[str, Any] = {"scalars": {}, "cell_read": {}, "cell_write": {}}
+    seen = set()
+
+    def add_scalar(name, value):
+        value = value.detach().float().mean()
+        total, count = stats["scalars"].get(name, (None, 0))
+        stats["scalars"][name] = (value if total is None else total + value, count + 1)
+
+    def hook_for(index):
+        def collect(_module, _inputs, output):
+            if not isinstance(output, tuple) or not output or not torch.is_tensor(output[0]):
+                return
+            read = output[0].detach().float()
+            add_scalar(f"memory_{index}_read_rms", read.square().mean().sqrt())
+            if len(output) < 2 or not isinstance(output[1], dict):
+                return
+            hidden = output[1]
+            memory = hidden.get("memory")
+            usage = hidden.get("usage_vector")
+            read_weights = hidden.get("read_weights")
+            write_weights = hidden.get("write_weights")
+            if torch.is_tensor(memory):
+                add_scalar(f"memory_{index}_cell_count", memory.shape[1])
+                add_scalar(f"memory_{index}_state_rms", memory.square().mean().sqrt())
+                cell_norm = memory.detach().float().square().mean(dim=(0, 2)).sqrt()
+                add_scalar(f"memory_{index}_active_cell_fraction", (cell_norm > 1e-8).float())
+            if torch.is_tensor(usage):
+                add_scalar(f"memory_{index}_usage_mean", usage)
+                add_scalar(
+                    f"memory_{index}_usage_active_fraction", (usage > 1e-6).float()
+                )
+            for key, weights, dims in (
+                ("cell_read", read_weights, (0, 1)),
+                ("cell_write", write_weights, (0, 1)),
+            ):
+                if not torch.is_tensor(weights) or weights.ndim < 2:
+                    continue
+                mass = weights.detach().float().sum(dim=dims)
+                collection = stats[key]
+                collection[index] = mass if index not in collection else collection[index] + mass
+
+        return collect
+
+    for index, memory in enumerate(getattr(model, "memories", ())):
+        if isinstance(memory, nn.Module) and id(memory) not in seen:
+            seen.add(id(memory))
+            handles.append(memory.register_forward_hook(hook_for(index)))
+    return handles, stats
+
+
+def _finish_memory_usage_hooks(handles, stats):
+    for handle in handles:
+        handle.remove()
+    result = {}
+    for name, (total, count) in stats["scalars"].items():
+        result[f"{name}_mean"] = float((total / max(count, 1)).cpu().item())
+    for kind in ("cell_read", "cell_write"):
+        for index, mass in stats[kind].items():
+            distribution = mass / mass.sum().clamp_min(1e-12)
+            if distribution.numel() == 0:
+                continue
+            most = int(distribution.argmax().item())
+            least = int(distribution.argmin().item())
+            prefix = f"memory_{index}_{kind}"
+            result[f"{prefix}_most_used_index"] = float(most)
+            result[f"{prefix}_most_used_fraction"] = float(distribution[most].item())
+            result[f"{prefix}_least_used_index"] = float(least)
+            result[f"{prefix}_least_used_fraction"] = float(distribution[least].item())
+            result[f"{prefix}_active_fraction"] = float((distribution > 0).float().mean().item())
+    return result
+
+
 def _report_first_nonfinite_gradient(named_parameters, step):
     """Identify the first parameter whose unscaled gradient is non-finite."""
     for name, parameter in named_parameters:
@@ -1067,6 +1174,11 @@ def run(
     has_dnc = (
         not split_graph_backbone_only and sgr_phase2_arm is None and memory_type == "dnc"
     )
+    has_memory = (
+        not split_graph_backbone_only
+        and sgr_phase2_arm is None
+        and memory_type in {"dnc", "kv", "delta"}
+    )
     periodic_ood_episodes = OOD_EVAL_EPISODES_PERIODIC
     final_ood_episodes = OOD_EVAL_EPISODES
     INPUT_DIM, TRIPLE_DIM = dataset.input_dim, dataset.output_dim
@@ -1400,23 +1512,54 @@ def run(
     # loss-only view can't see.
     mem_check_file: TextIO | None = None
     mem_check_writer: Any | None = None
-    if has_dnc:
+    if has_memory:
         mem_check_path = os.path.join(LOG_DIR, f"run_{run_id}_memory_dependency.csv")
+        mem_check_header = [
+            "step",
+            "lesson",
+            "memory_type",
+            "id_triple_acc",
+            "id_perfect_frac",
+            "ablated_triple_acc",
+            "ablated_perfect_frac",
+            "memory_dependency_triple",
+            "memory_dependency_perfect",
+            "shuffled_triple_acc",
+            "shuffled_perfect_frac",
+            "shuffle_dependency_triple",
+            "shuffle_dependency_perfect",
+        ]
+        if resuming and os.path.exists(mem_check_path):
+            with open(mem_check_path, newline="") as existing_file:
+                existing_header = next(csv.reader(existing_file), [])
+            if existing_header != mem_check_header:
+                mem_check_path = os.path.join(
+                    LOG_DIR, f"run_{run_id}_memory_dependency_v2.csv"
+                )
         mem_check_file = open(mem_check_path, "a" if resuming else "w", newline="")
         mem_check_writer = csv.writer(mem_check_file)
-        if not resuming:
-            mem_check_writer.writerow(
-                [
-                    "step",
-                    "lesson",
-                    "id_triple_acc",
-                    "id_perfect_frac",
-                    "ablated_triple_acc",
-                    "ablated_perfect_frac",
-                    "memory_dependency_triple",
-                    "memory_dependency_perfect",
-                ]
+        if not resuming or not os.path.exists(mem_check_path) or os.path.getsize(mem_check_path) == 0:
+            mem_check_writer.writerow(mem_check_header)
+
+    memory_usage_file: TextIO | None = None
+    memory_usage_writer: Any | None = None
+    if has_memory:
+        memory_usage_path = os.path.join(LOG_DIR, f"run_{run_id}_memory_usage.csv")
+        memory_usage_file = open(memory_usage_path, "a" if resuming else "w", newline="")
+        memory_usage_writer = csv.writer(memory_usage_file)
+        if not resuming or os.path.getsize(memory_usage_path) == 0:
+            memory_usage_writer.writerow(
+                ["step", "lesson", "eval_split", "memory_type", "metric", "value"]
             )
+
+    def write_memory_usage(step_value, lesson_value, eval_split, diagnostics):
+        if memory_usage_writer is None or memory_usage_file is None:
+            return
+        for metric, value in sorted(diagnostics.items()):
+            memory_usage_writer.writerow(
+                [step_value, lesson_value, eval_split, memory_type, metric, value]
+            )
+        memory_usage_file.flush()
 
     combiner_stage_log_path = os.path.join(LOG_DIR, f"run_{run_id}_combiner_stage_dependency.csv")
     combiner_stage_log_file = open(combiner_stage_log_path, "a" if resuming else "w", newline="")
@@ -4064,6 +4207,7 @@ def run(
         if step % EVAL_EVERY == 0:
             pre_advance_lesson = curriculum.lesson  # capture before maybe_advance can bump it
             id_stage_memory = rnn.memories[0]
+            id_usage_handles, id_usage_capture = _attach_memory_usage_hooks(rnn)
             if hasattr(id_stage_memory, "begin_stage_diagnostics"):
                 id_stage_memory.begin_stage_diagnostics()
             id_eval_rng_state = _capture_rng_state()
@@ -4094,6 +4238,8 @@ def run(
                 if hasattr(id_stage_memory, "finish_stage_diagnostics")
                 else {}
             )
+            id_stage_diagnostics.update(_finish_memory_usage_hooks(id_usage_handles, id_usage_capture))
+            write_memory_usage(step, pre_advance_lesson + 1, "id", id_stage_diagnostics)
             if (
                 has_dnc
                 and relational_probe_writer is not None
@@ -4174,6 +4320,7 @@ def run(
             ood_rng_state = ood_rng.getstate()
             ood_torch_rng = _capture_torch_rng()
             ood_stage_memory = rnn.memories[0]
+            ood_usage_handles, ood_usage_capture = _attach_memory_usage_hooks(rnn)
             if hasattr(ood_stage_memory, "begin_stage_diagnostics"):
                 ood_stage_memory.begin_stage_diagnostics()
             segment_diagnostics.set_channel("eval-ood")
@@ -4194,8 +4341,12 @@ def run(
                 if hasattr(ood_stage_memory, "finish_stage_diagnostics")
                 else {}
             )
+            ood_stage_diagnostics.update(
+                _finish_memory_usage_hooks(ood_usage_handles, ood_usage_capture)
+            )
+            write_memory_usage(step, curriculum.lesson + 1, "ood", ood_stage_diagnostics)
             ood_ablated_acc = None
-            if has_dnc and hasattr(dataset, "evaluate_ood_ablated"):
+            if has_memory and hasattr(dataset, "evaluate_ood_ablated"):
                 ood_ablated_rng = random.Random()
                 ood_ablated_rng.setstate(ood_rng_state)
                 segment_diagnostics.set_channel("eval-ood-memory-off")
@@ -4363,16 +4514,18 @@ def run(
             # whether the model actually used memory. Restore the post-ID
             # stream afterward so the paired evaluation consumes no extra
             # randomness from the run.
-            if not has_dnc:
+            if not has_memory:
                 print(
-                    f"[{run_id}] Step {step} DNC memory-dependency check: n/a "
-                    "(DNC is disabled for this split-graph run)."
+                    f"[{run_id}] Step {step} memory-dependency check: n/a "
+                    "(this model has no active memory module)."
                 )
             else:
                 rng_state_after_other_evaluations = _capture_rng_state()
-                _restore_rng_state(id_eval_rng_state)
-                segment_diagnostics.set_channel("eval-id-memory-off")
+                ablated_triple_acc = ablated_perfect_frac = None
+                shuffled_triple_acc = shuffled_perfect_frac = None
                 try:
+                    _restore_rng_state(id_eval_rng_state)
+                    segment_diagnostics.set_channel("eval-id-memory-off")
                     ablated_triple_acc, ablated_perfect_frac = dataset.evaluate_id_ablated(
                         rnn, device, curriculum, pre_advance_lesson
                     )
@@ -4383,29 +4536,79 @@ def run(
                             "id-memory-off",
                             dataset.last_eval_diagnostics,
                         )
+                    segment_diagnostics.emit("eval-id-memory-off")
+
+                    _restore_rng_state(id_eval_rng_state)
+                    segment_diagnostics.set_channel("eval-id-memory-shuffled")
+                    saved_lesson = curriculum.lesson
+                    saved_writers = {
+                        name: getattr(curriculum, name, None)
+                        for name in ("hop_log_writer", "field_log_writer")
+                    }
+                    try:
+                        curriculum.lesson = pre_advance_lesson
+                        for name in saved_writers:
+                            if hasattr(curriculum, name):
+                                setattr(curriculum, name, None)
+                        with _shuffle_memory_reads_across_batch(rnn):
+                            _, shuffled_triple_acc, shuffled_perfect_frac = (
+                                curriculum.maybe_advance(
+                                    rnn,
+                                    device,
+                                    step=step,
+                                    optimizer=optimizer,
+                                    allow_advance=False,
+                                )
+                            )
+                        if surprise_recall_logger is not None:
+                            surprise_recall_logger.write_evaluation(
+                                step,
+                                pre_advance_lesson + 1,
+                                "id-memory-shuffled",
+                                dataset.last_eval_diagnostics,
+                            )
+                    finally:
+                        curriculum.lesson = saved_lesson
+                        for name, value in saved_writers.items():
+                            if hasattr(curriculum, name):
+                                setattr(curriculum, name, value)
+                    segment_diagnostics.emit("eval-id-memory-shuffled")
                 finally:
                     _restore_rng_state(rng_state_after_other_evaluations)
-                segment_diagnostics.emit("eval-id-memory-off")
 
                 assert mem_check_writer is not None and mem_check_file is not None
                 mem_check_writer.writerow(
                     [
                         step,
                         pre_advance_lesson + 1,
+                        memory_type,
                         id_triple_acc,
                         id_perfect_frac,
                         ablated_triple_acc,
                         ablated_perfect_frac,
                         id_triple_acc - ablated_triple_acc,
                         id_perfect_frac - ablated_perfect_frac,
+                        shuffled_triple_acc,
+                        shuffled_perfect_frac,
+                        (
+                            id_triple_acc - shuffled_triple_acc
+                            if shuffled_triple_acc is not None
+                            else None
+                        ),
+                        (
+                            id_perfect_frac - shuffled_perfect_frac
+                            if shuffled_perfect_frac is not None
+                            else None
+                        ),
                     ]
                 )
                 mem_check_file.flush()
                 print(
-                    f"[{run_id}] Step {step} memory-dependency check: "
-                    f"ID (memory on) {id_triple_acc:.2f}% | ablated (memory off) "
-                    f"{ablated_triple_acc:.2f}% | dependency "
-                    f"{id_triple_acc - ablated_triple_acc:.2f}"
+                    f"[{run_id}] Step {step} memory-dependency check ({memory_type}): "
+                    f"on {id_triple_acc:.2f}% | off {ablated_triple_acc:.2f}% "
+                    f"(drop {id_triple_acc - ablated_triple_acc:.2f}) | "
+                    f"shuffled {shuffled_triple_acc:.2f}% "
+                    f"(drop {id_triple_acc - shuffled_triple_acc:.2f})"
                 )
 
             if combiner_stage_kinds is not None:
@@ -4513,6 +4716,7 @@ def run(
         kl_diag = {}
     print(f"\n[{run_id}] {completion_label}. Final evaluation on training-distribution lesson:")
     final_id_stage_memory = rnn.memories[0]
+    final_id_usage_handles, final_id_usage_capture = _attach_memory_usage_hooks(rnn)
     if isinstance(rnn, SplitGraphDNC) and rnn.workspace is not None:
         rnn.workspace.reset_bistable_diagnostics()
     if hasattr(final_id_stage_memory, "begin_stage_diagnostics"):
@@ -4545,6 +4749,10 @@ def run(
         if hasattr(final_id_stage_memory, "finish_stage_diagnostics")
         else {}
     )
+    final_id_stage_diagnostics.update(
+        _finish_memory_usage_hooks(final_id_usage_handles, final_id_usage_capture)
+    )
+    write_memory_usage(step, curriculum.lesson + 1, "final-id", final_id_stage_diagnostics)
     if (
         has_dnc
         and relational_probe_writer is not None
@@ -4570,6 +4778,7 @@ def run(
     final_ood_torch_rng = _capture_torch_rng()
     final_ood_field_log: dict[tuple[int, int], list[int]] = {}
     final_ood_stage_memory = rnn.memories[0]
+    final_ood_usage_handles, final_ood_usage_capture = _attach_memory_usage_hooks(rnn)
     if isinstance(rnn, SplitGraphDNC) and rnn.workspace is not None:
         rnn.workspace.reset_bistable_diagnostics()
     if hasattr(final_ood_stage_memory, "begin_stage_diagnostics"):
@@ -4594,6 +4803,10 @@ def run(
         if hasattr(final_ood_stage_memory, "finish_stage_diagnostics")
         else {}
     )
+    final_ood_stage_diagnostics.update(
+        _finish_memory_usage_hooks(final_ood_usage_handles, final_ood_usage_capture)
+    )
+    write_memory_usage(step, curriculum.lesson + 1, "final-ood", final_ood_stage_diagnostics)
 
     ood_offset_triple = id_triple_acc - ood_triple_acc
     ood_offset_perfect = id_perfect_frac - ood_perfect_frac
@@ -4703,7 +4916,7 @@ def run(
     )
     ood_log_file.flush()
     final_ood_ablated_acc = None
-    if has_dnc and hasattr(dataset, "evaluate_ood_ablated"):
+    if has_memory and hasattr(dataset, "evaluate_ood_ablated"):
         final_ood_ablated_rng = random.Random()
         final_ood_ablated_rng.setstate(final_ood_rng_state)
         segment_diagnostics.set_channel("eval-final-ood-memory-off")
@@ -4842,6 +5055,8 @@ def run(
     ogs_log_file.close()
     if mem_check_file is not None:
         mem_check_file.close()
+    if memory_usage_file is not None:
+        memory_usage_file.close()
     lesson_log_file.close()
     prior_log_file.close()
     field_log_file.close()  # v16

@@ -303,6 +303,8 @@ class MechanismMemory(Memory):
         self._stage_diagnostic_counts = {}
         self._stage_diagnostic_min = {}
         self._stage_diagnostic_max = {}
+        self._stage_cell_read_mass = None
+        self._stage_cell_write_mass = None
 
     def _record_stage_value(self, name: str, value: torch.Tensor) -> None:
         values = value.detach().float()
@@ -333,6 +335,25 @@ class MechanismMemory(Memory):
             result[f"{name}_min"] = float(self._stage_diagnostic_min[name].item())
             result[f"{name}_max"] = float(self._stage_diagnostic_max[name].item())
         result["diagnostic_steps"] = float(max(self._stage_diagnostic_counts.values(), default=0))
+        for name, mass in (
+            ("dnc_read_cell", self._stage_cell_read_mass),
+            ("dnc_write_cell", self._stage_cell_write_mass),
+        ):
+            if mass is None or mass.numel() == 0:
+                continue
+            distribution = mass / mass.sum().clamp_min(1e-12)
+            most = int(distribution.argmax().item())
+            least = int(distribution.argmin().item())
+            result[f"{name}_most_used_index"] = float(most)
+            result[f"{name}_most_used_fraction"] = float(distribution[most].item())
+            result[f"{name}_least_used_index"] = float(least)
+            result[f"{name}_least_used_fraction"] = float(distribution[least].item())
+            result[f"{name}_active_fraction"] = float((distribution > 0).float().mean().item())
+            result[f"{name}_usage_entropy"] = float(
+                -(distribution * distribution.clamp_min(1e-12).log()).sum().item()
+            )
+        self._stage_cell_read_mass = None
+        self._stage_cell_write_mass = None
         return result
 
     def set_backward_trace(self, enabled: bool, *, step: int | None = None) -> None:
@@ -538,6 +559,13 @@ class MechanismMemory(Memory):
         return raw
 
     def read_vectors(self, memory, read_weights):
+        if self._collect_stage_diagnostics:
+            cell_mass = read_weights.detach().float().sum(dim=(0, 1))
+            self._stage_cell_read_mass = (
+                cell_mass
+                if self._stage_cell_read_mass is None
+                else self._stage_cell_read_mass + cell_mass
+            )
         if self._backward_trace_enabled:
             self._memory_value_max = self._track_peak(self._memory_value_max, memory)
         vectors = super().read_vectors(memory, read_weights)
@@ -756,6 +784,13 @@ class MechanismMemory(Memory):
             write_gate,
             allocation_gate,
         )
+        if self._collect_stage_diagnostics:
+            cell_mass = hidden["write_weights"].detach().float().sum(dim=(0, 1))
+            self._stage_cell_write_mass = (
+                cell_mass
+                if self._stage_cell_write_mass is None
+                else self._stage_cell_write_mass + cell_mass
+            )
 
         # Exact online posterior mean/covariance update for each independently
         # modeled row: prior N(memory_i, variance_i I), observation

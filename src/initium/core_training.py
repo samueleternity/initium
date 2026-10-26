@@ -28,6 +28,7 @@ Version notes (core-level):
 """
 
 import csv
+import hashlib
 import math
 import os
 import random
@@ -159,6 +160,10 @@ from initium.data.graph_traversal.relational_probe import (
     score_probe_cases,
 )
 from initium.data.prepared_dataset import load_prepared_dataset, save_prepared_dataset
+from initium.data.common.causal_prediction import (
+    CausalInputPredictionHead,
+    masked_input_prediction_loss,
+)
 from initium.data.surprise_recall.next_token_prediction import (
     SurprisePredictionHead,
     evaluate_prediction_signals,
@@ -773,6 +778,20 @@ def restore_rng_state(rng_state):
         torch.cuda.set_rng_state_all(rng_state["cuda"])
 
 
+def _causal_prediction_loss(
+    predictions: torch.Tensor,
+    input_sequence: torch.Tensor,
+    decoder: nn.Module,
+    valid_mask: torch.Tensor,
+    stream_lengths: list[int] | None = None,
+) -> torch.Tensor:
+    if isinstance(decoder, CausalInputPredictionHead):
+        return masked_input_prediction_loss(predictions, input_sequence, valid_mask)
+    if stream_lengths is None:
+        raise ValueError("categorical next-token prediction requires stream_lengths")
+    return masked_next_token_loss(predictions, input_sequence, stream_lengths)
+
+
 def load_frozen_workspace_warm_start(
     rnn: nn.Module,
     output_proj: nn.Module,
@@ -904,6 +923,41 @@ def load_frozen_workspace_warm_start(
 # ==========================================
 #              TRAINING LOOP
 # ==========================================
+_MAX_RUN_ID_BYTES = 180
+
+
+def _filesystem_safe_run_id(run_id: str) -> str:
+    """Keep every artifact filename below common 255-byte component limits.
+
+    Preserve readable context from both ends (the architecture/config prefix
+    and the user-provided run suffix), and include a digest of the full ID so
+    distinct long configurations cannot silently collide after truncation.
+    """
+    if len(run_id.encode("utf-8")) <= _MAX_RUN_ID_BYTES:
+        return run_id
+
+    digest = hashlib.sha256(run_id.encode("utf-8")).hexdigest()[:12]
+    retained_bytes = (_MAX_RUN_ID_BYTES - len(digest) - 3) // 2
+
+    def keep_edge(value: str, limit: int, *, from_end: bool = False) -> str:
+        chars = reversed(value) if from_end else iter(value)
+        kept: list[str] = []
+        used = 0
+        for char in chars:
+            char_size = len(char.encode("utf-8"))
+            if used + char_size > limit:
+                break
+            kept.append(char)
+            used += char_size
+        if from_end:
+            kept.reverse()
+        return "".join(kept)
+
+    prefix = keep_edge(run_id, retained_bytes)
+    suffix = keep_edge(run_id, retained_bytes, from_end=True)
+    return f"{prefix}_h{digest}_{suffix}"
+
+
 def run(
     beta_target: float,
     run_id: str,
@@ -945,6 +999,7 @@ def run(
     split_graph_combiner_num_blocks: int = SPLIT_GRAPH_COMBINER_NUM_BLOCKS,
     workspace_enabled: bool = WORKSPACE_ENABLED,
     workspace_num_slots: int = WORKSPACE_NUM_SLOTS,
+    workspace_compile_recurrence: bool = False,
     workspace_no_selection: bool = WORKSPACE_NO_SELECTION,
     workspace_reset_each_step: bool = WORKSPACE_RESET_EACH_STEP,
     workspace_train_mode: str = WORKSPACE_TRAIN_MODE,
@@ -1004,6 +1059,15 @@ def run(
     sgr_dnc_write_salience: bool = False,
     sgr_workspace_write_salience: bool = False,
 ):
+    original_run_id = run_id
+    run_id = _filesystem_safe_run_id(run_id)
+    if run_id != original_run_id:
+        print(
+            f"[run-id] shortened artifact identifier from "
+            f"{len(original_run_id.encode('utf-8'))} to "
+            f"{len(run_id.encode('utf-8'))} bytes "
+            "to stay within filesystem filename limits"
+        )
     if log_every <= 0:
         raise ValueError("log_every must be positive")
     if memory_type not in {"none", "dnc", "kv", "delta"}:
@@ -1014,6 +1078,16 @@ def run(
         raise ValueError("memory_position must be none or rope")
     if memory_position != "none" and memory_type != "kv":
         raise ValueError("memory_position is only supported by KV memory")
+    if workspace_compile_recurrence and (
+        not workspace_enabled
+        or workspace_num_slots < 1
+        or workspace_gate_variant != "continuous"
+        or workspace_no_selection
+    ):
+        raise ValueError(
+            "compiled workspace recurrence requires active slots, continuous gating, "
+            "and routed writes; bistable gating and random writes are unsupported"
+        )
     inter_layer_memory_enabled = (
         memory_inter_layer_read or memory_inter_layer_read_every_block
     )
@@ -1069,13 +1143,11 @@ def run(
     if not math.isfinite(sgr_prediction_loss_weight) or sgr_prediction_loss_weight < 0.0:
         raise ValueError("sgr_prediction_loss_weight must be finite and >= 0")
     if sgr_prediction_enabled:
-        if getattr(dataset, "name", None) != "surprise-recall":
-            raise ValueError("--sgr-pred-loss-weight requires --dataset-type surprise-recall")
         if not split_graph_enabled:
-            raise ValueError("Phase 1 prediction loss requires --split-graph backbone features")
+            raise ValueError("next-input prediction loss requires --split-graph backbone features")
         if (moe_enabled or workspace_enabled) and not sgr_phase4_enabled:
-            raise ValueError("Phase 1 signal isolation requires MoE and workspace to be disabled")
-        if sgr_prediction_eval_episodes < 1:
+            raise ValueError("prediction-signal isolation requires MoE and workspace to be disabled")
+        if getattr(dataset, "name", None) == "surprise-recall" and sgr_prediction_eval_episodes < 1:
             raise ValueError("sgr_prediction_eval_episodes must be positive")
     # Resolve the split-graph Mamba hyperparameters before model selection.
     # Phase 2 builds its dedicated backbone-only model in the first branch
@@ -1156,12 +1228,10 @@ def run(
                 "use split_graph_combiner_mode='linear'"
             )
     if sgr_phase4_enabled:
-        if getattr(dataset, "name", None) != "surprise-recall":
-            raise ValueError("Phase 4 error consumers require --dataset-type surprise-recall")
         if not split_graph_enabled or split_graph_variant != "mamba1" or split_graph_num_blocks < 2:
-            raise ValueError("Phase 4 SGR consumers require a split-graph Mamba-1 backbone")
+            raise ValueError("prediction-error consumers require split-graph Mamba-1 with at least two blocks")
         if not sgr_prediction_enabled:
-            raise ValueError("Phase 4 error consumers require --sgr-pred-loss-weight > 0")
+            raise ValueError("prediction-error consumers require --sgr-pred-loss-weight > 0")
         if sgr_dnc_write_salience and dnc_compile_memory:
             raise ValueError(
                 "DNC compiled-forward mode does not include the Phase 4 prediction-error path"
@@ -1192,6 +1262,10 @@ def run(
         not split_graph_backbone_only
         and sgr_phase2_arm is None
         and memory_type in {"dnc", "kv", "delta"}
+    )
+    stochastic_write_heads_enabled = bool(
+        (has_dnc and not (split_graph_enabled and dnc_write_variant == "kanerva-closed-form"))
+        or (has_memory and memory_type == "kv")
     )
     periodic_ood_episodes = OOD_EVAL_EPISODES_PERIODIC
     final_ood_episodes = OOD_EVAL_EPISODES
@@ -2079,6 +2153,7 @@ def run(
             sgr_workspace_salience_enabled=sgr_workspace_write_salience,
             workspace_enabled=workspace_enabled,
             workspace_num_slots=workspace_num_slots,
+            workspace_compile_recurrence=workspace_compile_recurrence,
             workspace_no_selection=workspace_no_selection,
             workspace_reset_each_step=workspace_reset_each_step,
             workspace_train_mode=workspace_train_mode,
@@ -2214,6 +2289,7 @@ def run(
                     (None, None, None),
                     reset_experience=True,
                     sequence_valid_mask=sequence_valid_mask,
+                    prediction_valid_mask=prediction_valid_mask,
                     timespans=timespans,
                     return_backbone_features=sgr_prediction_decoder is not None,
                 )
@@ -2229,10 +2305,12 @@ def run(
                     assert isinstance(replay_features, torch.Tensor)
                     replay_prediction_logits = sgr_prediction_decoder(replay_features[:, :-1])
                     trace.observe("sgr_prediction.logits", replay_prediction_logits)
-                    replay_prediction_loss = masked_next_token_loss(
+                    replay_prediction_loss = _causal_prediction_loss(
                         replay_prediction_logits,
                         input_seq,
-                        dataset.last_stream_lengths,
+                        sgr_prediction_decoder,
+                        prediction_valid_mask,
+                        dataset_stream_lengths,
                     )
                     trace.observe("sgr_prediction.loss", replay_prediction_loss)
             trace.finish_error_replay(step)
@@ -2305,6 +2383,7 @@ def run(
                 f"[{run_id}] WORKSPACE {'active' if workspace_active else 'bypassed'} | "
                 f"slots={workspace_num_slots} | write_selection={write_mode} | "
                 f"persistence={persistence} | train_mode={workspace_train_mode} | "
+                f"recurrence_kernel={'torch.compile' if workspace_compile_recurrence else 'eager'} | "
                 f"gate={workspace_gate_variant} | "
                 f"bistable_gradient={workspace_bistable_gradient_mode} | "
                 f"workspace_bptt_horizon={workspace_bptt_horizon or 'full'} | "
@@ -2358,12 +2437,21 @@ def run(
         "split_graph_combiner_cfc_multi_source_moe": split_graph_combiner_cfc_multi_source_moe,
         "split_graph_backbone_only": split_graph_backbone_only,
         "dnc_enabled": has_dnc,
+        "stochastic_write_heads_enabled": stochastic_write_heads_enabled,
         "sgr_phase2_arm": sgr_phase2_arm,
         "sgr_phase2_signal": sgr_phase2_signal if sgr_phase2_arm is not None else None,
         "sgr_gate_eval_override": sgr_gate_eval_override if sgr_phase2_arm is not None else None,
         "sgr_phase4_dnc_write_salience": bool(sgr_dnc_write_salience),
         "sgr_phase4_workspace_write_salience": bool(sgr_workspace_write_salience),
-        "sgr_prediction_error_signal": sgr_phase2_signal if sgr_prediction_enabled else None,
+        "sgr_prediction_error_signal": (
+            None
+            if not sgr_prediction_enabled
+            else (
+                "normalized-input-error"
+                if getattr(dataset, "name", None) != "surprise-recall"
+                else sgr_phase2_signal
+            )
+        ),
         "split_graph_moe_placement": split_graph_moe_placement,
         "split_graph_moe_backbone_block_isolation": split_graph_moe_backbone_block_isolation,
         "split_graph_moe_backbone_residual_scale": split_graph_moe_backbone_residual_scale,
@@ -2381,6 +2469,7 @@ def run(
         "batch_size": batch_size,
         "workspace_enabled": workspace_enabled,
         "workspace_num_slots": workspace_num_slots,
+        "workspace_compile_recurrence": workspace_compile_recurrence,
         "workspace_no_selection": workspace_no_selection,
         "workspace_reset_each_step": workspace_reset_each_step,
         "workspace_train_mode": workspace_train_mode,
@@ -2401,6 +2490,12 @@ def run(
     if sgr_prediction_enabled:
         extra_model_config["sgr_prediction_decoder_enabled"] = True
         extra_model_config["sgr_prediction_loss_weight"] = float(sgr_prediction_loss_weight)
+        extra_model_config["sgr_prediction_decoder_objective"] = (
+            "categorical-next-token"
+            if getattr(dataset, "name", None) == "surprise-recall"
+            else "normalized-input-vector"
+        )
+        extra_model_config["sgr_prediction_decoder_input_size"] = int(dataset.input_dim)
     controller_model_config: dict[str, Any] = {}
     if controller == "mamba":
         controller_model_config = {
@@ -2516,7 +2611,11 @@ def run(
     ).to(device)
     dataset.set_output_proj(output_proj)
     sgr_prediction_decoder = (
-        SurprisePredictionHead(hidden_size, INPUT_DIM).to(device)
+        (
+            SurprisePredictionHead(hidden_size, INPUT_DIM)
+            if getattr(dataset, "name", None) == "surprise-recall"
+            else CausalInputPredictionHead(hidden_size, int(dataset.input_dim))
+        ).to(device)
         if sgr_prediction_enabled
         else None
     )
@@ -2684,19 +2783,17 @@ def run(
             f"raw_gradients[{gradient_debug or 'unavailable'}]"
         )
 
-    # Install the stochastic write head(s) BEFORE building the
-    # optimizer, so their parameters (mu_transform, logvar_transform) are
-    # included in optimizer.parameters(). mu_transform is initialized from
-    # the original deterministic write_vector_transform's weights, so at
-    # step 0 the sampled mean exactly matches Phase 0's write vector.
-    # sample=True for all beta in BETAS_TO_SWEEP now that beta=0 is dropped
-    # from the sweep (see header note) -- beta_target is always > 0.0 here.
-    if not has_dnc:
+    # Install Gaussian write heads BEFORE building the optimizer, so their
+    # parameters are included in optimizer.parameters(). For KV, the head
+    # replaces only the stored-value projection; queries and keys remain
+    # deterministic. Its mean starts from the original Linear, and beta=0
+    # keeps sampling disabled for the deterministic control.
+    if not stochastic_write_heads_enabled:
         # Phase 2's dedicated backbone-only model has no DNC Memory modules;
-        # the general split-graph backbone-only mode is identical in this
-        # respect. Keep the shared training/checkpoint code's head list empty.
+        # the general split-graph backbone-only and delta-memory paths also
+        # keep the shared training/checkpoint code's head list empty.
         stochastic_heads: list[Any] = []
-    elif split_graph_enabled and dnc_write_variant == "kanerva-closed-form":
+    elif has_dnc and split_graph_enabled and dnc_write_variant == "kanerva-closed-form":
         # The Bayesian update consumes a deterministic observation from the
         # DNC write-value projection. Sampling a stochastic write head here
         # would make uncertainty sampling a second, confounded write change.
@@ -2789,9 +2886,11 @@ def run(
         else:
             decoder_phase_label = "Phase 1"
         print(
-            f"[{run_id}] SGR {decoder_phase_label} decoder enabled | "
+            f"[{run_id}] causal prediction {decoder_phase_label} decoder enabled | "
             "pred_loss_weight="
-            f"{sgr_prediction_loss_weight:g} | signal source=causal backbone features"
+            f"{sgr_prediction_loss_weight:g} | objective="
+            f"{'categorical next-token' if isinstance(sgr_prediction_decoder, SurprisePredictionHead) else 'normalized input-vector prediction'} "
+            "| signal source=causal backbone features"
         )
     if sgr_phase4_enabled:
         consumers = []
@@ -3270,6 +3369,17 @@ def run(
         answer_mask = answer_mask.to(device, non_blocking=True)
         if timespans is not None:
             timespans = timespans.to(device, non_blocking=True)
+        # The auxiliary head predicts only observed input vectors; task labels
+        # are never part of its target. Nonzero input rows are the generic
+        # padding contract, independent of dataset-specific answer masks.
+        prediction_valid_mask = input_seq.ne(0).any(dim=-1)
+        dataset_stream_lengths = getattr(dataset, "last_stream_lengths", None)
+        if dataset_stream_lengths is not None:
+            stream_positions = torch.arange(input_seq.shape[1], device=device).unsqueeze(0)
+            stream_lengths_tensor = torch.as_tensor(
+                dataset_stream_lengths, device=device
+            ).unsqueeze(1)
+            prediction_valid_mask &= stream_positions < stream_lengths_tensor
         # The Phase 2 backbone-only route does not enter the split-graph DNC
         # branch below, where this diagnostic mask is normally initialized.
         # Keep it defined for all architectures so failure tracing cannot
@@ -3331,12 +3441,17 @@ def run(
                             hidden,
                             reset_experience=True,
                             sequence_valid_mask=sequence_valid_mask,
+                            prediction_valid_mask=prediction_valid_mask,
                             timespans=timespans,
                             return_backbone_features=True,
                             return_prediction_logits=True,
                         )
-                        prediction_loss = masked_next_token_loss(
-                            prediction_logits, input_seq, dataset.last_stream_lengths
+                        prediction_loss = _causal_prediction_loss(
+                            prediction_logits,
+                            input_seq,
+                            sgr_prediction_decoder,
+                            prediction_valid_mask,
+                            dataset_stream_lengths,
                         )
                     else:
                         output, hidden, backbone_features = rnn(
@@ -3424,10 +3539,12 @@ def run(
                 and not sgr_phase4_enabled
             ):
                 prediction_logits = sgr_prediction_decoder(backbone_features[:, :-1])
-                prediction_loss = masked_next_token_loss(
+                prediction_loss = _causal_prediction_loss(
                     prediction_logits,
                     input_seq,
-                    dataset.last_stream_lengths,
+                    sgr_prediction_decoder,
+                    prediction_valid_mask,
+                    dataset_stream_lengths,
                 )
 
         if check_finite_this_step and not _first_nonfinite_report(task_loss, "task_loss", step):
@@ -4346,7 +4463,7 @@ def run(
                 surprise_recall_logger.write_evaluation(
                     step, pre_advance_lesson + 1, "id", dataset.last_eval_diagnostics
                 )
-            if sgr_prediction_decoder is not None:
+            if isinstance(sgr_prediction_decoder, SurprisePredictionHead):
                 sgr_phase1_eval = evaluate_prediction_signals(
                     rnn.backbone,
                     sgr_prediction_decoder,
@@ -4876,7 +4993,7 @@ def run(
             step, curriculum.lesson + 1, "final-id", dataset.last_eval_diagnostics
         )
     final_sgr_phase1_eval = None
-    if sgr_prediction_decoder is not None:
+    if isinstance(sgr_prediction_decoder, SurprisePredictionHead):
         final_sgr_phase1_eval = evaluate_prediction_signals(
             rnn.backbone,
             sgr_prediction_decoder,
@@ -5489,6 +5606,16 @@ if __name__ == "__main__":
         help="Persistent workspace slot count (0 is the plumbing/bypass control).",
     )
     parser.add_argument(
+        "--workspace-compile-recurrence",
+        action="store_true",
+        help=(
+            "compile the causal workspace slot-update step with torch.compile/Inductor "
+            "for CUDA; preserves sequential updates and supports continuous routed writes, "
+            "reconsideration, and workspace write salience; does not support random-write "
+            "or bistable modes"
+        ),
+    )
+    parser.add_argument(
         "--workspace-no-selection",
         action="store_true",
         help="Control: use random, unweighted specialist writes instead of MoE-selected writes.",
@@ -5928,15 +6055,16 @@ if __name__ == "__main__":
         "--sgr-pred-loss-weight",
         type=float,
         default=0.0,
-        help="Enable the SGR next-token decoder with this auxiliary CE weight. "
-        "Requires --dataset-type surprise-recall and --split-graph.",
+        help="Enable the causal next-input predictor with this auxiliary-loss weight. "
+        "Uses a categorical objective for surprise-recall and scale-normalized "
+        "input prediction for other datasets; requires --split-graph.",
     )
     parser.add_argument(
         "--sgr-pred-eval-episodes",
         type=int,
         default=128,
         help="Fixed probe episodes per lesson for periodic active-lesson and final all-lesson "
-        "Phase 1 signal evaluation (default: 128).",
+        "Surprise Recall signal evaluation (default: 128).",
     )
     parser.add_argument(
         "--sgr-phase2-arm",
@@ -5954,12 +6082,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--sgr-dnc-write-salience",
         action="store_true",
-        help="Phase 4: add detached SGR prediction error to the DNC write-strength logits.",
+        help="Add detached causal input-prediction error to DNC write-strength logits.",
     )
     parser.add_argument(
         "--sgr-workspace-write-salience",
         action="store_true",
-        help="Phase 4: add detached SGR prediction error to the workspace write-gate logits; requires --workspace.",
+        help="Add detached causal input-prediction error to workspace write-gate logits; requires --workspace.",
     )
     parser.add_argument(
         "--sgr-gate-eval-override",
@@ -6232,20 +6360,16 @@ if __name__ == "__main__":
     if sgr_phase4_requested:
         if args.sgr_phase2_arm is not None:
             parser.error("Phase 2 arms cannot be combined with Phase 4 consumers or controls")
-        if args.dataset_type != "surprise-recall":
-            parser.error(
-                "Phase 4 prediction-error consumers require --dataset-type surprise-recall"
-            )
         if (
             not args.split_graph
             or args.split_graph_variant != "mamba1"
             or args.split_graph_num_blocks < 2
         ):
             parser.error(
-                "Phase 4 SGR consumers require split-graph Mamba-1 with at least two blocks"
+                "prediction-error consumers require split-graph Mamba-1 with at least two blocks"
             )
         if args.sgr_pred_loss_weight <= 0:
-            parser.error("Phase 4 SGR consumers require --sgr-pred-loss-weight > 0")
+            parser.error("prediction-error consumers require --sgr-pred-loss-weight > 0")
         if args.sgr_dnc_write_salience and args.dnc_compile_memory:
             parser.error(
                 "--dnc-compile-memory does not compile the Phase 4 prediction-error write path"
@@ -6313,6 +6437,16 @@ if __name__ == "__main__":
         parser.error("--workspace requires backbone MoE; use --moe-placement backbone or all")
     if args.workspace_num_slots < 0:
         parser.error("--workspace-num-slots must be >= 0")
+    if args.workspace_compile_recurrence and (
+        not args.workspace
+        or args.workspace_num_slots < 1
+        or args.workspace_gate_variant != "continuous"
+        or args.workspace_no_selection
+    ):
+        parser.error(
+            "--workspace-compile-recurrence requires --workspace with at least one slot, "
+            "continuous gate and routed writes; bistable gating and random writes are unsupported"
+        )
     if args.workspace_bptt_horizon < 0:
         parser.error("--workspace-bptt-horizon must be >= 0")
     if (
@@ -6406,6 +6540,7 @@ if __name__ == "__main__":
                 f"_dk{args.memory_dk}_dv{args.memory_dv}_lag{args.memory_read_lag}"
             )
             if args.memory_type == "kv":
+                run_id += "_gaussvalue"
                 run_id += f"_{args.memory_position}"
                 if args.memory_topk is not None:
                     run_id += f"_topk{args.memory_topk}"
@@ -6450,6 +6585,8 @@ if __name__ == "__main__":
                 run_id += f"_backbonerscale{args.moe_backbone_residual_scale:g}"
         if args.workspace:
             run_id += f"_workspace{args.workspace_num_slots}s_{args.workspace_train_mode}"
+            if args.workspace_compile_recurrence:
+                run_id += "_compiledrecurrence"
             if args.workspace_gate_variant != "continuous" or args.workspace_train_scope == "gate":
                 run_id += f"_gate{args.workspace_gate_variant}_{args.workspace_train_scope}"
             if args.workspace_gate_variant == "bistable":
@@ -6504,18 +6641,37 @@ if __name__ == "__main__":
             run_id = f"{run_id}_ds{args.dataset_type}"
         if args.sgr_pred_loss_weight > 0:
             pred_weight_tag = f"{args.sgr_pred_loss_weight:g}".replace(".", "p")
-            run_id += f"_sgrpred{pred_weight_tag}"
+            run_id += (
+                f"_sgrpred{pred_weight_tag}"
+                if args.dataset_type == "surprise-recall"
+                else f"_inputpred{pred_weight_tag}"
+            )
         if args.sgr_phase2_arm is not None:
             run_id += f"_sgrphase2-{args.sgr_phase2_arm}_{args.sgr_phase2_signal}"
             if args.sgr_gate_eval_override != "none":
                 run_id += f"_gateeval-{args.sgr_gate_eval_override}"
         if args.sgr_dnc_write_salience:
-            run_id += f"_sgrdncwrite-{args.sgr_phase2_signal}"
+            signal_tag = (
+                args.sgr_phase2_signal
+                if args.dataset_type == "surprise-recall"
+                else "input-relative"
+            )
+            run_id += f"_sgrdncwrite-{signal_tag}"
         if args.sgr_workspace_write_salience:
-            run_id += f"_sgrworkspacewrite-{args.sgr_phase2_signal}"
+            signal_tag = (
+                args.sgr_phase2_signal
+                if args.dataset_type == "surprise-recall"
+                else "input-relative"
+            )
+            run_id += f"_sgrworkspacewrite-{signal_tag}"
         if args.workspace_reconsideration_trigger.startswith("prediction_error"):
+            signal_tag = (
+                args.sgr_phase2_signal
+                if args.dataset_type == "surprise-recall"
+                else "input-relative"
+            )
             run_id += (
-                f"_sgrreconsider-{args.workspace_reconsideration_trigger}_{args.sgr_phase2_signal}"
+                f"_sgrreconsider-{args.workspace_reconsideration_trigger}_{signal_tag}"
             )
         if args.batch_size != BATCH_SIZE:
             run_id += f"_bs{args.batch_size}"
@@ -6563,6 +6719,7 @@ if __name__ == "__main__":
             split_graph_combiner_num_blocks=args.split_graph_combiner_num_blocks,
             workspace_enabled=args.workspace,
             workspace_num_slots=args.workspace_num_slots,
+            workspace_compile_recurrence=args.workspace_compile_recurrence,
             workspace_no_selection=args.workspace_no_selection,
             workspace_reset_each_step=args.workspace_reset_each_step,
             workspace_train_mode=args.workspace_train_mode,

@@ -289,11 +289,17 @@ class SegmentDiagnostics:
         self,
         record: dict[str, Any],
         prefix: str,
-        tensor: torch.Tensor,
+        tensor: torch.Tensor | None,
         *,
         location: tuple[int, int] | None = None,
         context: dict[str, torch.Tensor] | None = None,
     ) -> None:
+        # Compiled multi-output forwards can invoke a registered tensor hook
+        # with ``None`` when that output is unused by the loss. It carries no
+        # gradient statistics to record, and returning None from the hook
+        # preserves the original autograd behavior.
+        if tensor is None:
+            return
         value = tensor.detach().float().reshape(-1)
         finite = torch.isfinite(value)
         if (

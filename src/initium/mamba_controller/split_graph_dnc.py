@@ -116,7 +116,13 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from initium.data.surprise_recall.next_token_prediction import prediction_error_signal
+from initium.data.common.causal_prediction import (
+    CausalInputPredictionHead,
+    causal_input_prediction_error,
+)
+from initium.data.surprise_recall.next_token_prediction import (
+    prediction_error_signal,
+)
 from initium.LNN_controller.cfc_backbone_parallel import (
     build_parallel_backbone,
     collect_backbone_moe_layers,
@@ -238,6 +244,7 @@ class SplitGraphDNC(nn.Module):
         dnc_implementation: str = "base",
         workspace_enabled: bool = False,
         workspace_num_slots: int = 5,
+        workspace_compile_recurrence: bool = False,
         workspace_no_selection: bool = False,
         workspace_reset_each_step: bool = False,
         workspace_train_mode: str = "coadapted",
@@ -645,6 +652,22 @@ class SplitGraphDNC(nn.Module):
             self.output = None
         if workspace_num_slots < 0:
             raise ValueError("workspace_num_slots must be >= 0")
+        if workspace_compile_recurrence and (
+            not workspace_enabled or workspace_num_slots < 1
+        ):
+            raise ValueError(
+                "compiled workspace recurrence requires workspace_enabled=True "
+                "and workspace_num_slots >= 1"
+            )
+        if workspace_compile_recurrence and (
+            workspace_gate_variant != "continuous"
+            or workspace_no_selection
+        ):
+            raise ValueError(
+                "compiled workspace recurrence currently supports the continuous "
+                "gate with routed writes, reconsideration, and workspace write salience; "
+                "bistable gating and random writes are unsupported"
+            )
         # Build the optional module last so enabling it leaves the existing
         # backbone, combiner, DNC, and output-projection initializations and
         # subsequent global RNG stream intact for matched-seed controls.
@@ -665,6 +688,7 @@ class SplitGraphDNC(nn.Module):
                 reconsideration_surprise_threshold=(workspace_reconsideration_surprise_threshold),
                 reconsideration_trigger_mode=(workspace_reconsideration_trigger_mode),
                 prediction_error_salience_enabled=sgr_workspace_salience_enabled,
+                compile_recurrence=workspace_compile_recurrence,
             )
             if workspace_enabled and workspace_num_slots > 0
             else None
@@ -709,6 +733,7 @@ class SplitGraphDNC(nn.Module):
         combiner_skip_stages=None,
         start_step: int = 0,  # v20: resume the sequential loop mid-sequence (inference caching)
         sequence_valid_mask: torch.Tensor | None = None,
+        prediction_valid_mask: torch.Tensor | None = None,
         timespans: torch.Tensor | None = None,
         return_backbone_features: bool = False,
         return_prediction_logits: bool = False,
@@ -877,17 +902,29 @@ class SplitGraphDNC(nn.Module):
             nonlocal prediction_logits, prediction_error
             if sgr_decoder is None:
                 return
-            prediction_error, prediction_logits = prediction_error_signal(
-                features,
-                input,
-                sgr_decoder,
-                signal_mode=self.sgr_error_signal_mode,
-            )
+            if isinstance(sgr_decoder, CausalInputPredictionHead):
+                prediction_logits = sgr_decoder(features[:, :-1]).float()
+                valid_mask = prediction_valid_mask
+                if valid_mask is None:
+                    valid_mask = input.ne(0).any(dim=-1)
+                prediction_error = causal_input_prediction_error(
+                    prediction_logits, input, valid_mask
+                )
+                stream_mask = valid_mask.bool()
+            else:
+                prediction_error, prediction_logits = prediction_error_signal(
+                    features,
+                    input,
+                    sgr_decoder,
+                    signal_mode=self.sgr_error_signal_mode,
+                )
+                token_ids = input.argmax(dim=-1)
+                positions = torch.arange(input.shape[1], device=input.device).unsqueeze(0)
+                stream_lengths = torch.where(
+                    token_ids.eq(20), positions, input.shape[1]
+                ).amin(dim=1)
+                stream_mask = positions < stream_lengths.unsqueeze(1)
             detached_signal = prediction_error.detach()
-            token_ids = input.argmax(dim=-1)
-            positions = torch.arange(input.shape[1], device=input.device).unsqueeze(0)
-            stream_lengths = torch.where(token_ids.eq(20), positions, input.shape[1]).amin(dim=1)
-            stream_mask = positions < stream_lengths.unsqueeze(1)
             valid_signal = detached_signal[stream_mask]
             valid_count = stream_mask.sum().clamp_min(1)
             self.last_sgr_signal_diagnostics = {

@@ -1,13 +1,13 @@
 """
 file: stochastic_write_head_v2.py
-Phase 1 patch: stochastic (Gaussian) write vector for pytorch-dnc.
+Stochastic (Gaussian) memory writes for DNC and sequence-memory controllers.
 
 Design, per Phase 1 instructions:
   - Do NOT touch the controller, the write mechanism's addressing
     (content/allocation-based), or any other component.
   - The write head emits distribution parameters (mu_t, sigma_t) of a
     diagonal Gaussian q(v_t) = N(mu_t, diag(sigma_t^2)) instead of a
-    deterministic write vector.
+    deterministic write vector/value projection.
   - The value actually written to memory is sampled via the
     reparameterization trick: v_t = mu_t + sigma_t * eps, eps ~ N(0, I).
   - L_KL(t) = KL(q(v_t) || p0) is computed in closed form, using ONLY this
@@ -24,9 +24,11 @@ the write vector as:
     write_vector = self.write_vector_transform(interface_input)   # nn.Linear
 
 where `interface_input` is the same per-timestep tensor fed to every other
-head transform (read keys, erase vector, gates, ...). `write_vector_transform`
-is called with a single (BATCH, input_size) tensor and returns a single
-(BATCH, cell_size) tensor -- nothing more.
+head transform (read keys, erase vector, gates, ...). For sequence memories,
+the same Gaussian head replaces the stored-value projection. KV query/key
+projections remain deterministic: the value is the content written into the
+causal store, while the key continues to define deterministic addressing.
+Each projection returns the same tensor shape as its original Linear.
 
 StochasticWriteHead has the exact same call signature: forward(x) -> tensor
 of shape (BATCH, cell_size). We install it by literally replacing the
@@ -59,10 +61,11 @@ stay at their zero-init, i.e. N(0,I), reproducing Phase 1 bit-for-bit).
    roadmap's snapshot design exists to avoid). They are written to only by
    `update_prior_snapshot()`, under `torch.no_grad()`, on the training
    script's own periodic cadence -- never by `.backward()`.
-2. `forward()` now also accumulates a detached copy of every sampled write
-   v_t into `self._recent_writes` (only while `self.training and
-   self.sample`, matching the existing KL-accumulation guard). This is the
-   "recent writes" buffer `update_prior_snapshot()` fits mu_g/Sigma_g from.
+2. `forward()` also accumulates per-feature Welford moments for sampled write
+   vectors (only while `self.training and self.sample`, matching the existing
+   KL-accumulation guard). This bounded-memory statistic is what
+   `update_prior_snapshot()` fits mu_g/Sigma_g from; it handles variable batch
+   and sequence lengths without retaining full activation tensors.
 3. The per-write KL closed form is generalized from KL(q(v_t)||N(0,I)) to
    KL(q(v_t)||N(mu_g,Sigma_g)) -- reduces to the exact Phase 1 formula when
    mu_g=0, Sigma_g=I (the buffers' initial state), so this is a strict
@@ -74,7 +77,7 @@ stay at their zero-init, i.e. N(0,I), reproducing Phase 1 bit-for-bit).
    computation is the periodic snapshot update itself, isolated to
    `update_prior_snapshot()`.
 4. `update_prior_snapshot(step, ...)`: computes mu_g <- mean and Sigma_g
-   (diagonal) <- variance of the accumulated `_recent_writes` samples,
+   (diagonal) <- variance of the accumulated sampled write vectors,
    clamps the resulting log-variance to [min_logvar, max_logvar] as a
    numerical floor/ceiling (prevents a silent Sigma_g -> 0 collapse, which
    would not show up in the existing q(v_t) KL-collapse diagnostic at all,
@@ -108,9 +111,9 @@ import torch.nn as nn
 
 
 class StochasticWriteHead(nn.Module):
-    """Drop-in replacement for `Memory.write_vector_transform`.
+    """Drop-in Gaussian replacement for a memory write-value projection.
 
-    Emits a sampled write vector v_t = mu_t + sigma_t * eps (reparameterization
+    Emits a sampled write vector/value v_t = mu_t + sigma_t * eps (reparameterization
     trick) instead of a deterministic vector, and accumulates the closed-form
     per-timestep KL(q(v_t) || p0) -- p0 = N(0,I) in Phase 1, or the
     periodically-snapshotted N(prior_mu, diag(exp(prior_logvar))) once
@@ -121,8 +124,8 @@ class StochasticWriteHead(nn.Module):
     Parameters
     ----------
     in_features, out_features:
-        Same as the nn.Linear it replaces (in_features = Memory.input_size,
-        out_features = Memory.cell_size).
+        Same as the nn.Linear it replaces (DNC interface-to-cell projection,
+        or sequence-memory input-to-value projection).
     device:
         Passed through so the new parameters end up on the right device;
         mirrors Memory's own `.to(device)` handling.
@@ -171,7 +174,16 @@ class StochasticWriteHead(nn.Module):
         self.register_buffer("prior_mu", torch.zeros(out_features))
         self.register_buffer("prior_logvar", torch.zeros(out_features))
         self.last_snapshot_step: int = 0
-        self._recent_writes: list[torch.Tensor] = []  # detached v_t samples since last snapshot
+        # Welford sufficient statistics for detached sampled writes since the
+        # last prior snapshot. This keeps memory O(out_features), independent
+        # of sequence length and snapshot cadence.
+        self._recent_write_count = 0
+        self._recent_write_mean: torch.Tensor | None = None
+        self._recent_write_m2: torch.Tensor | None = None
+        # Retained as a compatibility hook for existing analysis/tests that
+        # seed controlled samples directly. The training forward path does not
+        # append sequence tensors here.
+        self._recent_writes: list[torch.Tensor] = []
 
         if device is not None and getattr(device, "type", None) == "cuda":
             self.to(device)
@@ -243,9 +255,38 @@ class StochasticWriteHead(nn.Module):
             # prior-snapshot fit. Detached -- this must never carry a graph
             # edge back into this step's backward pass; it is read only by
             # update_prior_snapshot(), itself always called under no_grad().
-            self._recent_writes.append(v.detach().float())
+            self._accumulate_recent_writes(v)
 
         return v
+
+    def _accumulate_recent_writes(self, values: torch.Tensor) -> None:
+        """Merge this call's sampled vectors into bounded-memory moments."""
+        samples = values.detach().reshape(-1, values.shape[-1]).float()
+        if samples.shape[0] == 0:
+            return
+
+        batch_count = samples.shape[0]
+        batch_mean = samples.mean(dim=0)
+        batch_m2 = (samples - batch_mean).square().sum(dim=0)
+        if self._recent_write_count == 0:
+            self._recent_write_count = batch_count
+            self._recent_write_mean = batch_mean
+            self._recent_write_m2 = batch_m2
+            return
+
+        assert self._recent_write_mean is not None and self._recent_write_m2 is not None
+        previous_count = self._recent_write_count
+        combined_count = previous_count + batch_count
+        delta = batch_mean - self._recent_write_mean
+        self._recent_write_mean = self._recent_write_mean + delta * (
+            batch_count / combined_count
+        )
+        self._recent_write_m2 = (
+            self._recent_write_m2
+            + batch_m2
+            + delta.square() * (previous_count * batch_count / combined_count)
+        )
+        self._recent_write_count = combined_count
 
     def pop_kl(self, free_bits: float = 0.0) -> tuple[torch.Tensor, dict]:
         """Consume and clear accumulated per-timestep KL terms.
@@ -316,8 +357,7 @@ class StochasticWriteHead(nn.Module):
         max_logvar: float = 6.0,
         eps: float = 1e-6,
     ) -> dict:
-        """Refit (prior_mu, prior_logvar) from the writes accumulated in
-        `self._recent_writes` since the last call, then clear that buffer.
+        """Refit (prior_mu, prior_logvar) from writes since the last call.
 
         This is the ONE place in this module where the prior's non-locality
         lives: it looks at (up to) every write since the last snapshot, not
@@ -338,22 +378,34 @@ class StochasticWriteHead(nn.Module):
 
         Returns a diagnostics dict (see snapshot_diagnostics()); additionally
         includes `n_samples`, the number of write-vector samples the fit was
-        computed from (0 if `_recent_writes` was empty, in which case the
+        computed from (0 if no writes were accumulated, in which case the
         previous snapshot is left unchanged and only `n_samples=0` is
         returned -- this can legitimately happen for e.g. sample=False heads,
         or a snapshot cadence shorter than one training step's writes).
         """
-        if not self._recent_writes:
+        # The legacy list is only populated by external callers; merge it into
+        # the same running moments so variable time dimensions are harmless.
+        if self._recent_writes:
+            legacy_samples = torch.cat(
+                [
+                    sample.detach().reshape(-1, sample.shape[-1]).float()
+                    for sample in self._recent_writes
+                ],
+                dim=0,
+            )
+            self._accumulate_recent_writes(legacy_samples)
+
+        if self._recent_write_count == 0:
             diag = self.snapshot_diagnostics()
             diag["n_samples"] = 0
             diag["raw_var_mean"] = diag["raw_var_max"] = diag["raw_hi_frac"] = 0.0
             return diag
 
         with torch.no_grad():
-            stacked = torch.cat(self._recent_writes, dim=0)  # (N, cell_size)
-            n_samples = stacked.shape[0]
-            new_mu = stacked.mean(dim=0)
-            new_var = stacked.var(dim=0, unbiased=False).clamp(min=eps)
+            n_samples = self._recent_write_count
+            assert self._recent_write_mean is not None and self._recent_write_m2 is not None
+            new_mu = self._recent_write_mean
+            new_var = (self._recent_write_m2 / n_samples).clamp(min=eps)
             raw_var_mean = new_var.mean().item()
             raw_var_max = new_var.max().item()
             raw_hi_frac = (new_var.log() > max_logvar).float().mean().item()
@@ -362,6 +414,9 @@ class StochasticWriteHead(nn.Module):
             self.prior_logvar.copy_(new_logvar)
 
         self.last_snapshot_step = step
+        self._recent_write_count = 0
+        self._recent_write_mean = None
+        self._recent_write_m2 = None
         self._recent_writes = []
 
         diag = self.snapshot_diagnostics()
@@ -375,7 +430,7 @@ class StochasticWriteHead(nn.Module):
         """Read-only summary of the current (prior_mu, prior_logvar)
         snapshot: ||mu_g||, diag(Sigma_g) mean/min/max, trace(Sigma_g), and
         the step it was last updated. Does not mutate anything, does not
-        touch `_recent_writes` -- safe to call from checkpointing or ad-hoc
+        touch pending write moments -- safe to call from checkpointing or ad-hoc
         logging without interfering with the next scheduled snapshot.
         """
         with torch.no_grad():

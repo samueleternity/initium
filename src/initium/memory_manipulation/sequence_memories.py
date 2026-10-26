@@ -320,7 +320,12 @@ class GatedDeltaMemory(SequenceMemory):
 
 
 class CausalKVMemory(SequenceMemory):
-    """Dense causal key/value memory using PyTorch scaled dot-product attention."""
+    """Dense causal KV memory using scaled dot-product attention.
+
+    Training may replace ``value`` with a Gaussian stochastic write head.
+    Keys remain deterministic so memory addressing is not sampled along with
+    stored content.
+    """
 
     def __init__(
         self,

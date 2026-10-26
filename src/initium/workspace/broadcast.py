@@ -7,6 +7,7 @@ which keeps resets explicit and makes continuation/checkpointing possible.
 from __future__ import annotations
 
 import math
+import warnings
 
 import torch
 import torch.nn as nn
@@ -40,12 +41,15 @@ class WorkspaceBroadcast(nn.Module):
         reconsideration_surprise_threshold: float = 0.5,
         reconsideration_trigger_mode: str = "innovation",
         prediction_error_salience_enabled: bool = False,
+        compile_recurrence: bool = False,
     ):
         super().__init__()
         if d_model < 1 or num_experts < 1:
             raise ValueError("d_model and num_experts must be positive")
         if num_slots < 0:
             raise ValueError("num_slots must be >= 0")
+        if compile_recurrence and num_slots == 0:
+            raise ValueError("compiled workspace recurrence requires at least one slot")
         if gate_variant not in ("continuous", "bistable"):
             raise ValueError("gate_variant must be 'continuous' or 'bistable'")
         if bptt_horizon < 0:
@@ -72,6 +76,10 @@ class WorkspaceBroadcast(nn.Module):
         self.reconsideration_surprise_threshold = float(reconsideration_surprise_threshold)
         self.reconsideration_trigger_mode = reconsideration_trigger_mode
         self.prediction_error_salience_enabled = bool(prediction_error_salience_enabled)
+        self.compile_recurrence = bool(compile_recurrence)
+        self._compiled_recurrence_step = None
+        self._compiled_recurrence_failed = False
+        self._compiled_fallback_warned = False
         self.query = nn.Linear(d_model, d_model, bias=False)
         self.key = nn.Linear(d_model, d_model, bias=False)
         self.value = nn.Linear(d_model, d_model, bias=False)
@@ -103,6 +111,186 @@ class WorkspaceBroadcast(nn.Module):
     def init_state(self, batch: int, *, device, dtype) -> torch.Tensor:
         return torch.zeros(batch, self.num_slots, self.d_model, device=device, dtype=dtype)
 
+    def _compiled_recurrence_step_impl(
+        self,
+        selected_deltas: torch.Tensor,
+        route_weights: torch.Tensor,
+        route_indices: torch.Tensor,
+        write_keys: torch.Tensor,
+        write_values: torch.Tensor,
+        read_queries: torch.Tensor,
+        state: torch.Tensor,
+        prediction_error: torch.Tensor,
+        reconsideration_error: torch.Tensor,
+        reconsideration_random_scores: torch.Tensor,
+    ):
+        """Pure tensor step suitable for torch.compile and autograd."""
+        scores = torch.einsum(
+            "bed,bsd->bes", write_keys.float(), self.query(state).float()
+        ) / math.sqrt(self.d_model)
+        attention = scores.softmax(dim=-1).to(selected_deltas.dtype)
+        weights = route_weights.float()
+        proposal = torch.einsum(
+            "be,bes,bed->bsd", weights, attention, write_values
+        )
+        mass = torch.einsum("be,bes->bs", weights, attention)
+        proposal = proposal / mass.unsqueeze(-1).clamp_min(1e-6)
+        update_logits = self.write_gate(torch.cat([state, proposal], dim=-1))
+        if self.prediction_error_to_write_gate is not None:
+            error_value = prediction_error.reshape(state.shape[0], 1).float().detach()
+            update_logits = update_logits + self.prediction_error_to_write_gate(
+                error_value
+            ).unsqueeze(1)
+        update = torch.sigmoid(update_logits)
+        has_writer = weights.sum(dim=-1, keepdim=True).unsqueeze(-1) > 0
+        update = update * has_writer.to(update.dtype)
+        reconsideration_diagnostics = ()
+        if self.reconsideration_enabled:
+            old_probe = state.detach().float()
+            # Spell norms as primitive reductions instead of linalg.vector_norm.
+            # Some Colab Triton/Inductor runtimes fail lowering a fused kernel
+            # containing vector_norm (PassManager::run failed).
+            old_norm_sq = old_probe.square().sum(dim=-1)
+            eligible = (old_norm_sq > 1e-12) & has_writer.squeeze(-1).squeeze(-1).unsqueeze(-1)
+            if self.reconsideration_trigger_mode in (
+                "prediction_error",
+                "prediction_error_random_rate_matched",
+            ):
+                signal = reconsideration_error.reshape(state.shape[0], 1).float()
+                surprise = signal.detach().clamp(0.0, 1.0).expand_as(eligible)
+            else:
+                proposal_probe = proposal.detach().float()
+                old_norm = old_norm_sq.sqrt()
+                proposal_norm = proposal_probe.square().sum(dim=-1).sqrt()
+                innovation = (proposal_probe - old_probe).square().sum(dim=-1).sqrt()
+                surprise = innovation / (old_norm + proposal_norm).clamp_min(1e-6)
+            innovation_trigger = eligible & (
+                surprise >= self.reconsideration_surprise_threshold
+            )
+            if self.reconsideration_trigger_mode in (
+                "random_rate_matched",
+                "prediction_error_random_rate_matched",
+            ):
+                eligible_flat = eligible.reshape(-1)
+                random_scores_flat = reconsideration_random_scores.reshape(-1).masked_fill(
+                    ~eligible_flat, -1.0
+                )
+                order = torch.argsort(random_scores_flat, descending=True)
+                ranks = torch.empty_like(order)
+                ranks.scatter_(0, order, torch.arange(order.numel(), device=order.device))
+                target_count = innovation_trigger.sum()
+                reconsideration_trigger = eligible & (
+                    ranks.reshape_as(eligible) < target_count
+                )
+            else:
+                reconsideration_trigger = innovation_trigger
+            update = torch.where(
+                reconsideration_trigger.unsqueeze(-1),
+                torch.ones_like(update),
+                update,
+            )
+        else:
+            reconsideration_trigger = None
+        next_state = update.mul(proposal).add((1.0 - update).mul(state))
+
+        if self.reconsideration_enabled and self.diagnostics_enabled:
+            eligible_count_raw = eligible.sum().float()
+            eligible_count = eligible_count_raw.clamp_min(1.0)
+            triggered_count = reconsideration_trigger.sum()
+            change = (next_state - state).float()
+            actual_change = change.square().sum(dim=-1).sqrt()
+            changed_count = (reconsideration_trigger & (actual_change > 1e-6)).sum().float()
+            state_delta_sq_sum = (actual_change * reconsideration_trigger).square().sum()
+            reconsideration_diagnostics = (
+                eligible.float().mean().detach(),
+                eligible_count_raw.detach(),
+                triggered_count.float().detach(),
+                ((surprise * eligible).sum() / eligible_count).detach(),
+                (triggered_count.float() / eligible_count).detach(),
+                ((surprise * eligible).sum() / eligible_count).detach(),
+                (changed_count / triggered_count.float().clamp_min(1.0)).detach(),
+                changed_count.detach(),
+                state_delta_sq_sum.detach(),
+                (state_delta_sq_sum / triggered_count.float().clamp_min(1.0)).sqrt().detach(),
+            )
+        prediction_error_diagnostics = ()
+        if self.prediction_error_to_write_gate is not None and self.diagnostics_enabled:
+            prediction_error_diagnostics = (
+                prediction_error.detach().float().mean(),
+                self.prediction_error_to_write_gate.weight.detach()
+                .float()
+                .square()
+                .mean()
+                .sqrt(),
+            )
+
+        read_scores = torch.einsum(
+            "bed,bsd->bes", read_queries.float(), self.key(next_state).float()
+        ) / math.sqrt(self.d_model)
+        read_weights = read_scores.softmax(dim=-1).to(selected_deltas.dtype)
+        read_values = self.value(next_state)
+        broadcast = torch.einsum("bes,bsd->bed", read_weights, read_values)
+        read_scale = torch.sigmoid(self.read_gate).to(selected_deltas.dtype)
+        output = (
+            (selected_deltas + read_scale * broadcast) * route_weights.unsqueeze(-1)
+        ).sum(dim=1)
+
+        if self.diagnostics_enabled:
+            write_mass = weights.sum(dim=-1).mean().detach()
+            active_write = (weights.sum(dim=-1) > 0).float().mean().detach()
+            write_gate_mean = update.detach().float().mean()
+            slot_rms = next_state.detach().float().square().mean().sqrt()
+            broadcast_rms = (
+                read_scale.detach().float() * broadcast.detach().float()
+            ).square().mean().sqrt()
+            specialist_rms = selected_deltas.detach().float().square().mean().sqrt()
+            writer_frequency = torch.zeros(
+                self.num_experts, device=route_indices.device, dtype=torch.float32
+            ).scatter_add_(
+                0,
+                route_indices.reshape(-1),
+                route_weights.detach().float().reshape(-1),
+            )
+            writer_frequency = writer_frequency / max(route_indices.shape[0], 1)
+            diagnostics = (
+                write_mass,
+                active_write,
+                write_gate_mean,
+                slot_rms,
+                broadcast_rms,
+                specialist_rms,
+                writer_frequency,
+            ) + reconsideration_diagnostics + prediction_error_diagnostics
+        else:
+            diagnostics = ()
+        return output, next_state, diagnostics
+
+    def _get_compiled_recurrence_step(self):
+        if self._compiled_recurrence_step is None:
+            compiler = getattr(torch, "compile", None)
+            if compiler is None:
+                raise RuntimeError(
+                    "--workspace-compile-recurrence requires PyTorch 2.4 or newer"
+                )
+            self._compiled_recurrence_step = compiler(
+                self._compiled_recurrence_step_impl,
+                # The compiled transition is called once per sequence token,
+                # and all calls retain autograd state until the sequence
+                # backward pass. CUDA-graph reduce-overhead mode is designed
+                # for completed invocation lifetimes and warns/falls back when
+                # many forwards are pending backward in this recurrence.
+                mode="default",
+                fullgraph=True,
+                dynamic=False,
+                # Respect the lightweight default path even if the Colab
+                # process has globally enabled max-autotune. This recurrence
+                # is a small per-token graph; exhaustive GEMM tuning adds
+                # compile-time work and can select unsupported Triton paths
+                # on the small SM-count GPUs commonly assigned by Colab.
+                options={"max_autotune": False},
+            )
+        return self._compiled_recurrence_step
+
     def forward_step(
         self,
         specialist_deltas: torch.Tensor,
@@ -118,6 +306,7 @@ class WorkspaceBroadcast(nn.Module):
         deterministic_gate: bool = False,
         prediction_error: torch.Tensor | None = None,
         reconsideration_error: torch.Tensor | None = None,
+        reconsideration_random_scores: torch.Tensor | None = None,
         selected_specialists_only: bool = False,
         projected_write_keys: torch.Tensor | None = None,
         projected_write_values: torch.Tensor | None = None,
@@ -140,6 +329,7 @@ class WorkspaceBroadcast(nn.Module):
                 deterministic_gate=deterministic_gate,
                 prediction_error=prediction_error,
                 reconsideration_error=reconsideration_error,
+                reconsideration_random_scores=reconsideration_random_scores,
                 selected_specialists_only=selected_specialists_only,
                 projected_write_keys=projected_write_keys,
                 projected_write_values=projected_write_values,
@@ -160,6 +350,7 @@ class WorkspaceBroadcast(nn.Module):
                     deterministic_gate=deterministic_gate,
                     prediction_error=prediction_error,
                     reconsideration_error=reconsideration_error,
+                    reconsideration_random_scores=reconsideration_random_scores,
                     selected_specialists_only=selected_specialists_only,
                     projected_write_keys=projected_write_keys,
                     projected_write_values=projected_write_values,
@@ -178,6 +369,7 @@ class WorkspaceBroadcast(nn.Module):
             deterministic_gate=deterministic_gate,
             prediction_error=prediction_error,
             reconsideration_error=reconsideration_error,
+            reconsideration_random_scores=reconsideration_random_scores,
             selected_specialists_only=selected_specialists_only,
             projected_write_keys=projected_write_keys,
             projected_write_values=projected_write_values,
@@ -199,6 +391,7 @@ class WorkspaceBroadcast(nn.Module):
         deterministic_gate: bool = False,
         prediction_error: torch.Tensor | None = None,
         reconsideration_error: torch.Tensor | None = None,
+        reconsideration_random_scores: torch.Tensor | None = None,
         selected_specialists_only: bool = False,
         projected_write_keys: torch.Tensor | None = None,
         projected_write_values: torch.Tensor | None = None,
@@ -329,7 +522,11 @@ class WorkspaceBroadcast(nn.Module):
             # Draw a fixed-shape random tape in both arms. This gives the
             # rate-matched null an independent choice among eligible slots while
             # keeping global RNG advancement aligned between matched runs.
-            random_scores = torch.rand_like(surprise)
+            random_scores = (
+                reconsideration_random_scores
+                if reconsideration_random_scores is not None
+                else torch.rand_like(surprise)
+            )
             if self.reconsideration_trigger_mode in (
                 "random_rate_matched",
                 "prediction_error_random_rate_matched",
@@ -522,22 +719,32 @@ class WorkspaceBroadcast(nn.Module):
         projected_write_keys = None
         projected_write_values = None
         projected_read_queries = None
+        time_major_deltas = None
+        time_major_route_indices = None
+        time_major_route_weights = None
         if self.num_slots > 0 and not self.write_gate_closed:
             # These projections depend only on this token's routed expert
             # outputs, so batch them over time before the causal slot loop.
             # The recurrence itself remains sequential and uses the exact
             # per-token state-dependent query, proposal, gate, and update.
+            # Use time-major contiguous tensors for recurrent slicing. The
+            # batch stride of ``x[:, step]`` depends on total sequence length;
+            # changing curriculum lengths would otherwise produce a new
+            # Dynamo stride guard/compiled variant for the same recurrence.
+            time_major_deltas = specialist_deltas.transpose(0, 1).contiguous()
+            time_major_route_indices = route_indices.transpose(0, 1).contiguous()
+            time_major_route_weights = route_weights.transpose(0, 1).contiguous()
             selected_deltas = (
-                specialist_deltas
+                time_major_deltas
                 if selected_specialists_only
-                else specialist_deltas.gather(
+                else time_major_deltas.gather(
                     2,
-                    route_indices.unsqueeze(-1).expand(
+                    time_major_route_indices.unsqueeze(-1).expand(
                         -1, -1, -1, self.d_model
                     ),
                 )
             )
-            write_candidates = specialist_deltas if no_selection else selected_deltas
+            write_candidates = time_major_deltas if no_selection else selected_deltas
             projection_context = (
                 torch.autocast(device_type="cuda", enabled=False)
                 if specialist_deltas.is_cuda
@@ -548,6 +755,60 @@ class WorkspaceBroadcast(nn.Module):
                 projected_write_values = self.value(write_candidates.float())
                 if not bypass_broadcast:
                     projected_read_queries = self.query(selected_deltas.float())
+        compiled_step = None
+        # The fused recurrence is a training optimization. Curriculum and
+        # periodic evaluations use variable/partial batch sizes, which would
+        # otherwise create new fullgraph specializations for each batch shape.
+        # Keep evaluation on the eager path; its state transition is identical.
+        if (
+            self.compile_recurrence
+            and self.training
+            and torch.is_grad_enabled()
+            and not self._compiled_recurrence_failed
+        ):
+            if not specialist_deltas.is_cuda:
+                raise RuntimeError(
+                    "--workspace-compile-recurrence requires a CUDA device"
+                )
+            if (
+                no_selection
+                or not selected_specialists_only
+                or self.bistable_gate is not None
+            ):
+                raise RuntimeError(
+                    "compiled workspace recurrence supports routed writes with the "
+                    "continuous gate, reconsideration, and prediction-error write salience; "
+                    "random-write and bistable modes require the eager path"
+                )
+            if (
+                self.reconsideration_enabled
+                and self.reconsideration_trigger_mode.startswith("prediction_error")
+                and prediction_error is None
+            ):
+                raise ValueError(
+                    "prediction-error reconsideration requires a per-step prediction_error"
+                )
+            if self.prediction_error_to_write_gate is not None and prediction_error is None:
+                raise ValueError("workspace prediction-error salience requires prediction_error")
+            if bypass_broadcast or self.write_gate_closed:
+                if not self._compiled_fallback_warned:
+                    warnings.warn(
+                        "compiled workspace recurrence is bypassed for this forward; "
+                        "using the eager workspace path",
+                        stacklevel=2,
+                    )
+                    self._compiled_fallback_warned = True
+            else:
+                compiled_step = self._get_compiled_recurrence_step()
+        compiled_zero_reconsideration_error = None
+        compiled_zero_reconsideration_scores = None
+        if compiled_step is not None:
+            compiled_zero_reconsideration_error = state.new_zeros(
+                (state.shape[0],), dtype=torch.float32
+            )
+            compiled_zero_reconsideration_scores = state.new_zeros(
+                state.shape[:2], dtype=torch.float32
+            )
         for step in range(specialist_deltas.shape[1]):
             # Truncate only the gradient carried by persistent slots. Detach
             # preserves the exact forward state and therefore the full write /
@@ -566,36 +827,197 @@ class WorkspaceBroadcast(nn.Module):
                     smoothed_prediction_error = (
                         decay * smoothed_prediction_error + (1.0 - decay) * current_error
                     )
-            out, state = self.forward_step(
-                specialist_deltas[:, step],
-                route_indices[:, step],
-                route_weights[:, step],
-                state,
-                no_selection=no_selection,
-                reset_each_step=reset_each_step,
-                bypass_broadcast=bypass_broadcast,
-                bistable_noise_scale=bistable_noise_scale,
-                bistable_selection_scale=bistable_selection_scale,
-                deterministic_gate=deterministic_gate,
-                prediction_error=step_prediction_error,
-                reconsideration_error=smoothed_prediction_error,
-                selected_specialists_only=selected_specialists_only,
-                projected_write_keys=(
-                    projected_write_keys[:, step]
-                    if projected_write_keys is not None
-                    else None
-                ),
-                projected_write_values=(
-                    projected_write_values[:, step]
-                    if projected_write_values is not None
-                    else None
-                ),
-                projected_read_queries=(
-                    projected_read_queries[:, step]
-                    if projected_read_queries is not None
-                    else None
-                ),
-            )
+            reconsideration_random_scores = None
+            if compiled_step is not None:
+                if reset_each_step:
+                    state = torch.zeros_like(state)
+                # The first workspace state is usually a fresh zero tensor
+                # with requires_grad=False; subsequent recurrent states
+                # require gradients through the slot update. Dynamo guards
+                # on this property and otherwise recompiles the fullgraph at
+                # the first transition (and after each BPTT detach/reset).
+                if self.training and torch.is_grad_enabled() and not state.requires_grad:
+                    state = state.detach().requires_grad_(True)
+                if self.reconsideration_enabled:
+                    # The eager path advances RNG once per token even for a
+                    # deterministic innovation trigger. Keep that draw outside
+                    # the graph and pass the random tape into the recurrence.
+                    reconsideration_random_scores = torch.rand_like(
+                        state[..., 0], memory_format=torch.contiguous_format
+                    )
+                else:
+                    reconsideration_random_scores = compiled_zero_reconsideration_scores
+                compiled_reconsideration_error = (
+                    smoothed_prediction_error
+                    if smoothed_prediction_error is not None
+                    else compiled_zero_reconsideration_error
+                )
+                compiled_prediction_error = (
+                    step_prediction_error
+                    if step_prediction_error is not None
+                    else compiled_zero_reconsideration_error
+                )
+                try:
+                    with torch.autocast(device_type="cuda", enabled=False):
+                        out, state, compiled_diagnostics = compiled_step(
+                            time_major_deltas[step].float(),
+                            time_major_route_weights[step].float(),
+                            time_major_route_indices[step],
+                            projected_write_keys[step].float(),
+                            projected_write_values[step].float(),
+                            projected_read_queries[step].float(),
+                            state.float(),
+                            compiled_prediction_error.float(),
+                            compiled_reconsideration_error.float(),
+                            reconsideration_random_scores,
+                        )
+                except Exception as exc:
+                    compile_error_names = {
+                        "BackendCompilerFailed",
+                        "InductorError",
+                        "SubprocException",
+                        "TritonError",
+                    }
+                    cause = exc
+                    is_compile_error = False
+                    while cause is not None:
+                        if type(cause).__name__ in compile_error_names:
+                            is_compile_error = True
+                            break
+                        cause = cause.__cause__ or cause.__context__
+                    if not is_compile_error:
+                        raise
+                    self._compiled_recurrence_failed = True
+                    self._compiled_recurrence_step = None
+                    compiled_step = None
+                    compiler_details = []
+                    cause = exc
+                    seen_exceptions = set()
+                    while cause is not None and id(cause) not in seen_exceptions:
+                        seen_exceptions.add(id(cause))
+                        message_lines = [
+                            line.strip()
+                            for line in str(cause).splitlines()
+                            if line.strip()
+                        ]
+                        diagnostic_lines = [
+                            line
+                            for line in message_lines
+                            if "Name=" in line
+                            or "RuntimeError:" in line
+                            or "error:" in line.lower()
+                        ]
+                        summary_lines = diagnostic_lines[-3:] or message_lines[-1:]
+                        detail = " | ".join(summary_lines)
+                        if detail:
+                            compiler_details.append(
+                                f"{type(cause).__name__}: {detail[:700]}"
+                            )
+                        cause = cause.__cause__ or cause.__context__
+                    detail_text = " <- ".join(compiler_details)
+                    warnings.warn(
+                        "torch.compile could not build the workspace recurrence "
+                        f"({type(exc).__name__}: {str(exc).splitlines()[0]}; "
+                        f"compiler chain: {detail_text or 'details unavailable'}). "
+                        "Disabling the compiled path for this model and continuing "
+                        "with the mathematically equivalent eager recurrence.",
+                        stacklevel=2,
+                    )
+            if compiled_step is None:
+                # A backend compile failure is safe to recover from here: the
+                # recurrence is pure, the parameters/state have not been
+                # mutated, and the same pre-drawn RNG tape is reused by eager.
+                out, state = self.forward_step(
+                    specialist_deltas[:, step],
+                    route_indices[:, step],
+                    route_weights[:, step],
+                    state,
+                    no_selection=no_selection,
+                    reset_each_step=reset_each_step,
+                    bypass_broadcast=bypass_broadcast,
+                    bistable_noise_scale=bistable_noise_scale,
+                    bistable_selection_scale=bistable_selection_scale,
+                    deterministic_gate=deterministic_gate,
+                    prediction_error=step_prediction_error,
+                    reconsideration_error=smoothed_prediction_error,
+                    reconsideration_random_scores=reconsideration_random_scores,
+                    selected_specialists_only=selected_specialists_only,
+                    projected_write_keys=(
+                        projected_write_keys[step]
+                        if projected_write_keys is not None
+                        else None
+                    ),
+                    projected_write_values=(
+                        projected_write_values[step]
+                        if projected_write_values is not None
+                        else None
+                    ),
+                    projected_read_queries=(
+                        projected_read_queries[step]
+                        if projected_read_queries is not None
+                        else None
+                    ),
+                )
+            else:
+                if self.diagnostics_enabled:
+                    (
+                        write_mass,
+                        active_write_frac,
+                        write_gate_mean,
+                        slot_rms,
+                        broadcast_rms,
+                        specialist_rms,
+                        writer_frequency,
+                    ) = compiled_diagnostics[:7]
+                    self._last_step_diag = {
+                        "write_mass": write_mass,
+                        "active_write_frac": active_write_frac,
+                        "write_gate_mean": write_gate_mean,
+                        "slot_rms": slot_rms,
+                        "broadcast_rms": broadcast_rms,
+                        "specialist_rms": specialist_rms,
+                        "writer_frequency": writer_frequency,
+                    }
+                    if self.reconsideration_enabled:
+                        (
+                            eligible_frac,
+                            eligible_count,
+                            trigger_count,
+                            surprise_mean,
+                            trigger_frac,
+                            prediction_error_mean,
+                            changed_frac,
+                            changed_count,
+                            state_delta_sq_sum,
+                            state_delta_rms,
+                        ) = compiled_diagnostics[7:]
+                        self._last_step_diag.update(
+                            {
+                                "reconsideration_eligible_frac": eligible_frac,
+                                "reconsideration_eligible_count": eligible_count,
+                                "reconsideration_trigger_count": trigger_count,
+                                "reconsideration_surprise_mean": surprise_mean,
+                                "reconsideration_trigger_frac": trigger_frac,
+                                "reconsideration_prediction_error_mean": prediction_error_mean,
+                                "reconsideration_changed_frac": changed_frac,
+                                "reconsideration_changed_count": changed_count,
+                                "reconsideration_state_delta_sq_sum": state_delta_sq_sum,
+                                "reconsideration_state_delta_rms": state_delta_rms,
+                            }
+                        )
+                    diagnostic_offset = 7 + (10 if self.reconsideration_enabled else 0)
+                    if self.prediction_error_to_write_gate is not None:
+                        error_mean, write_scale_rms = compiled_diagnostics[
+                            diagnostic_offset : diagnostic_offset + 2
+                        ]
+                        self._last_step_diag.update(
+                            {
+                                "prediction_error_mean": error_mean,
+                                "prediction_error_write_scale_rms": write_scale_rms,
+                            }
+                        )
+                else:
+                    self._last_step_diag = {}
             if state_observer is not None:
                 state_observer(state, call_index=step)
             outputs.append(out)

@@ -224,6 +224,7 @@ def _build_split_graph(c: _Cfg, input_dim, hidden, nr_cells, cell_size, read_hea
         ),
         workspace_enabled=c.get("workspace_enabled", cc.WORKSPACE_ENABLED),
         workspace_num_slots=c.get("workspace_num_slots", cc.WORKSPACE_NUM_SLOTS),
+        workspace_compile_recurrence=c.get("workspace_compile_recurrence", False),
         workspace_no_selection=c.get("workspace_no_selection", cc.WORKSPACE_NO_SELECTION),
         workspace_reset_each_step=c.get("workspace_reset_each_step", cc.WORKSPACE_RESET_EACH_STEP),
         workspace_train_mode=c.get("workspace_train_mode", cc.WORKSPACE_TRAIN_MODE),
@@ -283,9 +284,18 @@ def load_model(ckpt: dict, device: torch.device, deterministic_write: bool = Fal
     output_proj = nn.Linear(w.shape[1], w.shape[0]).to(device)
 
     beta = float(ckpt.get("beta_target", 0.0) or 0.0)
+    stochastic_heads_enabled = raw.get("stochastic_write_heads_enabled")
+    if stochastic_heads_enabled is None:
+        # Backward compatibility: pre-metadata DNC checkpoints installed the
+        # Gaussian head, while pre-KV-beta checkpoints did not. Do not infer
+        # KV stochasticity from beta alone.
+        stochastic_heads_enabled = (
+            raw.get("memory_type", "dnc") == "dnc"
+            and getattr(rnn, "dnc_enabled", True)
+        )
     heads = (
         install_stochastic_write_heads(rnn, device=device, sample=(beta > 0.0))
-        if getattr(rnn, "dnc_enabled", True) or getattr(rnn, "sequence_memory_enabled", False)
+        if stochastic_heads_enabled
         else []
     )
 

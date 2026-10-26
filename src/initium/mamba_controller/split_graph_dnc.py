@@ -278,8 +278,6 @@ class SplitGraphDNC(nn.Module):
             raise ValueError("inter-layer memory reads require KV or delta sequence memory")
         if memory_inter_layer_read and (mamba_variant != "mamba1" or num_backbone_blocks < 2):
             raise ValueError("inter-layer memory reads require at least two Mamba-1 backbone blocks")
-        if memory_inter_layer_read and workspace_enabled:
-            raise ValueError("inter-layer sequence memory is not yet supported with workspace")
         if memory_type == "kv" and memory_topk is not None and memory_topk <= 0:
             raise ValueError("memory_topk must be positive")
         if memory_position not in {"none", "rope"}:
@@ -768,8 +766,6 @@ class SplitGraphDNC(nn.Module):
             if eval_inter_layer_override is None
             else eval_inter_layer_override
         )
-        if inter_layer_memory_enabled and self.workspace is not None:
-            raise ValueError("inter-layer sequence memory is not yet supported with workspace")
         inter_layer_memory_read_done = False
         inter_layer_memory_state = None
         inter_layer_memory_read = None
@@ -876,9 +872,50 @@ class SplitGraphDNC(nn.Module):
             }
             if timespans is not None and getattr(final_stage, "supports_timespans", False):
                 specialist_kwargs["timespans"] = timespans
+            if inter_layer_memory_enabled:
+                if not self.sequence_memory_enabled or not callable(
+                    getattr(final_stage, "forward_with_specialists", None)
+                ):
+                    raise ValueError(
+                        "inter-layer workspace reads require KV/delta memory and a "
+                        "parallel backbone with workspace specialist support"
+                    )
+                inter_layer_memory_state = (
+                    mhx[0]
+                    if (
+                        not reset_experience
+                        and mhx is not None
+                        and len(mhx) > 0
+                        and mhx[0] is not None
+                    )
+                    else self.sequence_memory.reset_state(B, device=device)
+                )
+
+                def inject_workspace_inter_layer_read(features: torch.Tensor) -> torch.Tensor:
+                    nonlocal inter_layer_memory_state, inter_layer_memory_read
+                    memory_features = features[:, start_step:]
+                    if pass_through_memory:
+                        inter_layer_memory_read, inter_layer_memory_state, _aux = (
+                            self.sequence_memory(
+                                memory_features,
+                                state=inter_layer_memory_state,
+                                lag=self.memory_read_lag,
+                            )
+                        )
+                    else:
+                        inter_layer_memory_read = torch.zeros_like(memory_features)
+                    enriched = features.clone()
+                    enriched[:, start_step:] = (
+                        enriched[:, start_step:] + inter_layer_memory_read
+                    )
+                    return enriched
+
+                specialist_kwargs["inter_layer_read"] = inject_workspace_inter_layer_read
             base, specialists, route_indices, route_weights = forward_with_specialists(
                 stage_input, **specialist_kwargs
             )
+            if inter_layer_memory_enabled:
+                inter_layer_memory_read_done = True
             # Workspace mode bypasses MoEBlock's ordinary residual add, so
             # apply its configured residual scale to specialist candidates
             # before they are used for slot writes or workspace readback.

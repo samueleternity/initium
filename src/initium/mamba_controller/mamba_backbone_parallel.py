@@ -620,14 +620,18 @@ class MambaBackboneParallel(nn.Module):
         *,
         token_mask: torch.Tensor | None = None,
         intermediate_observer=None,
+        inter_layer_read=None,
     ):
         """Return final MoE candidates and sparse routes for workspace use.
 
-        Earlier backbone/MoE blocks remain unchanged. The final MoE block
-        exposes expert deltas before routing so the workspace can broadcast
-        context to every specialist, then reuse the original sparse route.
-        The split-graph caller applies this block's configured residual scale
-        to the combined routed and broadcast delta.
+        Earlier backbone/MoE blocks remain unchanged unless an explicit
+        ``inter_layer_read`` callback is supplied. In that case the callback
+        runs after block 0 and its MoE residual, before the next backbone
+        block. The final MoE block exposes expert deltas before routing so
+        the workspace can broadcast context to every specialist, then reuse
+        the original sparse route. The split-graph caller applies this
+        block's configured residual scale to the combined routed and
+        broadcast delta.
         """
         if not self.moe_enabled or self.moe_blocks is None:
             raise RuntimeError("workspace broadcast requires an enabled MoE expert pool")
@@ -640,6 +644,8 @@ class MambaBackboneParallel(nn.Module):
             raise RuntimeError(
                 "workspace broadcast requires the final backbone block to have an active MoE bank"
             )
+        if inter_layer_read is not None and final_index < 1:
+            raise ValueError("inter-layer workspace reads require at least two backbone blocks")
         for i, block in enumerate(self.blocks):
             h = block(h)
             if i == 0 and intermediate_observer is not None:
@@ -659,4 +665,8 @@ class MambaBackboneParallel(nn.Module):
                 h = self.moe_blocks[i](h, token_mask=token_mask)
                 if numeric_observer is not None:
                     numeric_observer(f"block.{i}.moe_output", h)
+            if i == 0 and inter_layer_read is not None:
+                h = inter_layer_read(h)
+                if numeric_observer is not None:
+                    numeric_observer("inter_layer_memory.output", h)
         raise RuntimeError("parallel backbone has no blocks")

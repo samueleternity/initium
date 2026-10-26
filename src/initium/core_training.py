@@ -1022,8 +1022,6 @@ def run(
         raise ValueError(
             "inter-layer memory requires KV/delta with split-graph Mamba-1 and at least two blocks"
         )
-    if memory_inter_layer_read and workspace_enabled:
-        raise ValueError("inter-layer sequence memory currently requires workspace to be disabled")
     if memory_type != "dnc" and not split_graph_enabled:
         raise ValueError("non-DNC memory types require --split-graph")
     if split_graph_backbone_only and memory_type != "dnc":
@@ -1614,7 +1612,6 @@ def run(
         include_inter_layer = (
             split_graph_variant == "mamba1"
             and split_graph_num_blocks >= 2
-            and not workspace_enabled
         )
         path_results = dataset.evaluate_memory_path_conditions(
             rnn,
@@ -2251,7 +2248,6 @@ def run(
             inter_layer_probe = (
                 split_graph_variant == "mamba1"
                 and split_graph_num_blocks >= 2
-                and not workspace_enabled
             )
             print(
                 f"[{run_id}] paired graph memory-path probes every "
@@ -6015,8 +6011,6 @@ if __name__ == "__main__":
         parser.error(
             "--memory-inter-layer-read requires KV/delta and split-graph Mamba-1 with at least two blocks"
         )
-    if args.memory_inter_layer_read and args.workspace:
-        parser.error("--memory-inter-layer-read currently requires workspace to be disabled")
     if args.split_graph_backbone_only and args.memory_type != "dnc":
         parser.error("--split-graph-backbone-only cannot be combined with --memory-type")
     if args.memory_type != "dnc" and args.dynamic_n_mode:

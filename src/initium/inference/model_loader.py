@@ -200,6 +200,9 @@ def _build_split_graph(c: _Cfg, input_dim, hidden, nr_cells, cell_size, read_hea
         memory_dv=c.get("memory_dv", 64),
         memory_read_lag=c.get("memory_read_lag", 1),
         memory_inter_layer_read=c.get("memory_inter_layer_read", False),
+        memory_inter_layer_read_every_block=c.get(
+            "memory_inter_layer_read_every_block", False
+        ),
         memory_topk=c.get("memory_topk"),
         memory_position=c.get("memory_position", "none"),
         delta_gate=c.get("delta_gate", True),

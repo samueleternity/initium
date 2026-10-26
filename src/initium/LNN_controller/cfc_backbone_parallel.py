@@ -251,6 +251,7 @@ class CfCBackboneParallel(nn.Module):
         token_mask: torch.Tensor | None = None,
         timespans: torch.Tensor | None = None,
         intermediate_observer=None,
+        selected_specialists_only: bool = True,
     ):
         """Return final MoE candidates and routes for shared-workspace use."""
         if not self.moe_enabled or self.moe_blocks is None:
@@ -269,7 +270,10 @@ class CfCBackboneParallel(nn.Module):
             if i == final_index:
                 base = h
                 _, experts, indices, weights = self.moe_blocks[i](
-                    h, return_details=True, token_mask=token_mask
+                    h,
+                    return_details=not selected_specialists_only,
+                    return_selected_details=selected_specialists_only,
+                    token_mask=token_mask,
                 )
                 return base, experts, indices, weights
             if isinstance(self.moe_blocks[i], MoEBlock):

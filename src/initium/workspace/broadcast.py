@@ -118,6 +118,10 @@ class WorkspaceBroadcast(nn.Module):
         deterministic_gate: bool = False,
         prediction_error: torch.Tensor | None = None,
         reconsideration_error: torch.Tensor | None = None,
+        selected_specialists_only: bool = False,
+        projected_write_keys: torch.Tensor | None = None,
+        projected_write_values: torch.Tensor | None = None,
+        projected_read_queries: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Keep the zero-slot/closed-gate bypass identical to the selection-only
         # MoE path. Active workspace attention and recurrent slot updates use
@@ -136,6 +140,10 @@ class WorkspaceBroadcast(nn.Module):
                 deterministic_gate=deterministic_gate,
                 prediction_error=prediction_error,
                 reconsideration_error=reconsideration_error,
+                selected_specialists_only=selected_specialists_only,
+                projected_write_keys=projected_write_keys,
+                projected_write_values=projected_write_values,
+                projected_read_queries=projected_read_queries,
             )
         if specialist_deltas.is_cuda:
             with torch.autocast(device_type="cuda", enabled=False):
@@ -152,6 +160,10 @@ class WorkspaceBroadcast(nn.Module):
                     deterministic_gate=deterministic_gate,
                     prediction_error=prediction_error,
                     reconsideration_error=reconsideration_error,
+                    selected_specialists_only=selected_specialists_only,
+                    projected_write_keys=projected_write_keys,
+                    projected_write_values=projected_write_values,
+                    projected_read_queries=projected_read_queries,
                 )
         return self._forward_step(
             specialist_deltas.float(),
@@ -166,6 +178,10 @@ class WorkspaceBroadcast(nn.Module):
             deterministic_gate=deterministic_gate,
             prediction_error=prediction_error,
             reconsideration_error=reconsideration_error,
+            selected_specialists_only=selected_specialists_only,
+            projected_write_keys=projected_write_keys,
+            projected_write_values=projected_write_values,
+            projected_read_queries=projected_read_queries,
         )
 
     def _forward_step(
@@ -183,10 +199,18 @@ class WorkspaceBroadcast(nn.Module):
         deterministic_gate: bool = False,
         prediction_error: torch.Tensor | None = None,
         reconsideration_error: torch.Tensor | None = None,
+        selected_specialists_only: bool = False,
+        projected_write_keys: torch.Tensor | None = None,
+        projected_write_values: torch.Tensor | None = None,
+        projected_read_queries: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.num_slots == 0 or self.write_gate_closed:
-            selected = specialist_deltas.gather(
-                1, route_indices.unsqueeze(-1).expand(-1, -1, self.d_model)
+            selected = (
+                specialist_deltas
+                if selected_specialists_only
+                else specialist_deltas.gather(
+                    1, route_indices.unsqueeze(-1).expand(-1, -1, self.d_model)
+                )
             )
             if self.diagnostics_enabled:
                 zero = specialist_deltas.new_zeros((), dtype=torch.float32)
@@ -201,15 +225,22 @@ class WorkspaceBroadcast(nn.Module):
             return (selected * route_weights.unsqueeze(-1)).sum(dim=1), state
 
         batch, experts, width = specialist_deltas.shape
-        if (experts, width) != (self.num_experts, self.d_model):
+        expected_experts = route_indices.shape[-1] if selected_specialists_only else self.num_experts
+        if (experts, width) != (expected_experts, self.d_model):
             raise ValueError("specialist delta shape does not match workspace configuration")
+        if selected_specialists_only and no_selection:
+            raise ValueError("random workspace selection requires all expert candidates")
         if state.shape != (batch, self.num_slots, self.d_model):
             raise ValueError("workspace state has an incompatible batch/slot/feature shape")
 
         if reset_each_step:
             state = torch.zeros_like(state)
-        selected_deltas = specialist_deltas.gather(
-            1, route_indices.unsqueeze(-1).expand(-1, -1, self.d_model)
+        selected_deltas = (
+            specialist_deltas
+            if selected_specialists_only
+            else specialist_deltas.gather(
+                1, route_indices.unsqueeze(-1).expand(-1, -1, self.d_model)
+            )
         )
         if no_selection:
             # The random-write control intentionally samples across every
@@ -229,11 +260,19 @@ class WorkspaceBroadcast(nn.Module):
 
         # Candidate keys compete over slots using content-based attention;
         # slot writes are weighted by the existing sparse MoE selection.
-        keys = self.key(write_candidates)
+        keys = (
+            projected_write_keys
+            if projected_write_keys is not None
+            else self.key(write_candidates)
+        )
         scores = torch.einsum("bed,bsd->bes", keys.float(), self.query(state).float())
         scores = scores / math.sqrt(self.d_model)
         slot_attention = scores.softmax(dim=-1).to(specialist_deltas.dtype)
-        values = self.value(write_candidates)
+        values = (
+            projected_write_values
+            if projected_write_values is not None
+            else self.value(write_candidates)
+        )
         slot_proposal = torch.einsum(
             "be,bes,bed->bsd", write_weights.to(values.dtype), slot_attention, values
         )
@@ -410,7 +449,11 @@ class WorkspaceBroadcast(nn.Module):
 
         # Only routed experts are combined into the backbone residual, so
         # computing readback for unselected experts is dead work.
-        read_queries = self.query(selected_deltas)
+        read_queries = (
+            projected_read_queries
+            if projected_read_queries is not None
+            else self.query(selected_deltas)
+        )
         read_scores = torch.einsum(
             "bed,bsd->bes", read_queries.float(), self.key(next_state).float()
         )
@@ -469,12 +512,42 @@ class WorkspaceBroadcast(nn.Module):
         bistable_selection_scale: float | None = None,
         deterministic_gate: bool = False,
         prediction_error: torch.Tensor | None = None,
+        selected_specialists_only: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Process time-major specialists ``(B,T,E,D)`` sequentially."""
         outputs: list[torch.Tensor] = []
         step_diags: list[dict[str, torch.Tensor]] | None = [] if self.diagnostics_enabled else None
         state_observer = getattr(self, "_initium_recurrent_state_observer", None)
         smoothed_prediction_error = None
+        projected_write_keys = None
+        projected_write_values = None
+        projected_read_queries = None
+        if self.num_slots > 0 and not self.write_gate_closed:
+            # These projections depend only on this token's routed expert
+            # outputs, so batch them over time before the causal slot loop.
+            # The recurrence itself remains sequential and uses the exact
+            # per-token state-dependent query, proposal, gate, and update.
+            selected_deltas = (
+                specialist_deltas
+                if selected_specialists_only
+                else specialist_deltas.gather(
+                    2,
+                    route_indices.unsqueeze(-1).expand(
+                        -1, -1, -1, self.d_model
+                    ),
+                )
+            )
+            write_candidates = specialist_deltas if no_selection else selected_deltas
+            projection_context = (
+                torch.autocast(device_type="cuda", enabled=False)
+                if specialist_deltas.is_cuda
+                else torch.autocast(device_type="cpu", enabled=False)
+            )
+            with projection_context:
+                projected_write_keys = self.key(write_candidates.float())
+                projected_write_values = self.value(write_candidates.float())
+                if not bypass_broadcast:
+                    projected_read_queries = self.query(selected_deltas.float())
         for step in range(specialist_deltas.shape[1]):
             # Truncate only the gradient carried by persistent slots. Detach
             # preserves the exact forward state and therefore the full write /
@@ -506,6 +579,22 @@ class WorkspaceBroadcast(nn.Module):
                 deterministic_gate=deterministic_gate,
                 prediction_error=step_prediction_error,
                 reconsideration_error=smoothed_prediction_error,
+                selected_specialists_only=selected_specialists_only,
+                projected_write_keys=(
+                    projected_write_keys[:, step]
+                    if projected_write_keys is not None
+                    else None
+                ),
+                projected_write_values=(
+                    projected_write_values[:, step]
+                    if projected_write_values is not None
+                    else None
+                ),
+                projected_read_queries=(
+                    projected_read_queries[:, step]
+                    if projected_read_queries is not None
+                    else None
+                ),
             )
             if state_observer is not None:
                 state_observer(state, call_index=step)

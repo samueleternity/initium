@@ -979,6 +979,7 @@ def run(
     memory_dv: int = 64,
     memory_read_lag: int = 1,
     memory_inter_layer_read: bool = False,
+    memory_inter_layer_read_every_block: bool = False,
     memory_topk: int | None = None,
     memory_position: str = "none",
     delta_gate: bool = True,
@@ -1013,7 +1014,10 @@ def run(
         raise ValueError("memory_position must be none or rope")
     if memory_position != "none" and memory_type != "kv":
         raise ValueError("memory_position is only supported by KV memory")
-    if memory_inter_layer_read and (
+    inter_layer_memory_enabled = (
+        memory_inter_layer_read or memory_inter_layer_read_every_block
+    )
+    if inter_layer_memory_enabled and (
         memory_type not in {"kv", "delta"}
         or not split_graph_enabled
         or split_graph_variant != "mamba1"
@@ -1579,6 +1583,7 @@ def run(
             "condition",
             "configured_lag",
             "configured_inter_layer",
+            "configured_inter_layer_every_block",
             "triple_acc",
             "perfect_frac",
             "episodes",
@@ -1623,7 +1628,7 @@ def run(
             batch_size=8,
             include_inter_layer=include_inter_layer,
         )
-        configured_inter_layer = int(memory_inter_layer_read)
+        configured_inter_layer = int(inter_layer_memory_enabled)
         for result in path_results:
             memory_path_writer.writerow(
                 [
@@ -1633,11 +1638,19 @@ def run(
                     result["condition"],
                     result["configured_lag"],
                     result["configured_inter_layer"],
+                    result["configured_inter_layer_every_block"],
                     result["triple_acc"],
                     result["perfect_frac"],
                     result["episodes"],
                     diagnostic_seed,
                 ]
+            )
+            configured_path = (
+                "every-block"
+                if result["configured_inter_layer_every_block"]
+                else "block0"
+                if configured_inter_layer
+                else "final"
             )
             print(
                 f"[{run_id}] Step {step_value} paired memory-path "
@@ -1646,7 +1659,7 @@ def run(
                 f"perfect {result['perfect_frac']:.2f}% "
                 f"({result['episodes']} episodes; "
                 f"configured lag={result['configured_lag']}, "
-                f"inter-layer={configured_inter_layer})"
+                f"inter-layer={configured_path})"
             )
         memory_path_file.flush()
         memory_path_probe_steps.add(int(step_value))
@@ -2047,7 +2060,8 @@ def run(
             memory_dk=memory_dk,
             memory_dv=memory_dv,
             memory_read_lag=memory_read_lag,
-            memory_inter_layer_read=memory_inter_layer_read,
+            memory_inter_layer_read=inter_layer_memory_enabled,
+            memory_inter_layer_read_every_block=memory_inter_layer_read_every_block,
             memory_topk=memory_topk,
             memory_position=memory_position,
             delta_gate=delta_gate,
@@ -2239,10 +2253,17 @@ def run(
             trace.close()
 
     if memory_type in {"kv", "delta"}:
+        memory_read_path = (
+            "between-every-block"
+            if memory_inter_layer_read_every_block
+            else "block0->memory->block1"
+            if inter_layer_memory_enabled
+            else "final-backbone"
+        )
         print(
             f"[{run_id}] memory={memory_type} | heads={memory_heads} d_k={memory_dk} "
             f"d_v={memory_dv} read_lag={memory_read_lag} | "
-            f"read_path={'block0->memory->block1' if memory_inter_layer_read else 'final-backbone'}"
+            f"read_path={memory_read_path}"
         )
         if paired_graph_memory_diagnostics:
             inter_layer_probe = (
@@ -2452,8 +2473,10 @@ def run(
         else {}
     )
     extra_model_config.update(memory_model_config)
-    if memory_inter_layer_read:
+    if inter_layer_memory_enabled:
         extra_model_config["memory_inter_layer_read"] = True
+    if memory_inter_layer_read_every_block:
+        extra_model_config["memory_inter_layer_read_every_block"] = True
     expected_resume_model_config: dict[str, Any] = {
         "input_size": INPUT_DIM,
         "hidden_size": hidden_size,
@@ -5734,8 +5757,17 @@ if __name__ == "__main__":
         "--memory-inter-layer-read",
         action="store_true",
         help=(
-            "roadmap ablation: read KV/delta memory after Mamba-1 block 0 and add it "
-            "before block 1; requires split-graph Mamba-1 with at least two blocks and no workspace"
+            "read KV/delta memory after Mamba-1 block 0 and before block 1; "
+            "requires split-graph Mamba-1 with at least two blocks"
+        ),
+    )
+    parser.add_argument(
+        "--memory-inter-layer-read-every-block",
+        action="store_true",
+        help=(
+            "read KV/delta memory after every non-final Mamba-1 block; "
+            "with four blocks, reads occur after blocks 0, 1, and 2. "
+            "Supports workspace/MoE and requires split-graph Mamba-1 with at least two blocks"
         ),
     )
     parser.add_argument("--memory-topk", type=int, default=None)
@@ -6002,14 +6034,19 @@ if __name__ == "__main__":
         parser.error("--dnc-allocation-topk requires --split-graph")
     if args.memory_type != "dnc" and not args.split_graph:
         parser.error("non-DNC memory types require --split-graph")
-    if args.memory_inter_layer_read and (
+    if args.memory_inter_layer_read and args.memory_inter_layer_read_every_block:
+        parser.error(
+            "choose either --memory-inter-layer-read or "
+            "--memory-inter-layer-read-every-block"
+        )
+    if (args.memory_inter_layer_read or args.memory_inter_layer_read_every_block) and (
         args.memory_type not in {"kv", "delta"}
         or not args.split_graph
         or args.split_graph_variant != "mamba1"
         or args.split_graph_num_blocks < 2
     ):
         parser.error(
-            "--memory-inter-layer-read requires KV/delta and split-graph Mamba-1 with at least two blocks"
+            "inter-layer memory reads require KV/delta and split-graph Mamba-1 with at least two blocks"
         )
     if args.split_graph_backbone_only and args.memory_type != "dnc":
         parser.error("--split-graph-backbone-only cannot be combined with --memory-type")
@@ -6376,7 +6413,9 @@ if __name__ == "__main__":
                 run_id += f"_chunk{args.delta_chunk}_{'gate' if args.delta_gate else 'nogate'}"
                 if args.delta_use_fla:
                     run_id += "_fla"
-            if args.memory_inter_layer_read:
+            if args.memory_inter_layer_read_every_block:
+                run_id += "_interlayer_everyblock"
+            elif args.memory_inter_layer_read:
                 run_id += "_interlayer"
         if args.controller == "mamba":
             run_id = f"{run_id}_mambactrl"
@@ -6560,6 +6599,7 @@ if __name__ == "__main__":
             memory_dv=args.memory_dv,
             memory_read_lag=args.memory_read_lag,
             memory_inter_layer_read=args.memory_inter_layer_read,
+            memory_inter_layer_read_every_block=args.memory_inter_layer_read_every_block,
             memory_topk=args.memory_topk,
             memory_position=args.memory_position,
             delta_gate=args.delta_gate,

@@ -202,6 +202,7 @@ class SplitGraphDNC(nn.Module):
         memory_dv: int = 64,
         memory_read_lag: int = 1,
         memory_inter_layer_read: bool = False,
+        memory_inter_layer_read_every_block: bool = False,
         memory_topk: int | None = None,
         memory_position: str = "none",
         delta_gate: bool = True,
@@ -274,9 +275,14 @@ class SplitGraphDNC(nn.Module):
             raise ValueError("memory_type must be one of none, dnc, kv, delta")
         if memory_read_lag not in (0, 1):
             raise ValueError("memory_read_lag must be 0 or 1")
-        if memory_inter_layer_read and memory_type not in {"kv", "delta"}:
+        inter_layer_memory_enabled = (
+            memory_inter_layer_read or memory_inter_layer_read_every_block
+        )
+        if inter_layer_memory_enabled and memory_type not in {"kv", "delta"}:
             raise ValueError("inter-layer memory reads require KV or delta sequence memory")
-        if memory_inter_layer_read and (mamba_variant != "mamba1" or num_backbone_blocks < 2):
+        if inter_layer_memory_enabled and (
+            mamba_variant != "mamba1" or num_backbone_blocks < 2
+        ):
             raise ValueError("inter-layer memory reads require at least two Mamba-1 backbone blocks")
         if memory_type == "kv" and memory_topk is not None and memory_topk <= 0:
             raise ValueError("memory_topk must be positive")
@@ -286,7 +292,8 @@ class SplitGraphDNC(nn.Module):
             raise ValueError("memory_position is only supported by KV memory")
         self.memory_type = memory_type
         self.memory_read_lag = int(memory_read_lag)
-        self.memory_inter_layer_read = bool(memory_inter_layer_read)
+        self.memory_inter_layer_read = bool(inter_layer_memory_enabled)
+        self.memory_inter_layer_read_every_block = bool(memory_inter_layer_read_every_block)
         self.sequence_memory = None
         if memory_type in {"kv", "delta"}:
             rng_state = torch.random.get_rng_state()
@@ -714,9 +721,9 @@ class SplitGraphDNC(nn.Module):
         hx: (chx, mhx, last_read). chx is unused by this controller (the
             combiner has no recurrent state of its own -- it's a plain
             per-timestep Linear, not a cell) and is passed through
-            untouched. mhx follows dnc.DNC's own convention: None on a
-            fresh call, or a single-entry list `[mem_state_dict]` on a
-            resumed/continuing call.
+            untouched. Sequence-memory mhx is a list of recurrent states;
+            repeated inter-layer reads keep one independent state per
+            inter-block boundary to preserve causal sequence order.
         pass_through_memory: when False, skips Memory read AND write for
             EVERY timestep and substitutes zero read-vectors -- this is
             the functional-usage ablation check
@@ -756,19 +763,74 @@ class SplitGraphDNC(nn.Module):
                 raise ValueError("start_step>0 requires a resumed hx=(chx, mhx, last_read)")
         device = input.device
 
-        # A runtime-only override lets paired evaluation compare the standard
-        # final-layer read with the roadmap's block-0 -> memory -> block-1
-        # path on the same episodes/checkpoint. Training arms use the saved
-        # ``memory_inter_layer_read`` config above.
+        # Runtime-only overrides let paired evaluation compare final-layer,
+        # single inter-layer, and repeated inter-layer paths on the same
+        # episodes/checkpoint. Training arms use the saved configuration.
         eval_inter_layer_override = getattr(self, "_initium_eval_inter_layer_read", None)
         inter_layer_memory_enabled = bool(
             self.memory_inter_layer_read
             if eval_inter_layer_override is None
             else eval_inter_layer_override
         )
+        eval_inter_layer_every_block_override = getattr(
+            self, "_initium_eval_inter_layer_read_every_block", None
+        )
+        inter_layer_memory_every_block = bool(
+            self.memory_inter_layer_read_every_block
+            if eval_inter_layer_every_block_override is None
+            else eval_inter_layer_every_block_override
+        )
         inter_layer_memory_read_done = False
-        inter_layer_memory_state = None
+        inter_layer_memory_states = None
         inter_layer_memory_read = None
+
+        if inter_layer_memory_enabled:
+            if not self.sequence_memory_enabled or self.sequence_memory is None:
+                raise ValueError("inter-layer reads require KV/delta sequence memory")
+            memory_path_count = (
+                len(self.backbone.blocks) - 1
+                if inter_layer_memory_every_block
+                else 1
+            )
+            prior_memory_states = (
+                mhx
+                if not reset_experience and isinstance(mhx, (list, tuple))
+                else ()
+            )
+            inter_layer_memory_states = []
+            for path_index in range(memory_path_count):
+                prior_state = (
+                    prior_memory_states[path_index]
+                    if path_index < len(prior_memory_states)
+                    else None
+                )
+                inter_layer_memory_states.append(
+                    prior_state
+                    if prior_state is not None
+                    else self.sequence_memory.reset_state(B, device=device)
+                )
+
+        def inject_inter_layer_read(
+            features: torch.Tensor, block_index: int = 0
+        ) -> torch.Tensor:
+            nonlocal inter_layer_memory_read
+            if inter_layer_memory_states is None:
+                raise RuntimeError("inter-layer memory state was not initialized")
+            memory_path_index = block_index if inter_layer_memory_every_block else 0
+            memory_state = inter_layer_memory_states[memory_path_index]
+            memory_features = features[:, start_step:]
+            if pass_through_memory:
+                inter_layer_memory_read, memory_state, _aux = self.sequence_memory(
+                    memory_features,
+                    state=memory_state,
+                    lag=self.memory_read_lag,
+                )
+                inter_layer_memory_states[memory_path_index] = memory_state
+            else:
+                inter_layer_memory_read = torch.zeros_like(memory_features)
+            enriched = features.clone()
+            enriched[:, start_step:] = enriched[:, start_step:] + inter_layer_memory_read
+            return enriched
 
         def observe_tensor(label: str, value: torch.Tensor) -> None:
             observer = getattr(self, "_initium_segment_observer", None)
@@ -873,44 +935,17 @@ class SplitGraphDNC(nn.Module):
             if timespans is not None and getattr(final_stage, "supports_timespans", False):
                 specialist_kwargs["timespans"] = timespans
             if inter_layer_memory_enabled:
-                if not self.sequence_memory_enabled or not callable(
-                    getattr(final_stage, "forward_with_specialists", None)
-                ):
+                if not callable(getattr(final_stage, "forward_with_specialists", None)):
                     raise ValueError(
-                        "inter-layer workspace reads require KV/delta memory and a "
-                        "parallel backbone with workspace specialist support"
+                        "inter-layer workspace reads require a parallel backbone "
+                        "with workspace specialist support"
                     )
-                inter_layer_memory_state = (
-                    mhx[0]
-                    if (
-                        not reset_experience
-                        and mhx is not None
-                        and len(mhx) > 0
-                        and mhx[0] is not None
-                    )
-                    else self.sequence_memory.reset_state(B, device=device)
+                specialist_kwargs["inter_layer_read"] = inject_inter_layer_read
+                specialist_kwargs["inter_layer_read_every_block"] = (
+                    inter_layer_memory_every_block
                 )
-
-                def inject_workspace_inter_layer_read(features: torch.Tensor) -> torch.Tensor:
-                    nonlocal inter_layer_memory_state, inter_layer_memory_read
-                    memory_features = features[:, start_step:]
-                    if pass_through_memory:
-                        inter_layer_memory_read, inter_layer_memory_state, _aux = (
-                            self.sequence_memory(
-                                memory_features,
-                                state=inter_layer_memory_state,
-                                lag=self.memory_read_lag,
-                            )
-                        )
-                    else:
-                        inter_layer_memory_read = torch.zeros_like(memory_features)
-                    enriched = features.clone()
-                    enriched[:, start_step:] = (
-                        enriched[:, start_step:] + inter_layer_memory_read
-                    )
-                    return enriched
-
-                specialist_kwargs["inter_layer_read"] = inject_workspace_inter_layer_read
+            selected_specialists_only = not self.workspace_no_selection
+            specialist_kwargs["selected_specialists_only"] = selected_specialists_only
             base, specialists, route_indices, route_weights = forward_with_specialists(
                 stage_input, **specialist_kwargs
             )
@@ -939,6 +974,7 @@ class SplitGraphDNC(nn.Module):
                     if prediction_error is not None and workspace_error_consumer
                     else None
                 ),
+                selected_specialists_only=selected_specialists_only,
             )
             H = base.clone()
             # The workspace returns a selected, broadcast-enriched MoE delta
@@ -962,45 +998,16 @@ class SplitGraphDNC(nn.Module):
             )
             forward_with_intermediate = getattr(self.backbone, "forward_with_intermediate", None)
             if inter_layer_memory_enabled:
-                if not self.sequence_memory_enabled or not callable(
+                if not callable(
                     getattr(self.backbone, "forward_with_inter_layer_memory", None)
                 ):
                     raise ValueError(
                         "inter-layer reads require KV/delta memory and a supported parallel backbone"
                     )
-                inter_layer_memory_state = (
-                    mhx[0]
-                    if (
-                        not reset_experience
-                        and mhx is not None
-                        and len(mhx) > 0
-                        and mhx[0] is not None
-                    )
-                    else self.sequence_memory.reset_state(B, device=device)
-                )
-
-                def inject_inter_layer_read(features: torch.Tensor) -> torch.Tensor:
-                    nonlocal inter_layer_memory_state, inter_layer_memory_read
-                    memory_features = features[:, start_step:]
-                    if pass_through_memory:
-                        inter_layer_memory_read, inter_layer_memory_state, _aux = (
-                            self.sequence_memory(
-                                memory_features,
-                                state=inter_layer_memory_state,
-                                lag=self.memory_read_lag,
-                            )
-                        )
-                    else:
-                        inter_layer_memory_read = torch.zeros_like(memory_features)
-                    enriched = features.clone()
-                    enriched[:, start_step:] = (
-                        enriched[:, start_step:] + inter_layer_memory_read
-                    )
-                    return enriched
-
                 H = self.backbone.forward_with_inter_layer_memory(
                     input,
                     inter_layer_read=inject_inter_layer_read,
+                    inter_layer_read_every_block=inter_layer_memory_every_block,
                     token_mask=sequence_valid_mask,
                     intermediate_observer=(
                         observe_prediction_features if needs_prediction_features else None
@@ -1043,7 +1050,7 @@ class SplitGraphDNC(nn.Module):
         if self.sequence_memory_enabled:
             assert self.sequence_memory is not None
             if inter_layer_memory_read_done:
-                memory_state = inter_layer_memory_state
+                memory_states = inter_layer_memory_states
                 memory_read = inter_layer_memory_read
             else:
                 memory_state = None
@@ -1058,6 +1065,7 @@ class SplitGraphDNC(nn.Module):
                     )
                 else:
                     memory_read = torch.zeros_like(memory_features)
+                memory_states = [memory_state]
             # The adapter in each sequence memory is zero-initialized, so the
             # initial output is exactly the backbone-only path. Reads are
             # applied after the parallel controller and never fed back into
@@ -1069,7 +1077,7 @@ class SplitGraphDNC(nn.Module):
             last_read = memory_read[:, -1] if memory_read.shape[1] else None
             if self.workspace is not None:
                 chx = {"_initium_workspace_state": workspace_state}
-            state = (chx, [memory_state], last_read)
+            state = (chx, memory_states, last_read)
             if return_backbone_features:
                 assert backbone_features is not None
                 if return_prediction_logits:

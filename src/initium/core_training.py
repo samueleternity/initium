@@ -1048,6 +1048,7 @@ def run(
     dataset_type: str = DATASET_TYPE,
     dataset_link: str | None = DATASET_LINK,
     test_dataset_link: str | None = None,
+    workspace_task_track: str = "all",
     prepared_dataset=None,
     ogs_weights: tuple[float, float, float] = OGS_WEIGHTS,
     batch_size: int = BATCH_SIZE,
@@ -1117,7 +1118,18 @@ def run(
         dataset_link,
         test_dataset_link=test_dataset_link,
         prepared_dataset=prepared_dataset,
+        workspace_task_track=workspace_task_track,
+        batch_size_hint=batch_size,
     )
+    if getattr(dataset, "name", None) == "workspace-capability":
+        if not split_graph_enabled or split_graph_variant != "mamba1":
+            raise ValueError("workspace-capability training requires split-graph Mamba-1")
+        if memory_type not in {"none", "kv"}:
+            raise ValueError("workspace-capability comparison supports memory_type='none' or 'kv'")
+        if dataset_link is not None or test_dataset_link is not None or prepared_dataset is not None:
+            raise ValueError(
+                "workspace-capability uses generated episodes and does not accept dataset links/prepared data"
+            )
     if split_graph_numeric_trace_step is not None:
         if not split_graph_enabled:
             raise ValueError("--split-graph-numeric-trace-step requires --split-graph")
@@ -1310,6 +1322,16 @@ def run(
     checkpoint_state = (
         (resume_checkpoint.get("rnn_state_dict") or {}) if resume_checkpoint is not None else {}
     )
+    if (
+        resume_requested
+        and getattr(dataset, "name", None) == "workspace-capability"
+        and checkpoint_config.get("workspace_task_track") not in (None, dataset.task_track)
+    ):
+        raise ValueError(
+            "cannot resume a workspace-capability checkpoint with a different task track: "
+            f"checkpoint={checkpoint_config.get('workspace_task_track')!r}, "
+            f"requested={dataset.task_track!r}"
+        )
     checkpoint_has_workspace = any(
         key.startswith("workspace.") or ".workspace." in key for key in checkpoint_state
     )
@@ -1629,6 +1651,52 @@ def run(
         if not resuming or not os.path.exists(mem_check_path) or os.path.getsize(mem_check_path) == 0:
             mem_check_writer.writerow(mem_check_header)
 
+    workspace_check_file: TextIO | None = None
+    workspace_check_writer: Any | None = None
+    if workspace_enabled and callable(getattr(dataset, "evaluate_workspace_ablated", None)):
+        workspace_check_path = os.path.join(
+            LOG_DIR, f"run_{run_id}_workspace_dependency.csv"
+        )
+        workspace_check_header = [
+            "step", "lesson", "track", "condition", "answer_accuracy_pct",
+            "episode_exact_match_pct", "accuracy_drop_vs_full_pp",
+            "exact_match_drop_vs_full_pp",
+        ]
+        if resuming and os.path.exists(workspace_check_path):
+            with open(workspace_check_path, newline="") as existing_file:
+                existing_header = next(csv.reader(existing_file), [])
+            if existing_header != workspace_check_header:
+                workspace_check_path = os.path.join(
+                    LOG_DIR, f"run_{run_id}_workspace_dependency_v2.csv"
+                )
+        workspace_check_file = open(
+            workspace_check_path, "a" if resuming else "w", newline=""
+        )
+        workspace_check_writer = csv.writer(workspace_check_file)
+        if not resuming or os.path.getsize(workspace_check_path) == 0:
+            workspace_check_writer.writerow(workspace_check_header)
+
+    workspace_task_file: TextIO | None = None
+    workspace_task_writer: Any | None = None
+    if getattr(dataset, "name", None) == "workspace-capability":
+        workspace_task_path = os.path.join(
+            LOG_DIR, f"run_{run_id}_workspace_task_metrics.csv"
+        )
+        workspace_task_file = open(
+            workspace_task_path, "a" if resuming else "w", newline=""
+        )
+        workspace_task_writer = csv.writer(workspace_task_file)
+        if not resuming or os.path.getsize(workspace_task_path) == 0:
+            workspace_task_writer.writerow(
+                [
+                    "step", "lesson", "eval_type", "track", "answer_accuracy_pct",
+                    "episode_exact_match_pct", "episodes", "answers", "mean_context_tokens",
+                    "mean_relevant_updates", "mean_distractors", "correction_episode_fraction",
+                    "novelty_episode_fraction", "mean_sources", "candidate_baseline_pct",
+                    "priority_tie_episode_fraction",
+                ]
+            )
+
     memory_usage_file: TextIO | None = None
     memory_usage_writer: Any | None = None
     if has_memory:
@@ -1683,6 +1751,115 @@ def run(
                 [step_value, lesson_value, eval_split, memory_type, metric, value]
             )
         memory_usage_file.flush()
+
+    def write_workspace_task_metrics(step_value, lesson_value, eval_type, diagnostics):
+        if workspace_task_writer is None or workspace_task_file is None or not diagnostics:
+            return
+        workspace_task_writer.writerow(
+            [
+                step_value,
+                lesson_value,
+                eval_type,
+                "all",
+                diagnostics.get("accuracy"),
+                diagnostics.get("episode_exact_match"),
+                diagnostics.get("n_episodes"),
+                sum(item.get("answers", 0) for item in diagnostics.get("tracks", {}).values()),
+                diagnostics.get("mean_context_tokens"),
+                diagnostics.get("mean_relevant_updates"),
+                diagnostics.get("mean_distractors"),
+                diagnostics.get("correction_episode_fraction"),
+                diagnostics.get("novelty_episode_fraction"),
+                diagnostics.get("mean_sources"),
+                diagnostics.get("mean_candidate_baseline_pct"),
+                diagnostics.get("priority_tie_episode_fraction"),
+            ]
+        )
+        for track, values in sorted(diagnostics.get("tracks", {}).items()):
+            workspace_task_writer.writerow(
+                [
+                    step_value,
+                    lesson_value,
+                    eval_type,
+                    track,
+                    values.get("accuracy"),
+                    values.get("exact_match"),
+                    values.get("episodes"),
+                    values.get("answers"),
+                    values.get("mean_context_tokens"),
+                    values.get("mean_relevant_updates"),
+                    values.get("mean_distractors"),
+                    values.get("correction_episode_fraction"),
+                    values.get("novelty_episode_fraction"),
+                    values.get("mean_sources"),
+                    values.get("mean_candidate_baseline_pct"),
+                    values.get("priority_tie_episode_fraction"),
+                ]
+            )
+        workspace_task_file.flush()
+
+    def write_workspace_dependency(
+        step_value, lesson_value, baseline_accuracy, baseline_exact, baseline_diagnostics
+    ):
+        if workspace_check_writer is None or workspace_check_file is None:
+            return
+        if not callable(getattr(dataset, "evaluate_workspace_ablated", None)):
+            return
+        rng_state_after = _capture_rng_state()
+        try:
+            segment_diagnostics.set_channel("eval-id-workspace-bypass")
+            _restore_rng_state(id_eval_rng_state)
+            ablated_accuracy, ablated_exact = dataset.evaluate_workspace_ablated(
+                rnn, device, curriculum, lesson_value - 1
+            )
+            ablated_diagnostics = getattr(dataset, "last_eval_diagnostics", {})
+            segment_diagnostics.emit("eval-id-workspace-bypass")
+            segment_diagnostics.set_channel("eval-id-workspace-shuffled")
+            _restore_rng_state(id_eval_rng_state)
+            shuffled_accuracy, shuffled_exact = dataset.evaluate_workspace_shuffled(
+                rnn, device, curriculum, lesson_value - 1
+            )
+            shuffled_diagnostics = getattr(dataset, "last_eval_diagnostics", {})
+            segment_diagnostics.emit("eval-id-workspace-shuffled")
+            rows = [
+                ("all", "full", baseline_accuracy, baseline_exact),
+                ("all", "readback_bypassed", ablated_accuracy, ablated_exact),
+                ("all", "readback_shuffled", shuffled_accuracy, shuffled_exact),
+            ]
+            base_tracks = (baseline_diagnostics or {}).get("tracks", {})
+            ablated_tracks = ablated_diagnostics.get("tracks", {})
+            shuffled_tracks = shuffled_diagnostics.get("tracks", {})
+            for track in sorted(set(base_tracks) & set(ablated_tracks) & set(shuffled_tracks)):
+                rows.extend(
+                    [
+                        (track, "full", base_tracks[track]["accuracy"], base_tracks[track]["exact_match"]),
+                        (track, "readback_bypassed", ablated_tracks[track]["accuracy"], ablated_tracks[track]["exact_match"]),
+                        (track, "readback_shuffled", shuffled_tracks[track]["accuracy"], shuffled_tracks[track]["exact_match"]),
+                    ]
+                )
+            for track, condition, accuracy, exact in rows:
+                workspace_check_writer.writerow(
+                    [
+                        step_value,
+                        lesson_value,
+                        track,
+                        condition,
+                        accuracy,
+                        exact,
+                        baseline_accuracy - accuracy,
+                        baseline_exact - exact,
+                    ]
+                )
+            workspace_check_file.flush()
+            print(
+                f"[{run_id}] Step {step_value} workspace readback dependency: "
+                f"on {baseline_accuracy:.2f}% exact {baseline_exact:.2f}% | "
+                f"bypassed {ablated_accuracy:.2f}% | shuffled {shuffled_accuracy:.2f}% | "
+                f"accuracy drops {baseline_accuracy - ablated_accuracy:.2f}/"
+                f"{baseline_accuracy - shuffled_accuracy:.2f} pp"
+            )
+        finally:
+            _restore_rng_state(rng_state_after)
 
     def write_paired_graph_memory_diagnostics(step_value, lesson_idx):
         if memory_path_writer is None or memory_path_file is None:
@@ -2406,6 +2583,7 @@ def run(
     extra_model_config = {
         "dataset_type": dataset_type,
         "dataset_name": dataset.name,
+        "workspace_task_track": getattr(dataset, "task_track", None),
         "supported_dataset_types": [dataset_type],  # use ["*"] for a future multi-modal model
         "input_dim": INPUT_DIM,
         "output_dim": TRIPLE_DIM,
@@ -4459,6 +4637,10 @@ def run(
             _, id_triple_acc, id_perfect_frac = curriculum.maybe_advance(
                 rnn, device, step=step, optimizer=optimizer
             )
+            id_task_diagnostics = getattr(dataset, "last_eval_diagnostics", None)
+            write_workspace_task_metrics(
+                step, pre_advance_lesson + 1, "id", id_task_diagnostics
+            )
             if surprise_recall_logger is not None:
                 surprise_recall_logger.write_evaluation(
                     step, pre_advance_lesson + 1, "id", dataset.last_eval_diagnostics
@@ -4574,6 +4756,9 @@ def run(
                 num_episodes=periodic_ood_episodes,
                 rng=ood_rng,
                 field_log=ood_field_log,
+            )
+            write_workspace_task_metrics(
+                step, curriculum.lesson + 1, "ood", getattr(dataset, "last_eval_diagnostics", None)
             )
             if surprise_recall_logger is not None:
                 surprise_recall_logger.write_evaluation(
@@ -4867,6 +5052,15 @@ def run(
                     f"{shuffle_summary}"
                 )
 
+            if workspace_check_writer is not None:
+                write_workspace_dependency(
+                    step,
+                    pre_advance_lesson + 1,
+                    id_triple_acc,
+                    id_perfect_frac,
+                    id_task_diagnostics,
+                )
+
             if (
                 paired_graph_memory_diagnostics
                 and memory_path_writer is not None
@@ -4984,9 +5178,15 @@ def run(
         rnn.workspace.reset_bistable_diagnostics()
     if hasattr(final_id_stage_memory, "begin_stage_diagnostics"):
         final_id_stage_memory.begin_stage_diagnostics()
+    id_eval_rng_state = _capture_rng_state()
+    final_eval_lesson = curriculum.lesson
     segment_diagnostics.set_channel("eval-final-id")
     _, id_triple_acc, id_perfect_frac = curriculum.maybe_advance(
         rnn, device, step=step, optimizer=optimizer, allow_advance=not eval_only
+    )
+    final_id_task_diagnostics = getattr(dataset, "last_eval_diagnostics", None)
+    write_workspace_task_metrics(
+        step, final_eval_lesson + 1, "final-id", final_id_task_diagnostics
     )
     if surprise_recall_logger is not None:
         surprise_recall_logger.write_evaluation(
@@ -5006,6 +5206,14 @@ def run(
                 step, "final-all-lessons", final_sgr_phase1_eval
             )
     segment_diagnostics.emit("eval-final-id")
+    if workspace_check_writer is not None:
+        write_workspace_dependency(
+            step,
+            final_eval_lesson + 1,
+            id_triple_acc,
+            id_perfect_frac,
+            final_id_task_diagnostics,
+        )
     report_bistable_evaluation("ID")
     final_id_stage_diagnostics = (
         final_id_stage_memory.finish_stage_diagnostics()
@@ -5054,6 +5262,9 @@ def run(
         rng=ood_rng,
         verbose_n=10,
         field_log=final_ood_field_log,
+    )
+    write_workspace_task_metrics(
+        step, curriculum.lesson + 1, "final-ood", getattr(dataset, "last_eval_diagnostics", None)
     )
     if surprise_recall_logger is not None:
         surprise_recall_logger.write_evaluation(
@@ -5325,6 +5536,10 @@ def run(
     ogs_log_file.close()
     if mem_check_file is not None:
         mem_check_file.close()
+    if workspace_check_file is not None:
+        workspace_check_file.close()
+    if workspace_task_file is not None:
+        workspace_task_file.close()
     if memory_usage_file is not None:
         memory_usage_file.close()
     if memory_path_file is not None:
@@ -6040,6 +6255,7 @@ if __name__ == "__main__":
             "video",
             "multimodal",
             "surprise-recall",
+            "workspace-capability",
         ],
         help="Dataset plugged into the core loop (data/dataset_registry.py).",
     )
@@ -6050,6 +6266,23 @@ if __name__ == "__main__":
         help=f"Training episodes per optimizer step (default: {BATCH_SIZE}); "
         "larger values may improve device utilization at higher memory use and "
         "change the effective gradient batch.",
+    )
+    parser.add_argument(
+        "--workspace-task-track",
+        type=str,
+        choices=[
+            "all",
+            "permutation",
+            "entity_state",
+            "relational_join",
+            "nth_farthest",
+            "retrieval_aggregation",
+        ],
+        default="all",
+        help=(
+            "Track for --dataset-type workspace-capability. 'all' balances all five "
+            "tracks in each batch; individual tracks get independent curricula."
+        ),
     )
     parser.add_argument(
         "--sgr-pred-loss-weight",
@@ -6147,6 +6380,22 @@ if __name__ == "__main__":
 
     if args.prepare_only and args.load_prepared:
         parser.error("--prepare-only cannot be combined with --load-prepared")
+    if args.dataset_type == "workspace-capability":
+        if not args.split_graph or args.split_graph_variant != "mamba1":
+            parser.error(
+                "workspace-capability requires --split-graph --split-graph-variant mamba1"
+            )
+        if args.memory_type not in {"none", "kv"}:
+            parser.error(
+                "workspace-capability primary comparisons support --memory-type none or kv"
+            )
+        if any(
+            value is not None
+            for value in (args.dataset_link, args.test_dataset_link, args.load_prepared, args.save)
+        ) or args.prepare_only:
+            parser.error("workspace-capability is generated on demand; dataset links/prepared data are unsupported")
+    elif args.workspace_task_track != "all":
+        parser.error("--workspace-task-track requires --dataset-type workspace-capability")
     if args.dnc_write_observation_variance <= 0:
         parser.error("--dnc-write-observation-variance must be positive")
     if args._dnc_optimized_bundle and args.split_graph:
@@ -6298,6 +6547,8 @@ if __name__ == "__main__":
             args.dataset_type,
             args.dataset_link,
             test_dataset_link=args.test_dataset_link,
+            workspace_task_track=args.workspace_task_track,
+            batch_size_hint=args.batch_size,
         )
 
         if args.save:
@@ -6639,6 +6890,8 @@ if __name__ == "__main__":
             run_id += "_dnccompiled"
         if args.dataset_type != "graph":
             run_id = f"{run_id}_ds{args.dataset_type}"
+        if args.dataset_type == "workspace-capability":
+            run_id += f"_track{args.workspace_task_track}"
         if args.sgr_pred_loss_weight > 0:
             pred_weight_tag = f"{args.sgr_pred_loss_weight:g}".replace(".", "p")
             run_id += (
@@ -6770,6 +7023,7 @@ if __name__ == "__main__":
             dataset_type=args.dataset_type,
             dataset_link=args.dataset_link,
             test_dataset_link=args.test_dataset_link,
+            workspace_task_track=args.workspace_task_track,
             prepared_dataset=prepared_dataset,
             ogs_weights=tuple(args.ogs_weights),
             batch_size=args.batch_size,

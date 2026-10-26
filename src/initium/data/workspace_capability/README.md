@@ -1,0 +1,149 @@
+# Workspace Capability Task Family
+
+This package provides a synthetic, oracle-backed benchmark for testing what
+the split-graph workspace can retain, update, retrieve, and combine. It is
+designed to separate memory capability from natural-language comprehension:
+episodes are typed event streams, answers are categorical tokens, and the
+Python generator maintains the exact symbolic state used to produce labels.
+
+## What the benchmark compares
+
+The intended model is a split-graph Mamba-1 controller with MoE. Run the same
+task configuration with four resource arms:
+
+| Arm | Sequence memory | Workspace | What it isolates |
+|---|---|---|---|
+| Backbone/MoE control | none | off | Performance without either persistent memory mechanism |
+| Workspace only | none | on | What the learned slots add to the same backbone |
+| KV only | causal KV | off | What the token-addressable sequence memory adds |
+| KV + workspace | causal KV | on | Whether the two memories complement one another |
+
+For the interaction, compare `(KV + workspace - KV only) - (workspace only -
+backbone control)`. Keep backbone depth, MoE settings, training steps, optimizer,
+and seed fixed across a matched panel. Workspace-enabled runs need MoE and use
+the project's existing workspace gate, reconsideration, prediction-error
+salience, and slot-count options. Treat workspace variants as separate
+experiments; do not aggregate them into one “workspace” score.
+
+## Task tracks
+
+Each track has its own generator and symbolic oracle in `tracks/`. Select one
+track for diagnosis or use `all` for a balanced multi-track curriculum.
+
+### `permutation` — sequential state composition
+
+The stream initializes objects in positions and then applies pairwise swaps.
+The query asks either where an object ended up or which object occupies a
+position. The oracle applies every swap in order; distractor swaps avoid the
+queried object/occupant. This tests maintaining and composing state across a
+long sequence, and separates relevant swaps from unrelated operations. The
+curriculum scales object count and swap depth; OOD examples use held-out object
+IDs and longer streams.
+
+### `entity_state` — source priority, corrections, and retractions
+
+Facts assign a relation value to an entity under a source. Sources have a
+documented priority (`source_id % 3`); higher priority wins, then the most
+recent active fact wins, then lower source ID breaks a remaining tie. The event
+stream includes assertions, moves, retractions, removals, and supersessions.
+The query asks for the winning current value or `NONE`. High-surprise facts on
+other relations are irrelevant distractors. This tests state replacement,
+source conflict resolution, correction handling, and whether update signals
+favor useful corrections over novelty. Per-episode metadata flags relevant
+corrections, novelty distractors, and equal-priority/equal-time conflicts.
+
+### `relational_join` — multi-hop fact composition
+
+Source-tagged facts form a one-, two-, or three-hop chain between entities.
+The query supplies the start entity and relation sequence, and asks for the
+terminal entity. Interleaved near-miss facts use unrelated relations and
+cannot create an alternate valid path. This tests retaining separate facts
+and composing them at query time, rather than retrieving one matching token.
+OOD examples use held-out entity/relation bands and more distractors.
+
+### `nth_farthest` — relational comparison across remembered items
+
+The stream presents quantized vectors for candidate entities and a query
+vector. The model must return the identity of the Nth-farthest candidate.
+Nearest and farthest controls are mixed into the track and reported as separate
+query types. This is a positive control for slot interaction and comparison:
+the answer depends on comparing multiple remembered items to one another and
+to the query vector.
+
+### `retrieval_aggregation` — delayed recall and aggregation
+
+The stream writes key/value pairs, updates selected keys, adds unrelated
+key/value distractors, and asks for one or more current values or an
+aggregation. Supported operations are exact recall, sum modulo 16, count of
+even values, and parity. Multi-query episodes place all requested keys at the
+end. This tests associative retrieval, update precedence, multi-item retrieval,
+and simple aggregation as context and interference grow.
+
+## Curriculum, evaluation, and metrics
+
+Each track has six difficulty levels. `all` rotates a balanced set of tracks
+through each batch and advances only after the overall answer-accuracy
+threshold and every track's threshold are met. The dataset can also be run
+with `--workspace-task-track <track>` to study one skill without dilution from
+the others. Evaluation uses locally seeded ID and OOD episode generators so
+the episode set is reproducible for paired model conditions.
+
+The trainer reports answer-token accuracy and episode exact match, overall and
+per track. `./logs/run_<id>_workspace_task_metrics.csv` also records context
+length, relevant updates, distractors, correction/novelty fractions, source
+count, random candidate baseline, and priority-tie rate. The dataset-owned
+`field_breakdown.csv` stratifies query type, context length, relevant-update
+count, hop/source count, correction and novelty flags, priority conflicts,
+distractor count, and candidate count.
+
+Workspace-enabled runs additionally write
+`workspace_dependency.csv` (or `_v2.csv` when resuming a legacy schema). Its
+matched ID episodes are scored with full readback, readback bypassed, and
+readback shuffled across batch items. The shuffle changes only whose slot
+state is read; slot writes and state updates stay with their original examples.
+Existing workspace slot/gate/router telemetry is still emitted by the shared
+trainer. KV runs additionally retain the existing memory usage diagnostics.
+
+Candidate-baseline percentages are simple random-choice references, not
+calibrated statistical baselines. Use answer accuracy together with episode
+exact match and the task strata. Memory-off alone does not establish that
+memory contents were correct; compare it with the workspace readback
+counterfactuals and, for KV, the existing KV dependency/shuffle diagnostics.
+The core suite is symbolic. Natural-language transfer is deliberately deferred
+until the symbolic controls are validated.
+
+## Example Colab commands
+
+Use the same backbone/MoE configuration and seed when comparing arms. These
+examples use all task tracks and seed 0; remove `--workspace` for a no-workspace
+arm. Set `--memory-type none` for the no-KV arm or `kv` for causal KV.
+
+```bash
+!python -m src.initium.core_training 0.0 --dataset-type workspace-capability --workspace-task-track all --split-graph --split-graph-variant mamba1 --split-graph-num-blocks 4 --memory-type none --moe --moe-placement all --moe-num-experts 8 --moe-top-k 1 --moe-capacity-factor 1.5 --moe-backbone-residual-scale 0.1 --seed 0 --total-steps 50000 --run-id-suffix wcap-workspace-none-s0 --checkpoint-every 10000 --workspace --workspace-num-slots 5 --workspace-train-mode coadapted
+```
+
+For KV, change `--memory-type none` to `--memory-type kv` and add
+`--memory-heads 4 --memory-dk 64 --memory-dv 64 --memory-read-lag 1
+--memory-inter-layer-read-every-block`. Keep `--moe-backbone-residual-scale
+0.1` in workspace arms. Workspace reconsideration and prediction-error options
+can be added as controlled variants using the core trainer's CLI help.
+
+## Package map
+
+- `episode.py`: token vocabulary, episode record, and boundary validation.
+- `tracks/*.py`: one task generator/oracle per benchmark track.
+- `curriculum.py`: per-track difficulty schedules and progression policy.
+- `dataset.py`: `BaseDataset` adapter, batching, evaluation, ablations, and task
+  metrics.
+- `../../dataset_registry.py`: registration as `workspace-capability`.
+- `../../core_training.py`: model compatibility checks and run-level CSV output.
+
+Unit and integration coverage for the package lives in
+`tests/unit/test_workspace_capability.py` and
+`tests/integration/test_workspace_capability_pipeline.py`.
+
+Run the focused checks from the repository root with:
+
+```bash
+python -m pytest tests/unit/test_workspace_capability.py tests/integration/test_workspace_capability_pipeline.py -q
+```

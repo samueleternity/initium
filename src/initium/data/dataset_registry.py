@@ -27,6 +27,7 @@ AUDIO_ALIASES = ("audio",)
 VIDEO_ALIASES = ("video",)
 MULTIMODAL_ALIASES = ("multimodal", "multi-modal", "multi_modal")
 SURPRISE_RECALL_ALIASES = ("surprise-recall", "surprise_recall", "sgr")
+WORKSPACE_CAPABILITY_ALIASES = ("workspace-capability", "workspace_capability")
 
 
 def get_dataset(
@@ -64,4 +65,11 @@ def get_dataset(
         from initium.data.surprise_recall.surprise_recall import SurpriseRecallDataset
 
         return SurpriseRecallDataset()
+    if t in WORKSPACE_CAPABILITY_ALIASES:
+        from initium.data.workspace_capability.dataset import WorkspaceCapabilityDataset
+
+        return WorkspaceCapabilityDataset(
+            task_track=kwargs.get("workspace_task_track", "all"),
+            batch_size_hint=kwargs.get("batch_size_hint", 16),
+        )
     raise ValueError(f"unknown dataset type {dataset_type!r}")

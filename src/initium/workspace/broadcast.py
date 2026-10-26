@@ -301,6 +301,7 @@ class WorkspaceBroadcast(nn.Module):
         no_selection: bool = False,
         reset_each_step: bool = False,
         bypass_broadcast: bool = False,
+        shuffle_readback_across_batch: bool = False,
         bistable_noise_scale: float | None = None,
         bistable_selection_scale: float | None = None,
         deterministic_gate: bool = False,
@@ -324,6 +325,7 @@ class WorkspaceBroadcast(nn.Module):
                 no_selection=no_selection,
                 reset_each_step=reset_each_step,
                 bypass_broadcast=bypass_broadcast,
+                shuffle_readback_across_batch=shuffle_readback_across_batch,
                 bistable_noise_scale=bistable_noise_scale,
                 bistable_selection_scale=bistable_selection_scale,
                 deterministic_gate=deterministic_gate,
@@ -345,6 +347,7 @@ class WorkspaceBroadcast(nn.Module):
                     no_selection=no_selection,
                     reset_each_step=reset_each_step,
                     bypass_broadcast=bypass_broadcast,
+                    shuffle_readback_across_batch=shuffle_readback_across_batch,
                     bistable_noise_scale=bistable_noise_scale,
                     bistable_selection_scale=bistable_selection_scale,
                     deterministic_gate=deterministic_gate,
@@ -364,6 +367,7 @@ class WorkspaceBroadcast(nn.Module):
             no_selection=no_selection,
             reset_each_step=reset_each_step,
             bypass_broadcast=bypass_broadcast,
+            shuffle_readback_across_batch=shuffle_readback_across_batch,
             bistable_noise_scale=bistable_noise_scale,
             bistable_selection_scale=bistable_selection_scale,
             deterministic_gate=deterministic_gate,
@@ -386,6 +390,7 @@ class WorkspaceBroadcast(nn.Module):
         no_selection: bool = False,
         reset_each_step: bool = False,
         bypass_broadcast: bool = False,
+        shuffle_readback_across_batch: bool = False,
         bistable_noise_scale: float | None = None,
         bistable_selection_scale: float | None = None,
         deterministic_gate: bool = False,
@@ -651,12 +656,17 @@ class WorkspaceBroadcast(nn.Module):
             if projected_read_queries is not None
             else self.query(selected_deltas)
         )
+        read_state = (
+            torch.roll(next_state, shifts=1, dims=0)
+            if shuffle_readback_across_batch and next_state.shape[0] > 1
+            else next_state
+        )
         read_scores = torch.einsum(
-            "bed,bsd->bes", read_queries.float(), self.key(next_state).float()
+            "bed,bsd->bes", read_queries.float(), self.key(read_state).float()
         )
         read_scores = read_scores / math.sqrt(self.d_model)
         read_weights = read_scores.softmax(dim=-1).to(specialist_deltas.dtype)
-        read_values = self.value(next_state)
+        read_values = self.value(read_state)
         broadcast = torch.einsum("bes,bsd->bed", read_weights, read_values)
         read_scale = torch.sigmoid(self.read_gate).to(specialist_deltas.dtype)
         enriched = selected_deltas + read_scale * broadcast
@@ -705,6 +715,7 @@ class WorkspaceBroadcast(nn.Module):
         no_selection: bool = False,
         reset_each_step: bool = False,
         bypass_broadcast: bool = False,
+        shuffle_readback_across_batch: bool = False,
         bistable_noise_scale: float | None = None,
         bistable_selection_scale: float | None = None,
         deterministic_gate: bool = False,
@@ -764,6 +775,7 @@ class WorkspaceBroadcast(nn.Module):
             self.compile_recurrence
             and self.training
             and torch.is_grad_enabled()
+            and not shuffle_readback_across_batch
             and not self._compiled_recurrence_failed
         ):
             if not specialist_deltas.is_cuda:
@@ -935,6 +947,7 @@ class WorkspaceBroadcast(nn.Module):
                     no_selection=no_selection,
                     reset_each_step=reset_each_step,
                     bypass_broadcast=bypass_broadcast,
+                    shuffle_readback_across_batch=shuffle_readback_across_batch,
                     bistable_noise_scale=bistable_noise_scale,
                     bistable_selection_scale=bistable_selection_scale,
                     deterministic_gate=deterministic_gate,

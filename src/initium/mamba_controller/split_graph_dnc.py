@@ -389,6 +389,7 @@ class SplitGraphDNC(nn.Module):
         # part of checkpoint config/state so a saved model can be scored with
         # and without workspace readback using identical learned weights.
         self.workspace_eval_bypass = False
+        self.workspace_eval_shuffle_readback = False
 
         # Mamba bookkeeping, for checkpoint self-description -- same
         # rationale/convention as MambaDNC (mamba_controller.py).
@@ -1003,6 +1004,7 @@ class SplitGraphDNC(nn.Module):
                 no_selection=self.workspace_no_selection,
                 reset_each_step=self.workspace_reset_each_step,
                 bypass_broadcast=self.workspace_eval_bypass,
+                shuffle_readback_across_batch=self.workspace_eval_shuffle_readback,
                 bistable_noise_scale=self.workspace_bistable_noise_scale,
                 bistable_selection_scale=self.workspace_bistable_selection_scale,
                 deterministic_gate=self.workspace_bistable_deterministic,

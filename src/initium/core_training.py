@@ -823,6 +823,9 @@ def load_frozen_workspace_warm_start(
         "dnc_backward_trace",  # diagnostic instrumentation, not architecture
         "workspace_enabled",
         "workspace_num_slots",
+        "workspace_entity_keyed_writes",
+        "workspace_semantic_entity_addressing",
+        "workspace_key_match_threshold",
         "workspace_no_selection",
         "workspace_reset_each_step",
         "workspace_train_mode",
@@ -1000,6 +1003,9 @@ def run(
     workspace_enabled: bool = WORKSPACE_ENABLED,
     workspace_num_slots: int = WORKSPACE_NUM_SLOTS,
     workspace_compile_recurrence: bool = False,
+    workspace_entity_keyed_writes: bool = False,
+    workspace_semantic_entity_addressing: bool = False,
+    workspace_key_match_threshold: float = 0.5,
     workspace_no_selection: bool = WORKSPACE_NO_SELECTION,
     workspace_reset_each_step: bool = WORKSPACE_RESET_EACH_STEP,
     workspace_train_mode: str = WORKSPACE_TRAIN_MODE,
@@ -1035,6 +1041,7 @@ def run(
     memory_read_lag: int = 1,
     memory_inter_layer_read: bool = False,
     memory_inter_layer_read_every_block: bool = False,
+    memory_inter_layer_read_scale: float = 0.1,
     memory_topk: int | None = None,
     memory_position: str = "none",
     delta_gate: bool = True,
@@ -1049,6 +1056,9 @@ def run(
     dataset_link: str | None = DATASET_LINK,
     test_dataset_link: str | None = None,
     workspace_task_track: str = "all",
+    workspace_semantic_state_diagnostics: bool = False,
+    workspace_state_diagnostic_max_events: int = 16,
+    workspace_state_loss_weight: float = 0.0,
     prepared_dataset=None,
     ogs_weights: tuple[float, float, float] = OGS_WEIGHTS,
     batch_size: int = BATCH_SIZE,
@@ -1073,8 +1083,12 @@ def run(
         raise ValueError("log_every must be positive")
     if memory_type not in {"none", "dnc", "kv", "delta"}:
         raise ValueError("memory_type must be none, dnc, kv, or delta")
+    if not math.isfinite(workspace_state_loss_weight) or workspace_state_loss_weight < 0:
+        raise ValueError("workspace_state_loss_weight must be finite and >= 0")
     if memory_read_lag not in (0, 1):
         raise ValueError("memory_read_lag must be 0 or 1")
+    if not math.isfinite(memory_inter_layer_read_scale) or memory_inter_layer_read_scale < 0:
+        raise ValueError("memory_inter_layer_read_scale must be finite and >= 0")
     if memory_position not in {"none", "rope"}:
         raise ValueError("memory_position must be none or rope")
     if memory_position != "none" and memory_type != "kv":
@@ -1130,6 +1144,28 @@ def run(
             raise ValueError(
                 "workspace-capability uses generated episodes and does not accept dataset links/prepared data"
             )
+        if workspace_semantic_state_diagnostics:
+            if not workspace_semantic_entity_addressing:
+                raise ValueError(
+                    "workspace semantic state diagnostics require semantic entity addressing"
+                )
+            if workspace_state_diagnostic_max_events < 0:
+                raise ValueError("workspace state diagnostic max events must be >= 0")
+        if workspace_state_loss_weight > 0:
+            if not workspace_enabled or not workspace_semantic_entity_addressing:
+                raise ValueError(
+                    "workspace state loss requires --workspace and semantic entity addressing"
+                )
+            if workspace_num_slots < 1:
+                raise ValueError("workspace state loss requires at least one workspace slot")
+            if workspace_task_track not in {"all", "permutation"}:
+                raise ValueError(
+                    "workspace state loss is supervised only on the permutation track"
+                )
+    elif workspace_semantic_state_diagnostics or workspace_state_loss_weight > 0:
+        raise ValueError(
+            "workspace state diagnostics and state loss require workspace-capability"
+        )
     if split_graph_numeric_trace_step is not None:
         if not split_graph_enabled:
             raise ValueError("--split-graph-numeric-trace-step requires --split-graph")
@@ -1755,12 +1791,17 @@ def run(
     def write_workspace_task_metrics(step_value, lesson_value, eval_type, diagnostics):
         if workspace_task_writer is None or workspace_task_file is None or not diagnostics:
             return
+        overall_track = (
+            "permutation/all_conditions"
+            if diagnostics.get("permutation_generalization")
+            else "all"
+        )
         workspace_task_writer.writerow(
             [
                 step_value,
                 lesson_value,
                 eval_type,
-                "all",
+                overall_track,
                 diagnostics.get("accuracy"),
                 diagnostics.get("episode_exact_match"),
                 diagnostics.get("n_episodes"),
@@ -1796,6 +1837,54 @@ def run(
                     values.get("priority_tie_episode_fraction"),
                 ]
             )
+        for split, values in sorted(diagnostics.get("permutation_generalization", {}).items()):
+            workspace_task_writer.writerow(
+                [
+                    step_value,
+                    lesson_value,
+                    eval_type,
+                    f"permutation/{split}",
+                    values.get("accuracy"),
+                    values.get("exact_match"),
+                    values.get("episodes"),
+                    values.get("answers"),
+                    values.get("mean_context_tokens"),
+                    values.get("mean_relevant_updates"),
+                    values.get("mean_distractors"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ]
+            )
+        state_probe = diagnostics.get("permutation_state_diagnostics")
+        if state_probe:
+            for event in state_probe.get("events", ()):
+                for mode, accuracy in (
+                    ("readback", event.get("accuracy")),
+                    ("bypassed", event.get("bypass_accuracy")),
+                ):
+                    workspace_task_writer.writerow(
+                        [
+                            step_value,
+                            lesson_value,
+                            eval_type,
+                            f"permutation_state_{mode}/{event['name']}",
+                            accuracy,
+                            None,
+                            1,
+                            event.get("queries"),
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                        ]
+                    )
         workspace_task_file.flush()
 
     def write_workspace_dependency(
@@ -2313,6 +2402,7 @@ def run(
             memory_read_lag=memory_read_lag,
             memory_inter_layer_read=inter_layer_memory_enabled,
             memory_inter_layer_read_every_block=memory_inter_layer_read_every_block,
+            memory_inter_layer_read_scale=memory_inter_layer_read_scale,
             memory_topk=memory_topk,
             memory_position=memory_position,
             delta_gate=delta_gate,
@@ -2331,6 +2421,9 @@ def run(
             workspace_enabled=workspace_enabled,
             workspace_num_slots=workspace_num_slots,
             workspace_compile_recurrence=workspace_compile_recurrence,
+            workspace_entity_keyed_writes=workspace_entity_keyed_writes,
+            workspace_semantic_entity_addressing=workspace_semantic_entity_addressing,
+            workspace_key_match_threshold=workspace_key_match_threshold,
             workspace_no_selection=workspace_no_selection,
             workspace_reset_each_step=workspace_reset_each_step,
             workspace_train_mode=workspace_train_mode,
@@ -2469,6 +2562,7 @@ def run(
                     prediction_valid_mask=prediction_valid_mask,
                     timespans=timespans,
                     return_backbone_features=sgr_prediction_decoder is not None,
+                    **workspace_forward_kwargs,
                 )
                 replay_output = replay_result[0]
                 replay_features = replay_result[2] if len(replay_result) > 2 else None
@@ -2519,6 +2613,11 @@ def run(
             f"[{run_id}] memory={memory_type} | heads={memory_heads} d_k={memory_dk} "
             f"d_v={memory_dv} read_lag={memory_read_lag} | "
             f"read_path={memory_read_path}"
+            + (
+                f" read_scale={memory_inter_layer_read_scale:g}"
+                if inter_layer_memory_enabled
+                else ""
+            )
         )
         if paired_graph_memory_diagnostics:
             inter_layer_probe = (
@@ -2559,6 +2658,7 @@ def run(
             print(
                 f"[{run_id}] WORKSPACE {'active' if workspace_active else 'bypassed'} | "
                 f"slots={workspace_num_slots} | write_selection={write_mode} | "
+                f"write_addressing={('semantic-entity-token' if workspace_semantic_entity_addressing else 'learned-address') if workspace_entity_keyed_writes else 'shared'} | "
                 f"persistence={persistence} | train_mode={workspace_train_mode} | "
                 f"recurrence_kernel={'torch.compile' if workspace_compile_recurrence else 'eager'} | "
                 f"gate={workspace_gate_variant} | "
@@ -2648,6 +2748,9 @@ def run(
         "workspace_enabled": workspace_enabled,
         "workspace_num_slots": workspace_num_slots,
         "workspace_compile_recurrence": workspace_compile_recurrence,
+        "workspace_entity_keyed_writes": workspace_entity_keyed_writes,
+        "workspace_state_loss_weight": workspace_state_loss_weight,
+        "workspace_key_match_threshold": workspace_key_match_threshold,
         "workspace_no_selection": workspace_no_selection,
         "workspace_reset_each_step": workspace_reset_each_step,
         "workspace_train_mode": workspace_train_mode,
@@ -2665,6 +2768,8 @@ def run(
         "workspace_bistable_deterministic": workspace_bistable_deterministic,
         "workspace_stability_max_activation": workspace_stability_max_activation,
     }
+    if workspace_semantic_entity_addressing:
+        extra_model_config["workspace_semantic_entity_addressing"] = True
     if sgr_prediction_enabled:
         extra_model_config["sgr_prediction_decoder_enabled"] = True
         extra_model_config["sgr_prediction_loss_weight"] = float(sgr_prediction_loss_weight)
@@ -2748,6 +2853,7 @@ def run(
     extra_model_config.update(memory_model_config)
     if inter_layer_memory_enabled:
         extra_model_config["memory_inter_layer_read"] = True
+        extra_model_config["memory_inter_layer_read_scale"] = memory_inter_layer_read_scale
     if memory_inter_layer_read_every_block:
         extra_model_config["memory_inter_layer_read_every_block"] = True
     expected_resume_model_config: dict[str, Any] = {
@@ -3448,6 +3554,9 @@ def run(
     # (potentially still reflecting the old buggy drifted value).
     running_task_loss, running_kl_loss, running_div, running_grad_norm = 0.0, 0.0, 0, 0.0
     running_sgr_prediction_loss: Any = 0.0
+    running_workspace_state_loss: Any = 0.0
+    running_workspace_state_correct: Any = 0.0
+    running_workspace_state_count: Any = 0.0
     running_log_steps = 0
     last_train_sgr_signal_diagnostics: dict[str, torch.Tensor] = {}
     workspace_reconsideration_window: dict[str, torch.Tensor] | None = None
@@ -3542,6 +3651,32 @@ def run(
                 "(inputs, targets, mask, timespans)"
             )
 
+        workspace_forward_kwargs = {}
+        if workspace_semantic_entity_addressing:
+            workspace_metadata = dataset.workspace_entity_address_metadata(input_seq)
+            workspace_forward_kwargs = {
+                key: value.to(device, non_blocking=True)
+                for key, value in workspace_metadata.items()
+            }
+        state_supervision_positions = None
+        state_supervision_mask = None
+        if workspace_state_loss_weight > 0:
+            state_metadata = dataset.workspace_state_supervision_metadata(input_seq)
+            state_supervision_positions = state_metadata["state_supervision_positions"].to(
+                device, non_blocking=True
+            )
+            state_supervision_mask = state_metadata["state_supervision_mask"].to(
+                device, non_blocking=True
+            )
+            workspace_forward_kwargs.update(
+                {
+                    "state_supervision_entity_ids": state_metadata[
+                        "state_supervision_entity_ids"
+                    ].to(device, non_blocking=True),
+                    "state_supervision_mask": state_supervision_mask,
+                    "state_supervision_steps": state_metadata["state_supervision_steps"],
+                }
+            )
         input_seq = input_seq.to(device, non_blocking=True)
         target_digits = target_digits.to(device, non_blocking=True)
         answer_mask = answer_mask.to(device, non_blocking=True)
@@ -3623,6 +3758,7 @@ def run(
                             timespans=timespans,
                             return_backbone_features=True,
                             return_prediction_logits=True,
+                            **workspace_forward_kwargs,
                         )
                         prediction_loss = _causal_prediction_loss(
                             prediction_logits,
@@ -3639,6 +3775,7 @@ def run(
                             sequence_valid_mask=sequence_valid_mask,
                             timespans=timespans,
                             return_backbone_features=True,
+                            **workspace_forward_kwargs,
                         )
                 else:
                     output, hidden = rnn(
@@ -3647,6 +3784,7 @@ def run(
                         reset_experience=True,
                         sequence_valid_mask=sequence_valid_mask,
                         timespans=timespans,
+                        **workspace_forward_kwargs,
                     )
             else:
                 output, hidden = rnn(input_seq, hidden, reset_experience=True)
@@ -3709,6 +3847,35 @@ def run(
                     "stopping before backward/optimizer update to protect the checkpoint."
                 )
             task_loss = dataset.loss(output, target_digits, answer_mask)
+            workspace_state_loss = None
+            if workspace_state_loss_weight > 0:
+                workspace_module = getattr(rnn, "workspace", None)
+                if workspace_module is None:
+                    raise RuntimeError("workspace state supervision has no active workspace module")
+                event_predictions = workspace_module.pop_semantic_state_predictions()
+                event_losses = []
+                state_correct = task_loss.new_zeros(())
+                state_count = task_loss.new_zeros(())
+                for event_step, position_logits in event_predictions:
+                    valid_states = state_supervision_mask[:, event_step]
+                    if bool(valid_states.any()):
+                        position_targets = state_supervision_positions[:, event_step]
+                        selected_logits = position_logits[valid_states].float()
+                        selected_targets = position_targets[valid_states]
+                        event_losses.append(
+                            nn.functional.cross_entropy(
+                                selected_logits,
+                                selected_targets,
+                            )
+                        )
+                        state_correct = state_correct + (
+                            selected_logits.argmax(dim=-1) == selected_targets
+                        ).sum().to(state_correct.dtype)
+                        state_count = state_count + selected_targets.numel()
+                if event_losses:
+                    workspace_state_loss = torch.stack(event_losses).mean()
+                else:
+                    workspace_state_loss = task_loss.new_zeros(())
             if split_graph_forward_trace is not None and split_graph_forward_trace.active:
                 split_graph_forward_trace.observe("task_output.loss", task_loss)
             if (
@@ -3796,6 +3963,11 @@ def run(
         loss = (
             task_loss
             + (sgr_prediction_loss_weight * prediction_loss if prediction_loss is not None else 0.0)
+            + (
+                workspace_state_loss_weight * workspace_state_loss
+                if workspace_state_loss is not None
+                else 0.0
+            )
             + beta_eff * kl_loss
             + moe_aux_loss
         )
@@ -4075,6 +4247,10 @@ def run(
         amp_scale = scaler.get_scale()
         running_task_loss += task_loss.detach()
         running_kl_loss += kl_loss.detach()
+        if workspace_state_loss is not None:
+            running_workspace_state_loss += workspace_state_loss.detach()
+            running_workspace_state_correct += state_correct.detach()
+            running_workspace_state_count += state_count
         if prediction_loss is not None:
             running_sgr_prediction_loss += prediction_loss.detach()
         running_div += dataset.diversity(output.detach(), target_digits, answer_mask)
@@ -4164,6 +4340,41 @@ def run(
                 if torch.is_tensor(running_task_loss)
                 else running_task_loss
             ) / window_steps
+            avg_workspace_state_loss = (
+                (
+                    running_workspace_state_loss.item()
+                    if torch.is_tensor(running_workspace_state_loss)
+                    else running_workspace_state_loss
+                )
+                / window_steps
+                if workspace_state_loss_weight > 0
+                else None
+            )
+            avg_workspace_state_accuracy = (
+                (
+                    running_workspace_state_correct.item()
+                    if torch.is_tensor(running_workspace_state_correct)
+                    else running_workspace_state_correct
+                )
+                / max(
+                    running_workspace_state_count.item()
+                    if torch.is_tensor(running_workspace_state_count)
+                    else running_workspace_state_count,
+                    1,
+                )
+                if workspace_state_loss_weight > 0
+                else None
+            )
+            avg_workspace_state_count = (
+                (
+                    running_workspace_state_count.item()
+                    if torch.is_tensor(running_workspace_state_count)
+                    else running_workspace_state_count
+                )
+                / window_steps
+                if workspace_state_loss_weight > 0
+                else None
+            )
             avg_sgr_prediction_loss = (
                 (
                     running_sgr_prediction_loss.item()
@@ -4205,6 +4416,12 @@ def run(
                 f"[{run_id}] Step {step}/{total_steps} | Lesson {curriculum.lesson + 1}/{len(curriculum.table)}",
                 f"L_task {avg_task:.4f}",
             ]
+            if avg_workspace_state_loss is not None:
+                parts.append(
+                    f"L_ws_state {avg_workspace_state_loss:.4f} "
+                    f"acc={avg_workspace_state_accuracy:.1%} "
+                    f"states/batch={avg_workspace_state_count:.1f}"
+                )
             if avg_sgr_prediction_loss is not None:
                 parts.append(f"L_pred {avg_sgr_prediction_loss:.4f}")
             sgr_signal_values = {
@@ -4270,6 +4487,14 @@ def run(
                             f"broadcast/specialist {workspace_diag['broadcast_to_specialist_ratio'].item():.3f} "
                             f"read_gate {workspace_diag['read_gate'].item():.3f}]"
                         )
+                        if workspace_entity_keyed_writes:
+                            parts.append(
+                                "workspace_address["
+                                f"matched {workspace_diag['address_match_frac'].item():.1%} "
+                                f"allocated {workspace_diag['address_allocation_frac'].item():.1%} "
+                                f"overflow {workspace_diag['address_capacity_overflow_frac'].item():.1%} "
+                                f"occupied {workspace_diag['address_occupied_frac'].item():.1%}]"
+                            )
                         if "prediction_error_write_scale_rms" in workspace_diag:
                             parts.append(
                                 "sgr_workspace_write_scale_rms="
@@ -4574,6 +4799,9 @@ def run(
             log_file.flush()
             running_task_loss, running_kl_loss, running_div, running_grad_norm = 0.0, 0.0, 0, 0.0
             running_sgr_prediction_loss = 0.0
+            running_workspace_state_loss = 0.0
+            running_workspace_state_correct = 0.0
+            running_workspace_state_count = 0.0
             running_log_steps = 0
             running_postclip_grad_norm = 0.0
             running_finite_grad_steps = 0
@@ -4784,6 +5012,51 @@ def run(
                         rnn, device, periodic_ood_episodes, ood_ablated_rng
                     )
                 segment_diagnostics.emit("eval-ood-memory-off")
+
+            if (
+                callable(getattr(dataset, "evaluate_permutation_generalization", None))
+                and getattr(dataset, "task_track", None) in {"all", "permutation"}
+            ):
+                permutation_eval_seed = int(seed) * 1_000_003 + int(step) + 0x5045524D
+                permutation_episodes_per_split = max(8, periodic_ood_episodes // 4)
+                permutation_torch_rng = _capture_torch_rng()
+                segment_diagnostics.set_channel("eval-permutation-generalization")
+                with _replay_torch_rng(permutation_torch_rng):
+                    dataset.evaluate_permutation_generalization(
+                        rnn,
+                        device,
+                        curriculum.lesson,
+                        episodes_per_split=permutation_episodes_per_split,
+                        rng=random.Random(permutation_eval_seed),
+                    )
+                permutation_diagnostics = dataset.last_eval_diagnostics
+                write_workspace_task_metrics(
+                    step,
+                    curriculum.lesson + 1,
+                    "permutation-generalization",
+                    permutation_diagnostics,
+                )
+                segment_diagnostics.emit("eval-permutation-generalization")
+                if has_memory:
+                    segment_diagnostics.set_channel("eval-permutation-generalization-memory-off")
+                    with _replay_torch_rng(permutation_torch_rng):
+                        dataset.evaluate_permutation_generalization(
+                            rnn,
+                            device,
+                            curriculum.lesson,
+                            episodes_per_split=permutation_episodes_per_split,
+                            rng=random.Random(permutation_eval_seed),
+                            ablate_memory=True,
+                        )
+                    write_workspace_task_metrics(
+                        step,
+                        curriculum.lesson + 1,
+                        "permutation-generalization-memory-off",
+                        dataset.last_eval_diagnostics,
+                    )
+                    segment_diagnostics.emit(
+                        "eval-permutation-generalization-memory-off"
+                    )
 
             ood_log_writer.writerow(
                 [
@@ -5060,6 +5333,29 @@ def run(
                     id_perfect_frac,
                     id_task_diagnostics,
                 )
+
+            if workspace_semantic_state_diagnostics:
+                state_rng = random.Random(
+                    int(seed) * 1_000_003 + int(step) + 0x53544154
+                )
+                state_torch_rng = _capture_torch_rng()
+                segment_diagnostics.set_channel("eval-permutation-state-diagnostics")
+                with _replay_torch_rng(state_torch_rng):
+                    state_probe = dataset.evaluate_permutation_state_diagnostics(
+                        rnn,
+                        device,
+                        pre_advance_lesson,
+                        num_episodes=1,
+                        max_events_per_episode=workspace_state_diagnostic_max_events,
+                        rng=state_rng,
+                    )
+                write_workspace_task_metrics(
+                    step,
+                    pre_advance_lesson + 1,
+                    "permutation-state-diagnostics",
+                    {"permutation_state_diagnostics": state_probe},
+                )
+                segment_diagnostics.emit("eval-permutation-state-diagnostics")
 
             if (
                 paired_graph_memory_diagnostics
@@ -5406,6 +5702,75 @@ def run(
                 rnn, device, final_ood_episodes, final_ood_ablated_rng
             )
         segment_diagnostics.emit("eval-final-ood-memory-off")
+
+    if (
+        callable(getattr(dataset, "evaluate_permutation_generalization", None))
+        and getattr(dataset, "task_track", None) in {"all", "permutation"}
+    ):
+        permutation_eval_seed = int(seed) * 1_000_003 + int(step) + 0x5045524D
+        permutation_episodes_per_split = max(8, final_ood_episodes // 4)
+        permutation_torch_rng = _capture_torch_rng()
+        segment_diagnostics.set_channel("eval-final-permutation-generalization")
+        with _replay_torch_rng(permutation_torch_rng):
+            dataset.evaluate_permutation_generalization(
+                rnn,
+                device,
+                curriculum.lesson,
+                episodes_per_split=permutation_episodes_per_split,
+                rng=random.Random(permutation_eval_seed),
+            )
+        write_workspace_task_metrics(
+            step,
+            curriculum.lesson + 1,
+            "final-permutation-generalization",
+            dataset.last_eval_diagnostics,
+        )
+        segment_diagnostics.emit("eval-final-permutation-generalization")
+        if has_memory:
+            segment_diagnostics.set_channel(
+                "eval-final-permutation-generalization-memory-off"
+            )
+            with _replay_torch_rng(permutation_torch_rng):
+                dataset.evaluate_permutation_generalization(
+                    rnn,
+                    device,
+                    curriculum.lesson,
+                    episodes_per_split=permutation_episodes_per_split,
+                    rng=random.Random(permutation_eval_seed),
+                    ablate_memory=True,
+                )
+            write_workspace_task_metrics(
+                step,
+                curriculum.lesson + 1,
+                "final-permutation-generalization-memory-off",
+                dataset.last_eval_diagnostics,
+            )
+            segment_diagnostics.emit(
+                "eval-final-permutation-generalization-memory-off"
+            )
+
+    if workspace_semantic_state_diagnostics:
+        state_rng = random.Random(
+            int(seed) * 1_000_003 + int(step) + 0x53544154
+        )
+        state_torch_rng = _capture_torch_rng()
+        segment_diagnostics.set_channel("eval-final-permutation-state-diagnostics")
+        with _replay_torch_rng(state_torch_rng):
+            state_probe = dataset.evaluate_permutation_state_diagnostics(
+                rnn,
+                device,
+                curriculum.lesson,
+                num_episodes=1,
+                max_events_per_episode=workspace_state_diagnostic_max_events,
+                rng=state_rng,
+            )
+        write_workspace_task_metrics(
+            step,
+            curriculum.lesson + 1,
+            "final-permutation-state-diagnostics",
+            {"permutation_state_diagnostics": state_probe},
+        )
+        segment_diagnostics.emit("eval-final-permutation-state-diagnostics")
 
     q99_metrics = None
     if split_graph_enabled and dnc_write_variant == "kanerva-closed-form":
@@ -5821,13 +6186,70 @@ if __name__ == "__main__":
         help="Persistent workspace slot count (0 is the plumbing/bypass control).",
     )
     parser.add_argument(
+        "--workspace-entity-keyed-writes",
+        action="store_true",
+        help=(
+            "Use per-slot addresses for workspace writes and reads: by default addresses "
+            "are learned from specialist representations; combine with "
+            "--workspace-semantic-entity-addressing to use stable entity-token IDs "
+            "for the permutation capability task."
+        ),
+    )
+    parser.add_argument(
+        "--workspace-semantic-entity-addressing",
+        action="store_true",
+        help=(
+            "Use fixed one-hot entity-token addresses and event-only workspace writes "
+            "for workspace-capability permutation episodes. Requires "
+            "--workspace-entity-keyed-writes; values remain learned specialist payloads."
+        ),
+    )
+    parser.add_argument(
+        "--workspace-semantic-state-diagnostics",
+        action="store_true",
+        help=(
+            "At periodic and final evaluations, replay one permutation episode and log "
+            "accepted entity slots plus model readback against the oracle state after "
+            "initialization/swap events. Requires semantic entity addressing."
+        ),
+    )
+    parser.add_argument(
+        "--workspace-state-diagnostic-max-events",
+        type=int,
+        default=16,
+        help=(
+            "Maximum number of state transitions sampled per diagnostic episode; "
+            "0 logs every transition (default: 16)."
+        ),
+    )
+    parser.add_argument(
+        "--workspace-state-loss-weight",
+        type=float,
+        default=0.0,
+        metavar="WEIGHT",
+        help=(
+            "Auxiliary cross-entropy for decoding each initialized entity's position "
+            "from its addressed workspace payload after every initialization/swap. "
+            "Requires semantic entity addressing on the permutation track; default 0 disables it."
+        ),
+    )
+    parser.add_argument(
+        "--workspace-key-match-threshold",
+        type=float,
+        default=0.5,
+        help=(
+            "Cosine similarity below which an entity-keyed write allocates a free slot "
+            "instead of overwriting the nearest occupied slot (default: 0.5)."
+        ),
+    )
+    parser.add_argument(
         "--workspace-compile-recurrence",
         action="store_true",
         help=(
             "compile the causal workspace slot-update step with torch.compile/Inductor "
             "for CUDA; preserves sequential updates and supports continuous routed writes, "
-            "reconsideration, and workspace write salience; does not support random-write "
-            "or bistable modes"
+            "learned entity-keyed addressing, reconsideration, and workspace write salience; "
+            "does not support random-write or bistable modes"
         ),
     )
     parser.add_argument(
@@ -6110,6 +6532,15 @@ if __name__ == "__main__":
             "read KV/delta memory after every non-final Mamba-1 block; "
             "with four blocks, reads occur after blocks 0, 1, and 2. "
             "Supports workspace/MoE and requires split-graph Mamba-1 with at least two blocks"
+        ),
+    )
+    parser.add_argument(
+        "--memory-inter-layer-read-scale",
+        type=float,
+        default=0.1,
+        help=(
+            "residual gain for each inter-layer KV/delta read injection; "
+            "defaults to 0.1 to limit feedback amplification"
         ),
     )
     parser.add_argument("--memory-topk", type=int, default=None)
@@ -6416,6 +6847,8 @@ if __name__ == "__main__":
             "choose either --memory-inter-layer-read or "
             "--memory-inter-layer-read-every-block"
         )
+    if not math.isfinite(args.memory_inter_layer_read_scale) or args.memory_inter_layer_read_scale < 0:
+        parser.error("--memory-inter-layer-read-scale must be finite and >= 0")
     if (args.memory_inter_layer_read or args.memory_inter_layer_read_every_block) and (
         args.memory_type not in {"kv", "delta"}
         or not args.split_graph
@@ -6688,6 +7121,54 @@ if __name__ == "__main__":
         parser.error("--workspace requires backbone MoE; use --moe-placement backbone or all")
     if args.workspace_num_slots < 0:
         parser.error("--workspace-num-slots must be >= 0")
+    if args.workspace_entity_keyed_writes and (
+        not args.workspace or args.workspace_num_slots < 1
+    ):
+        parser.error(
+            "--workspace-entity-keyed-writes requires --workspace and at least one slot"
+        )
+    if args.workspace_semantic_entity_addressing and not args.workspace_entity_keyed_writes:
+        parser.error(
+            "--workspace-semantic-entity-addressing requires --workspace-entity-keyed-writes"
+        )
+    if args.workspace_semantic_entity_addressing and (
+        args.dataset_type != "workspace-capability"
+        or args.workspace_task_track not in ("permutation", "all")
+    ):
+        parser.error(
+            "--workspace-semantic-entity-addressing requires "
+            "--dataset-type workspace-capability and "
+            "--workspace-task-track permutation or all"
+        )
+    if args.workspace_semantic_state_diagnostics and not args.workspace_semantic_entity_addressing:
+        parser.error(
+            "--workspace-semantic-state-diagnostics requires "
+            "--workspace-semantic-entity-addressing"
+        )
+    if args.workspace_state_diagnostic_max_events < 0:
+        parser.error("--workspace-state-diagnostic-max-events must be >= 0")
+    if not math.isfinite(args.workspace_state_loss_weight) or args.workspace_state_loss_weight < 0:
+        parser.error("--workspace-state-loss-weight must be finite and >= 0")
+    if args.workspace_state_loss_weight > 0 and not args.workspace_semantic_entity_addressing:
+        parser.error(
+            "--workspace-state-loss-weight requires --workspace-semantic-entity-addressing"
+        )
+    if args.workspace_state_loss_weight > 0 and (
+        args.dataset_type != "workspace-capability"
+        or args.workspace_task_track not in ("permutation", "all")
+    ):
+        parser.error(
+            "--workspace-state-loss-weight requires workspace-capability permutation episodes"
+        )
+    if not math.isfinite(args.workspace_key_match_threshold) or not (
+        -1.0 <= args.workspace_key_match_threshold <= 1.0
+    ):
+        parser.error("--workspace-key-match-threshold must be finite and in [-1, 1]")
+    if args.workspace_semantic_entity_addressing and args.workspace_key_match_threshold <= 0:
+        parser.error(
+            "--workspace-semantic-entity-addressing requires a positive "
+            "--workspace-key-match-threshold to keep distinct one-hot entity IDs separate"
+        )
     if args.workspace_compile_recurrence and (
         not args.workspace
         or args.workspace_num_slots < 1
@@ -6803,6 +7284,8 @@ if __name__ == "__main__":
                 run_id += "_interlayer_everyblock"
             elif args.memory_inter_layer_read:
                 run_id += "_interlayer"
+        if args.memory_inter_layer_read or args.memory_inter_layer_read_every_block:
+            run_id += f"_readscale{args.memory_inter_layer_read_scale:g}"
         if args.controller == "mamba":
             run_id = f"{run_id}_mambactrl"
         elif args.controller == "mamba2":
@@ -6836,6 +7319,13 @@ if __name__ == "__main__":
                 run_id += f"_backbonerscale{args.moe_backbone_residual_scale:g}"
         if args.workspace:
             run_id += f"_workspace{args.workspace_num_slots}s_{args.workspace_train_mode}"
+            if args.workspace_entity_keyed_writes:
+                key_threshold_tag = f"{args.workspace_key_match_threshold:g}".replace(
+                    ".", "p"
+                ).replace("-", "m")
+                run_id += f"_entitykeyed{key_threshold_tag}"
+            if args.workspace_semantic_entity_addressing:
+                run_id += "_semanticentityaddr"
             if args.workspace_compile_recurrence:
                 run_id += "_compiledrecurrence"
             if args.workspace_gate_variant != "continuous" or args.workspace_train_scope == "gate":
@@ -6973,6 +7463,11 @@ if __name__ == "__main__":
             workspace_enabled=args.workspace,
             workspace_num_slots=args.workspace_num_slots,
             workspace_compile_recurrence=args.workspace_compile_recurrence,
+            workspace_entity_keyed_writes=args.workspace_entity_keyed_writes,
+            workspace_semantic_entity_addressing=(
+                args.workspace_semantic_entity_addressing
+            ),
+            workspace_key_match_threshold=args.workspace_key_match_threshold,
             workspace_no_selection=args.workspace_no_selection,
             workspace_reset_each_step=args.workspace_reset_each_step,
             workspace_train_mode=args.workspace_train_mode,
@@ -7010,6 +7505,7 @@ if __name__ == "__main__":
             memory_read_lag=args.memory_read_lag,
             memory_inter_layer_read=args.memory_inter_layer_read,
             memory_inter_layer_read_every_block=args.memory_inter_layer_read_every_block,
+            memory_inter_layer_read_scale=args.memory_inter_layer_read_scale,
             memory_topk=args.memory_topk,
             memory_position=args.memory_position,
             delta_gate=args.delta_gate,
@@ -7024,6 +7520,9 @@ if __name__ == "__main__":
             dataset_link=args.dataset_link,
             test_dataset_link=args.test_dataset_link,
             workspace_task_track=args.workspace_task_track,
+            workspace_semantic_state_diagnostics=args.workspace_semantic_state_diagnostics,
+            workspace_state_diagnostic_max_events=args.workspace_state_diagnostic_max_events,
+            workspace_state_loss_weight=args.workspace_state_loss_weight,
             prepared_dataset=prepared_dataset,
             ogs_weights=tuple(args.ogs_weights),
             batch_size=args.batch_size,

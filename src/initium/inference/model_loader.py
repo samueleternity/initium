@@ -203,6 +203,8 @@ def _build_split_graph(c: _Cfg, input_dim, hidden, nr_cells, cell_size, read_hea
         memory_inter_layer_read_every_block=c.get(
             "memory_inter_layer_read_every_block", False
         ),
+        # Historical checkpoints injected full-strength inter-layer reads.
+        memory_inter_layer_read_scale=c.get("memory_inter_layer_read_scale", 1.0),
         memory_topk=c.get("memory_topk"),
         memory_position=c.get("memory_position", "none"),
         delta_gate=c.get("delta_gate", True),
@@ -225,6 +227,11 @@ def _build_split_graph(c: _Cfg, input_dim, hidden, nr_cells, cell_size, read_hea
         workspace_enabled=c.get("workspace_enabled", cc.WORKSPACE_ENABLED),
         workspace_num_slots=c.get("workspace_num_slots", cc.WORKSPACE_NUM_SLOTS),
         workspace_compile_recurrence=c.get("workspace_compile_recurrence", False),
+        workspace_entity_keyed_writes=c.get("workspace_entity_keyed_writes", False),
+        workspace_semantic_entity_addressing=c.get(
+            "workspace_semantic_entity_addressing", False
+        ),
+        workspace_key_match_threshold=c.get("workspace_key_match_threshold", 0.5),
         workspace_no_selection=c.get("workspace_no_selection", cc.WORKSPACE_NO_SELECTION),
         workspace_reset_each_step=c.get("workspace_reset_each_step", cc.WORKSPACE_RESET_EACH_STEP),
         workspace_train_mode=c.get("workspace_train_mode", cc.WORKSPACE_TRAIN_MODE),

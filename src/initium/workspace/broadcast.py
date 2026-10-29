@@ -11,8 +11,33 @@ import warnings
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from initium.workspace.bistability import BistableWriteGate
+
+
+def _normalize_address(value: torch.Tensor) -> torch.Tensor:
+    """Unit-normalize addresses with bounded gradients and compiler-friendly ops.
+
+    Routed MoE deltas can be extremely small after residual scaling. Ordinary
+    L2 normalization then amplifies gradients by the inverse vector norm, which
+    made the recurrent address path numerically unstable. Preserve exact unit
+    vectors in the forward pass while scaling the normalization Jacobian so its
+    local gain is at most 1. The straight-through scale is detached and uses
+    only reductions supported by the fused Colab recurrence backend.
+    """
+    value = value.float()
+    norm_sq = value.square().sum(dim=-1, keepdim=True)
+    norm = norm_sq.clamp_min(1e-12).sqrt()
+    normalized = value / norm
+    backward_scale = norm.clamp(max=1.0).detach()
+    return normalized.detach() + (normalized - normalized.detach()) * backward_scale
+
+
+def _condition_address_input(value: torch.Tensor) -> torch.Tensor:
+    """Scale tiny address inputs in forward while keeping source gradients tame."""
+    scaled = value * WorkspaceBroadcast._ADDRESS_PROJECTION_INPUT_SCALE
+    return value + (scaled - value).detach()
 
 
 class WorkspaceBroadcast(nn.Module):
@@ -20,11 +45,19 @@ class WorkspaceBroadcast(nn.Module):
 
     Inputs are specialist deltas ``(B, E, D)`` and sparse MoE routes
     ``(B, K)``/weights ``(B, K)``. The router's selection determines which
-    specialists write. Every specialist independently queries all slots and
-    receives the resulting context before the selected deltas are combined.
+    specialists write. By default writes/readback use shared content slots.
+    Learned entity-keyed mode stores learned address/value pairs; semantic
+    entity mode accepts stable token-ID addresses and an event write mask while
+    retaining learned specialist values.
     """
 
     _RECONSIDERATION_ERROR_EMA_DECAY = 0.9
+    _SEMANTIC_ENTITY_COUNT = 64
+    _SEMANTIC_POSITION_COUNT = 16
+    # MoE residuals may be scaled to ~1e-5 before entering workspace. This
+    # homogeneous scale improves address-projection gradient conditioning;
+    # address normalization leaves forward similarities unchanged.
+    _ADDRESS_PROJECTION_INPUT_SCALE = 10_000.0
 
     def __init__(
         self,
@@ -42,6 +75,9 @@ class WorkspaceBroadcast(nn.Module):
         reconsideration_trigger_mode: str = "innovation",
         prediction_error_salience_enabled: bool = False,
         compile_recurrence: bool = False,
+        entity_keyed_writes: bool = False,
+        semantic_entity_addressing: bool = False,
+        key_match_threshold: float = 0.5,
     ):
         super().__init__()
         if d_model < 1 or num_experts < 1:
@@ -50,6 +86,8 @@ class WorkspaceBroadcast(nn.Module):
             raise ValueError("num_slots must be >= 0")
         if compile_recurrence and num_slots == 0:
             raise ValueError("compiled workspace recurrence requires at least one slot")
+        if not math.isfinite(key_match_threshold) or not -1.0 <= key_match_threshold <= 1.0:
+            raise ValueError("key_match_threshold must be finite and in [-1, 1]")
         if gate_variant not in ("continuous", "bistable"):
             raise ValueError("gate_variant must be 'continuous' or 'bistable'")
         if bptt_horizon < 0:
@@ -77,12 +115,43 @@ class WorkspaceBroadcast(nn.Module):
         self.reconsideration_trigger_mode = reconsideration_trigger_mode
         self.prediction_error_salience_enabled = bool(prediction_error_salience_enabled)
         self.compile_recurrence = bool(compile_recurrence)
+        self.entity_keyed_writes = bool(entity_keyed_writes)
+        self.semantic_entity_addressing = bool(semantic_entity_addressing)
+        if self.semantic_entity_addressing and not self.entity_keyed_writes:
+            raise ValueError("semantic entity addressing requires entity-keyed workspace writes")
+        if self.semantic_entity_addressing and d_model < self._SEMANTIC_ENTITY_COUNT:
+            raise ValueError(
+                "semantic entity addressing requires workspace width >= 64"
+            )
+        if self.semantic_entity_addressing and key_match_threshold <= 0:
+            raise ValueError(
+                "semantic entity addressing requires a positive key-match threshold"
+            )
+        self.key_match_threshold = float(key_match_threshold)
+        self.semantic_state_decoder = (
+            nn.Linear(d_model, self._SEMANTIC_POSITION_COUNT)
+            if self.semantic_entity_addressing
+            else None
+        )
+        self._last_semantic_state_predictions: list[tuple[int, torch.Tensor]] = []
         self._compiled_recurrence_step = None
         self._compiled_recurrence_failed = False
         self._compiled_fallback_warned = False
+        # Optional evaluation-only observer. Kept unset during training so it
+        # adds no synchronization or work to the recurrence.
+        self._initium_address_assignment_observer = None
+        self._last_address_assignment_indices = None
         self.query = nn.Linear(d_model, d_model, bias=False)
         self.key = nn.Linear(d_model, d_model, bias=False)
         self.value = nn.Linear(d_model, d_model, bias=False)
+        self.address_write = (
+            nn.Linear(d_model, d_model, bias=False)
+            if self.entity_keyed_writes and not self.semantic_entity_addressing
+            else None
+        )
+        self.address_read = (
+            nn.Linear(d_model, d_model, bias=False) if self.entity_keyed_writes else None
+        )
         self.write_gate = nn.Linear(2 * d_model, d_model)
         self.prediction_error_to_write_gate = (
             nn.Linear(1, d_model, bias=False) if self.prediction_error_salience_enabled else None
@@ -108,8 +177,146 @@ class WorkspaceBroadcast(nn.Module):
         if self.prediction_error_to_write_gate is not None:
             nn.init.zeros_(self.prediction_error_to_write_gate.weight)
 
+    def pop_semantic_state_predictions(self) -> list[tuple[int, torch.Tensor]]:
+        """Return and clear auxiliary predictions from the most recent call."""
+        predictions = self._last_semantic_state_predictions
+        self._last_semantic_state_predictions = []
+        return predictions
+
+    def _semantic_state_logits(
+        self, state: torch.Tensor, entity_ids: torch.Tensor, valid_mask: torch.Tensor
+    ) -> torch.Tensor:
+        if self.semantic_state_decoder is None:
+            raise RuntimeError("semantic state decoding requires semantic entity addressing")
+        address_state, content_state = state.split(self.d_model, dim=-1)
+        safe_ids = entity_ids.clamp(min=0, max=self._SEMANTIC_ENTITY_COUNT - 1)
+        queries = F.one_hot(safe_ids, num_classes=self._SEMANTIC_ENTITY_COUNT).to(
+            device=state.device, dtype=torch.float32
+        )
+        queries = F.pad(queries, (0, self.d_model - self._SEMANTIC_ENTITY_COUNT))
+        address_state = address_state.float()
+        occupied = address_state.square().sum(dim=-1) > 1e-12
+        scores = torch.einsum("bqd,bsd->bqs", queries, _normalize_address(address_state))
+        scores = scores.masked_fill(~occupied.unsqueeze(1), -1e4)
+        read_weights = torch.softmax(scores, dim=-1)
+        read_weights = read_weights * occupied.unsqueeze(1).to(read_weights.dtype)
+        read_weights = read_weights / read_weights.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        read_weights = read_weights * valid_mask.unsqueeze(-1).to(read_weights.dtype)
+        read_values = torch.einsum("bqs,bsd->bqd", read_weights, content_state.float())
+        return self.semantic_state_decoder(read_values)
+
     def init_state(self, batch: int, *, device, dtype) -> torch.Tensor:
-        return torch.zeros(batch, self.num_slots, self.d_model, device=device, dtype=dtype)
+        state_width = self.d_model * (2 if self.entity_keyed_writes else 1)
+        return torch.zeros(batch, self.num_slots, state_width, device=device, dtype=dtype)
+
+    def _entity_keyed_write_proposals(
+        self,
+        write_candidates: torch.Tensor,
+        write_weights: torch.Tensor,
+        address_state: torch.Tensor,
+        candidate_addresses: torch.Tensor | None = None,
+        projected_values: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        """Route each candidate to a matching address or allocate a free slot.
+
+        Assignment is discrete (nearest normalized address); gradients still
+        flow through the address projections and the selected key/value update.
+        When several new candidates arrive together, their rank assigns them
+        distinct free slots before any slot is overwritten.
+        """
+        if candidate_addresses is None:
+            if self.address_write is None:
+                raise ValueError(
+                    "semantic entity addressing requires explicit entity IDs"
+                )
+            candidate_addresses = self.address_write(_condition_address_input(write_candidates))
+        candidate_addresses = _normalize_address(candidate_addresses)
+        stored_addresses = _normalize_address(address_state)
+        occupied = address_state.detach().float().square().sum(dim=-1) > 1e-12
+        working_addresses = stored_addresses
+        active = write_weights > 0
+        assignments = []
+        assignment_indices = []
+        matched_candidates = []
+        allocated_candidates = []
+        overflow_candidates = []
+        # Top-k is typically one, so this short loop makes same-token duplicate
+        # entity proposals observe earlier allocations without expanding a
+        # (batch, experts, experts, slots) collision tensor.
+        for candidate_index in range(write_candidates.shape[1]):
+            candidate = candidate_addresses[:, candidate_index]
+            candidate_active = active[:, candidate_index]
+            similarity = torch.einsum("bd,bsd->bs", candidate, working_addresses)
+            similarity = similarity.masked_fill(~occupied, -2.0)
+            best_similarity, best_slot = similarity.max(dim=-1)
+            needs_allocation = candidate_active & (
+                best_similarity < self.key_match_threshold
+            )
+            free = ~occupied
+            can_allocate = needs_allocation & free.any(dim=-1)
+            capacity_overflow = needs_allocation & ~can_allocate
+            free_slot = free.to(torch.int64).argmax(dim=-1)
+            destination = torch.where(can_allocate, free_slot, best_slot)
+            assignment_active = candidate_active
+            if self.semantic_entity_addressing:
+                # Never overwrite a different semantic identity when all slots
+                # are occupied. Dropping that write preserves existing bindings.
+                assignment_active = candidate_active & ~capacity_overflow
+            assignment = F.one_hot(destination, num_classes=self.num_slots).to(
+                candidate_addresses.dtype
+            )
+            assignment = assignment * assignment_active.unsqueeze(-1).to(assignment.dtype)
+            assignments.append(assignment)
+            assignment_indices.append(
+                torch.where(assignment_active, destination, torch.full_like(destination, -1))
+            )
+            matched_candidates.append(candidate_active & ~needs_allocation)
+            allocated_candidates.append(can_allocate)
+            overflow_candidates.append(capacity_overflow)
+            new_address_mask = F.one_hot(
+                destination, num_classes=self.num_slots
+            ).bool() & can_allocate.unsqueeze(-1)
+            working_addresses = torch.where(
+                new_address_mask.unsqueeze(-1), candidate.unsqueeze(1), working_addresses
+            )
+            occupied = occupied | (
+                F.one_hot(destination, num_classes=self.num_slots).bool()
+                & assignment_active.unsqueeze(-1)
+            )
+        assignment = torch.stack(assignments, dim=1)
+        observer = self._initium_address_assignment_observer
+        if observer is not None:
+            assignment_index_tensor = torch.stack(assignment_indices, dim=1)
+            self._last_address_assignment_indices = torch.where(
+                active,
+                assignment_index_tensor,
+                torch.full_like(assignment_index_tensor, -1),
+            )
+        weighted_assignment = assignment * write_weights.float().unsqueeze(-1)
+        mass = weighted_assignment.sum(dim=1)
+        denominator = mass.clamp_min(1e-6)
+
+        values = projected_values if projected_values is not None else self.value(write_candidates)
+        value_proposal = torch.einsum(
+            "bes,bed->bsd", weighted_assignment.to(values.dtype), values
+        ) / denominator.to(values.dtype).unsqueeze(-1)
+        address_proposal = torch.einsum(
+            "bes,bed->bsd", weighted_assignment, candidate_addresses
+        ) / denominator.unsqueeze(-1)
+        address_proposal = _normalize_address(address_proposal)
+        active_count = active.sum().float().clamp_min(1.0)
+        address_diagnostics = {
+            "address_match_frac": torch.stack(matched_candidates, dim=1).sum().float()
+            / active_count,
+            "address_allocation_frac": torch.stack(allocated_candidates, dim=1).sum().float()
+            / active_count,
+            "address_capacity_overflow_frac": torch.stack(
+                overflow_candidates, dim=1
+            ).sum().float()
+            / active_count,
+            "address_occupied_frac": occupied.float().mean(),
+        }
+        return value_proposal, mass, address_proposal, address_diagnostics
 
     def _compiled_recurrence_step_impl(
         self,
@@ -123,35 +330,63 @@ class WorkspaceBroadcast(nn.Module):
         prediction_error: torch.Tensor,
         reconsideration_error: torch.Tensor,
         reconsideration_random_scores: torch.Tensor,
+        entity_write_mask: torch.Tensor | None,
     ):
         """Pure tensor step suitable for torch.compile and autograd."""
-        scores = torch.einsum(
-            "bed,bsd->bes", write_keys.float(), self.query(state).float()
-        ) / math.sqrt(self.d_model)
-        attention = scores.softmax(dim=-1).to(selected_deltas.dtype)
         weights = route_weights.float()
-        proposal = torch.einsum(
-            "be,bes,bed->bsd", weights, attention, write_values
-        )
-        mass = torch.einsum("be,bes->bs", weights, attention)
-        proposal = proposal / mass.unsqueeze(-1).clamp_min(1e-6)
-        update_logits = self.write_gate(torch.cat([state, proposal], dim=-1))
+        write_weights = weights
+        if entity_write_mask is not None:
+            write_weights = write_weights * entity_write_mask.reshape(-1, 1).to(
+                write_weights.dtype
+            )
+        if self.entity_keyed_writes:
+            address_state, content_state = state.split(self.d_model, dim=-1)
+            proposal, mass, address_proposal, address_diagnostics = (
+                self._entity_keyed_write_proposals(
+                    selected_deltas,
+                    write_weights,
+                    address_state,
+                    candidate_addresses=write_keys,
+                    projected_values=write_values,
+                )
+            )
+        else:
+            address_state = None
+            address_proposal = None
+            address_diagnostics = None
+            content_state = state
+            scores = torch.einsum(
+                "bed,bsd->bes", write_keys.float(), self.query(state).float()
+            ) / math.sqrt(self.d_model)
+            attention = scores.softmax(dim=-1).to(selected_deltas.dtype)
+            proposal = torch.einsum(
+                "be,bes,bed->bsd", write_weights, attention, write_values
+            )
+            mass = torch.einsum("be,bes->bs", write_weights, attention)
+            proposal = proposal / mass.unsqueeze(-1).clamp_min(1e-6)
+        update_logits = self.write_gate(torch.cat([content_state, proposal], dim=-1))
         if self.prediction_error_to_write_gate is not None:
             error_value = prediction_error.reshape(state.shape[0], 1).float().detach()
             update_logits = update_logits + self.prediction_error_to_write_gate(
                 error_value
             ).unsqueeze(1)
         update = torch.sigmoid(update_logits)
-        has_writer = weights.sum(dim=-1, keepdim=True).unsqueeze(-1) > 0
-        update = update * has_writer.to(update.dtype)
-        reconsideration_diagnostics = ()
+        # A write proposal belongs to an individual slot. Masking only by
+        # whether the batch item has any writer lets unrelated slots decay
+        # toward their zero proposal on every token, corrupting persistent
+        # values and potentially erasing their semantic addresses.
+        has_writer = mass > 0
+        update = update * has_writer.unsqueeze(-1).to(update.dtype)
+        eligible = None
+        surprise = None
+        reconsideration_trigger = None
         if self.reconsideration_enabled:
-            old_probe = state.detach().float()
+            old_probe = content_state.detach().float()
             # Spell norms as primitive reductions instead of linalg.vector_norm.
             # Some Colab Triton/Inductor runtimes fail lowering a fused kernel
             # containing vector_norm (PassManager::run failed).
             old_norm_sq = old_probe.square().sum(dim=-1)
-            eligible = (old_norm_sq > 1e-12) & has_writer.squeeze(-1).squeeze(-1).unsqueeze(-1)
+            eligible = (old_norm_sq > 1e-12) & has_writer
             if self.reconsideration_trigger_mode in (
                 "prediction_error",
                 "prediction_error_random_rate_matched",
@@ -189,81 +424,64 @@ class WorkspaceBroadcast(nn.Module):
                 torch.ones_like(update),
                 update,
             )
+        next_content = update.mul(proposal).add((1.0 - update).mul(content_state))
+        if self.entity_keyed_writes:
+            next_address = update.mul(address_proposal).add(
+                (1.0 - update).mul(address_state)
+            )
+            next_address = _normalize_address(next_address)
+            next_state = torch.cat((next_address, next_content), dim=-1)
+            occupied = next_address.detach().float().square().sum(dim=-1) > 1e-12
+            read_scores = torch.einsum(
+                "bed,bsd->bes",
+                _normalize_address(read_queries),
+                _normalize_address(next_address),
+            )
+            read_scores = read_scores.masked_fill(~occupied.unsqueeze(1), -1e4)
+            read_weights = read_scores.softmax(dim=-1).to(selected_deltas.dtype)
+            read_weights = read_weights * occupied.unsqueeze(1).to(read_weights.dtype)
+            read_weights = read_weights / read_weights.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+            address_match_frac = address_diagnostics["address_match_frac"]
+            address_allocation_frac = address_diagnostics["address_allocation_frac"]
+            address_capacity_overflow_frac = address_diagnostics[
+                "address_capacity_overflow_frac"
+            ]
+            address_occupied_frac = address_diagnostics["address_occupied_frac"]
         else:
-            reconsideration_trigger = None
-        next_state = update.mul(proposal).add((1.0 - update).mul(state))
-
-        if self.reconsideration_enabled and self.diagnostics_enabled:
-            eligible_count_raw = eligible.sum().float()
-            eligible_count = eligible_count_raw.clamp_min(1.0)
-            triggered_count = reconsideration_trigger.sum()
-            change = (next_state - state).float()
-            actual_change = change.square().sum(dim=-1).sqrt()
-            changed_count = (reconsideration_trigger & (actual_change > 1e-6)).sum().float()
-            state_delta_sq_sum = (actual_change * reconsideration_trigger).square().sum()
-            reconsideration_diagnostics = (
-                eligible.float().mean().detach(),
-                eligible_count_raw.detach(),
-                triggered_count.float().detach(),
-                ((surprise * eligible).sum() / eligible_count).detach(),
-                (triggered_count.float() / eligible_count).detach(),
-                ((surprise * eligible).sum() / eligible_count).detach(),
-                (changed_count / triggered_count.float().clamp_min(1.0)).detach(),
-                changed_count.detach(),
-                state_delta_sq_sum.detach(),
-                (state_delta_sq_sum / triggered_count.float().clamp_min(1.0)).sqrt().detach(),
-            )
-        prediction_error_diagnostics = ()
-        if self.prediction_error_to_write_gate is not None and self.diagnostics_enabled:
-            prediction_error_diagnostics = (
-                prediction_error.detach().float().mean(),
-                self.prediction_error_to_write_gate.weight.detach()
-                .float()
-                .square()
-                .mean()
-                .sqrt(),
-            )
-
-        read_scores = torch.einsum(
-            "bed,bsd->bes", read_queries.float(), self.key(next_state).float()
-        ) / math.sqrt(self.d_model)
-        read_weights = read_scores.softmax(dim=-1).to(selected_deltas.dtype)
-        read_values = self.value(next_state)
+            next_state = next_content
+            read_scores = torch.einsum(
+                "bed,bsd->bes", read_queries.float(), self.key(next_state).float()
+            ) / math.sqrt(self.d_model)
+            read_weights = read_scores.softmax(dim=-1).to(selected_deltas.dtype)
+            address_match_frac = weights.new_zeros(())
+            address_allocation_frac = weights.new_zeros(())
+            address_capacity_overflow_frac = weights.new_zeros(())
+            address_occupied_frac = weights.new_zeros(())
+        read_values = self.value(next_content)
         broadcast = torch.einsum("bes,bsd->bed", read_weights, read_values)
         read_scale = torch.sigmoid(self.read_gate).to(selected_deltas.dtype)
         output = (
             (selected_deltas + read_scale * broadcast) * route_weights.unsqueeze(-1)
         ).sum(dim=1)
 
-        if self.diagnostics_enabled:
-            write_mass = weights.sum(dim=-1).mean().detach()
-            active_write = (weights.sum(dim=-1) > 0).float().mean().detach()
-            write_gate_mean = update.detach().float().mean()
-            slot_rms = next_state.detach().float().square().mean().sqrt()
-            broadcast_rms = (
-                read_scale.detach().float() * broadcast.detach().float()
-            ).square().mean().sqrt()
-            specialist_rms = selected_deltas.detach().float().square().mean().sqrt()
-            writer_frequency = torch.zeros(
-                self.num_experts, device=route_indices.device, dtype=torch.float32
-            ).scatter_add_(
-                0,
-                route_indices.reshape(-1),
-                route_weights.detach().float().reshape(-1),
-            )
-            writer_frequency = writer_frequency / max(route_indices.shape[0], 1)
-            diagnostics = (
-                write_mass,
-                active_write,
-                write_gate_mean,
-                slot_rms,
-                broadcast_rms,
-                specialist_rms,
-                writer_frequency,
-            ) + reconsideration_diagnostics + prediction_error_diagnostics
-        else:
-            diagnostics = ()
-        return output, next_state, diagnostics
+        # Keep logging reductions and indexed accumulation outside the compiled
+        # transition. Triton can fail lowering their fused reduction graph on
+        # some Colab builds; the raw tensors below are already produced by the
+        # transition and let the caller compute exactly the same telemetry in
+        # eager mode without changing state/update math.
+        return (
+            output,
+            next_state,
+            update,
+            broadcast,
+            eligible,
+            surprise,
+            reconsideration_trigger,
+            address_match_frac,
+            address_allocation_frac,
+            address_capacity_overflow_frac,
+            address_occupied_frac,
+        )
 
     def _get_compiled_recurrence_step(self):
         if self._compiled_recurrence_step is None:
@@ -276,10 +494,8 @@ class WorkspaceBroadcast(nn.Module):
                 self._compiled_recurrence_step_impl,
                 # The compiled transition is called once per sequence token,
                 # and all calls retain autograd state until the sequence
-                # backward pass. CUDA-graph reduce-overhead mode is designed
-                # for completed invocation lifetimes and warns/falls back when
-                # many forwards are pending backward in this recurrence.
-                mode="default",
+                # backward pass. Use the options argument without a mode
+                # argument: current PyTorch rejects specifying both.
                 fullgraph=True,
                 dynamic=False,
                 # Respect the lightweight default path even if the Colab
@@ -312,6 +528,7 @@ class WorkspaceBroadcast(nn.Module):
         projected_write_keys: torch.Tensor | None = None,
         projected_write_values: torch.Tensor | None = None,
         projected_read_queries: torch.Tensor | None = None,
+        entity_write_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Keep the zero-slot/closed-gate bypass identical to the selection-only
         # MoE path. Active workspace attention and recurrent slot updates use
@@ -336,6 +553,7 @@ class WorkspaceBroadcast(nn.Module):
                 projected_write_keys=projected_write_keys,
                 projected_write_values=projected_write_values,
                 projected_read_queries=projected_read_queries,
+                entity_write_mask=entity_write_mask,
             )
         if specialist_deltas.is_cuda:
             with torch.autocast(device_type="cuda", enabled=False):
@@ -358,6 +576,7 @@ class WorkspaceBroadcast(nn.Module):
                     projected_write_keys=projected_write_keys,
                     projected_write_values=projected_write_values,
                     projected_read_queries=projected_read_queries,
+                    entity_write_mask=entity_write_mask,
                 )
         return self._forward_step(
             specialist_deltas.float(),
@@ -378,6 +597,7 @@ class WorkspaceBroadcast(nn.Module):
             projected_write_keys=projected_write_keys,
             projected_write_values=projected_write_values,
             projected_read_queries=projected_read_queries,
+            entity_write_mask=entity_write_mask,
         )
 
     def _forward_step(
@@ -401,6 +621,7 @@ class WorkspaceBroadcast(nn.Module):
         projected_write_keys: torch.Tensor | None = None,
         projected_write_values: torch.Tensor | None = None,
         projected_read_queries: torch.Tensor | None = None,
+        entity_write_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.num_slots == 0 or self.write_gate_closed:
             selected = (
@@ -428,11 +649,16 @@ class WorkspaceBroadcast(nn.Module):
             raise ValueError("specialist delta shape does not match workspace configuration")
         if selected_specialists_only and no_selection:
             raise ValueError("random workspace selection requires all expert candidates")
-        if state.shape != (batch, self.num_slots, self.d_model):
+        state_width = self.d_model * (2 if self.entity_keyed_writes else 1)
+        if state.shape != (batch, self.num_slots, state_width):
             raise ValueError("workspace state has an incompatible batch/slot/feature shape")
 
         if reset_each_step:
             state = torch.zeros_like(state)
+        if self.entity_keyed_writes:
+            address_state, content_state = state.split(self.d_model, dim=-1)
+        else:
+            address_state, content_state = None, state
         selected_deltas = (
             specialist_deltas
             if selected_specialists_only
@@ -455,29 +681,58 @@ class WorkspaceBroadcast(nn.Module):
             # if supplied by a caller, retain their original additive effect.
             write_weights = route_weights.float()
             write_candidates = selected_deltas
+        if entity_write_mask is not None:
+            if not self.semantic_entity_addressing:
+                raise ValueError("entity_write_mask requires semantic entity addressing")
+            if entity_write_mask.shape != (batch,):
+                raise ValueError("entity_write_mask must have shape (batch,)")
+            write_weights = write_weights * entity_write_mask.reshape(-1, 1).to(
+                write_weights.dtype
+            )
 
-        # Candidate keys compete over slots using content-based attention;
-        # slot writes are weighted by the existing sparse MoE selection.
-        keys = (
-            projected_write_keys
-            if projected_write_keys is not None
-            else self.key(write_candidates)
-        )
-        scores = torch.einsum("bed,bsd->bes", keys.float(), self.query(state).float())
-        scores = scores / math.sqrt(self.d_model)
-        slot_attention = scores.softmax(dim=-1).to(specialist_deltas.dtype)
-        values = (
-            projected_write_values
-            if projected_write_values is not None
-            else self.value(write_candidates)
-        )
-        slot_proposal = torch.einsum(
-            "be,bes,bed->bsd", write_weights.to(values.dtype), slot_attention, values
-        )
-        mass = torch.einsum("be,bes->bs", write_weights.to(values.dtype), slot_attention)
-        slot_proposal = slot_proposal / mass.unsqueeze(-1).clamp_min(1e-6)
+        # Shared mode softly pools selected candidates into every slot.
+        # Entity-keyed mode stores a separate address per slot and routes each
+        # candidate to its nearest matching address, allocating free slots for
+        # novel addresses while capacity remains.
+        address_proposal = None
+        address_diagnostics = {}
+        if self.entity_keyed_writes:
+            assert address_state is not None
+            (
+                slot_proposal,
+                mass,
+                address_proposal,
+                address_diagnostics,
+            ) = self._entity_keyed_write_proposals(
+                write_candidates,
+                write_weights,
+                address_state,
+                candidate_addresses=projected_write_keys,
+                projected_values=projected_write_values,
+            )
+        else:
+            keys = (
+                projected_write_keys
+                if projected_write_keys is not None
+                else self.key(write_candidates)
+            )
+            scores = torch.einsum(
+                "bed,bsd->bes", keys.float(), self.query(content_state).float()
+            )
+            scores = scores / math.sqrt(self.d_model)
+            slot_attention = scores.softmax(dim=-1).to(specialist_deltas.dtype)
+            values = (
+                projected_write_values
+                if projected_write_values is not None
+                else self.value(write_candidates)
+            )
+            slot_proposal = torch.einsum(
+                "be,bes,bed->bsd", write_weights.to(values.dtype), slot_attention, values
+            )
+            mass = torch.einsum("be,bes->bs", write_weights.to(values.dtype), slot_attention)
+            slot_proposal = slot_proposal / mass.unsqueeze(-1).clamp_min(1e-6)
         slot_inputs = slot_proposal
-        old_inputs = state
+        old_inputs = content_state
         update_logits = self.write_gate(torch.cat([old_inputs, slot_inputs], dim=-1))
         error_value = None
         if prediction_error is not None:
@@ -491,8 +746,9 @@ class WorkspaceBroadcast(nn.Module):
         elif self.prediction_error_salience_enabled:
             raise ValueError("workspace prediction-error salience requires prediction_error")
         update = torch.sigmoid(update_logits)
-        has_writer = write_weights.sum(dim=-1, keepdim=True).unsqueeze(-1) > 0
-        update = update * has_writer.to(update.dtype)
+        # Keep the compiled transition aligned with the eager per-slot mask.
+        has_writer = mass > 0
+        update = update * has_writer.unsqueeze(-1).to(update.dtype)
         reconsideration_diag = {}
         reconsideration_trigger = None
         if self.reconsideration_enabled:
@@ -506,7 +762,7 @@ class WorkspaceBroadcast(nn.Module):
             proposal_norm = torch.linalg.vector_norm(proposal_probe, dim=-1)
             innovation = torch.linalg.vector_norm(proposal_probe - old_probe, dim=-1)
             surprise = innovation / (old_norm + proposal_norm).clamp_min(1e-6)
-            eligible = (old_norm > 1e-6) & has_writer.squeeze(-1).squeeze(-1).unsqueeze(-1)
+            eligible = (old_norm > 1e-6) & has_writer
             if self.reconsideration_trigger_mode in (
                 "prediction_error",
                 "prediction_error_random_rate_matched",
@@ -572,7 +828,7 @@ class WorkspaceBroadcast(nn.Module):
             committed, _ = self.bistable_gate(
                 mass,
                 selection_confidence=write_weights.sum(dim=-1),
-                candidate_mask=has_writer.reshape(batch),
+                candidate_mask=has_writer.any(dim=-1),
                 noise_scale=bistable_noise_scale,
                 selection_scale=bistable_selection_scale,
                 deterministic=deterministic_gate,
@@ -595,7 +851,16 @@ class WorkspaceBroadcast(nn.Module):
                 batch, self.num_experts, device=route_indices.device, dtype=torch.float32
             ).scatter_add_(1, route_indices, route_weights.float())
             writer_frequency = writer_weights.mean(dim=0).detach()
-        next_state = update.mul(slot_inputs).add((1.0 - update).mul(old_inputs))
+        next_content = update.mul(slot_inputs).add((1.0 - update).mul(old_inputs))
+        if self.entity_keyed_writes:
+            assert address_state is not None and address_proposal is not None
+            next_address = update.mul(address_proposal).add(
+                (1.0 - update).mul(address_state)
+            )
+            next_address = _normalize_address(next_address)
+            next_state = torch.cat((next_address, next_content), dim=-1)
+        else:
+            next_state = next_content
         if self.diagnostics_enabled and reconsideration_trigger is not None:
             triggered_count_raw = reconsideration_trigger.sum().float()
             triggered_count = triggered_count_raw.clamp_min(1.0)
@@ -622,11 +887,12 @@ class WorkspaceBroadcast(nn.Module):
                     "write_mass": write_weights.detach().sum(dim=-1).mean(),
                     "active_write_frac": (write_weights.detach().sum(dim=-1) > 0).float().mean(),
                     "write_gate_mean": update.detach().float().mean(),
-                    "slot_rms": next_state.detach().float().square().mean().sqrt(),
+                    "slot_rms": next_content.detach().float().square().mean().sqrt(),
                     "broadcast_rms": next_state.new_zeros((), dtype=torch.float32),
                     "specialist_rms": specialist_deltas.detach().float().square().mean().sqrt(),
                     **reconsideration_diag,
                     **bistable_diag,
+                    **address_diagnostics,
                     **(
                         {"prediction_error_mean": error_value.mean().detach()}
                         if error_value is not None
@@ -651,22 +917,44 @@ class WorkspaceBroadcast(nn.Module):
 
         # Only routed experts are combined into the backbone residual, so
         # computing readback for unselected experts is dead work.
-        read_queries = (
-            projected_read_queries
-            if projected_read_queries is not None
-            else self.query(selected_deltas)
-        )
+        if self.entity_keyed_writes:
+            assert self.address_read is not None
+            read_queries = (
+                projected_read_queries
+                if projected_read_queries is not None
+                else self.address_read(_condition_address_input(selected_deltas))
+            )
+        else:
+            read_queries = (
+                projected_read_queries
+                if projected_read_queries is not None
+                else self.query(selected_deltas)
+            )
         read_state = (
             torch.roll(next_state, shifts=1, dims=0)
             if shuffle_readback_across_batch and next_state.shape[0] > 1
             else next_state
         )
-        read_scores = torch.einsum(
-            "bed,bsd->bes", read_queries.float(), self.key(read_state).float()
-        )
-        read_scores = read_scores / math.sqrt(self.d_model)
-        read_weights = read_scores.softmax(dim=-1).to(specialist_deltas.dtype)
-        read_values = self.value(read_state)
+        if self.entity_keyed_writes:
+            read_addresses, read_content = read_state.split(self.d_model, dim=-1)
+            read_scores = torch.einsum(
+                "bed,bsd->bes",
+                _normalize_address(read_queries),
+                _normalize_address(read_addresses),
+            )
+            occupied = read_addresses.detach().float().square().sum(dim=-1) > 1e-12
+            read_scores = read_scores.masked_fill(~occupied.unsqueeze(1), -1e4)
+            read_weights = read_scores.softmax(dim=-1).to(specialist_deltas.dtype)
+            read_weights = read_weights * occupied.unsqueeze(1).to(read_weights.dtype)
+            read_weights = read_weights / read_weights.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        else:
+            read_content = read_state
+            read_scores = torch.einsum(
+                "bed,bsd->bes", read_queries.float(), self.key(read_content).float()
+            )
+            read_scores = read_scores / math.sqrt(self.d_model)
+            read_weights = read_scores.softmax(dim=-1).to(specialist_deltas.dtype)
+        read_values = self.value(read_content)
         broadcast = torch.einsum("bes,bsd->bed", read_weights, read_values)
         read_scale = torch.sigmoid(self.read_gate).to(specialist_deltas.dtype)
         enriched = selected_deltas + read_scale * broadcast
@@ -675,7 +963,7 @@ class WorkspaceBroadcast(nn.Module):
                 "write_mass": write_weights.detach().sum(dim=-1).mean(),
                 "active_write_frac": (write_weights.detach().sum(dim=-1) > 0).float().mean(),
                 "write_gate_mean": update.detach().float().mean(),
-                "slot_rms": next_state.detach().float().square().mean().sqrt(),
+                "slot_rms": next_content.detach().float().square().mean().sqrt(),
                 "broadcast_rms": (read_scale.detach().float() * broadcast.detach().float())
                 .square()
                 .mean()
@@ -683,6 +971,7 @@ class WorkspaceBroadcast(nn.Module):
                 "specialist_rms": specialist_deltas.detach().float().square().mean().sqrt(),
                 **reconsideration_diag,
                 **bistable_diag,
+                **address_diagnostics,
                 **(
                     {"prediction_error_mean": error_value.mean().detach()}
                     if error_value is not None
@@ -721,9 +1010,15 @@ class WorkspaceBroadcast(nn.Module):
         deterministic_gate: bool = False,
         prediction_error: torch.Tensor | None = None,
         selected_specialists_only: bool = False,
+        entity_ids: torch.Tensor | None = None,
+        entity_write_mask: torch.Tensor | None = None,
+        state_supervision_entity_ids: torch.Tensor | None = None,
+        state_supervision_mask: torch.Tensor | None = None,
+        state_supervision_steps: tuple[int, ...] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Process time-major specialists ``(B,T,E,D)`` sequentially."""
         outputs: list[torch.Tensor] = []
+        self._last_semantic_state_predictions = []
         step_diags: list[dict[str, torch.Tensor]] | None = [] if self.diagnostics_enabled else None
         state_observer = getattr(self, "_initium_recurrent_state_observer", None)
         smoothed_prediction_error = None
@@ -733,6 +1028,44 @@ class WorkspaceBroadcast(nn.Module):
         time_major_deltas = None
         time_major_route_indices = None
         time_major_route_weights = None
+        if self.semantic_entity_addressing:
+            if entity_ids is None or entity_write_mask is None:
+                raise ValueError(
+                    "semantic entity addressing requires entity_ids and entity_write_mask"
+                )
+            expected_shape = specialist_deltas.shape[:2]
+            if entity_ids.shape != expected_shape or entity_write_mask.shape != expected_shape:
+                raise ValueError(
+                    "entity_ids and entity_write_mask must match the specialist (batch, time) axes"
+                )
+            if entity_ids.dtype not in (torch.int32, torch.int64):
+                raise TypeError("entity_ids must use an integer tensor dtype")
+            if entity_write_mask.dtype != torch.bool:
+                raise TypeError("entity_write_mask must use torch.bool")
+        elif entity_ids is not None or entity_write_mask is not None:
+            raise ValueError(
+                "entity metadata is only accepted when semantic entity addressing is enabled"
+            )
+        if state_supervision_entity_ids is not None or state_supervision_mask is not None:
+            if not self.semantic_entity_addressing:
+                raise ValueError("state supervision requires semantic entity addressing")
+            expected = (specialist_deltas.shape[0], specialist_deltas.shape[1], 16)
+            if (
+                state_supervision_entity_ids is None
+                or state_supervision_mask is None
+                or state_supervision_entity_ids.shape != expected
+                or state_supervision_mask.shape != expected
+            ):
+                raise ValueError("state supervision IDs and mask must have shape (batch, time, 16)")
+            if state_supervision_entity_ids.dtype not in (torch.int32, torch.int64):
+                raise TypeError("state supervision entity IDs must use an integer tensor dtype")
+            if state_supervision_mask.dtype != torch.bool:
+                raise TypeError("state supervision mask must use torch.bool")
+            state_supervision_steps = tuple(sorted(set(state_supervision_steps or ())))
+            if any(step < 0 or step >= specialist_deltas.shape[1] for step in state_supervision_steps):
+                raise ValueError("state supervision step is outside the current sequence")
+        elif state_supervision_steps:
+            raise ValueError("state supervision steps require state supervision IDs and mask")
         if self.num_slots > 0 and not self.write_gate_closed:
             # These projections depend only on this token's routed expert
             # outputs, so batch them over time before the causal slot loop.
@@ -762,10 +1095,50 @@ class WorkspaceBroadcast(nn.Module):
                 else torch.autocast(device_type="cpu", enabled=False)
             )
             with projection_context:
-                projected_write_keys = self.key(write_candidates.float())
+                if self.entity_keyed_writes:
+                    assert self.address_read is not None
+                    if self.semantic_entity_addressing:
+                        assert entity_ids is not None
+                        safe_entity_ids = entity_ids.clamp(
+                            min=0, max=self._SEMANTIC_ENTITY_COUNT - 1
+                        )
+                        identity_keys = F.one_hot(
+                            safe_entity_ids, num_classes=self._SEMANTIC_ENTITY_COUNT
+                        ).to(dtype=torch.float32)
+                        identity_keys = F.pad(
+                            identity_keys, (0, self.d_model - 64)
+                        )
+                        identity_keys = identity_keys * entity_ids.ge(0).unsqueeze(-1)
+                        projected_write_keys = identity_keys.permute(1, 0, 2).unsqueeze(2).expand(
+                            -1, -1, write_candidates.shape[2], -1
+                        )
+                    else:
+                        assert self.address_write is not None
+                        projected_write_keys = self.address_write(
+                            _condition_address_input(write_candidates.float())
+                        )
+                    if not bypass_broadcast:
+                        learned_queries = self.address_read(
+                            _condition_address_input(selected_deltas.float())
+                        )
+                        if self.semantic_entity_addressing:
+                            assert entity_ids is not None
+                            direct_queries = identity_keys.permute(1, 0, 2).unsqueeze(2).expand(
+                                -1, -1, selected_deltas.shape[2], -1
+                            )
+                            semantic_query_mask = entity_ids.ge(0).transpose(0, 1)[
+                                :, :, None, None
+                            ]
+                            projected_read_queries = torch.where(
+                                semantic_query_mask, direct_queries, learned_queries
+                            )
+                        else:
+                            projected_read_queries = learned_queries
+                else:
+                    projected_write_keys = self.key(write_candidates.float())
+                    if not bypass_broadcast:
+                        projected_read_queries = self.query(selected_deltas.float())
                 projected_write_values = self.value(write_candidates.float())
-                if not bypass_broadcast:
-                    projected_read_queries = self.query(selected_deltas.float())
         compiled_step = None
         # The fused recurrence is a training optimization. Curriculum and
         # periodic evaluations use variable/partial batch sizes, which would
@@ -830,6 +1203,9 @@ class WorkspaceBroadcast(nn.Module):
             step_prediction_error = (
                 prediction_error[:, step] if prediction_error is not None else None
             )
+            step_entity_write_mask = (
+                entity_write_mask[:, step] if entity_write_mask is not None else None
+            )
             if step_prediction_error is not None:
                 current_error = step_prediction_error.float().detach().clamp(0.0, 1.0)
                 if smoothed_prediction_error is None:
@@ -869,9 +1245,22 @@ class WorkspaceBroadcast(nn.Module):
                     if step_prediction_error is not None
                     else compiled_zero_reconsideration_error
                 )
+                previous_state = state
                 try:
                     with torch.autocast(device_type="cuda", enabled=False):
-                        out, state, compiled_diagnostics = compiled_step(
+                        (
+                            out,
+                            state,
+                            compiled_update,
+                            compiled_broadcast,
+                            compiled_eligible,
+                            compiled_surprise,
+                            compiled_trigger,
+                            compiled_address_match_frac,
+                            compiled_address_allocation_frac,
+                            compiled_address_capacity_overflow_frac,
+                            compiled_address_occupied_frac,
+                        ) = compiled_step(
                             time_major_deltas[step].float(),
                             time_major_route_weights[step].float(),
                             time_major_route_indices[step],
@@ -882,6 +1271,7 @@ class WorkspaceBroadcast(nn.Module):
                             compiled_prediction_error.float(),
                             compiled_reconsideration_error.float(),
                             reconsideration_random_scores,
+                            step_entity_write_mask,
                         )
                 except Exception as exc:
                     compile_error_names = {
@@ -970,18 +1360,41 @@ class WorkspaceBroadcast(nn.Module):
                         if projected_read_queries is not None
                         else None
                     ),
+                    entity_write_mask=step_entity_write_mask,
                 )
+                observer = self._initium_address_assignment_observer
+                assignments = self._last_address_assignment_indices
+                if observer is not None and assignments is not None:
+                    observer(step, assignments.detach())
             else:
                 if self.diagnostics_enabled:
-                    (
-                        write_mass,
-                        active_write_frac,
-                        write_gate_mean,
-                        slot_rms,
-                        broadcast_rms,
-                        specialist_rms,
-                        writer_frequency,
-                    ) = compiled_diagnostics[:7]
+                    step_weights = time_major_route_weights[step].detach().float()
+                    step_routes = time_major_route_indices[step]
+                    write_mass = step_weights.sum(dim=-1).mean()
+                    active_write_frac = (step_weights.sum(dim=-1) > 0).float().mean()
+                    write_gate_mean = compiled_update.detach().float().mean()
+                    diagnostic_state = (
+                        state.split(self.d_model, dim=-1)[1]
+                        if self.entity_keyed_writes
+                        else state
+                    )
+                    slot_rms = diagnostic_state.detach().float().square().mean().sqrt()
+                    broadcast_rms = (
+                        torch.sigmoid(self.read_gate.detach()).float()
+                        * compiled_broadcast.detach().float()
+                    ).square().mean().sqrt()
+                    specialist_rms = (
+                        time_major_deltas[step].detach().float().square().mean().sqrt()
+                    )
+                    writer_frequency = torch.zeros(
+                        self.num_experts,
+                        device=step_routes.device,
+                        dtype=torch.float32,
+                    ).scatter_add_(
+                        0,
+                        step_routes.reshape(-1),
+                        step_weights.reshape(-1),
+                    ) / max(step_routes.shape[0], 1)
                     self._last_step_diag = {
                         "write_mass": write_mass,
                         "active_write_frac": active_write_frac,
@@ -991,38 +1404,68 @@ class WorkspaceBroadcast(nn.Module):
                         "specialist_rms": specialist_rms,
                         "writer_frequency": writer_frequency,
                     }
+                    if self.entity_keyed_writes:
+                        self._last_step_diag.update(
+                            {
+                                "address_match_frac": compiled_address_match_frac,
+                                "address_allocation_frac": compiled_address_allocation_frac,
+                                "address_capacity_overflow_frac": (
+                                    compiled_address_capacity_overflow_frac
+                                ),
+                                "address_occupied_frac": compiled_address_occupied_frac,
+                            }
+                        )
                     if self.reconsideration_enabled:
-                        (
-                            eligible_frac,
-                            eligible_count,
-                            trigger_count,
-                            surprise_mean,
-                            trigger_frac,
-                            prediction_error_mean,
-                            changed_frac,
-                            changed_count,
-                            state_delta_sq_sum,
-                            state_delta_rms,
-                        ) = compiled_diagnostics[7:]
+                        eligible = compiled_eligible.detach()
+                        surprise = compiled_surprise.detach()
+                        trigger = compiled_trigger.detach()
+                        eligible_count_raw = eligible.sum().float()
+                        eligible_count = eligible_count_raw.clamp_min(1.0)
+                        trigger_count = trigger.sum().float()
+                        surprise_mean = (surprise * eligible).sum() / eligible_count
+                        if self.entity_keyed_writes:
+                            state_content = state.split(self.d_model, dim=-1)[1]
+                            previous_content = previous_state.split(self.d_model, dim=-1)[1]
+                            actual_change = state_content.detach() - previous_content.detach()
+                        else:
+                            actual_change = state.detach() - previous_state.detach()
+                        actual_change = actual_change.float()
+                        actual_change = actual_change.square().sum(dim=-1).sqrt()
+                        changed_count = (
+                            trigger & (actual_change > 1e-6)
+                        ).sum().float()
+                        state_delta_sq_sum = (
+                            actual_change * trigger
+                        ).square().sum()
+                        eligible_frac = eligible.float().mean()
+                        trigger_frac = trigger_count / eligible_count
+                        changed_frac = changed_count / trigger_count.clamp_min(1.0)
+                        state_delta_rms = (
+                            state_delta_sq_sum / trigger_count.clamp_min(1.0)
+                        ).sqrt()
                         self._last_step_diag.update(
                             {
                                 "reconsideration_eligible_frac": eligible_frac,
-                                "reconsideration_eligible_count": eligible_count,
+                                "reconsideration_eligible_count": eligible_count_raw,
                                 "reconsideration_trigger_count": trigger_count,
                                 "reconsideration_surprise_mean": surprise_mean,
                                 "reconsideration_trigger_frac": trigger_frac,
-                                "reconsideration_prediction_error_mean": prediction_error_mean,
+                                "reconsideration_prediction_error_mean": surprise_mean,
                                 "reconsideration_changed_frac": changed_frac,
                                 "reconsideration_changed_count": changed_count,
                                 "reconsideration_state_delta_sq_sum": state_delta_sq_sum,
                                 "reconsideration_state_delta_rms": state_delta_rms,
                             }
                         )
-                    diagnostic_offset = 7 + (10 if self.reconsideration_enabled else 0)
                     if self.prediction_error_to_write_gate is not None:
-                        error_mean, write_scale_rms = compiled_diagnostics[
-                            diagnostic_offset : diagnostic_offset + 2
-                        ]
+                        error_mean = compiled_prediction_error.detach().float().mean()
+                        write_scale_rms = (
+                            self.prediction_error_to_write_gate.weight.detach()
+                            .float()
+                            .square()
+                            .mean()
+                            .sqrt()
+                        )
                         self._last_step_diag.update(
                             {
                                 "prediction_error_mean": error_mean,
@@ -1033,6 +1476,22 @@ class WorkspaceBroadcast(nn.Module):
                     self._last_step_diag = {}
             if state_observer is not None:
                 state_observer(state, call_index=step)
+            if (
+                state_supervision_steps
+                and step in state_supervision_steps
+                and state_supervision_entity_ids is not None
+                and state_supervision_mask is not None
+            ):
+                self._last_semantic_state_predictions.append(
+                    (
+                        step,
+                        self._semantic_state_logits(
+                            state,
+                            state_supervision_entity_ids[:, step],
+                            state_supervision_mask[:, step],
+                        ),
+                    )
+                )
             outputs.append(out)
             if step_diags is not None:
                 step_diags.append(self._last_step_diag)

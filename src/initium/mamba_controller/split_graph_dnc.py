@@ -110,6 +110,7 @@ the opposite order, this is the one line to fix.
 
 from __future__ import annotations
 
+import math
 import weakref
 from typing import Any
 
@@ -209,6 +210,7 @@ class SplitGraphDNC(nn.Module):
         memory_read_lag: int = 1,
         memory_inter_layer_read: bool = False,
         memory_inter_layer_read_every_block: bool = False,
+        memory_inter_layer_read_scale: float = 1.0,
         memory_topk: int | None = None,
         memory_position: str = "none",
         delta_gate: bool = True,
@@ -245,6 +247,9 @@ class SplitGraphDNC(nn.Module):
         workspace_enabled: bool = False,
         workspace_num_slots: int = 5,
         workspace_compile_recurrence: bool = False,
+        workspace_entity_keyed_writes: bool = False,
+        workspace_semantic_entity_addressing: bool = False,
+        workspace_key_match_threshold: float = 0.5,
         workspace_no_selection: bool = False,
         workspace_reset_each_step: bool = False,
         workspace_train_mode: str = "coadapted",
@@ -301,6 +306,9 @@ class SplitGraphDNC(nn.Module):
         self.memory_read_lag = int(memory_read_lag)
         self.memory_inter_layer_read = bool(inter_layer_memory_enabled)
         self.memory_inter_layer_read_every_block = bool(memory_inter_layer_read_every_block)
+        if not math.isfinite(memory_inter_layer_read_scale) or memory_inter_layer_read_scale < 0:
+            raise ValueError("memory_inter_layer_read_scale must be finite and >= 0")
+        self.memory_inter_layer_read_scale = float(memory_inter_layer_read_scale)
         self.sequence_memory = None
         if memory_type in {"kv", "delta"}:
             rng_state = torch.random.get_rng_state()
@@ -365,8 +373,19 @@ class SplitGraphDNC(nn.Module):
             raise ValueError("workspace_train_mode must be 'coadapted' or 'frozen'")
         if workspace_enabled and workspace_train_mode == "frozen" and workspace_num_slots == 0:
             raise ValueError("frozen workspace training requires workspace_num_slots > 0")
+        if workspace_semantic_entity_addressing and not (
+            workspace_enabled and workspace_entity_keyed_writes
+        ):
+            raise ValueError(
+                "semantic entity addressing requires an active entity-keyed workspace"
+            )
         self.workspace_enabled = workspace_enabled
         self.workspace_num_slots = workspace_num_slots
+        self.workspace_entity_keyed_writes = bool(workspace_entity_keyed_writes)
+        self.workspace_semantic_entity_addressing = bool(
+            workspace_semantic_entity_addressing
+        )
+        self.workspace_key_match_threshold = float(workspace_key_match_threshold)
         self.workspace_no_selection = workspace_no_selection
         self.workspace_reset_each_step = workspace_reset_each_step
         self.workspace_train_mode = workspace_train_mode
@@ -690,6 +709,9 @@ class SplitGraphDNC(nn.Module):
                 reconsideration_trigger_mode=(workspace_reconsideration_trigger_mode),
                 prediction_error_salience_enabled=sgr_workspace_salience_enabled,
                 compile_recurrence=workspace_compile_recurrence,
+                entity_keyed_writes=workspace_entity_keyed_writes,
+                semantic_entity_addressing=workspace_semantic_entity_addressing,
+                key_match_threshold=workspace_key_match_threshold,
             )
             if workspace_enabled and workspace_num_slots > 0
             else None
@@ -735,6 +757,11 @@ class SplitGraphDNC(nn.Module):
         start_step: int = 0,  # v20: resume the sequential loop mid-sequence (inference caching)
         sequence_valid_mask: torch.Tensor | None = None,
         prediction_valid_mask: torch.Tensor | None = None,
+        entity_ids: torch.Tensor | None = None,
+        entity_write_mask: torch.Tensor | None = None,
+        state_supervision_entity_ids: torch.Tensor | None = None,
+        state_supervision_mask: torch.Tensor | None = None,
+        state_supervision_steps: tuple[int, ...] | None = None,
         timespans: torch.Tensor | None = None,
         return_backbone_features: bool = False,
         return_prediction_logits: bool = False,
@@ -768,6 +795,26 @@ class SplitGraphDNC(nn.Module):
         """
         chx, mhx, last_read = hx
         B, T, _ = input.shape
+        if self.workspace_semantic_entity_addressing:
+            if entity_ids is None or entity_write_mask is None:
+                raise ValueError(
+                    "semantic workspace addressing requires entity_ids and entity_write_mask"
+                )
+            if entity_ids.shape != (B, T) or entity_write_mask.shape != (B, T):
+                raise ValueError(
+                    "entity_ids and entity_write_mask must match the model batch/time axes"
+                )
+        if state_supervision_entity_ids is not None or state_supervision_mask is not None:
+            if not self.workspace_semantic_entity_addressing:
+                raise ValueError("workspace state supervision requires semantic entity addressing")
+            expected_state_shape = (B, T, 16)
+            if (
+                state_supervision_entity_ids is None
+                or state_supervision_mask is None
+                or state_supervision_entity_ids.shape != expected_state_shape
+                or state_supervision_mask.shape != expected_state_shape
+            ):
+                raise ValueError("workspace state supervision metadata must have shape (batch, time, 16)")
         combiner_hx_in = chx
         workspace_state = None
         if self.workspace is not None:
@@ -855,7 +902,10 @@ class SplitGraphDNC(nn.Module):
             else:
                 inter_layer_memory_read = torch.zeros_like(memory_features)
             enriched = features.clone()
-            enriched[:, start_step:] = enriched[:, start_step:] + inter_layer_memory_read
+            enriched[:, start_step:] = (
+                enriched[:, start_step:]
+                + self.memory_inter_layer_read_scale * inter_layer_memory_read
+            )
             return enriched
 
         def observe_tensor(label: str, value: torch.Tensor) -> None:
@@ -1014,6 +1064,27 @@ class SplitGraphDNC(nn.Module):
                     else None
                 ),
                 selected_specialists_only=selected_specialists_only,
+                entity_ids=(entity_ids[:, start_step:] if entity_ids is not None else None),
+                entity_write_mask=(
+                    entity_write_mask[:, start_step:]
+                    if entity_write_mask is not None
+                    else None
+                ),
+                state_supervision_entity_ids=(
+                    state_supervision_entity_ids[:, start_step:]
+                    if state_supervision_entity_ids is not None
+                    else None
+                ),
+                state_supervision_mask=(
+                    state_supervision_mask[:, start_step:]
+                    if state_supervision_mask is not None
+                    else None
+                ),
+                state_supervision_steps=(
+                    tuple(step - start_step for step in (state_supervision_steps or ()) if step >= start_step)
+                    if state_supervision_entity_ids is not None
+                    else None
+                ),
             )
             H = base.clone()
             # The workspace returns a selected, broadcast-enriched MoE delta

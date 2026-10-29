@@ -83,6 +83,29 @@ def test_dataset_evaluation_runs_full_bypass_and_shuffled_workspace_paths():
     assert model.training is True
 
 
+def test_permutation_generalization_evaluation_reports_independent_axes():
+    torch.manual_seed(21)
+    dataset = WorkspaceCapabilityDataset("permutation", batch_size_hint=4)
+    model = TinyWorkspacePipeline().train()
+    dataset.set_output_proj(nn.Linear(4, VOCAB_SIZE))
+
+    dataset.evaluate_permutation_generalization(
+        model,
+        torch.device("cpu"),
+        lesson_idx=2,
+        episodes_per_split=3,
+    )
+    splits = dataset.last_eval_diagnostics["permutation_generalization"]
+
+    assert set(splits) == {
+        "in_distribution", "label_only", "length_only", "combined"
+    }
+    assert all(item["episodes"] == 3 for item in splits.values())
+    assert splits["label_only"]["mean_context_tokens"] == splits["in_distribution"]["mean_context_tokens"]
+    assert splits["length_only"]["mean_context_tokens"] > splits["in_distribution"]["mean_context_tokens"]
+    assert model.training is True
+
+
 def test_workspace_readback_shuffle_changes_only_read_path_not_slot_writes():
     torch.manual_seed(12)
     model = TinyWorkspacePipeline().eval()

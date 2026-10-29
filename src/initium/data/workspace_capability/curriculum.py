@@ -3,14 +3,33 @@
 from __future__ import annotations
 
 import random
+from collections.abc import Iterable
 
 
 _LEVELS = 6
 
 
-def difficulty_for(track: str, level: int, *, ood: bool = False) -> dict:
+def difficulty_for(
+    track: str,
+    level: int,
+    *,
+    ood: bool = False,
+    ood_axes: Iterable[str] | None = None,
+) -> dict:
     """Return a fresh serializable configuration for a track/lesson."""
     level = max(0, min(int(level), _LEVELS - 1))
+    if ood_axes is None:
+        if ood and track == "permutation":
+            axes = {"labels", "length"}
+        else:
+            axes = {"legacy"} if ood else set()
+    else:
+        axes = {str(axis).strip().lower() for axis in ood_axes}
+        unknown_axes = axes - {"labels", "length"}
+        if unknown_axes:
+            raise ValueError(f"unknown OOD axes for {track!r}: {sorted(unknown_axes)}")
+        if track != "permutation":
+            raise ValueError("explicit OOD axes are currently supported only for permutation")
     if track == "permutation":
         config = {
             "entities": (4, 6, 8, 10, 12, 16)[level],
@@ -50,13 +69,10 @@ def difficulty_for(track: str, level: int, *, ood: bool = False) -> dict:
         }
     else:
         raise ValueError(f"unknown workspace capability track {track!r}")
-    if ood:
+    if ood and track != "permutation":
         # OOD increases temporal interference while keeping each generator's
         # schema bounds valid and uses its held-out identifier band where able.
-        if track == "permutation":
-            config["swaps"] = min(config["swaps"] * 2, 512)
-            config["distractors"] = min(config["distractors"] * 2 + 4, 64)
-        elif track == "entity_state":
+        if track == "entity_state":
             config["updates"] = min(config["updates"] + 8, 32)
             config["distractors"] = min(config["distractors"] * 2 + 2, 24)
         elif track == "relational_join":
@@ -66,6 +82,9 @@ def difficulty_for(track: str, level: int, *, ood: bool = False) -> dict:
         else:
             config["updates"] = min(config["updates"] + 8, 24)
             config["distractors"] = min(config["distractors"] * 2 + 4, 64)
+    if track == "permutation" and "length" in axes:
+        config["swaps"] = min(config["swaps"] * 2, 512)
+        config["distractors"] = min(config["distractors"] * 2 + 4, 64)
     return config
 
 

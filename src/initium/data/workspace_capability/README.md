@@ -37,8 +37,63 @@ The query asks either where an object ended up or which object occupies a
 position. The oracle applies every swap in order; distractor swaps avoid the
 queried object/occupant. This tests maintaining and composing state across a
 long sequence, and separates relevant swaps from unrelated operations. The
-curriculum scales object count and swap depth; OOD examples use held-out object
-IDs and longer streams.
+curriculum scales object count and swap depth. Entity IDs `0–47` are reserved
+for ID episodes and `48–63` for held-out label evaluation, so those sets do not
+overlap. The evaluator reports four matched conditions: ID baseline,
+label-only (same lesson difficulty and sequence structure, held-out IDs),
+length-only (same entity count and ID labels, more swaps/distractors), and
+combined. This keeps label generalization separate from sequence-length
+difficulty. The original max-difficulty OOD result remains a combined stress
+test for continuity with other tracks.
+
+For a binding diagnostic, combine `--workspace-entity-keyed-writes` with
+`--workspace-semantic-entity-addressing`. The latter uses a fixed one-hot key
+for each entity token and writes initialization only after its location token.
+Swap operands first appear in a read-only event prefix. An `EV_COMMIT` marker
+then starts a second, write-enabled pair of entity tokens, so both operands are
+known before either entity slot is updated. The two addressed updates remain
+sequential within the recurrent workspace step; this staging does not claim a
+hardware-atomic multi-slot write. Query entity tokens can read their slot but
+never write. Stored values still come from selected learned specialist
+payloads, not from injected oracle state. On slot exhaustion, a new semantic
+write is skipped and counted as address overflow rather than overwriting
+another entity's binding. Keep at least as many slots as the lesson's entity
+count. This mode supports `--workspace-compile-recurrence` and requires a
+model width of at least 64 for the fixed entity-ID key basis.
+
+Semantic entity keys identify addresses; the first occurrence of each ID is
+assigned to the next free slot. Slot numbers are therefore episode-local and
+should not be compared across episodes. The binding report checks every active
+MoE write route, reports within-episode entity fragmentation and
+different-entity slot collisions, and flags when routes for one token disagree.
+For end-to-end state verification, add
+`--workspace-semantic-state-diagnostics`. At periodic and final evaluations it
+replays one episode prefix after selected initialization/swap events, queries
+each currently initialized entity, and logs the accepted slot, its value RMS,
+the oracle position, and the model's readback prediction alongside a matched
+workspace-readback-bypassed prediction. Per-event accuracy is written to the
+workspace task metrics CSV; entity-level slot and position details go to the
+console. The event limit is
+controlled by `--workspace-state-diagnostic-max-events` (default 16; use 0 to
+include every transition). This is evaluation-only and can add noticeable
+runtime, especially on later lessons with many swaps.
+
+To directly train the stored payloads to represent the permutation state, add
+`--workspace-state-loss-weight WEIGHT` (for example `0.1`). At every
+initialization and swap boundary, the auxiliary head reads each initialized
+entity through its semantic address and predicts its oracle location. Only the
+loss target uses the episode's oracle snapshot; the model input and workspace
+payload remain the normal causal token stream and learned specialist values.
+The console reports `L_ws_state`, accuracy over supervised entity states, and
+the task loss separately. This option requires semantic entity addressing and
+the `permutation` or `all` track. A fresh run is recommended because the
+auxiliary decoder is a trainable model component.
+
+Example permutation run:
+
+```bash
+python -m src.initium.core_training 0.0 --dataset-type workspace-capability --workspace-task-track permutation --split-graph --split-graph-variant mamba1 --split-graph-num-blocks 4 --split-graph-backbone-only --moe --moe-placement all --moe-backbone-residual-scale 0.1 --workspace --workspace-num-slots 16 --workspace-entity-keyed-writes --workspace-semantic-entity-addressing --workspace-state-loss-weight 0.1 --workspace-semantic-state-diagnostics --workspace-state-diagnostic-max-events 16 --workspace-compile-recurrence --seed 0 --total-steps 50000 --run-id-suffix wcap-permutation-semantic-state-loss-s0 --checkpoint-every 5000
+```
 
 ### `entity_state` — source priority, corrections, and retractions
 
@@ -87,6 +142,13 @@ threshold and every track's threshold are met. The dataset can also be run
 with `--workspace-task-track <track>` to study one skill without dilution from
 the others. Evaluation uses locally seeded ID and OOD episode generators so
 the episode set is reproducible for paired model conditions.
+
+Permutation generalization is additionally logged at periodic and final
+evaluation in `workspace_task_metrics.csv`, using `permutation/<condition>`
+track names. KV runs include matched memory-on and memory-off rows for all four
+conditions. The label-only and ID episodes are generated from the same paired
+structural seed; only the entity-label band changes. Length-only preserves the
+lesson's entity count and label band while increasing temporal interference.
 
 The trainer reports answer-token accuracy and episode exact match, overall and
 per track. `./logs/run_<id>_workspace_task_metrics.csv` also records context

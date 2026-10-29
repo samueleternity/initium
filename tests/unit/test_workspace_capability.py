@@ -18,6 +18,7 @@ from initium.data.workspace_capability.episode import (
     BOOL_TRUE,
     COUNT_BASE,
     ENTITY_BASE,
+    ENTITY_COUNT,
     EOS,
     EV_ASSERT,
     EV_COUNT_QUERY,
@@ -102,6 +103,52 @@ def test_ood_track_generation_stays_inside_the_shared_vocabulary(track, generato
     assert episode.track == track
     assert min(episode.inputs + episode.answer) >= 0
     assert max(episode.inputs + episode.answer) < VOCAB_SIZE
+
+
+def _permutation_initial_entity_ids(episode):
+    return {
+        segment[1] - ENTITY_BASE
+        for segment in _segments(episode)
+        if segment[0] == EV_INIT
+    }
+
+
+def test_permutation_id_and_ood_entity_labels_are_disjoint():
+    difficulty = difficulty_for("permutation", 5)
+    id_episode = permutation.generate(difficulty, random.Random(481))
+    ood_episode = permutation.generate(
+        difficulty, random.Random(481), ood_axes=("labels",)
+    )
+
+    id_labels = _permutation_initial_entity_ids(id_episode)
+    ood_labels = _permutation_initial_entity_ids(ood_episode)
+    assert len(id_labels) == len(ood_labels) == difficulty["entities"]
+    assert max(id_labels) < ENTITY_COUNT - 16
+    assert min(ood_labels) >= ENTITY_COUNT - 16
+    assert id_labels.isdisjoint(ood_labels)
+
+
+def test_permutation_label_and_length_shifts_are_independent():
+    lesson = 2
+    base_difficulty = difficulty_for("permutation", lesson)
+    longer_difficulty = difficulty_for(
+        "permutation", lesson, ood_axes=("length",)
+    )
+    assert longer_difficulty["entities"] == base_difficulty["entities"]
+    assert longer_difficulty["swaps"] > base_difficulty["swaps"]
+
+    baseline = permutation.generate(base_difficulty, random.Random(902))
+    label_only = permutation.generate(
+        base_difficulty, random.Random(902), ood_axes=("labels",)
+    )
+    length_only = permutation.generate(
+        longer_difficulty, random.Random(902), ood_axes=("length",)
+    )
+    assert len(label_only.inputs) == len(baseline.inputs)
+    assert label_only.metadata["query_type"] == baseline.metadata["query_type"]
+    assert label_only.metadata["relevant_updates"] == baseline.metadata["relevant_updates"]
+    assert len(length_only.inputs) > len(baseline.inputs)
+    assert max(_permutation_initial_entity_ids(length_only)) < ENTITY_COUNT - 16
 
 
 def test_permutation_oracle_composes_swaps_and_answers_both_directions():

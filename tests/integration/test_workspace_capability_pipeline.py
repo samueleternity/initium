@@ -53,6 +53,58 @@ class TinyWorkspacePipeline(nn.Module):
         return output.transpose(0, 1), (None, None, state)
 
 
+class TransactionalPermutationPipeline(nn.Module):
+    """Small end-to-end adapter for transactional permutation evaluation."""
+
+    def __init__(self):
+        super().__init__()
+        self.workspace = WorkspaceBroadcast(
+            d_model=64,
+            num_experts=1,
+            num_slots=16,
+            entity_keyed_writes=True,
+            semantic_entity_addressing=True,
+            permutation_transactional=True,
+            diagnostics_enabled=True,
+        )
+        self.workspace_semantic_entity_addressing = True
+        self.workspace_permutation_transactional = True
+        self.workspace_eval_bypass = False
+        self.workspace_eval_shuffle_readback = False
+        self.input_projection = nn.Linear(VOCAB_SIZE, 64, bias=False)
+
+    def forward(
+        self,
+        inputs,
+        hidden=None,
+        *,
+        reset_experience=False,
+        pass_through_memory=True,
+        combiner_skip_stages=None,
+        **workspace_metadata,
+    ):
+        batch, steps, _ = inputs.shape
+        state = None if hidden is None else hidden[2]
+        if reset_experience or state is None:
+            state = self.workspace.init_state(
+                batch, device=inputs.device, dtype=inputs.dtype
+            )
+        specialists = self.input_projection(inputs).unsqueeze(2)
+        routes = torch.zeros(batch, steps, 1, dtype=torch.long, device=inputs.device)
+        weights = torch.ones(batch, steps, 1, dtype=inputs.dtype, device=inputs.device)
+        output, state = self.workspace(
+            specialists,
+            routes,
+            weights,
+            state,
+            bypass_broadcast=self.workspace_eval_bypass,
+            shuffle_readback_across_batch=self.workspace_eval_shuffle_readback,
+            selected_specialists_only=True,
+            **workspace_metadata,
+        )
+        return output.transpose(0, 1), (None, None, state)
+
+
 def test_dataset_evaluation_runs_full_bypass_and_shuffled_workspace_paths():
     torch.manual_seed(4)
     dataset = WorkspaceCapabilityDataset("permutation", batch_size_hint=4)
@@ -104,6 +156,35 @@ def test_permutation_generalization_evaluation_reports_independent_axes():
     assert splits["label_only"]["mean_context_tokens"] == splits["in_distribution"]["mean_context_tokens"]
     assert splits["length_only"]["mean_context_tokens"] > splits["in_distribution"]["mean_context_tokens"]
     assert model.training is True
+
+
+def test_transactional_evaluation_logs_query_directions_state_depth_and_commits():
+    torch.manual_seed(31)
+    dataset = WorkspaceCapabilityDataset("permutation", batch_size_hint=2)
+    model = TransactionalPermutationPipeline().train()
+    dataset.set_output_proj(nn.Linear(64, VOCAB_SIZE))
+
+    dataset.evaluate_id(
+        model,
+        torch.device("cpu"),
+        lesson_idx=1,
+        num_episodes=4,
+    )
+    diagnostics = dataset.last_eval_diagnostics
+
+    assert set(diagnostics["permutation_query_directions"]) == {
+        "object_to_position",
+        "position_to_object",
+    }
+    assert diagnostics["permutation_pair_commit_attempts"] > 0
+    assert diagnostics["permutation_pair_commit_successes"] == diagnostics[
+        "permutation_pair_commit_attempts"
+    ]
+    assert diagnostics["permutation_state_accuracy_by_swap_depth"]
+    assert all(
+        0.0 <= item["accuracy"] <= 1.0
+        for item in diagnostics["permutation_state_accuracy_by_swap_depth"].values()
+    )
 
 
 def test_workspace_readback_shuffle_changes_only_read_path_not_slot_writes():

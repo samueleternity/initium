@@ -164,7 +164,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
         return inputs, targets, mask
 
     def workspace_entity_address_metadata(
-        self, input_vectors: torch.Tensor
+        self, input_vectors: torch.Tensor, *, paired_swap_commits: bool = False
     ) -> dict[str, torch.Tensor]:
         """Return causal token-ID keys and state-event write masks for permutation.
 
@@ -187,6 +187,12 @@ class WorkspaceCapabilityDataset(BaseDataset):
         write_mask = torch.zeros(
             input_vectors.shape[:2], dtype=torch.bool, device=input_vectors.device
         )
+        pair_swap_ids = torch.full(
+            (*input_vectors.shape[:2], 2), -1, dtype=torch.long, device=input_vectors.device
+        )
+        pair_swap_mask = torch.zeros(
+            input_vectors.shape[:2], dtype=torch.bool, device=input_vectors.device
+        )
         permutation_track_id = TRACK_BASE + TRACKS.index("permutation")
         for row, tokens in enumerate(token_ids):
             if self.task_track == ALL_TRACK and (
@@ -197,6 +203,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
             pending_entity = -1
             swap_entities_seen = 0
             commit_entities_seen = 0
+            pending_commit_entities: list[int] = []
             for position, token_value in enumerate(tokens):
                 token = int(token_value)
                 if ENTITY_BASE <= token < ENTITY_BASE + ENTITY_COUNT:
@@ -210,7 +217,9 @@ class WorkspaceCapabilityDataset(BaseDataset):
                         if swap_entities_seen == 2:
                             phase = "swap_done"
                     elif phase == "commit" and commit_entities_seen < 2:
-                        write_mask[row, position] = True
+                        if not paired_swap_commits:
+                            write_mask[row, position] = True
+                        pending_commit_entities.append(entity_id)
                         commit_entities_seen += 1
                         if commit_entities_seen == 2:
                             phase = "commit_done"
@@ -228,19 +237,120 @@ class WorkspaceCapabilityDataset(BaseDataset):
                     phase = "swap"
                     swap_entities_seen = 0
                     commit_entities_seen = 0
+                    pending_commit_entities = []
                 elif token == EV_COMMIT and phase == "swap_done":
                     phase = "commit"
                     commit_entities_seen = 0
                 elif token == QUERY:
                     phase = "query"
                 elif token == SEP:
+                    if (
+                        paired_swap_commits
+                        and phase == "commit_done"
+                        and len(pending_commit_entities) == 2
+                    ):
+                        pair_swap_ids[row, position] = torch.tensor(
+                            pending_commit_entities,
+                            dtype=torch.long,
+                            device=input_vectors.device,
+                        )
+                        pair_swap_mask[row, position] = True
                     phase = "none"
                     pending_entity = -1
                     swap_entities_seen = 0
-        return {"entity_ids": entity_ids, "entity_write_mask": write_mask}
+                    pending_commit_entities = []
+        metadata = {"entity_ids": entity_ids, "entity_write_mask": write_mask}
+        if paired_swap_commits:
+            metadata["pair_swap_entity_ids"] = pair_swap_ids
+            metadata["pair_swap_mask"] = pair_swap_mask
+            metadata["pair_swap_steps"] = tuple(
+                int(step)
+                for step in torch.nonzero(pair_swap_mask.any(dim=0), as_tuple=False)
+                .flatten()
+                .tolist()
+            )
+        return metadata
+
+    def workspace_permutation_query_metadata(
+        self,
+        input_vectors: torch.Tensor,
+        episodes: list[TaskEpisode] | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Mark the first answer position with its causal permutation query."""
+        if input_vectors.ndim != 3 or input_vectors.shape[-1] != VOCAB_SIZE:
+            raise ValueError(
+                "permutation query metadata expects one-hot inputs shaped "
+                "(batch, time, vocabulary)"
+            )
+        examples = self.last_batch_examples if episodes is None else episodes
+        batch, time, _ = input_vectors.shape
+        if len(examples) != batch:
+            raise RuntimeError("permutation query metadata lost batch/episode alignment")
+        query_kind = torch.zeros(
+            (batch, time), dtype=torch.long, device=input_vectors.device
+        )
+        query_id = torch.full_like(query_kind, -1)
+        query_steps = set()
+        for row, episode in enumerate(examples):
+            if episode.track != "permutation":
+                continue
+            step = len(episode.inputs)
+            if not 0 <= step < time:
+                raise RuntimeError("permutation answer step exceeds its collated sequence")
+            query_type = episode.metadata["query_type"]
+            if query_type == "object_to_position":
+                query_kind[row, step] = 1
+                query_id[row, step] = int(episode.metadata["query_entity_id"])
+                query_steps.add(step)
+            elif query_type == "position_to_object":
+                query_kind[row, step] = 2
+                query_id[row, step] = int(episode.metadata["query_location_id"])
+                query_steps.add(step)
+            else:
+                raise ValueError(f"unknown permutation query type {query_type!r}")
+        return {
+            "permutation_query_kind": query_kind,
+            "permutation_query_ids": query_id,
+            "permutation_query_steps": tuple(sorted(query_steps)),
+        }
+
+    @staticmethod
+    def apply_workspace_permutation_query_logits(logits, query_predictions):
+        """Replace marked answer logits with workspace-decoded permutation logits."""
+        if not query_predictions:
+            return logits
+        # Keep the task vocabulary mapping here, next to the dataset encoding.
+        result = logits.clone()
+        for step, position_logits, entity_logits, query_kind, _query_ids in query_predictions:
+            if not 0 <= int(step) < logits.shape[1]:
+                continue
+            position_logits = position_logits.to(device=logits.device, dtype=logits.dtype)
+            entity_logits = entity_logits.to(device=logits.device, dtype=logits.dtype)
+            query_kind = query_kind.to(device=logits.device)
+            position_vocab_logits = result.new_full(
+                (result.shape[0], result.shape[-1]), -1e4
+            )
+            position_vocab_logits[
+                :, LOCATION_BASE : LOCATION_BASE + LOCATION_COUNT
+            ] = position_logits
+            entity_vocab_logits = result.new_full(
+                (result.shape[0], result.shape[-1]), -1e4
+            )
+            entity_vocab_logits[:, ENTITY_BASE : ENTITY_BASE + ENTITY_COUNT] = entity_logits
+            original = logits[:, int(step)]
+            updated = torch.where(
+                query_kind.eq(1).unsqueeze(-1), position_vocab_logits, original
+            )
+            updated = torch.where(
+                query_kind.eq(2).unsqueeze(-1), entity_vocab_logits, updated
+            )
+            result[:, int(step)] = updated
+        return result
 
     def workspace_state_supervision_metadata(
-        self, input_vectors: torch.Tensor
+        self,
+        input_vectors: torch.Tensor,
+        episodes: list[TaskEpisode] | None = None,
     ) -> dict[str, Any]:
         """Pack oracle entity positions only at causal state-commit boundaries."""
         if input_vectors.ndim != 3 or input_vectors.shape[-1] != VOCAB_SIZE:
@@ -248,7 +358,8 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 "workspace state supervision expects one-hot inputs shaped (batch, time, vocabulary)"
             )
         batch, time, _ = input_vectors.shape
-        if len(self.last_batch_examples) != batch:
+        examples = self.last_batch_examples if episodes is None else episodes
+        if len(examples) != batch:
             raise RuntimeError("workspace state supervision lost batch/episode alignment")
         entity_ids = torch.full(
             (batch, time, 16), -1, dtype=torch.long, device=input_vectors.device
@@ -256,7 +367,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
         positions = torch.full_like(entity_ids, -100)
         valid = torch.zeros_like(entity_ids, dtype=torch.bool)
         supervised_steps = set()
-        for row, episode in enumerate(self.last_batch_examples):
+        for row, episode in enumerate(examples):
             if episode.track != "permutation":
                 continue
             for snapshot in episode.metadata.get("state_trace", ()):
@@ -361,6 +472,10 @@ class WorkspaceCapabilityDataset(BaseDataset):
         totals: dict[str, list[int]] = defaultdict(lambda: [0, 0, 0, 0])
         split_totals: dict[str, list[float]] = defaultdict(lambda: [0.0] * 7)
         metadata_totals: dict[str, list[float]] = defaultdict(lambda: [0.0] * 8)
+        permutation_query_totals: dict[str, list[int]] = defaultdict(lambda: [0, 0])
+        permutation_state_depth_totals: dict[int, list[int]] = defaultdict(lambda: [0, 0])
+        permutation_pair_commit_attempts = 0
+        permutation_pair_commit_successes = 0
         correct_total = answer_total = exact_total = 0
         binding_entity_mentions = binding_assigned_mentions = 0
         binding_repeated_entity_consistency = 0.0
@@ -382,11 +497,37 @@ class WorkspaceCapabilityDataset(BaseDataset):
                     if bool(
                         getattr(model, "workspace_semantic_entity_addressing", False)
                     ):
-                        binding_entity_metadata = self.workspace_entity_address_metadata(x)
+                        transactional = bool(
+                            getattr(model, "workspace_permutation_transactional", False)
+                        )
+                        binding_entity_metadata = self.workspace_entity_address_metadata(
+                            x, paired_swap_commits=transactional
+                        )
+                        if transactional:
+                            binding_entity_metadata.update(
+                                self.workspace_permutation_query_metadata(x, group)
+                            )
                         workspace_forward_kwargs = {
                             key: value.to(device, non_blocking=True)
+                            if isinstance(value, torch.Tensor)
+                            else value
                             for key, value in binding_entity_metadata.items()
                         }
+                        if transactional:
+                            state_metadata = self.workspace_state_supervision_metadata(x, group)
+                            workspace_forward_kwargs.update(
+                                {
+                                    "state_supervision_entity_ids": state_metadata[
+                                        "state_supervision_entity_ids"
+                                    ].to(device, non_blocking=True),
+                                    "state_supervision_mask": state_metadata[
+                                        "state_supervision_mask"
+                                    ].to(device, non_blocking=True),
+                                    "state_supervision_steps": state_metadata[
+                                        "state_supervision_steps"
+                                    ],
+                                }
+                            )
                     x = x.to(device, non_blocking=True)
                     hidden = (None, None, None)
                     assignment_trace = []
@@ -412,6 +553,17 @@ class WorkspaceCapabilityDataset(BaseDataset):
                         if observe_group:
                             workspace._initium_address_assignment_observer = (
                                 prior_assignment_observer
+                            )
+                    if bool(getattr(model, "workspace_permutation_transactional", False)):
+                        permutation_pair_commit_attempts += int(
+                            binding_entity_metadata["pair_swap_mask"].sum().item()
+                        )
+                        committed_events = workspace.pop_semantic_pair_commits()
+                        if committed_events:
+                            permutation_pair_commit_successes += int(
+                                torch.stack([value for _step, value in committed_events])
+                                .sum()
+                                .item()
                             )
                     if observe_group and assignment_trace:
                         # Copy the full trace once per batch; the observer is
@@ -490,6 +642,48 @@ class WorkspaceCapabilityDataset(BaseDataset):
                                         slots[left] == slots[right]
                                     )
                     logits = self._output_proj(output.transpose(0, 1).contiguous())
+                    if bool(getattr(model, "workspace_permutation_transactional", False)):
+                        query_predictions = workspace.pop_semantic_query_predictions()
+                        logits = self.apply_workspace_permutation_query_logits(
+                            logits, query_predictions
+                        )
+                        event_logits = dict(workspace.pop_semantic_state_predictions())
+                        event_steps = sorted(event_logits)
+                        if event_steps:
+                            event_predictions_cpu = torch.stack(
+                                [event_logits[step].argmax(dim=-1) for step in event_steps]
+                            ).cpu()
+                            event_predictions_by_step = dict(
+                                zip(event_steps, event_predictions_cpu)
+                            )
+                        else:
+                            event_predictions_by_step = {}
+                        for row, episode in enumerate(group):
+                            if episode.track != "permutation":
+                                continue
+                            swap_depth = 0
+                            for snapshot in episode.metadata.get("state_trace", ()):
+                                if snapshot["event"] in ("swap", "distractor"):
+                                    swap_depth += 1
+                                state_predictions = event_predictions_by_step.get(
+                                    int(snapshot["step"])
+                                )
+                                if state_predictions is None:
+                                    continue
+                                known_states = [
+                                    int(position)
+                                    for position in snapshot["positions"]
+                                    if int(position) >= 0
+                                ]
+                                for state_index, target_position in enumerate(known_states):
+                                    if int(target_position) < 0:
+                                        continue
+                                    counts = permutation_state_depth_totals[swap_depth]
+                                    counts[0] += int(
+                                        state_predictions[row, state_index].item()
+                                        == int(target_position)
+                                    )
+                                    counts[1] += 1
                     predictions = logits.argmax(dim=-1)
                     for local_idx, episode in enumerate(group):
                         start = len(episode.inputs)
@@ -498,6 +692,12 @@ class WorkspaceCapabilityDataset(BaseDataset):
                         n_correct = sum(int(a == b) for a, b in zip(pred, expected))
                         n_answers = len(expected)
                         exact = n_correct == n_answers
+                        if episode.track == "permutation":
+                            query_counts = permutation_query_totals[
+                                str(episode.metadata.get("query_type", "unknown"))
+                            ]
+                            query_counts[0] += int(exact)
+                            query_counts[1] += 1
                         correct_total += n_correct
                         answer_total += n_answers
                         exact_total += int(exact)
@@ -567,6 +767,27 @@ class WorkspaceCapabilityDataset(BaseDataset):
             "mean_sources": total_meta[5] / total_episodes,
             "mean_candidate_baseline_pct": total_meta[6] / total_episodes,
             "priority_tie_episode_fraction": total_meta[7] / total_episodes,
+            "permutation_query_directions": {
+                query_type: {
+                    "episodes": int(counts[1]),
+                    "exact_accuracy": float(counts[0] / counts[1]) if counts[1] else 0.0,
+                }
+                for query_type, counts in sorted(permutation_query_totals.items())
+            },
+            "permutation_state_accuracy_by_swap_depth": {
+                str(depth): {
+                    "entities": int(counts[1]),
+                    "accuracy": float(counts[0] / counts[1]) if counts[1] else 0.0,
+                }
+                for depth, counts in sorted(permutation_state_depth_totals.items())
+            },
+            "permutation_pair_commit_success_rate": (
+                permutation_pair_commit_successes / permutation_pair_commit_attempts
+                if permutation_pair_commit_attempts
+                else 0.0
+            ),
+            "permutation_pair_commit_attempts": permutation_pair_commit_attempts,
+            "permutation_pair_commit_successes": permutation_pair_commit_successes,
             "tracks": {
                 track: {
                     "accuracy": 100.0 * counts[0] / max(counts[1], 1),
@@ -793,7 +1014,10 @@ class WorkspaceCapabilityDataset(BaseDataset):
                         query_inputs,
                         (LOCATION_BASE + int(position), EOS),
                         {
-                            "query_type": "object_to_position_state_probe",
+                            "query_type": "object_to_position",
+                            "query_entity_id": int(entity_id),
+                            "query_location_id": int(position),
+                            "state_probe": True,
                             "sequence_length": len(query_inputs),
                         },
                     )
@@ -829,13 +1053,26 @@ class WorkspaceCapabilityDataset(BaseDataset):
                     group = probes[offset : offset + batch_size]
                     episodes = [item["probe"] for item in group]
                     x, _targets, _mask = self._collate(episodes)
-                    entity_metadata = self.workspace_entity_address_metadata(x)
-                    entity_ids = entity_metadata["entity_ids"].to(
-                        device, non_blocking=True
+                    transactional = bool(
+                        getattr(model, "workspace_permutation_transactional", False)
                     )
-                    entity_write_mask = entity_metadata["entity_write_mask"].to(
-                        device, non_blocking=True
+                    entity_metadata = self.workspace_entity_address_metadata(
+                        x, paired_swap_commits=transactional
                     )
+                    if transactional:
+                        entity_metadata.update(
+                            self.workspace_permutation_query_metadata(x, episodes)
+                        )
+                    forward_metadata = {
+                        key: value.to(device, non_blocking=True)
+                        if isinstance(value, torch.Tensor)
+                        else value
+                        for key, value in entity_metadata.items()
+                    }
+                    # Keep CPU copies for the detailed report below; the
+                    # forward metadata itself is moved to the model device.
+                    entity_ids = entity_metadata["entity_ids"]
+                    entity_write_mask = entity_metadata["entity_write_mask"]
                     assignment_trace = []
                     recurrent_state_trace = []
                     event_steps_needed = {item["event_step"] for item in group}
@@ -857,10 +1094,13 @@ class WorkspaceCapabilityDataset(BaseDataset):
                         (None, None, None),
                         reset_experience=True,
                         pass_through_memory=True,
-                        entity_ids=entity_ids,
-                        entity_write_mask=entity_write_mask,
+                        **forward_metadata,
                     )
                     logits = self._output_proj(output.transpose(0, 1).contiguous())
+                    if transactional:
+                        logits = self.apply_workspace_permutation_query_logits(
+                            logits, workspace.pop_semantic_query_predictions()
+                        )
                     predictions = logits.argmax(dim=-1)
                     workspace._initium_address_assignment_observer = None
                     workspace._initium_recurrent_state_observer = None
@@ -871,12 +1111,15 @@ class WorkspaceCapabilityDataset(BaseDataset):
                         (None, None, None),
                         reset_experience=True,
                         pass_through_memory=True,
-                        entity_ids=entity_ids,
-                        entity_write_mask=entity_write_mask,
+                        **forward_metadata,
                     )
                     bypass_logits = self._output_proj(
                         bypass_output.transpose(0, 1).contiguous()
                     )
+                    if transactional:
+                        bypass_logits = self.apply_workspace_permutation_query_logits(
+                            bypass_logits, workspace.pop_semantic_query_predictions()
+                        )
                     bypass_predictions = bypass_logits.argmax(dim=-1)
                     workspace._initium_address_assignment_observer = (
                         lambda step, assignments: assignment_trace.append(

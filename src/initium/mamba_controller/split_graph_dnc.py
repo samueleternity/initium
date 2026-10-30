@@ -249,6 +249,7 @@ class SplitGraphDNC(nn.Module):
         workspace_compile_recurrence: bool = False,
         workspace_entity_keyed_writes: bool = False,
         workspace_semantic_entity_addressing: bool = False,
+        workspace_permutation_transactional: bool = False,
         workspace_key_match_threshold: float = 0.5,
         workspace_no_selection: bool = False,
         workspace_reset_each_step: bool = False,
@@ -379,11 +380,20 @@ class SplitGraphDNC(nn.Module):
             raise ValueError(
                 "semantic entity addressing requires an active entity-keyed workspace"
             )
+        if workspace_permutation_transactional and not (
+            workspace_enabled and workspace_semantic_entity_addressing
+        ):
+            raise ValueError(
+                "transactional permutation commits require semantic entity-addressed workspace"
+            )
         self.workspace_enabled = workspace_enabled
         self.workspace_num_slots = workspace_num_slots
         self.workspace_entity_keyed_writes = bool(workspace_entity_keyed_writes)
         self.workspace_semantic_entity_addressing = bool(
             workspace_semantic_entity_addressing
+        )
+        self.workspace_permutation_transactional = bool(
+            workspace_permutation_transactional
         )
         self.workspace_key_match_threshold = float(workspace_key_match_threshold)
         self.workspace_no_selection = workspace_no_selection
@@ -711,6 +721,7 @@ class SplitGraphDNC(nn.Module):
                 compile_recurrence=workspace_compile_recurrence,
                 entity_keyed_writes=workspace_entity_keyed_writes,
                 semantic_entity_addressing=workspace_semantic_entity_addressing,
+                permutation_transactional=workspace_permutation_transactional,
                 key_match_threshold=workspace_key_match_threshold,
             )
             if workspace_enabled and workspace_num_slots > 0
@@ -759,6 +770,12 @@ class SplitGraphDNC(nn.Module):
         prediction_valid_mask: torch.Tensor | None = None,
         entity_ids: torch.Tensor | None = None,
         entity_write_mask: torch.Tensor | None = None,
+        pair_swap_entity_ids: torch.Tensor | None = None,
+        pair_swap_mask: torch.Tensor | None = None,
+        pair_swap_steps: tuple[int, ...] | None = None,
+        permutation_query_kind: torch.Tensor | None = None,
+        permutation_query_ids: torch.Tensor | None = None,
+        permutation_query_steps: tuple[int, ...] | None = None,
         state_supervision_entity_ids: torch.Tensor | None = None,
         state_supervision_mask: torch.Tensor | None = None,
         state_supervision_steps: tuple[int, ...] | None = None,
@@ -1068,6 +1085,36 @@ class SplitGraphDNC(nn.Module):
                 entity_write_mask=(
                     entity_write_mask[:, start_step:]
                     if entity_write_mask is not None
+                    else None
+                ),
+                pair_swap_entity_ids=(
+                    pair_swap_entity_ids[:, start_step:]
+                    if pair_swap_entity_ids is not None
+                    else None
+                ),
+                pair_swap_mask=(
+                    pair_swap_mask[:, start_step:]
+                    if pair_swap_mask is not None
+                    else None
+                ),
+                pair_swap_steps=(
+                    tuple(step - start_step for step in (pair_swap_steps or ()) if step >= start_step)
+                    if pair_swap_entity_ids is not None
+                    else None
+                ),
+                permutation_query_kind=(
+                    permutation_query_kind[:, start_step:]
+                    if permutation_query_kind is not None
+                    else None
+                ),
+                permutation_query_ids=(
+                    permutation_query_ids[:, start_step:]
+                    if permutation_query_ids is not None
+                    else None
+                ),
+                permutation_query_steps=(
+                    tuple(step - start_step for step in (permutation_query_steps or ()) if step >= start_step)
+                    if permutation_query_kind is not None
                     else None
                 ),
                 state_supervision_entity_ids=(

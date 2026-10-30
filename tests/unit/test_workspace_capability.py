@@ -19,6 +19,7 @@ from initium.data.workspace_capability.episode import (
     COUNT_BASE,
     ENTITY_BASE,
     ENTITY_COUNT,
+    EV_COMMIT,
     EOS,
     EV_ASSERT,
     EV_COUNT_QUERY,
@@ -53,6 +54,7 @@ from initium.data.workspace_capability.tracks import (
     relational_join,
     retrieval_aggregation,
 )
+from initium.workspace.broadcast import WorkspaceBroadcast
 
 
 GENERATORS = {
@@ -411,4 +413,121 @@ def test_task_field_log_rows_match_dataset_owned_header():
 def test_episode_rejects_tokens_outside_typed_vocabulary():
     with pytest.raises(ValueError, match="outside"):
         TaskEpisode("bad", (BOS, VOCAB_SIZE), (EOS,), {"query_type": "invalid"})
+
+
+def test_transactional_metadata_defers_swap_pair_and_marks_boundary():
+    dataset = capability_dataset.WorkspaceCapabilityDataset("permutation")
+    episode = TaskEpisode(
+        "permutation",
+        (
+            EV_INIT, ENTITY_BASE + 2, LOCATION_BASE + 1, SEP,
+            EV_INIT, ENTITY_BASE + 5, LOCATION_BASE + 3, SEP,
+            EV_SWAP, ENTITY_BASE + 2, ENTITY_BASE + 5,
+            EV_COMMIT, ENTITY_BASE + 2, ENTITY_BASE + 5, SEP,
+            QUERY, ENTITY_BASE + 2, SEP,
+        ),
+        (LOCATION_BASE + 3, EOS),
+        {
+            "query_type": "object_to_position",
+            "query_entity_id": 2,
+            "query_location_id": 3,
+        },
+    )
+    inputs, _, _ = dataset._collate([episode])
+    metadata = dataset.workspace_entity_address_metadata(
+        inputs, paired_swap_commits=True
+    )
+    commit_positions = [12, 13]
+    assert not metadata["entity_write_mask"][0, commit_positions].any()
+    boundary = 14
+    assert metadata["pair_swap_mask"][0, boundary]
+    assert metadata["pair_swap_entity_ids"][0, boundary].tolist() == [2, 5]
+    assert metadata["pair_swap_steps"] == (boundary,)
+    query = dataset.workspace_permutation_query_metadata(inputs, [episode])
+    assert query["permutation_query_kind"][0, len(episode.inputs)].item() == 1
+    assert query["permutation_query_ids"][0, len(episode.inputs)].item() == 2
+
+
+def test_transactional_workspace_swaps_payloads_and_emits_query_readout():
+    workspace = WorkspaceBroadcast(
+        d_model=64,
+        num_experts=1,
+        num_slots=16,
+        entity_keyed_writes=True,
+        semantic_entity_addressing=True,
+        permutation_transactional=True,
+        diagnostics_enabled=False,
+    ).eval()
+    pre_commit = workspace.init_state(1, device="cpu", dtype=torch.float32)
+    pre_commit[0, 0, 2] = 1.0
+    pre_commit[0, 1, 5] = 1.0
+    pre_commit[0, 0, 64:] = torch.arange(64, dtype=torch.float32)
+    pre_commit[0, 1, 64:] = torch.arange(64, dtype=torch.float32) + 100.0
+    exchanged, valid = workspace._apply_semantic_pair_swap(
+        pre_commit, torch.tensor([[2, 5]]), torch.tensor([True])
+    )
+    assert valid.tolist() == [True]
+    torch.testing.assert_close(exchanged[0, 0, 64:], pre_commit[0, 1, 64:])
+    torch.testing.assert_close(exchanged[0, 1, 64:], pre_commit[0, 0, 64:])
+    torch.testing.assert_close(exchanged[0, :, :64], pre_commit[0, :, :64])
+
+    batch, time = 1, 4
+    deltas = torch.randn(batch, time, 1, 64, requires_grad=True)
+    routes = torch.zeros(batch, time, 1, dtype=torch.long)
+    weights = torch.ones(batch, time, 1)
+    entity_ids = torch.tensor([[2, 5, 2, 2]])
+    write_mask = torch.tensor([[True, True, False, False]])
+    pair_ids = torch.tensor([[[-1, -1], [-1, -1], [2, 5], [-1, -1]]])
+    pair_mask = torch.tensor([[False, False, True, False]])
+    query_kind = torch.tensor([[0, 0, 0, 1]])
+    query_ids = torch.tensor([[-1, -1, -1, 2]])
+    _, state = workspace(
+        deltas,
+        routes,
+        weights,
+        workspace.init_state(batch, device=deltas.device, dtype=deltas.dtype),
+        selected_specialists_only=True,
+        entity_ids=entity_ids,
+        entity_write_mask=write_mask,
+        pair_swap_entity_ids=pair_ids,
+        pair_swap_mask=pair_mask,
+        pair_swap_steps=(2,),
+        permutation_query_kind=query_kind,
+        permutation_query_ids=query_ids,
+        permutation_query_steps=(3,),
+    )
+
+    commits = workspace.pop_semantic_pair_commits()
+    assert len(commits) == 1
+    assert commits[0][0] == 2
+    assert commits[0][1].tolist() == [True]
+    query_predictions = workspace.pop_semantic_query_predictions()
+    assert len(query_predictions) == 1
+    assert query_predictions[0][0] == 3
+    assert query_predictions[0][1].shape == (1, 16)
+    assert query_predictions[0][2].shape == (1, ENTITY_COUNT)
+    state_content = state.split(64, dim=-1)[1]
+    assert torch.isfinite(state_content).all()
+
+
+def test_workspace_query_logits_replace_answer_class_and_keep_gradient():
+    position_logits = torch.randn(1, 16, requires_grad=True)
+    position_logits.data[0, 7] = 10.0
+    entity_logits = torch.randn(1, ENTITY_COUNT, requires_grad=True)
+    query_predictions = [
+        (
+            0,
+            position_logits,
+            entity_logits,
+            torch.tensor([1]),
+            torch.tensor([2]),
+        )
+    ]
+    logits = torch.zeros(1, 1, VOCAB_SIZE, requires_grad=True)
+    mapped = capability_dataset.WorkspaceCapabilityDataset.apply_workspace_permutation_query_logits(
+        logits, query_predictions
+    )
+    assert mapped[0, 0].argmax().item() == LOCATION_BASE + 7
+    mapped[0, 0, LOCATION_BASE + 7].backward()
+    assert position_logits.grad[0, 7].item() == 1.0
 

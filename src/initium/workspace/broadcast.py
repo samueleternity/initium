@@ -40,6 +40,33 @@ def _condition_address_input(value: torch.Tensor) -> torch.Tensor:
     return value + (scaled - value).detach()
 
 
+def _cap_vector_rms(value: torch.Tensor, max_rms: float) -> torch.Tensor:
+    """Bound each vector's RMS while preserving direction and smaller values."""
+    value_float = value.float()
+    rms_sq = value_float.square().mean(dim=-1, keepdim=True).clamp_min(1e-12)
+    rms = rms_sq.sqrt()
+    scale = (float(max_rms) / rms).clamp(max=1.0)
+    return value * scale.to(value.dtype)
+
+
+def _cap_readback_to_reference(
+    readback: torch.Tensor, reference: torch.Tensor, max_ratio: float
+) -> torch.Tensor:
+    """Keep semantic-memory residuals bounded relative to their current writer."""
+    reference_rms_sq = (
+        reference.detach().float().square().mean(dim=-1, keepdim=True).clamp_min(1e-12)
+    )
+    readback_rms_sq = (
+        readback.float().square().mean(dim=-1, keepdim=True).clamp_min(1e-12)
+    )
+    reference_rms = reference_rms_sq.sqrt()
+    readback_rms = readback_rms_sq.sqrt()
+    scale = (
+        reference_rms * float(max_ratio) / readback_rms
+    ).clamp(max=1.0)
+    return readback * scale.to(readback.dtype)
+
+
 class WorkspaceBroadcast(nn.Module):
     """Competitive MoE-selected writes and all-expert shared-slot readback.
 
@@ -54,6 +81,8 @@ class WorkspaceBroadcast(nn.Module):
     _RECONSIDERATION_ERROR_EMA_DECAY = 0.9
     _SEMANTIC_ENTITY_COUNT = 64
     _SEMANTIC_POSITION_COUNT = 16
+    _SEMANTIC_CONTENT_RMS_LIMIT = 1.0
+    _SEMANTIC_READBACK_MAX_RATIO = 1.0
     # MoE residuals may be scaled to ~1e-5 before entering workspace. This
     # homogeneous scale improves address-projection gradient conditioning;
     # address normalization leaves forward similarities unchanged.
@@ -77,6 +106,7 @@ class WorkspaceBroadcast(nn.Module):
         compile_recurrence: bool = False,
         entity_keyed_writes: bool = False,
         semantic_entity_addressing: bool = False,
+        permutation_transactional: bool = False,
         key_match_threshold: float = 0.5,
     ):
         super().__init__()
@@ -117,6 +147,11 @@ class WorkspaceBroadcast(nn.Module):
         self.compile_recurrence = bool(compile_recurrence)
         self.entity_keyed_writes = bool(entity_keyed_writes)
         self.semantic_entity_addressing = bool(semantic_entity_addressing)
+        self.permutation_transactional = bool(permutation_transactional)
+        if self.permutation_transactional and not self.semantic_entity_addressing:
+            raise ValueError(
+                "permutation transactional mode requires semantic entity addressing"
+            )
         if self.semantic_entity_addressing and not self.entity_keyed_writes:
             raise ValueError("semantic entity addressing requires entity-keyed workspace writes")
         if self.semantic_entity_addressing and d_model < self._SEMANTIC_ENTITY_COUNT:
@@ -134,6 +169,10 @@ class WorkspaceBroadcast(nn.Module):
             else None
         )
         self._last_semantic_state_predictions: list[tuple[int, torch.Tensor]] = []
+        self._last_semantic_query_predictions: list[
+            tuple[int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = []
+        self._last_semantic_pair_commits: list[tuple[int, torch.Tensor]] = []
         self._compiled_recurrence_step = None
         self._compiled_recurrence_failed = False
         self._compiled_fallback_warned = False
@@ -182,6 +221,90 @@ class WorkspaceBroadcast(nn.Module):
         predictions = self._last_semantic_state_predictions
         self._last_semantic_state_predictions = []
         return predictions
+
+    def pop_semantic_query_predictions(
+        self,
+    ) -> list[tuple[int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+        predictions = self._last_semantic_query_predictions
+        self._last_semantic_query_predictions = []
+        return predictions
+
+    def pop_semantic_pair_commits(self) -> list[tuple[int, torch.Tensor]]:
+        commits = self._last_semantic_pair_commits
+        self._last_semantic_pair_commits = []
+        return commits
+
+    def _apply_semantic_pair_swap(
+        self, state: torch.Tensor, entity_ids: torch.Tensor, active: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Exchange two addressed payloads from the same pre-commit state."""
+        address_state, content_state = state.split(self.d_model, dim=-1)
+        safe_ids = entity_ids.clamp(min=0, max=self._SEMANTIC_ENTITY_COUNT - 1)
+        keys = F.one_hot(safe_ids, num_classes=self._SEMANTIC_ENTITY_COUNT).to(
+            device=state.device, dtype=torch.float32
+        )
+        keys = F.pad(keys, (0, self.d_model - self._SEMANTIC_ENTITY_COUNT))
+        scores = torch.einsum(
+            "bpd,bsd->bps", keys, _normalize_address(address_state.float())
+        )
+        occupied = address_state.detach().float().square().sum(dim=-1) > 1e-12
+        scores = scores.masked_fill(~occupied.unsqueeze(1), -2.0)
+        best_scores, slot_ids = scores.max(dim=-1)
+        valid = (
+            active
+            & entity_ids.ge(0).all(dim=-1)
+            & entity_ids[:, 0].ne(entity_ids[:, 1])
+            & best_scores.ge(self.key_match_threshold).all(dim=-1)
+            & slot_ids[:, 0].ne(slot_ids[:, 1])
+        )
+        left_content = content_state.gather(
+            1, slot_ids[:, 0, None, None].expand(-1, 1, self.d_model)
+        ).squeeze(1)
+        right_content = content_state.gather(
+            1, slot_ids[:, 1, None, None].expand(-1, 1, self.d_model)
+        ).squeeze(1)
+        left_slot = F.one_hot(slot_ids[:, 0], num_classes=self.num_slots).bool()
+        right_slot = F.one_hot(slot_ids[:, 1], num_classes=self.num_slots).bool()
+        left_slot = left_slot & valid.unsqueeze(-1)
+        right_slot = right_slot & valid.unsqueeze(-1)
+        exchanged = torch.where(
+            left_slot.unsqueeze(-1), right_content.unsqueeze(1), content_state
+        )
+        exchanged = torch.where(
+            right_slot.unsqueeze(-1), left_content.unsqueeze(1), exchanged
+        )
+        return torch.cat((address_state, exchanged), dim=-1), valid
+
+    def _semantic_query_class_logits(
+        self, state: torch.Tensor, query_kind: torch.Tensor, query_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Decode object->position and position->object answers from slot values."""
+        if self.semantic_state_decoder is None:
+            raise RuntimeError("semantic query readout requires semantic entity addressing")
+        address_state, content_state = state.split(self.d_model, dim=-1)
+        occupied = address_state.detach().float().square().sum(dim=-1) > 1e-12
+        entity_to_position = self._semantic_state_logits(
+            state, query_ids[:, None], query_kind.eq(1)[:, None]
+        ).squeeze(1)
+
+        slot_position_logits = self.semantic_state_decoder(content_state.float())
+        slot_position_log_probs = torch.log_softmax(slot_position_logits.float(), dim=-1)
+        safe_positions = query_ids.clamp(min=0, max=self._SEMANTIC_POSITION_COUNT - 1)
+        entity_position_scores = slot_position_log_probs.gather(
+            -1,
+            safe_positions[:, None, None].expand(-1, self.num_slots, 1),
+        ).squeeze(-1)
+        address_ids = address_state[..., : self._SEMANTIC_ENTITY_COUNT].argmax(dim=-1)
+        entity_keys = F.one_hot(
+            address_ids, num_classes=self._SEMANTIC_ENTITY_COUNT
+        ).bool() & occupied.unsqueeze(-1)
+        entity_to_slot = entity_keys.transpose(1, 2)
+        entity_scores = torch.where(
+            entity_to_slot,
+            entity_position_scores[:, None, :],
+            torch.full_like(entity_position_scores[:, None, :], -1e4),
+        ).amax(dim=-1)
+        return entity_to_position, entity_scores
 
     def _semantic_state_logits(
         self, state: torch.Tensor, entity_ids: torch.Tensor, valid_mask: torch.Tensor
@@ -300,6 +423,10 @@ class WorkspaceBroadcast(nn.Module):
         value_proposal = torch.einsum(
             "bes,bed->bsd", weighted_assignment.to(values.dtype), values
         ) / denominator.to(values.dtype).unsqueeze(-1)
+        if self.semantic_entity_addressing:
+            value_proposal = _cap_vector_rms(
+                value_proposal, self._SEMANTIC_CONTENT_RMS_LIMIT
+            )
         address_proposal = torch.einsum(
             "bes,bed->bsd", weighted_assignment, candidate_addresses
         ) / denominator.unsqueeze(-1)
@@ -425,6 +552,10 @@ class WorkspaceBroadcast(nn.Module):
                 update,
             )
         next_content = update.mul(proposal).add((1.0 - update).mul(content_state))
+        if self.semantic_entity_addressing:
+            next_content = _cap_vector_rms(
+                next_content, self._SEMANTIC_CONTENT_RMS_LIMIT
+            )
         if self.entity_keyed_writes:
             next_address = update.mul(address_proposal).add(
                 (1.0 - update).mul(address_state)
@@ -459,6 +590,10 @@ class WorkspaceBroadcast(nn.Module):
             address_occupied_frac = weights.new_zeros(())
         read_values = self.value(next_content)
         broadcast = torch.einsum("bes,bsd->bed", read_weights, read_values)
+        if self.semantic_entity_addressing:
+            broadcast = _cap_readback_to_reference(
+                broadcast, selected_deltas, self._SEMANTIC_READBACK_MAX_RATIO
+            )
         read_scale = torch.sigmoid(self.read_gate).to(selected_deltas.dtype)
         output = (
             (selected_deltas + read_scale * broadcast) * route_weights.unsqueeze(-1)
@@ -852,6 +987,10 @@ class WorkspaceBroadcast(nn.Module):
             ).scatter_add_(1, route_indices, route_weights.float())
             writer_frequency = writer_weights.mean(dim=0).detach()
         next_content = update.mul(slot_inputs).add((1.0 - update).mul(old_inputs))
+        if self.semantic_entity_addressing:
+            next_content = _cap_vector_rms(
+                next_content, self._SEMANTIC_CONTENT_RMS_LIMIT
+            )
         if self.entity_keyed_writes:
             assert address_state is not None and address_proposal is not None
             next_address = update.mul(address_proposal).add(
@@ -956,6 +1095,10 @@ class WorkspaceBroadcast(nn.Module):
             read_weights = read_scores.softmax(dim=-1).to(specialist_deltas.dtype)
         read_values = self.value(read_content)
         broadcast = torch.einsum("bes,bsd->bed", read_weights, read_values)
+        if self.semantic_entity_addressing:
+            broadcast = _cap_readback_to_reference(
+                broadcast, selected_deltas, self._SEMANTIC_READBACK_MAX_RATIO
+            )
         read_scale = torch.sigmoid(self.read_gate).to(specialist_deltas.dtype)
         enriched = selected_deltas + read_scale * broadcast
         if self.diagnostics_enabled:
@@ -1012,6 +1155,12 @@ class WorkspaceBroadcast(nn.Module):
         selected_specialists_only: bool = False,
         entity_ids: torch.Tensor | None = None,
         entity_write_mask: torch.Tensor | None = None,
+        pair_swap_entity_ids: torch.Tensor | None = None,
+        pair_swap_mask: torch.Tensor | None = None,
+        pair_swap_steps: tuple[int, ...] | None = None,
+        permutation_query_kind: torch.Tensor | None = None,
+        permutation_query_ids: torch.Tensor | None = None,
+        permutation_query_steps: tuple[int, ...] | None = None,
         state_supervision_entity_ids: torch.Tensor | None = None,
         state_supervision_mask: torch.Tensor | None = None,
         state_supervision_steps: tuple[int, ...] | None = None,
@@ -1019,6 +1168,8 @@ class WorkspaceBroadcast(nn.Module):
         """Process time-major specialists ``(B,T,E,D)`` sequentially."""
         outputs: list[torch.Tensor] = []
         self._last_semantic_state_predictions = []
+        self._last_semantic_query_predictions = []
+        self._last_semantic_pair_commits = []
         step_diags: list[dict[str, torch.Tensor]] | None = [] if self.diagnostics_enabled else None
         state_observer = getattr(self, "_initium_recurrent_state_observer", None)
         smoothed_prediction_error = None
@@ -1028,6 +1179,7 @@ class WorkspaceBroadcast(nn.Module):
         time_major_deltas = None
         time_major_route_indices = None
         time_major_route_weights = None
+        time_major_entity_write_mask = None
         if self.semantic_entity_addressing:
             if entity_ids is None or entity_write_mask is None:
                 raise ValueError(
@@ -1046,6 +1198,56 @@ class WorkspaceBroadcast(nn.Module):
             raise ValueError(
                 "entity metadata is only accepted when semantic entity addressing is enabled"
             )
+        if self.permutation_transactional:
+            expected_pair_shape = (*specialist_deltas.shape[:2], 2)
+            expected_metadata_shape = specialist_deltas.shape[:2]
+            if (
+                pair_swap_entity_ids is None
+                or pair_swap_mask is None
+                or pair_swap_entity_ids.shape != expected_pair_shape
+                or pair_swap_mask.shape != expected_metadata_shape
+            ):
+                raise ValueError(
+                    "transactional permutation mode requires pair swap IDs/mask "
+                    "with shapes (batch,time,2) and (batch,time)"
+                )
+            if (
+                permutation_query_kind is None
+                or permutation_query_ids is None
+                or permutation_query_kind.shape != expected_metadata_shape
+                or permutation_query_ids.shape != expected_metadata_shape
+            ):
+                raise ValueError(
+                    "transactional permutation mode requires query kind/ID tensors "
+                    "with shape (batch,time)"
+                )
+            if pair_swap_entity_ids.dtype not in (torch.int32, torch.int64):
+                raise TypeError("pair swap entity IDs must use an integer tensor dtype")
+            if pair_swap_mask.dtype != torch.bool:
+                raise TypeError("pair swap mask must use torch.bool")
+            if permutation_query_kind.dtype not in (torch.int32, torch.int64):
+                raise TypeError("permutation query kinds must use an integer tensor dtype")
+            if permutation_query_ids.dtype not in (torch.int32, torch.int64):
+                raise TypeError("permutation query IDs must use an integer tensor dtype")
+            pair_swap_steps = tuple(sorted(set(pair_swap_steps or ())))
+            permutation_query_steps = tuple(sorted(set(permutation_query_steps or ())))
+            max_steps = specialist_deltas.shape[1]
+            if any(step < 0 or step >= max_steps for step in pair_swap_steps):
+                raise ValueError("pair swap step is outside the current sequence")
+            if any(step < 0 or step >= max_steps for step in permutation_query_steps):
+                raise ValueError("permutation query step is outside the current sequence")
+        elif any(
+            value is not None
+            for value in (
+                pair_swap_entity_ids,
+                pair_swap_mask,
+                pair_swap_steps,
+                permutation_query_kind,
+                permutation_query_ids,
+                permutation_query_steps,
+            )
+        ):
+            raise ValueError("transactional metadata requires permutation_transactional mode")
         if state_supervision_entity_ids is not None or state_supervision_mask is not None:
             if not self.semantic_entity_addressing:
                 raise ValueError("state supervision requires semantic entity addressing")
@@ -1078,6 +1280,11 @@ class WorkspaceBroadcast(nn.Module):
             time_major_deltas = specialist_deltas.transpose(0, 1).contiguous()
             time_major_route_indices = route_indices.transpose(0, 1).contiguous()
             time_major_route_weights = route_weights.transpose(0, 1).contiguous()
+            time_major_entity_write_mask = (
+                entity_write_mask.transpose(0, 1).contiguous()
+                if entity_write_mask is not None
+                else None
+            )
             selected_deltas = (
                 time_major_deltas
                 if selected_specialists_only
@@ -1099,19 +1306,25 @@ class WorkspaceBroadcast(nn.Module):
                     assert self.address_read is not None
                     if self.semantic_entity_addressing:
                         assert entity_ids is not None
-                        safe_entity_ids = entity_ids.clamp(
+                        entity_ids_time_major = entity_ids.transpose(0, 1).contiguous()
+                        safe_entity_ids = entity_ids_time_major.clamp(
                             min=0, max=self._SEMANTIC_ENTITY_COUNT - 1
                         )
-                        identity_keys = F.one_hot(
+                        identity_keys_time_major = F.one_hot(
                             safe_entity_ids, num_classes=self._SEMANTIC_ENTITY_COUNT
                         ).to(dtype=torch.float32)
-                        identity_keys = F.pad(
-                            identity_keys, (0, self.d_model - 64)
+                        identity_keys_time_major = F.pad(
+                            identity_keys_time_major, (0, self.d_model - 64)
                         )
-                        identity_keys = identity_keys * entity_ids.ge(0).unsqueeze(-1)
-                        projected_write_keys = identity_keys.permute(1, 0, 2).unsqueeze(2).expand(
-                            -1, -1, write_candidates.shape[2], -1
+                        # Keep the batch stride of each time slice stable as
+                        # the curriculum changes sequence length. The expert
+                        # axis remains a zero-copy expansion.
+                        identity_keys_time_major = identity_keys_time_major * (
+                            entity_ids_time_major.ge(0).unsqueeze(-1)
                         )
+                        projected_write_keys = identity_keys_time_major.unsqueeze(
+                            2
+                        ).expand(-1, -1, write_candidates.shape[2], -1)
                     else:
                         assert self.address_write is not None
                         projected_write_keys = self.address_write(
@@ -1123,9 +1336,9 @@ class WorkspaceBroadcast(nn.Module):
                         )
                         if self.semantic_entity_addressing:
                             assert entity_ids is not None
-                            direct_queries = identity_keys.permute(1, 0, 2).unsqueeze(2).expand(
-                                -1, -1, selected_deltas.shape[2], -1
-                            )
+                            direct_queries = identity_keys_time_major.unsqueeze(
+                                2
+                            ).expand(-1, -1, selected_deltas.shape[2], -1)
                             semantic_query_mask = entity_ids.ge(0).transpose(0, 1)[
                                 :, :, None, None
                             ]
@@ -1204,7 +1417,9 @@ class WorkspaceBroadcast(nn.Module):
                 prediction_error[:, step] if prediction_error is not None else None
             )
             step_entity_write_mask = (
-                entity_write_mask[:, step] if entity_write_mask is not None else None
+                time_major_entity_write_mask[step]
+                if time_major_entity_write_mask is not None
+                else None
             )
             if step_prediction_error is not None:
                 current_error = step_prediction_error.float().detach().clamp(0.0, 1.0)
@@ -1474,8 +1689,41 @@ class WorkspaceBroadcast(nn.Module):
                         )
                 else:
                     self._last_step_diag = {}
+            if (
+                self.permutation_transactional
+                and pair_swap_steps
+                and step in pair_swap_steps
+            ):
+                assert pair_swap_entity_ids is not None and pair_swap_mask is not None
+                state, committed = self._apply_semantic_pair_swap(
+                    state,
+                    pair_swap_entity_ids[:, step],
+                    pair_swap_mask[:, step],
+                )
+                if not self.training:
+                    self._last_semantic_pair_commits.append((step, committed))
             if state_observer is not None:
                 state_observer(state, call_index=step)
+            if (
+                self.permutation_transactional
+                and permutation_query_steps
+                and step in permutation_query_steps
+            ):
+                assert permutation_query_kind is not None and permutation_query_ids is not None
+                position_logits, entity_logits = self._semantic_query_class_logits(
+                    state,
+                    permutation_query_kind[:, step],
+                    permutation_query_ids[:, step],
+                )
+                self._last_semantic_query_predictions.append(
+                    (
+                        step,
+                        position_logits,
+                        entity_logits,
+                        permutation_query_kind[:, step],
+                        permutation_query_ids[:, step],
+                    )
+                )
             if (
                 state_supervision_steps
                 and step in state_supervision_steps

@@ -825,6 +825,7 @@ def load_frozen_workspace_warm_start(
         "workspace_num_slots",
         "workspace_entity_keyed_writes",
         "workspace_semantic_entity_addressing",
+        "workspace_permutation_transactional",
         "workspace_key_match_threshold",
         "workspace_no_selection",
         "workspace_reset_each_step",
@@ -1005,6 +1006,7 @@ def run(
     workspace_compile_recurrence: bool = False,
     workspace_entity_keyed_writes: bool = False,
     workspace_semantic_entity_addressing: bool = False,
+    workspace_permutation_transactional: bool = False,
     workspace_key_match_threshold: float = 0.5,
     workspace_no_selection: bool = WORKSPACE_NO_SELECTION,
     workspace_reset_each_step: bool = WORKSPACE_RESET_EACH_STEP,
@@ -1162,9 +1164,34 @@ def run(
                 raise ValueError(
                     "workspace state loss is supervised only on the permutation track"
                 )
-    elif workspace_semantic_state_diagnostics or workspace_state_loss_weight > 0:
+        if workspace_permutation_transactional:
+            if not (
+                workspace_enabled
+                and workspace_semantic_entity_addressing
+                and workspace_entity_keyed_writes
+            ):
+                raise ValueError(
+                    "workspace_permutation_transactional requires --workspace and semantic entity-addressed writes"
+                )
+            if dataset_type != "workspace-capability" or workspace_task_track not in (
+                "permutation",
+                "all",
+            ):
+                raise ValueError(
+                    "workspace_permutation_transactional requires workspace-capability permutation episodes"
+                )
+            if workspace_num_slots < 16:
+                raise ValueError(
+                    "workspace_permutation_transactional requires at least 16 workspace slots"
+                )
+    elif (
+        workspace_semantic_state_diagnostics
+        or workspace_state_loss_weight > 0
+        or workspace_permutation_transactional
+    ):
         raise ValueError(
-            "workspace state diagnostics and state loss require workspace-capability"
+            "workspace state diagnostics, state loss, and transactional permutation "
+            "mode require workspace-capability"
         )
     if split_graph_numeric_trace_step is not None:
         if not split_graph_enabled:
@@ -1837,6 +1864,42 @@ def run(
                     values.get("priority_tie_episode_fraction"),
                 ]
             )
+        for query_type, values in sorted(
+            diagnostics.get("permutation_query_directions", {}).items()
+        ):
+            workspace_task_writer.writerow(
+                [
+                    step_value, lesson_value, eval_type,
+                    f"permutation_query/{query_type}",
+                    100.0 * values.get("exact_accuracy", 0.0),
+                    100.0 * values.get("exact_accuracy", 0.0),
+                    values.get("episodes", 0), values.get("episodes", 0),
+                    *([None] * 8),
+                ]
+            )
+        for depth, values in sorted(
+            diagnostics.get("permutation_state_accuracy_by_swap_depth", {}).items(),
+            key=lambda item: int(item[0]),
+        ):
+            workspace_task_writer.writerow(
+                [
+                    step_value, lesson_value, eval_type,
+                    f"permutation_state/swap_depth_{depth}",
+                    100.0 * values.get("accuracy", 0.0), None,
+                    None, values.get("entities", 0), *([None] * 8),
+                ]
+            )
+        if "permutation_pair_commit_attempts" in diagnostics:
+            attempts = int(diagnostics.get("permutation_pair_commit_attempts", 0))
+            successes = int(diagnostics.get("permutation_pair_commit_successes", 0))
+            workspace_task_writer.writerow(
+                [
+                    step_value, lesson_value, eval_type,
+                    "permutation_pair_commit",
+                    100.0 * diagnostics.get("permutation_pair_commit_success_rate", 0.0),
+                    None, attempts, successes, *([None] * 8),
+                ]
+            )
         for split, values in sorted(diagnostics.get("permutation_generalization", {}).items()):
             workspace_task_writer.writerow(
                 [
@@ -2423,6 +2486,7 @@ def run(
             workspace_compile_recurrence=workspace_compile_recurrence,
             workspace_entity_keyed_writes=workspace_entity_keyed_writes,
             workspace_semantic_entity_addressing=workspace_semantic_entity_addressing,
+            workspace_permutation_transactional=workspace_permutation_transactional,
             workspace_key_match_threshold=workspace_key_match_threshold,
             workspace_no_selection=workspace_no_selection,
             workspace_reset_each_step=workspace_reset_each_step,
@@ -2655,10 +2719,17 @@ def run(
                 eval_only and eval_workspace_mode == "reset-each-step"
             )
             persistence = "off (reset each timestep)" if reset_workspace_each_step else "on"
+            semantic_state_bounds = (
+                "semantic_state_bounds=slot_rms<=1,readback_rms<=writer_rms | "
+                if workspace_semantic_entity_addressing
+                else ""
+            )
             print(
                 f"[{run_id}] WORKSPACE {'active' if workspace_active else 'bypassed'} | "
                 f"slots={workspace_num_slots} | write_selection={write_mode} | "
                 f"write_addressing={('semantic-entity-token' if workspace_semantic_entity_addressing else 'learned-address') if workspace_entity_keyed_writes else 'shared'} | "
+                f"permutation_commit={'atomic-pair' if workspace_permutation_transactional else 'standard'} | "
+                f"{semantic_state_bounds}"
                 f"persistence={persistence} | train_mode={workspace_train_mode} | "
                 f"recurrence_kernel={'torch.compile' if workspace_compile_recurrence else 'eager'} | "
                 f"gate={workspace_gate_variant} | "
@@ -2749,6 +2820,7 @@ def run(
         "workspace_num_slots": workspace_num_slots,
         "workspace_compile_recurrence": workspace_compile_recurrence,
         "workspace_entity_keyed_writes": workspace_entity_keyed_writes,
+        "workspace_permutation_transactional": workspace_permutation_transactional,
         "workspace_state_loss_weight": workspace_state_loss_weight,
         "workspace_key_match_threshold": workspace_key_match_threshold,
         "workspace_no_selection": workspace_no_selection,
@@ -2770,6 +2842,8 @@ def run(
     }
     if workspace_semantic_entity_addressing:
         extra_model_config["workspace_semantic_entity_addressing"] = True
+    if workspace_permutation_transactional:
+        extra_model_config["workspace_permutation_transactional"] = True
     if sgr_prediction_enabled:
         extra_model_config["sgr_prediction_decoder_enabled"] = True
         extra_model_config["sgr_prediction_loss_weight"] = float(sgr_prediction_loss_weight)
@@ -3653,9 +3727,18 @@ def run(
 
         workspace_forward_kwargs = {}
         if workspace_semantic_entity_addressing:
-            workspace_metadata = dataset.workspace_entity_address_metadata(input_seq)
+            workspace_metadata = dataset.workspace_entity_address_metadata(
+                input_seq,
+                paired_swap_commits=workspace_permutation_transactional,
+            )
+            if workspace_permutation_transactional:
+                workspace_metadata.update(
+                    dataset.workspace_permutation_query_metadata(input_seq)
+                )
             workspace_forward_kwargs = {
                 key: value.to(device, non_blocking=True)
+                if isinstance(value, torch.Tensor)
+                else value
                 for key, value in workspace_metadata.items()
             }
         state_supervision_positions = None
@@ -3825,6 +3908,13 @@ def run(
                 )
             output = output.transpose(0, 1)  # (B, T, 92); Linear accepts non-contiguous input.
             output = output_proj(output)  # (B, T, 90)
+            if workspace_permutation_transactional:
+                workspace_module = getattr(rnn, "workspace", None)
+                if workspace_module is None:
+                    raise RuntimeError("transactional permutation readout has no workspace module")
+                output = dataset.apply_workspace_permutation_query_logits(
+                    output, workspace_module.pop_semantic_query_predictions()
+                )
             if split_graph_forward_trace is not None and split_graph_forward_trace.active:
                 split_graph_forward_trace.observe("task_output.logits", output)
             if check_finite_this_step and not _first_nonfinite_report(
@@ -6205,6 +6295,16 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--workspace-permutation-transactional",
+        action="store_true",
+        help=(
+            "For permutation episodes, defer both swap writes and atomically exchange "
+            "the two addressed slot payloads at the pair boundary; decode the final "
+            "object/position query directly from workspace state. Requires semantic "
+            "entity addressing and at least 16 slots."
+        ),
+    )
+    parser.add_argument(
         "--workspace-semantic-state-diagnostics",
         action="store_true",
         help=(
@@ -7131,6 +7231,24 @@ if __name__ == "__main__":
         parser.error(
             "--workspace-semantic-entity-addressing requires --workspace-entity-keyed-writes"
         )
+    if args.workspace_permutation_transactional:
+        if not args.workspace:
+            parser.error("--workspace-permutation-transactional requires --workspace")
+        if not args.workspace_semantic_entity_addressing:
+            parser.error(
+                "--workspace-permutation-transactional requires "
+                "--workspace-semantic-entity-addressing"
+            )
+        if args.workspace_num_slots < 16:
+            parser.error("--workspace-permutation-transactional requires --workspace-num-slots >= 16")
+        if args.dataset_type != "workspace-capability" or args.workspace_task_track not in (
+            "permutation",
+            "all",
+        ):
+            parser.error(
+                "--workspace-permutation-transactional requires workspace-capability "
+                "permutation episodes"
+            )
     if args.workspace_semantic_entity_addressing and (
         args.dataset_type != "workspace-capability"
         or args.workspace_task_track not in ("permutation", "all")
@@ -7326,6 +7444,8 @@ if __name__ == "__main__":
                 run_id += f"_entitykeyed{key_threshold_tag}"
             if args.workspace_semantic_entity_addressing:
                 run_id += "_semanticentityaddr"
+            if args.workspace_permutation_transactional:
+                run_id += "_pairtransaction"
             if args.workspace_compile_recurrence:
                 run_id += "_compiledrecurrence"
             if args.workspace_gate_variant != "continuous" or args.workspace_train_scope == "gate":
@@ -7466,6 +7586,9 @@ if __name__ == "__main__":
             workspace_entity_keyed_writes=args.workspace_entity_keyed_writes,
             workspace_semantic_entity_addressing=(
                 args.workspace_semantic_entity_addressing
+            ),
+            workspace_permutation_transactional=(
+                args.workspace_permutation_transactional
             ),
             workspace_key_match_threshold=args.workspace_key_match_threshold,
             workspace_no_selection=args.workspace_no_selection,

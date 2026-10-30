@@ -89,6 +89,38 @@ the task loss separately. This option requires semantic entity addressing and
 the `permutation` or `all` track. A fresh run is recommended because the
 auxiliary decoder is a trainable model component.
 
+Semantic-address mode also bounds each stored content vector to RMS 1.0 and
+clips each readback vector to at most the corresponding routed writer's RMS.
+This prevents an unconstrained learned value projection from making workspace
+readback grow larger than the specialist signal. The console identifies this
+as `semantic_state_bounds`; `slot_rms` and `broadcast/specialist` telemetry
+show whether the bounds are active. This affects only semantic entity-address
+mode, leaving ordinary shared and learned-address workspace runs unchanged.
+
+For an explicitly swap-aware ablation, add
+`--workspace-permutation-transactional`. This is a separate update rule layered
+on semantic entity addressing: the two swap commit tokens are read-only, then
+at the event boundary both entity slots are resolved from the same pre-commit
+address state and their content payloads are exchanged together. It requires
+`--workspace`, `--workspace-entity-keyed-writes`,
+`--workspace-semantic-entity-addressing`, at least 16 slots, and the
+`permutation` or `all` track. The state decoder is also used as the task
+readout: object-to-position queries score the requested entity's slot value;
+position-to-object queries compare each occupied slot's decoded position and
+score the corresponding entity address. Its class logits replace the normal
+task logits only at the answer token, so the task loss trains the same decoder
+that is evaluated. It supports `--workspace-compile-recurrence`; pair commits
+are applied at event boundaries around the compiled per-token recurrence.
+
+Transactional evaluations write separate `permutation_query/` rows for the
+two query directions and `permutation_state/swap_depth_N` rows in the workspace
+task-metrics CSV. State accuracy is measured on held-out episodes after each
+initialization/swap snapshot, grouped by the number of swaps committed so far.
+The `permutation_pair_commit` row records how many requested exchanges found
+both distinct entity slots and were actually applied.
+Use a fresh run because this mode changes state dynamics and makes the task
+decoder part of the answer path.
+
 Example permutation run:
 
 ```bash

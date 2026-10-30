@@ -155,6 +155,8 @@ def generate(
         answer,
         {
             "query_type": query_type,
+            "query_entity_id": int(query_obj),
+            "query_location_id": int(query_pos),
             "sequence_length": len(stream),
             "relevant_updates": relevant,
             "distractor_count": distractors,

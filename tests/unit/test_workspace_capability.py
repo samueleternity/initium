@@ -56,6 +56,7 @@ from initium.data.workspace_capability.tracks import (
     retrieval_aggregation,
 )
 from initium.workspace.broadcast import WorkspaceBroadcast
+from initium.workspace.nth_farthest import select_nth_farthest
 
 
 GENERATORS = {
@@ -297,6 +298,67 @@ def test_nth_farthest_oracle_ranks_candidates_by_squared_distance():
         ),
     )
     assert episode.answer == (ranked[rank - 1], EOS)
+
+
+def test_nth_farthest_exact_readout_uses_descending_distance_and_entity_id_ties():
+    vectors = torch.tensor([[[3.0, 0.0], [-3.0, 0.0], [0.0, 1.0], [99.0, 99.0]]])
+    query = torch.zeros(1, 2)
+    entity_ids = torch.tensor([[9, 2, 5, -1]])
+    mask = torch.tensor([[True, True, True, False]])
+    selected, distances = select_nth_farthest(
+        vectors, query, entity_ids, torch.tensor([0]), mask
+    )
+    # The two distance-9 candidates tie; entity ID 2 wins the oracle tie-break.
+    assert selected.tolist() == [2]
+    assert distances.tolist() == [[9.0, 9.0, 1.0, 19602.0]]
+
+
+def test_workspace_nth_farthest_readout_decodes_addressed_slots_and_tie_breaks():
+    workspace = WorkspaceBroadcast(
+        d_model=64,
+        num_experts=1,
+        num_slots=64,
+        entity_keyed_writes=True,
+        semantic_entity_addressing=True,
+        nth_farthest_exact_readout=True,
+    )
+    with torch.no_grad():
+        decoder = workspace.semantic_vector_decoder
+        decoder.weight.zero_()
+        decoder.bias.zero_()
+        for coordinate_value in range(16):
+            decoder.weight[coordinate_value, coordinate_value] = 10.0
+    state = torch.zeros(1, 64, 128)
+    # Entities 7 and 2 are both distance 9, while entity 9 is distance 1.
+    for entity, coordinate in ((7, 3), (2, 3), (9, 1)):
+        state[0, entity, entity] = 1.0
+        state[0, entity, 64 + coordinate] = 1.0
+    candidate_ids = torch.tensor([[7, 2, 9] + [-1] * 13])
+    candidate_mask = torch.tensor([[True, True, True] + [False] * 13])
+    query = torch.tensor([[0, -1, -1, -1, -1, -1]])
+    logits, selected, _distances, active = workspace._nth_farthest_query_logits(
+        state, candidate_ids, candidate_mask, query, torch.tensor([0])
+    )
+    assert active.tolist() == [True]
+    assert selected.tolist() == [2]
+    assert int(logits.argmax(dim=-1).item()) == 2
+
+
+def test_nth_farthest_workspace_metadata_is_input_only_and_handles_all_track():
+    dataset = WorkspaceCapabilityDataset("all", batch_size_hint=2)
+    episodes = [
+        dataset._make_episode("nth_farthest", 1, random.Random(81)),
+        dataset._make_episode("entity_state", 1, random.Random(82)),
+    ]
+    inputs, _targets, _mask = dataset._collate(episodes)
+    metadata = dataset.workspace_nth_farthest_metadata(inputs, episodes)
+    assert metadata["nth_farthest_vector_steps"]
+    assert metadata["nth_farthest_query_steps"] == (len(episodes[0].inputs),)
+    query_step = len(episodes[0].inputs)
+    assert int(metadata["nth_farthest_query_candidate_mask"][0, query_step].sum()) == episodes[0].metadata["candidate_count"]
+    assert not bool(metadata["nth_farthest_query_candidate_mask"][1].any())
+    assert metadata["nth_farthest_query_vectors"][0, query_step].ge(0).any()
+    assert metadata["nth_farthest_query_vectors"][1].eq(-1).all()
 
 
 @pytest.mark.parametrize(

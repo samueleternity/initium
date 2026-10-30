@@ -537,6 +537,101 @@ class WorkspaceCapabilityDataset(BaseDataset):
             "state_supervision_steps": tuple(sorted(supervised_steps)),
         }
 
+    def workspace_nth_farthest_metadata(
+        self,
+        input_vectors: torch.Tensor,
+        episodes: list[TaskEpisode] | None = None,
+    ) -> dict[str, Any]:
+        """Build input-only vector targets and causal query metadata.
+
+        Targets are attached to completed EV_VECTOR separators. Candidate IDs,
+        query coordinates, and zero-based rank come only from input tokens;
+        answer labels are never inspected.
+        """
+        if input_vectors.ndim != 3 or input_vectors.shape[-1] != VOCAB_SIZE:
+            raise ValueError("Nth-farthest metadata expects one-hot (batch,time,vocab) inputs")
+        examples = self.last_batch_examples if episodes is None else episodes
+        batch, time, _ = input_vectors.shape
+        if len(examples) != batch:
+            raise RuntimeError("Nth-farthest metadata lost batch/episode alignment")
+        tokens_by_row = input_vectors.argmax(dim=-1).detach().cpu().tolist()
+        event_ids = torch.full((batch, time, 16), -1, dtype=torch.long, device=input_vectors.device)
+        event_targets = torch.full((batch, time, 16, 6), -100, dtype=torch.long, device=input_vectors.device)
+        event_mask = torch.zeros((batch, time, 16), dtype=torch.bool, device=input_vectors.device)
+        query_ids = torch.full_like(event_ids, -1)
+        query_mask = torch.zeros_like(event_mask)
+        query_vectors = torch.full((batch, time, 6), -1, dtype=torch.long, device=input_vectors.device)
+        query_ranks = torch.full((batch, time), -1, dtype=torch.long, device=input_vectors.device)
+        vector_steps: set[int] = set()
+        query_steps: set[int] = set()
+        for row, episode in enumerate(examples):
+            if episode.track != "nth_farthest":
+                continue
+            tokens = [int(token) for token in tokens_by_row[row][:len(episode.inputs)]]
+            candidates: list[int] = []
+            index = 0
+            while index < len(tokens):
+                if tokens[index] != EV_VECTOR:
+                    index += 1
+                    continue
+                if index + 1 >= len(tokens) or not ENTITY_BASE <= tokens[index + 1] < ENTITY_BASE + ENTITY_COUNT:
+                    raise ValueError("malformed Nth-farthest vector event: missing entity ID")
+                entity_id = tokens[index + 1] - ENTITY_BASE
+                end = index + 2
+                values = []
+                while end < len(tokens) and tokens[end] != SEP:
+                    if SCALAR_BASE <= tokens[end] < SCALAR_BASE + SCALAR_COUNT:
+                        values.append(tokens[end] - SCALAR_BASE)
+                    end += 1
+                if end >= len(tokens) or not 1 <= len(values) <= 6 or len(candidates) >= 16:
+                    raise ValueError("malformed or oversized Nth-farthest vector event")
+                candidates.append(entity_id)
+                event_ids[row, end, 0] = entity_id
+                event_targets[row, end, 0, :len(values)] = torch.tensor(
+                    values, dtype=torch.long, device=input_vectors.device
+                )
+                event_mask[row, end, 0] = True
+                vector_steps.add(end)
+                index = end + 1
+
+            query_index = next((i for i, token in enumerate(tokens) if token == QUERY), None)
+            if query_index is None:
+                raise ValueError("Nth-farthest episode is missing its query")
+            query_end = tokens.index(SEP, query_index + 1)
+            query_tokens = tokens[query_index + 1:query_end]
+            if not query_tokens or not candidates:
+                raise ValueError("Nth-farthest query has no rank or candidate vectors")
+            rank_token = query_tokens[0]
+            if not SCALAR_BASE <= rank_token < SCALAR_BASE + SCALAR_COUNT:
+                raise ValueError("Nth-farthest query rank is not a scalar token")
+            coords = [token - SCALAR_BASE for token in query_tokens[1:]
+                      if SCALAR_BASE <= token < SCALAR_BASE + SCALAR_COUNT]
+            if not 1 <= len(coords) <= 6:
+                raise ValueError("Nth-farthest query must contain 1..6 coordinates")
+            answer_step = len(episode.inputs)
+            if not 0 <= answer_step < time:
+                raise RuntimeError("Nth-farthest answer step exceeds collated sequence")
+            query_ids[row, answer_step, :len(candidates)] = torch.tensor(
+                candidates, dtype=torch.long, device=input_vectors.device
+            )
+            query_mask[row, answer_step, :len(candidates)] = True
+            query_vectors[row, answer_step, :len(coords)] = torch.tensor(
+                coords, dtype=torch.long, device=input_vectors.device
+            )
+            query_ranks[row, answer_step] = rank_token - SCALAR_BASE
+            query_steps.add(answer_step)
+        return {
+            "nth_farthest_vector_entity_ids": event_ids,
+            "nth_farthest_vector_targets": event_targets,
+            "nth_farthest_vector_mask": event_mask,
+            "nth_farthest_vector_steps": tuple(sorted(vector_steps)),
+            "nth_farthest_query_candidate_ids": query_ids,
+            "nth_farthest_query_candidate_mask": query_mask,
+            "nth_farthest_query_vectors": query_vectors,
+            "nth_farthest_query_ranks": query_ranks,
+            "nth_farthest_query_steps": tuple(sorted(query_steps)),
+        }
+
     def loss(self, output, target, mask):
         if output.shape[:-1] != target.shape or target.shape != mask.shape:
             raise ValueError("output, target, and mask batch/time dimensions must match")
@@ -616,6 +711,11 @@ class WorkspaceCapabilityDataset(BaseDataset):
         metadata_totals: dict[str, list[float]] = defaultdict(lambda: [0.0] * 8)
         permutation_query_totals: dict[str, list[int]] = defaultdict(lambda: [0, 0])
         permutation_state_depth_totals: dict[int, list[int]] = defaultdict(lambda: [0, 0])
+        nth_vector_coordinate_correct = nth_vector_coordinate_count = 0
+        nth_vector_exact_correct = nth_vector_exact_count = 0
+        nth_readout_correct = nth_readout_count = 0
+        nth_invalid_readout_count = 0
+        nth_readout_by_stratum: dict[str, list[int]] = defaultdict(lambda: [0, 0])
         permutation_pair_commit_attempts = 0
         permutation_pair_commit_successes = 0
         correct_total = answer_total = exact_total = 0
@@ -657,6 +757,18 @@ class WorkspaceCapabilityDataset(BaseDataset):
                         if transactional:
                             binding_entity_metadata.update(
                                 self.workspace_permutation_query_metadata(x, group)
+                            )
+                        nth_enabled = bool(
+                            getattr(model, "workspace_nth_farthest_exact_readout", False)
+                        )
+                        if nth_enabled:
+                            nth_metadata = self.workspace_nth_farthest_metadata(x, group)
+                            binding_entity_metadata.update(
+                                {
+                                    key: value
+                                    for key, value in nth_metadata.items()
+                                    if key != "nth_farthest_vector_targets"
+                                }
                             )
                         workspace_forward_kwargs = {
                             key: value.to(device, non_blocking=True)
@@ -835,6 +947,77 @@ class WorkspaceCapabilityDataset(BaseDataset):
                                         == int(target_position)
                                     )
                                     counts[1] += 1
+                    nth_predictions_by_step = {}
+                    if bool(getattr(model, "workspace_nth_farthest_exact_readout", False)):
+                        query_predictions = workspace.pop_nth_farthest_query_predictions()
+                        vector_predictions = dict(
+                            workspace.pop_nth_farthest_vector_predictions()
+                        )
+                        nth_predictions_by_step = {
+                            step: (selected, active)
+                            for step, _query_logits, selected, active in query_predictions
+                        }
+                        if query_predictions:
+                            logits = logits.clone()
+                            for query_step, query_logits, selected, active in query_predictions:
+                                if not 0 <= int(query_step) < logits.shape[1]:
+                                    continue
+                                entity_logits = logits.new_full(
+                                    (logits.shape[0], logits.shape[-1]), -1e4
+                                )
+                                entity_logits[:, ENTITY_BASE:ENTITY_BASE + ENTITY_COUNT] = (
+                                    query_logits.to(device=logits.device, dtype=logits.dtype)
+                                )
+                                invalid_readout = active.to(device=logits.device) & selected.to(
+                                    device=logits.device
+                                ).lt(0)
+                                entity_logits = torch.where(
+                                    invalid_readout.unsqueeze(-1),
+                                    torch.full_like(entity_logits, -1e4),
+                                    entity_logits,
+                                )
+                                logits[:, int(query_step)] = torch.where(
+                                    active.to(device=logits.device).unsqueeze(-1),
+                                    entity_logits,
+                                    logits[:, int(query_step)],
+                                )
+                        for vector_step, vector_logits in vector_predictions.items():
+                            target = nth_metadata["nth_farthest_vector_targets"][:, vector_step].to(
+                                device=vector_logits.device
+                            )
+                            valid_coordinates = target.ne(-100)
+                            prediction = vector_logits.argmax(dim=-1)
+                            equal = prediction.eq(target) & valid_coordinates
+                            nth_vector_coordinate_correct += int(equal.sum().item())
+                            nth_vector_coordinate_count += int(valid_coordinates.sum().item())
+                            valid_vectors = valid_coordinates.any(dim=-1)
+                            vector_exact = ((prediction.eq(target) | ~valid_coordinates).all(dim=-1))
+                            nth_vector_exact_correct += int((vector_exact & valid_vectors).sum().item())
+                            nth_vector_exact_count += int(valid_vectors.sum().item())
+                        for row, episode in enumerate(group):
+                            if episode.track != "nth_farthest":
+                                continue
+                            answer_step = len(episode.inputs)
+                            selected_active = nth_predictions_by_step.get(answer_step)
+                            if selected_active is None or not bool(selected_active[1][row].item()):
+                                continue
+                            selected_entity = int(selected_active[0][row].item())
+                            expected_entity = int(episode.answer[0]) - ENTITY_BASE
+                            nth_invalid_readout_count += int(selected_entity < 0)
+                            correct_readout = int(selected_entity == expected_entity)
+                            nth_readout_correct += correct_readout
+                            nth_readout_count += 1
+                            zero_based_rank = int(
+                                nth_metadata["nth_farthest_query_ranks"][row, answer_step].item()
+                            )
+                            stratum = (
+                                f"{episode.metadata.get('query_type', 'unknown')}|"
+                                f"n{episode.metadata.get('candidate_count', 0)}|"
+                                f"d{int(nth_metadata['nth_farthest_query_vectors'][row, answer_step].ne(-1).sum().item())}|"
+                                f"r{zero_based_rank}"
+                            )
+                            nth_readout_by_stratum[stratum][0] += correct_readout
+                            nth_readout_by_stratum[stratum][1] += 1
                     predictions = logits.argmax(dim=-1)
                     for local_idx, episode in enumerate(group):
                         start = len(episode.inputs)
@@ -957,6 +1140,24 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 for track, counts in totals.items()
             },
         }
+        if bool(getattr(model, "workspace_nth_farthest_exact_readout", False)):
+            diagnostics["nth_farthest_workspace"] = {
+                "vector_coordinate_accuracy": 100.0 * nth_vector_coordinate_correct / max(nth_vector_coordinate_count, 1),
+                "vector_coordinates_correct": nth_vector_coordinate_correct,
+                "vector_coordinates_total": nth_vector_coordinate_count,
+                "vector_exact_accuracy": 100.0 * nth_vector_exact_correct / max(nth_vector_exact_count, 1),
+                "vectors_exact": nth_vector_exact_correct,
+                "vectors_total": nth_vector_exact_count,
+                "exact_readout_accuracy": 100.0 * nth_readout_correct / max(nth_readout_count, 1),
+                "readouts_correct": nth_readout_correct,
+                "readouts_total": nth_readout_count,
+                "invalid_readouts": nth_invalid_readout_count,
+                "readout_by_query_stratum": {
+                    key: {"accuracy": 100.0 * counts[0] / max(counts[1], 1),
+                          "correct": counts[0], "episodes": counts[1]}
+                    for key, counts in nth_readout_by_stratum.items()
+                },
+            }
         if binding_entity_mentions:
             binding_metrics = {
                 "entity_write_coverage": (
@@ -1002,6 +1203,24 @@ class WorkspaceCapabilityDataset(BaseDataset):
             f"[workspace-capability/{self.task_track}] accuracy {accuracy:.2f}% | "
             f"episode exact {perfect:.2f}% | episodes {len(episodes)}"
         )
+        nth_metrics = diagnostics.get("nth_farthest_workspace")
+        if nth_metrics:
+            print(
+                "  [workspace-nth-farthest] "
+                f"vector coordinate accuracy={nth_metrics['vector_coordinate_accuracy']:.1f}% "
+                f"({nth_metrics['vector_coordinates_correct']}/{nth_metrics['vector_coordinates_total']}) | "
+                f"exact candidate vectors={nth_metrics['vector_exact_accuracy']:.1f}% "
+                f"({nth_metrics['vectors_exact']}/{nth_metrics['vectors_total']}) | "
+                f"direct exact readout={nth_metrics['exact_readout_accuracy']:.1f}% "
+                f"({nth_metrics['readouts_correct']}/{nth_metrics['readouts_total']}) | "
+                f"missing/invalid candidate state={nth_metrics['invalid_readouts']}"
+            )
+            for stratum, values in sorted(nth_metrics["readout_by_query_stratum"].items()):
+                print(
+                    f"    [workspace-nth-farthest/{stratum}] "
+                    f"exact readout={values['accuracy']:.1f}% "
+                    f"({values['correct']}/{values['episodes']})"
+                )
         if binding_entity_mentions:
             print(
                 "  [workspace-binding/permutation] "

@@ -251,6 +251,7 @@ class SplitGraphDNC(nn.Module):
         workspace_entity_keyed_writes: bool = False,
         workspace_semantic_entity_addressing: bool = False,
         workspace_permutation_transactional: bool = False,
+        workspace_nth_farthest_exact_readout: bool = False,
         workspace_key_match_threshold: float = 0.5,
         workspace_no_selection: bool = False,
         workspace_reset_each_step: bool = False,
@@ -414,6 +415,9 @@ class SplitGraphDNC(nn.Module):
         )
         self.workspace_permutation_transactional = bool(
             workspace_permutation_transactional
+        )
+        self.workspace_nth_farthest_exact_readout = bool(
+            workspace_nth_farthest_exact_readout
         )
         self.workspace_key_match_threshold = float(workspace_key_match_threshold)
         self.workspace_no_selection = workspace_no_selection
@@ -742,6 +746,7 @@ class SplitGraphDNC(nn.Module):
                 entity_keyed_writes=workspace_entity_keyed_writes,
                 semantic_entity_addressing=workspace_semantic_entity_addressing,
                 permutation_transactional=workspace_permutation_transactional,
+                nth_farthest_exact_readout=workspace_nth_farthest_exact_readout,
                 key_match_threshold=workspace_key_match_threshold,
             )
             if workspace_enabled and workspace_num_slots > 0
@@ -813,6 +818,14 @@ class SplitGraphDNC(nn.Module):
         state_supervision_entity_ids: torch.Tensor | None = None,
         state_supervision_mask: torch.Tensor | None = None,
         state_supervision_steps: tuple[int, ...] | None = None,
+        nth_farthest_vector_entity_ids: torch.Tensor | None = None,
+        nth_farthest_vector_mask: torch.Tensor | None = None,
+        nth_farthest_vector_steps: tuple[int, ...] | None = None,
+        nth_farthest_query_candidate_ids: torch.Tensor | None = None,
+        nth_farthest_query_candidate_mask: torch.Tensor | None = None,
+        nth_farthest_query_vectors: torch.Tensor | None = None,
+        nth_farthest_query_ranks: torch.Tensor | None = None,
+        nth_farthest_query_steps: tuple[int, ...] | None = None,
         timespans: torch.Tensor | None = None,
         return_backbone_features: bool = False,
         return_prediction_logits: bool = False,
@@ -1211,6 +1224,38 @@ class SplitGraphDNC(nn.Module):
                     if state_supervision_entity_ids is not None
                     else None
                 ),
+                nth_farthest_vector_entity_ids=(
+                    nth_farthest_vector_entity_ids[:, start_step:]
+                    if nth_farthest_vector_entity_ids is not None else None
+                ),
+                nth_farthest_vector_mask=(
+                    nth_farthest_vector_mask[:, start_step:]
+                    if nth_farthest_vector_mask is not None else None
+                ),
+                nth_farthest_vector_steps=(
+                    tuple(step - start_step for step in (nth_farthest_vector_steps or ()) if step >= start_step)
+                    if nth_farthest_vector_entity_ids is not None else None
+                ),
+                nth_farthest_query_candidate_ids=(
+                    nth_farthest_query_candidate_ids[:, start_step:]
+                    if nth_farthest_query_candidate_ids is not None else None
+                ),
+                nth_farthest_query_candidate_mask=(
+                    nth_farthest_query_candidate_mask[:, start_step:]
+                    if nth_farthest_query_candidate_mask is not None else None
+                ),
+                nth_farthest_query_vectors=(
+                    nth_farthest_query_vectors[:, start_step:]
+                    if nth_farthest_query_vectors is not None else None
+                ),
+                nth_farthest_query_ranks=(
+                    nth_farthest_query_ranks[:, start_step:]
+                    if nth_farthest_query_ranks is not None else None
+                ),
+                nth_farthest_query_steps=(
+                    tuple(step - start_step for step in (nth_farthest_query_steps or ()) if step >= start_step)
+                    if nth_farthest_query_candidate_ids is not None else None
+                ),
                 collect_kv_records=self.workspace_kv_memory is not None,
             )
             if self.workspace_kv_memory is not None:
@@ -1356,6 +1401,14 @@ class SplitGraphDNC(nn.Module):
                         state_supervision_entity_ids=state_supervision_entity_ids,
                         state_supervision_mask=state_supervision_mask,
                         state_supervision_steps=state_supervision_steps,
+                        nth_farthest_vector_entity_ids=nth_farthest_vector_entity_ids,
+                        nth_farthest_vector_mask=nth_farthest_vector_mask,
+                        nth_farthest_vector_steps=nth_farthest_vector_steps,
+                        nth_farthest_query_candidate_ids=nth_farthest_query_candidate_ids,
+                        nth_farthest_query_candidate_mask=nth_farthest_query_candidate_mask,
+                        nth_farthest_query_vectors=nth_farthest_query_vectors,
+                        nth_farthest_query_ranks=nth_farthest_query_ranks,
+                        nth_farthest_query_steps=nth_farthest_query_steps,
                         timespans=timespans,
                         return_backbone_features=return_backbone_features,
                         return_prediction_logits=return_prediction_logits,

@@ -115,6 +115,9 @@ the second pass; only the second pass's records are kept as persistent state.
 | `--workspace-semantic-state-diagnostics` | Replays held-out permutation prefixes, reports accepted entity slots, slot value RMS, decoded state versus oracle state, and a workspace-readback-bypassed comparison. | Diagnose whether writes were accepted and whether readback contains the expected entity state. Evaluation adds runtime, especially when many events are sampled. |
 | `--workspace-state-diagnostic-max-events N` | Caps sampled state events per diagnostic episode. Default: `16`; `0` includes every event. | Reduce diagnostic cost while keeping a spread of initialization and swap points. |
 | `--workspace-state-loss-weight WEIGHT` | Adds auxiliary cross-entropy for decoding each initialized entity's position after initialization and swap events. | Directly train and observe state content when using semantic addressing on permutation/all. It uses oracle state only as the auxiliary target. Use a fresh run when changing this model/loss configuration. |
+| `--workspace-nth-farthest-exact-readout` | Enables a task-specific positive control for `nth_farthest` rows. At each complete vector event, a six-coordinate decoder is supervised from the addressed slot payload. At the answer token it decodes candidate vectors from workspace slots, computes squared distance to the input query vector, and returns the requested zero-based rank; exact distance ties use ascending entity ID. | Use with `--dataset-type workspace-capability --workspace-task-track nth_farthest` or `all`, semantic entity addressing, and at least 16 slots (`all` still needs 64 slots). This is an algorithmic ceiling/control path, not a general learned comparator. It requires no KV memory. |
+| `--workspace-nth-farthest-vector-loss-weight WEIGHT` | Scales the auxiliary coordinate cross-entropy for every completed candidate-vector write. Training console logs `L_nth_vec`, coordinate accuracy, and supervised coordinates per batch. Must be positive with the exact-readout flag. | Use to test whether workspace slots preserve the quantized vectors. The answer-time exact rank itself is non-differentiable; this loss trains the vector decoder used by that readout. |
+| Nth-farthest workspace evaluation metrics | Console and workspace task-metrics CSV report coordinate accuracy, whole-vector exact accuracy, direct exact-readout accuracy, invalid/missing candidate-state count, and readout by query type, candidate count, dimension, and zero-based rank. | Compare candidate-state preservation against task answer quality. Strong vector accuracy with weak readout accuracy points to rank/query handling; invalid readouts expose missing entity slots; weak vector accuracy points to writes, addressing, or payload stability. |
 | Transactional held-out metrics | With `--workspace-permutation-transactional`, the workspace task-metrics CSV records object→position and position→object answer accuracy, decoded state accuracy by committed swap depth, and successful pair-commit rate. | Use these metrics to separate answer-direction weaknesses, state degradation with repeated swaps, and failed address resolution. |
 | `--eval-workspace-mode checkpoint|reset-each-step|bypass` | Evaluation-only counterfactual: use checkpoint behavior, reset persistent slots every step, or bypass workspace readback. | Measure dependence on persistent readback without retraining. Requires `--eval-only --workspace`; `checkpoint` is the normal behavior. |
 
@@ -131,9 +134,13 @@ the second pass; only the second pass's records are kept as persistent state.
 4. Run `--workspace-permutation-transactional` as a separate swap-aware model
    variant. Inspect both answer directions, state accuracy by swap depth, and
    pair-commit success rate.
-5. Add reconsideration or prediction-error write salience as separate
+5. For Nth-farthest, test `--workspace-nth-farthest-exact-readout` with
+   `--workspace-nth-farthest-vector-loss-weight 0.1`. Treat it as an upper-bound
+   positive control and inspect vector accuracy separately from rank-readout
+   accuracy before evaluating any learned comparator.
+6. Add reconsideration or prediction-error write salience as separate
    interventions with their matched random controls.
-6. Try bistable last; it changes the write decision dynamics and cannot be
+7. Try bistable last; it changes the write decision dynamics and cannot be
    combined with compiled recurrence.
 
 The workspace's ordinary console diagnostics include write mass, active-write

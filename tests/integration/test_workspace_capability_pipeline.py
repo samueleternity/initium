@@ -107,6 +107,46 @@ class TransactionalPermutationPipeline(nn.Module):
         return output.transpose(0, 1), (None, None, state)
 
 
+class NthFarthestWorkspacePipeline(nn.Module):
+    """Integration adapter for the vector decoder and direct query readout."""
+
+    def __init__(self):
+        super().__init__()
+        self.workspace = WorkspaceBroadcast(
+            d_model=64,
+            num_experts=1,
+            num_slots=64,
+            entity_keyed_writes=True,
+            semantic_entity_addressing=True,
+            nth_farthest_exact_readout=True,
+        )
+        self.workspace_semantic_entity_addressing = True
+        self.workspace_nth_farthest_exact_readout = True
+        self.workspace_eval_bypass = False
+        self.workspace_eval_shuffle_readback = False
+        self.input_projection = nn.Linear(VOCAB_SIZE, 64, bias=False)
+
+    def forward(
+        self, inputs, hidden=None, *, reset_experience=False,
+        pass_through_memory=True, combiner_skip_stages=None, **workspace_metadata,
+    ):
+        batch, steps, _ = inputs.shape
+        state = None if hidden is None else hidden[2]
+        if reset_experience or state is None:
+            state = self.workspace.init_state(batch, device=inputs.device, dtype=inputs.dtype)
+        specialists = self.input_projection(inputs).unsqueeze(2)
+        routes = torch.zeros(batch, steps, 1, dtype=torch.long, device=inputs.device)
+        weights = torch.ones(batch, steps, 1, dtype=inputs.dtype, device=inputs.device)
+        output, state = self.workspace(
+            specialists, routes, weights, state,
+            bypass_broadcast=self.workspace_eval_bypass,
+            shuffle_readback_across_batch=self.workspace_eval_shuffle_readback,
+            selected_specialists_only=True,
+            **workspace_metadata,
+        )
+        return output.transpose(0, 1), (None, None, state)
+
+
 def test_dataset_evaluation_runs_full_bypass_and_shuffled_workspace_paths():
     torch.manual_seed(4)
     dataset = WorkspaceCapabilityDataset("permutation", batch_size_hint=4)
@@ -271,4 +311,54 @@ def test_synthetic_batch_trains_through_workspace_and_answer_only_objective():
         parameter.grad is not None and torch.isfinite(parameter.grad).all()
         for parameter in model.parameters()
     )
+
+
+def test_nth_farthest_exact_readout_evaluation_reports_vector_and_rank_metrics():
+    torch.manual_seed(37)
+    dataset = WorkspaceCapabilityDataset("all", batch_size_hint=4)
+    episodes = [
+        dataset._make_episode("nth_farthest", 2, random.Random(100 + index))
+        for index in range(4)
+    ]
+    model = NthFarthestWorkspacePipeline().train()
+    dataset.set_output_proj(nn.Linear(64, VOCAB_SIZE))
+
+    dataset._evaluate_episodes(model, torch.device("cpu"), episodes)
+    metrics = dataset.last_eval_diagnostics["nth_farthest_workspace"]
+
+    assert metrics["vector_coordinates_total"] > 0
+    assert metrics["vectors_total"] == sum(
+        episode.metadata["candidate_count"] for episode in episodes
+    )
+    assert metrics["readouts_total"] == len(episodes)
+    assert model.training is True
+
+    inputs, _targets, _mask = dataset._collate([episodes[0]])
+    forward_metadata = dataset.workspace_entity_address_metadata(inputs)
+    forward_metadata.update(dataset.workspace_nth_farthest_metadata(inputs, [episodes[0]]))
+    target_vectors = forward_metadata["nth_farthest_vector_targets"]
+    model_metadata = {
+        key: value for key, value in forward_metadata.items()
+        if key != "nth_farthest_vector_targets"
+    }
+    output, _state = model(
+        inputs,
+        (None, None, None),
+        reset_experience=True,
+        **model_metadata,
+    )
+    predictions = model.workspace.pop_nth_farthest_vector_predictions()
+    assert predictions
+    targets = target_vectors
+    step_indices = torch.tensor([step for step, _logits in predictions])
+    logits = torch.stack([value for _step, value in predictions], dim=1)
+    event_targets = targets.index_select(1, step_indices)
+    loss = nn.functional.cross_entropy(
+        logits.reshape(-1, 16), event_targets.reshape(-1), ignore_index=-100
+    )
+    loss.backward()
+    model.workspace.pop_nth_farthest_query_predictions()
+    assert torch.isfinite(loss)
+    assert model.workspace.semantic_vector_decoder.weight.grad is not None
+    assert torch.isfinite(model.workspace.semantic_vector_decoder.weight.grad).all()
 

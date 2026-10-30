@@ -1063,6 +1063,8 @@ def run(
     workspace_semantic_state_diagnostics: bool = False,
     workspace_state_diagnostic_max_events: int = 16,
     workspace_state_loss_weight: float = 0.0,
+    workspace_nth_farthest_exact_readout: bool = False,
+    workspace_nth_farthest_vector_loss_weight: float = 0.1,
     prepared_dataset=None,
     ogs_weights: tuple[float, float, float] = OGS_WEIGHTS,
     batch_size: int = BATCH_SIZE,
@@ -1089,6 +1091,8 @@ def run(
         raise ValueError("memory_type must be none, dnc, kv, or delta")
     if not math.isfinite(workspace_state_loss_weight) or workspace_state_loss_weight < 0:
         raise ValueError("workspace_state_loss_weight must be finite and >= 0")
+    if not math.isfinite(workspace_nth_farthest_vector_loss_weight) or workspace_nth_farthest_vector_loss_weight < 0:
+        raise ValueError("workspace_nth_farthest_vector_loss_weight must be finite and >= 0")
     if memory_read_lag not in (0, 1):
         raise ValueError("memory_read_lag must be 0 or 1")
     if not math.isfinite(memory_inter_layer_read_scale) or memory_inter_layer_read_scale < 0:
@@ -1178,6 +1182,21 @@ def run(
                 raise ValueError(
                     "workspace state loss is supervised only on the permutation track"
                 )
+        if workspace_nth_farthest_exact_readout:
+            if not workspace_enabled or not workspace_semantic_entity_addressing:
+                raise ValueError(
+                    "Nth-farthest exact readout requires --workspace and semantic entity addressing"
+                )
+            if dataset_type != "workspace-capability" or workspace_task_track not in ("all", "nth_farthest"):
+                raise ValueError(
+                    "Nth-farthest exact readout requires workspace-capability track all or nth_farthest"
+                )
+            if workspace_num_slots < 16:
+                raise ValueError("Nth-farthest exact readout requires at least 16 workspace slots")
+            if workspace_nth_farthest_vector_loss_weight <= 0:
+                raise ValueError(
+                    "Nth-farthest exact readout requires a positive vector state loss weight"
+                )
         if (
             workspace_semantic_entity_addressing
             and workspace_task_track == "all"
@@ -1210,11 +1229,12 @@ def run(
     elif (
         workspace_semantic_state_diagnostics
         or workspace_state_loss_weight > 0
+        or workspace_nth_farthest_exact_readout
         or workspace_permutation_transactional
     ):
         raise ValueError(
-            "workspace state diagnostics, state loss, and transactional permutation "
-            "mode require workspace-capability"
+            "workspace state diagnostics, state loss, Nth-farthest exact readout, and "
+            "transactional permutation mode require workspace-capability"
         )
     if split_graph_numeric_trace_step is not None:
         if not split_graph_enabled:
@@ -1971,6 +1991,42 @@ def run(
                             None,
                         ]
                     )
+        nth_metrics = diagnostics.get("nth_farthest_workspace", {})
+        for metric_name, accuracy_key, total_key in (
+            ("vector_coordinate_accuracy", "vector_coordinate_accuracy", "vector_coordinates_total"),
+            ("candidate_vector_exact_accuracy", "vector_exact_accuracy", "vectors_total"),
+            ("direct_exact_readout_accuracy", "exact_readout_accuracy", "readouts_total"),
+        ):
+            if not nth_metrics:
+                continue
+            if accuracy_key in nth_metrics:
+                workspace_task_writer.writerow(
+                    [
+                        step_value, lesson_value, eval_type,
+                        f"nth_farthest_workspace/{metric_name}",
+                        nth_metrics.get(accuracy_key), nth_metrics.get(accuracy_key),
+                        nth_metrics.get(total_key), nth_metrics.get(total_key),
+                        *([None] * 8),
+                    ]
+                )
+        for stratum, values in sorted(nth_metrics.get("readout_by_query_stratum", {}).items()):
+            workspace_task_writer.writerow(
+                [
+                    step_value, lesson_value, eval_type,
+                    f"nth_farthest_readout/{stratum}",
+                    values.get("accuracy"), values.get("accuracy"),
+                    values.get("episodes"), values.get("episodes"), *([None] * 8),
+                ]
+            )
+        if nth_metrics:
+            workspace_task_writer.writerow(
+                [
+                    step_value, lesson_value, eval_type,
+                    "nth_farthest_workspace/invalid_readout_count",
+                    None, None, nth_metrics.get("readouts_total"),
+                    nth_metrics.get("invalid_readouts"), *([None] * 8),
+                ]
+            )
         workspace_task_file.flush()
 
     def write_workspace_dependency(
@@ -2510,6 +2566,7 @@ def run(
             workspace_entity_keyed_writes=workspace_entity_keyed_writes,
             workspace_semantic_entity_addressing=workspace_semantic_entity_addressing,
             workspace_permutation_transactional=workspace_permutation_transactional,
+            workspace_nth_farthest_exact_readout=workspace_nth_farthest_exact_readout,
             workspace_key_match_threshold=workspace_key_match_threshold,
             workspace_no_selection=workspace_no_selection,
             workspace_reset_each_step=workspace_reset_each_step,
@@ -2848,6 +2905,8 @@ def run(
         "workspace_entity_keyed_writes": workspace_entity_keyed_writes,
         "workspace_permutation_transactional": workspace_permutation_transactional,
         "workspace_state_loss_weight": workspace_state_loss_weight,
+        "workspace_nth_farthest_exact_readout": workspace_nth_farthest_exact_readout,
+        "workspace_nth_farthest_vector_loss_weight": workspace_nth_farthest_vector_loss_weight,
         "workspace_key_match_threshold": workspace_key_match_threshold,
         "workspace_no_selection": workspace_no_selection,
         "workspace_reset_each_step": workspace_reset_each_step,
@@ -2872,6 +2931,8 @@ def run(
         extra_model_config["workspace_semantic_entity_addressing"] = True
     if workspace_permutation_transactional:
         extra_model_config["workspace_permutation_transactional"] = True
+    if workspace_nth_farthest_exact_readout:
+        extra_model_config["workspace_nth_farthest_exact_readout"] = True
     if sgr_prediction_enabled:
         extra_model_config["sgr_prediction_decoder_enabled"] = True
         extra_model_config["sgr_prediction_loss_weight"] = float(sgr_prediction_loss_weight)
@@ -3665,6 +3726,9 @@ def run(
     running_workspace_state_loss: Any = 0.0
     running_workspace_state_correct: Any = 0.0
     running_workspace_state_count: Any = 0.0
+    running_nth_vector_loss: Any = 0.0
+    running_nth_vector_correct: Any = 0.0
+    running_nth_vector_count: Any = 0.0
     running_log_steps = 0
     last_train_sgr_signal_diagnostics: dict[str, torch.Tensor] = {}
     workspace_reconsideration_window: dict[str, torch.Tensor] | None = None
@@ -3770,11 +3834,21 @@ def run(
             )
 
         workspace_forward_kwargs = {}
+        nth_metadata = None
         if workspace_semantic_entity_addressing:
             workspace_metadata = dataset.workspace_entity_address_metadata(
                 input_seq,
                 paired_swap_commits=workspace_permutation_transactional,
             )
+            if workspace_nth_farthest_exact_readout:
+                nth_metadata = dataset.workspace_nth_farthest_metadata(input_seq)
+                workspace_metadata.update(
+                    {
+                        key: value
+                        for key, value in nth_metadata.items()
+                        if key != "nth_farthest_vector_targets"
+                    }
+                )
             if workspace_permutation_transactional:
                 workspace_metadata.update(
                     dataset.workspace_permutation_query_metadata(input_seq)
@@ -3803,6 +3877,17 @@ def run(
                     "state_supervision_mask": state_supervision_mask,
                     "state_supervision_steps": state_metadata["state_supervision_steps"],
                 }
+            )
+        nth_vector_targets = None
+        nth_vector_mask = None
+        if workspace_nth_farthest_exact_readout:
+            if nth_metadata is None:
+                raise RuntimeError("Nth-farthest metadata requires semantic entity addressing")
+            nth_vector_targets = nth_metadata["nth_farthest_vector_targets"].to(
+                device, non_blocking=True
+            )
+            nth_vector_mask = nth_metadata["nth_farthest_vector_mask"].to(
+                device, non_blocking=True
             )
         input_seq = input_seq.to(device, non_blocking=True)
         target_digits = target_digits.to(device, non_blocking=True)
@@ -3950,6 +4035,11 @@ def run(
                     f"[{run_id}] non-finite recurrent output at step {step}; "
                     "stopping before backward/optimizer update to protect the checkpoint."
                 )
+            if workspace_nth_farthest_exact_readout:
+                # Training uses the differentiable vector-state objective;
+                # exact arg-sort is an inference/readout path and its hard
+                # selected logits carry no useful gradient. Clear its graph.
+                rnn.workspace.pop_nth_farthest_query_predictions()
             output = output.transpose(0, 1)  # (B, T, 92); Linear accepts non-contiguous input.
             output = output_proj(output)  # (B, T, 90)
             if workspace_permutation_transactional:
@@ -4024,6 +4114,35 @@ def run(
                     workspace_state_loss = task_loss.new_zeros(())
                     state_correct = task_loss.new_zeros(())
                     state_count = task_loss.new_zeros(())
+            nth_vector_loss = None
+            if workspace_nth_farthest_exact_readout:
+                workspace_module = getattr(rnn, "workspace", None)
+                if workspace_module is None or nth_vector_targets is None or nth_vector_mask is None:
+                    raise RuntimeError("Nth-farthest vector supervision is missing workspace metadata")
+                vector_predictions = workspace_module.pop_nth_farthest_vector_predictions()
+                if vector_predictions:
+                    vector_steps = torch.tensor(
+                        [event_step for event_step, _ in vector_predictions],
+                        device=device, dtype=torch.long,
+                    )
+                    vector_logits = torch.stack([value for _, value in vector_predictions], dim=1).float()
+                    vector_targets = nth_vector_targets.index_select(1, vector_steps)
+                    vector_valid = nth_vector_mask.index_select(1, vector_steps).unsqueeze(-1)
+                    vector_valid = vector_valid.expand_as(vector_targets) & vector_targets.ne(-100)
+                    per_coordinate_loss = nn.functional.cross_entropy(
+                        vector_logits.reshape(-1, 16), vector_targets.reshape(-1),
+                        reduction="none", ignore_index=-100,
+                    ).reshape_as(vector_targets)
+                    per_event_counts = vector_valid.sum(dim=(0, 2, 3)).to(per_coordinate_loss.dtype)
+                    active_events = per_event_counts.gt(0).to(per_coordinate_loss.dtype)
+                    per_event_loss = per_coordinate_loss.sum(dim=(0, 2, 3)) / per_event_counts.clamp_min(1.0)
+                    nth_vector_loss = (per_event_loss * active_events).sum() / active_events.sum().clamp_min(1.0)
+                    nth_vector_correct = (vector_logits.argmax(dim=-1).eq(vector_targets) & vector_valid).sum().to(task_loss.dtype)
+                    nth_vector_count = vector_valid.sum().to(task_loss.dtype)
+                else:
+                    nth_vector_loss = task_loss.new_zeros(())
+                    nth_vector_correct = task_loss.new_zeros(())
+                    nth_vector_count = task_loss.new_zeros(())
             if split_graph_forward_trace is not None and split_graph_forward_trace.active:
                 split_graph_forward_trace.observe("task_output.loss", task_loss)
             if (
@@ -4114,6 +4233,11 @@ def run(
             + (
                 workspace_state_loss_weight * workspace_state_loss
                 if workspace_state_loss is not None
+                else 0.0
+            )
+            + (
+                workspace_nth_farthest_vector_loss_weight * nth_vector_loss
+                if nth_vector_loss is not None
                 else 0.0
             )
             + beta_eff * kl_loss
@@ -4399,6 +4523,10 @@ def run(
             running_workspace_state_loss += workspace_state_loss.detach()
             running_workspace_state_correct += state_correct.detach()
             running_workspace_state_count += state_count
+        if nth_vector_loss is not None:
+            running_nth_vector_loss += nth_vector_loss.detach()
+            running_nth_vector_correct += nth_vector_correct.detach()
+            running_nth_vector_count += nth_vector_count.detach()
         if prediction_loss is not None:
             running_sgr_prediction_loss += prediction_loss.detach()
         running_div += dataset.diversity(output.detach(), target_digits, answer_mask)
@@ -4523,6 +4651,16 @@ def run(
                 if workspace_state_loss_weight > 0
                 else None
             )
+            avg_nth_vector_loss = (
+                (running_nth_vector_loss.item() if torch.is_tensor(running_nth_vector_loss) else running_nth_vector_loss)
+                / window_steps
+                if workspace_nth_farthest_exact_readout else None
+            )
+            avg_nth_vector_accuracy = (
+                (running_nth_vector_correct.item() if torch.is_tensor(running_nth_vector_correct) else running_nth_vector_correct)
+                / max(running_nth_vector_count.item() if torch.is_tensor(running_nth_vector_count) else running_nth_vector_count, 1)
+                if workspace_nth_farthest_exact_readout else None
+            )
             avg_sgr_prediction_loss = (
                 (
                     running_sgr_prediction_loss.item()
@@ -4569,6 +4707,12 @@ def run(
                     f"L_ws_state {avg_workspace_state_loss:.4f} "
                     f"acc={avg_workspace_state_accuracy:.1%} "
                     f"states/batch={avg_workspace_state_count:.1f}"
+                )
+            if avg_nth_vector_loss is not None:
+                parts.append(
+                    f"L_nth_vec {avg_nth_vector_loss:.4f} "
+                    f"coord_acc={avg_nth_vector_accuracy:.1%} "
+                    f"coords/batch={((running_nth_vector_count.item() if torch.is_tensor(running_nth_vector_count) else running_nth_vector_count) / window_steps):.1f}"
                 )
             if avg_sgr_prediction_loss is not None:
                 parts.append(f"L_pred {avg_sgr_prediction_loss:.4f}")
@@ -4959,6 +5103,9 @@ def run(
             running_workspace_state_loss = 0.0
             running_workspace_state_correct = 0.0
             running_workspace_state_count = 0.0
+            running_nth_vector_loss = 0.0
+            running_nth_vector_correct = 0.0
+            running_nth_vector_count = 0.0
             running_log_steps = 0
             running_postclip_grad_norm = 0.0
             running_finite_grad_steps = 0
@@ -6420,6 +6567,25 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--workspace-nth-farthest-exact-readout",
+        action="store_true",
+        help=(
+            "Enable the Nth-farthest positive-control path: supervise quantized candidate "
+            "vectors in entity-addressed workspace slots and rank their decoded vectors "
+            "exactly at the query. Supports track nth_farthest or all."
+        ),
+    )
+    parser.add_argument(
+        "--workspace-nth-farthest-vector-loss-weight",
+        type=float,
+        default=0.1,
+        metavar="WEIGHT",
+        help=(
+            "Auxiliary coordinate cross-entropy for each completed Nth-farthest vector "
+            "write; required and positive with --workspace-nth-farthest-exact-readout."
+        ),
+    )
+    parser.add_argument(
         "--workspace-key-match-threshold",
         type=float,
         default=0.5,
@@ -7349,7 +7515,7 @@ if __name__ == "__main__":
             )
     if args.workspace_semantic_entity_addressing and (
         args.dataset_type != "workspace-capability"
-        or args.workspace_task_track not in ("permutation", "all")
+        or args.workspace_task_track not in ("permutation", "nth_farthest", "all")
     ):
         parser.error(
             "--workspace-semantic-entity-addressing requires "
@@ -7385,6 +7551,31 @@ if __name__ == "__main__":
         parser.error(
             "--workspace-state-loss-weight requires workspace-capability permutation episodes"
         )
+    if (
+        not math.isfinite(args.workspace_nth_farthest_vector_loss_weight)
+        or args.workspace_nth_farthest_vector_loss_weight < 0
+    ):
+        parser.error("--workspace-nth-farthest-vector-loss-weight must be finite and >= 0")
+    if args.workspace_nth_farthest_exact_readout:
+        if not args.workspace or not args.workspace_semantic_entity_addressing:
+            parser.error(
+                "--workspace-nth-farthest-exact-readout requires --workspace and "
+                "--workspace-semantic-entity-addressing"
+            )
+        if args.dataset_type != "workspace-capability" or args.workspace_task_track not in (
+            "nth_farthest", "all"
+        ):
+            parser.error(
+                "--workspace-nth-farthest-exact-readout requires workspace-capability "
+                "track nth_farthest or all"
+            )
+        if args.workspace_num_slots < 16:
+            parser.error("--workspace-nth-farthest-exact-readout requires --workspace-num-slots >= 16")
+        if args.workspace_nth_farthest_vector_loss_weight <= 0:
+            parser.error(
+                "--workspace-nth-farthest-exact-readout requires a positive "
+                "--workspace-nth-farthest-vector-loss-weight"
+            )
     if not math.isfinite(args.workspace_key_match_threshold) or not (
         -1.0 <= args.workspace_key_match_threshold <= 1.0
     ):
@@ -7555,6 +7746,9 @@ if __name__ == "__main__":
                 run_id += "_semanticentityaddr"
             if args.workspace_permutation_transactional:
                 run_id += "_pairtransaction"
+            if args.workspace_nth_farthest_exact_readout:
+                vector_loss_tag = f"{args.workspace_nth_farthest_vector_loss_weight:g}".replace(".", "p")
+                run_id += f"_nthfarthestexact_vec{vector_loss_tag}"
             if args.workspace_compile_recurrence:
                 run_id += "_compiledrecurrence"
             if args.workspace_gate_variant != "continuous" or args.workspace_train_scope == "gate":
@@ -7757,6 +7951,8 @@ if __name__ == "__main__":
             workspace_semantic_state_diagnostics=args.workspace_semantic_state_diagnostics,
             workspace_state_diagnostic_max_events=args.workspace_state_diagnostic_max_events,
             workspace_state_loss_weight=args.workspace_state_loss_weight,
+            workspace_nth_farthest_exact_readout=args.workspace_nth_farthest_exact_readout,
+            workspace_nth_farthest_vector_loss_weight=args.workspace_nth_farthest_vector_loss_weight,
             prepared_dataset=prepared_dataset,
             ogs_weights=tuple(args.ogs_weights),
             batch_size=args.batch_size,

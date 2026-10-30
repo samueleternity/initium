@@ -14,6 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from initium.workspace.bistability import BistableWriteGate
+from initium.workspace.nth_farthest import select_nth_farthest
 
 
 def _normalize_address(value: torch.Tensor) -> torch.Tensor:
@@ -107,6 +108,7 @@ class WorkspaceBroadcast(nn.Module):
         entity_keyed_writes: bool = False,
         semantic_entity_addressing: bool = False,
         permutation_transactional: bool = False,
+        nth_farthest_exact_readout: bool = False,
         key_match_threshold: float = 0.5,
     ):
         super().__init__()
@@ -148,6 +150,11 @@ class WorkspaceBroadcast(nn.Module):
         self.entity_keyed_writes = bool(entity_keyed_writes)
         self.semantic_entity_addressing = bool(semantic_entity_addressing)
         self.permutation_transactional = bool(permutation_transactional)
+        self.nth_farthest_exact_readout = bool(nth_farthest_exact_readout)
+        if self.nth_farthest_exact_readout and not self.semantic_entity_addressing:
+            raise ValueError(
+                "Nth-farthest exact readout requires semantic entity addressing"
+            )
         if self.permutation_transactional and not self.semantic_entity_addressing:
             raise ValueError(
                 "permutation transactional mode requires semantic entity addressing"
@@ -168,11 +175,20 @@ class WorkspaceBroadcast(nn.Module):
             if self.semantic_entity_addressing
             else None
         )
+        self.semantic_vector_decoder = (
+            nn.Linear(d_model, 6 * 16)
+            if self.nth_farthest_exact_readout
+            else None
+        )
         self._last_semantic_state_predictions: list[tuple[int, torch.Tensor]] = []
         self._last_semantic_query_predictions: list[
             tuple[int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
         ] = []
         self._last_semantic_pair_commits: list[tuple[int, torch.Tensor]] = []
+        self._last_nth_farthest_vector_predictions: list[tuple[int, torch.Tensor]] = []
+        self._last_nth_farthest_query_predictions: list[
+            tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = []
         self._compiled_recurrence_step = None
         self._compiled_recurrence_failed = False
         self._compiled_fallback_warned = False
@@ -233,6 +249,104 @@ class WorkspaceBroadcast(nn.Module):
         commits = self._last_semantic_pair_commits
         self._last_semantic_pair_commits = []
         return commits
+
+    def pop_nth_farthest_vector_predictions(self) -> list[tuple[int, torch.Tensor]]:
+        predictions = self._last_nth_farthest_vector_predictions
+        self._last_nth_farthest_vector_predictions = []
+        return predictions
+
+    def pop_nth_farthest_query_predictions(
+        self,
+    ) -> list[tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]]:
+        predictions = self._last_nth_farthest_query_predictions
+        self._last_nth_farthest_query_predictions = []
+        return predictions
+
+    def _semantic_vector_logits(
+        self, state: torch.Tensor, entity_ids: torch.Tensor, valid_mask: torch.Tensor
+    ) -> torch.Tensor:
+        if self.semantic_vector_decoder is None:
+            raise RuntimeError("Nth-farthest vector decoding is not enabled")
+        address_state, content_state = state.split(self.d_model, dim=-1)
+        safe_ids = entity_ids.clamp(min=0, max=self._SEMANTIC_ENTITY_COUNT - 1)
+        queries = F.one_hot(safe_ids, num_classes=self._SEMANTIC_ENTITY_COUNT).to(
+            device=state.device, dtype=torch.float32
+        )
+        queries = F.pad(queries, (0, self.d_model - self._SEMANTIC_ENTITY_COUNT))
+        address_state = address_state.float()
+        occupied = address_state.square().sum(dim=-1) > 1e-12
+        scores = torch.einsum("bqd,bsd->bqs", queries, _normalize_address(address_state))
+        scores = scores.masked_fill(~occupied.unsqueeze(1), -2.0)
+        best_scores, slot_indices = scores.max(dim=-1)
+        found = valid_mask & best_scores.ge(self.key_match_threshold)
+        read_values = content_state.gather(
+            1, slot_indices.unsqueeze(-1).expand(-1, -1, self.d_model)
+        ).float()
+        read_values = read_values * found.unsqueeze(-1).to(read_values.dtype)
+        return self.semantic_vector_decoder(read_values).reshape(
+            *read_values.shape[:-1], 6, 16
+        )
+
+    def _nth_farthest_query_logits(
+        self,
+        state: torch.Tensor,
+        candidate_ids: torch.Tensor,
+        candidate_mask: torch.Tensor,
+        query_vector: torch.Tensor,
+        rank: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        vector_logits = self._semantic_vector_logits(state, candidate_ids, candidate_mask)
+        decoded_vectors = vector_logits.argmax(dim=-1).float()
+        dimensions = query_vector.ne(-1).sum(dim=-1).clamp(min=1, max=6)
+        dimension_mask = torch.arange(6, device=state.device).unsqueeze(0) < dimensions.unsqueeze(1)
+        expected_candidates = candidate_mask & candidate_ids.ge(0)
+        address_state = state.split(self.d_model, dim=-1)[0].float()
+        address_queries = F.one_hot(
+            candidate_ids.clamp(min=0, max=self._SEMANTIC_ENTITY_COUNT - 1),
+            num_classes=self._SEMANTIC_ENTITY_COUNT,
+        ).to(device=state.device, dtype=torch.float32)
+        address_queries = F.pad(
+            address_queries, (0, self.d_model - self._SEMANTIC_ENTITY_COUNT)
+        )
+        occupied = address_state.square().sum(dim=-1) > 1e-12
+        address_scores = torch.einsum(
+            "bqd,bsd->bqs", address_queries, _normalize_address(address_state)
+        ).masked_fill(~occupied.unsqueeze(1), -2.0)
+        found = address_scores.max(dim=-1).values.ge(self.key_match_threshold)
+        candidate_mask = expected_candidates & found
+        active = expected_candidates.any(dim=-1)
+        all_candidates_found = (~expected_candidates | found).all(dim=-1)
+        candidate_counts = candidate_mask.sum(dim=-1)
+        rank_valid = rank.ge(0) & rank.lt(candidate_counts)
+        query_valid = active & all_candidates_found & rank_valid
+        safe_mask = candidate_mask.clone()
+        safe_ids = candidate_ids.clone()
+        safe_vectors = decoded_vectors * dimension_mask.unsqueeze(1)
+        safe_query = query_vector.clamp(min=0).float() * dimension_mask
+        safe_rank = torch.minimum(
+            rank.clamp_min(0), candidate_counts.clamp_min(1) - 1
+        )
+        safe_mask[:, 0] = torch.where(active, safe_mask[:, 0], True)
+        safe_ids[:, 0] = torch.where(active, safe_ids[:, 0], 0)
+        safe_vectors[:, 0] = torch.where(
+            active.unsqueeze(-1), safe_vectors[:, 0], 0
+        )
+        safe_query = torch.where(active.unsqueeze(-1), safe_query, 0)
+        safe_rank = torch.where(active, safe_rank, 0)
+        selected, distances = select_nth_farthest(
+            safe_vectors,
+            safe_query,
+            safe_ids,
+            safe_rank,
+            safe_mask,
+        )
+        selected = torch.where(query_valid, selected, torch.full_like(selected, -1))
+        logits = state.new_full(
+            (state.shape[0], self._SEMANTIC_ENTITY_COUNT), -20.0, dtype=torch.float32
+        )
+        logits.scatter_(1, selected.clamp_min(0).unsqueeze(1), 20.0)
+        logits = torch.where(query_valid.unsqueeze(-1), logits, -20.0)
+        return logits, selected, distances, active
 
     def _apply_semantic_pair_swap(
         self, state: torch.Tensor, entity_ids: torch.Tensor, active: torch.Tensor
@@ -1176,6 +1290,14 @@ class WorkspaceBroadcast(nn.Module):
         state_supervision_entity_ids: torch.Tensor | None = None,
         state_supervision_mask: torch.Tensor | None = None,
         state_supervision_steps: tuple[int, ...] | None = None,
+        nth_farthest_vector_entity_ids: torch.Tensor | None = None,
+        nth_farthest_vector_mask: torch.Tensor | None = None,
+        nth_farthest_vector_steps: tuple[int, ...] | None = None,
+        nth_farthest_query_candidate_ids: torch.Tensor | None = None,
+        nth_farthest_query_candidate_mask: torch.Tensor | None = None,
+        nth_farthest_query_vectors: torch.Tensor | None = None,
+        nth_farthest_query_ranks: torch.Tensor | None = None,
+        nth_farthest_query_steps: tuple[int, ...] | None = None,
         collect_kv_records: bool = False,
     ):
         """Process time-major specialists ``(B,T,E,D)`` sequentially."""
@@ -1185,6 +1307,8 @@ class WorkspaceBroadcast(nn.Module):
         self._last_semantic_state_predictions = []
         self._last_semantic_query_predictions = []
         self._last_semantic_pair_commits = []
+        self._last_nth_farthest_vector_predictions = []
+        self._last_nth_farthest_query_predictions = []
         step_diags: list[dict[str, torch.Tensor]] | None = [] if self.diagnostics_enabled else None
         state_observer = getattr(self, "_initium_recurrent_state_observer", None)
         smoothed_prediction_error = None
@@ -1283,6 +1407,49 @@ class WorkspaceBroadcast(nn.Module):
                 raise ValueError("state supervision step is outside the current sequence")
         elif state_supervision_steps:
             raise ValueError("state supervision steps require state supervision IDs and mask")
+        if self.nth_farthest_exact_readout:
+            expected_ids = (*specialist_deltas.shape[:2], 16)
+            expected_vectors = (*specialist_deltas.shape[:2], 6)
+            if (
+                nth_farthest_vector_entity_ids is None
+                or nth_farthest_vector_mask is None
+                or nth_farthest_query_candidate_ids is None
+                or nth_farthest_query_candidate_mask is None
+                or nth_farthest_query_vectors is None
+                or nth_farthest_query_ranks is None
+            ):
+                raise ValueError("Nth-farthest exact readout requires complete supervision/query metadata")
+            if (
+                nth_farthest_vector_entity_ids.shape != expected_ids
+                or nth_farthest_vector_mask.shape != expected_ids
+                or nth_farthest_query_candidate_ids.shape != expected_ids
+                or nth_farthest_query_candidate_mask.shape != expected_ids
+                or nth_farthest_query_vectors.shape != expected_vectors
+                or nth_farthest_query_ranks.shape != specialist_deltas.shape[:2]
+            ):
+                raise ValueError("Nth-farthest metadata shapes must match (batch,time,16[,6])")
+            if nth_farthest_vector_mask.dtype != torch.bool or nth_farthest_query_candidate_mask.dtype != torch.bool:
+                raise TypeError("Nth-farthest candidate masks must use bool dtype")
+            integer_tensors = (
+                nth_farthest_vector_entity_ids,
+                nth_farthest_query_candidate_ids,
+                nth_farthest_query_vectors,
+                nth_farthest_query_ranks,
+            )
+            if any(value.dtype not in (torch.int32, torch.int64) for value in integer_tensors):
+                raise TypeError("Nth-farthest IDs, coordinates, and ranks must use integer tensors")
+            nth_farthest_vector_steps = tuple(sorted(set(nth_farthest_vector_steps or ())))
+            nth_farthest_query_steps = tuple(sorted(set(nth_farthest_query_steps or ())))
+            max_steps = specialist_deltas.shape[1]
+            if any(step < 0 or step >= max_steps for step in (*nth_farthest_vector_steps, *nth_farthest_query_steps)):
+                raise ValueError("Nth-farthest event step is outside the current sequence")
+        elif any(value is not None for value in (
+            nth_farthest_vector_entity_ids, nth_farthest_vector_mask,
+            nth_farthest_vector_steps, nth_farthest_query_candidate_ids,
+            nth_farthest_query_candidate_mask, nth_farthest_query_vectors,
+            nth_farthest_query_ranks, nth_farthest_query_steps,
+        )):
+            raise ValueError("Nth-farthest metadata requires nth_farthest_exact_readout mode")
         if self.num_slots > 0 and not self.write_gate_closed:
             # These projections depend only on this token's routed expert
             # outputs, so batch them over time before the causal slot loop.
@@ -1787,6 +1954,37 @@ class WorkspaceBroadcast(nn.Module):
                             state_supervision_mask[:, step],
                         ),
                     )
+                )
+            if (
+                nth_farthest_vector_steps
+                and step in nth_farthest_vector_steps
+                and nth_farthest_vector_entity_ids is not None
+                and nth_farthest_vector_mask is not None
+            ):
+                self._last_nth_farthest_vector_predictions.append(
+                    (
+                        step,
+                        self._semantic_vector_logits(
+                            state,
+                            nth_farthest_vector_entity_ids[:, step],
+                            nth_farthest_vector_mask[:, step],
+                        ),
+                    )
+                )
+            if nth_farthest_query_steps and step in nth_farthest_query_steps:
+                assert nth_farthest_query_candidate_ids is not None
+                assert nth_farthest_query_candidate_mask is not None
+                assert nth_farthest_query_vectors is not None
+                assert nth_farthest_query_ranks is not None
+                query_logits, selected_entities, _distances, active_queries = self._nth_farthest_query_logits(
+                    state,
+                    nth_farthest_query_candidate_ids[:, step],
+                    nth_farthest_query_candidate_mask[:, step],
+                    nth_farthest_query_vectors[:, step],
+                    nth_farthest_query_ranks[:, step],
+                )
+                self._last_nth_farthest_query_predictions.append(
+                    (step, query_logits, selected_entities, active_queries)
                 )
             outputs.append(out)
             if step_diags is not None:

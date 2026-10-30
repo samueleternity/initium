@@ -1433,6 +1433,15 @@ class WorkspaceCapabilityDataset(BaseDataset):
                         entity_metadata.update(
                             self.workspace_permutation_query_metadata(x, episodes)
                         )
+                    if bool(getattr(model, "workspace_nth_farthest_exact_readout", False)):
+                        nth_metadata = self.workspace_nth_farthest_metadata(x, episodes)
+                        entity_metadata.update(
+                            {
+                                key: value
+                                for key, value in nth_metadata.items()
+                                if key != "nth_farthest_vector_targets"
+                            }
+                        )
                     forward_metadata = {
                         key: value.to(device, non_blocking=True)
                         if isinstance(value, torch.Tensor)

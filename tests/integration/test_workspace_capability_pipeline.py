@@ -362,3 +362,21 @@ def test_nth_farthest_exact_readout_evaluation_reports_vector_and_rank_metrics()
     assert model.workspace.semantic_vector_decoder.weight.grad is not None
     assert torch.isfinite(model.workspace.semantic_vector_decoder.weight.grad).all()
 
+
+def test_nth_farthest_mode_keeps_permutation_state_diagnostics_compatible():
+    dataset = WorkspaceCapabilityDataset("all", batch_size_hint=8)
+    model = NthFarthestWorkspacePipeline().train()
+    dataset.set_output_proj(nn.Linear(64, VOCAB_SIZE))
+
+    result = dataset.evaluate_permutation_state_diagnostics(
+        model,
+        torch.device("cpu"),
+        lesson_idx=1,
+        num_episodes=1,
+        max_events_per_episode=1,
+        rng=random.Random(310),
+    )
+
+    assert result["queries"] > 0
+    assert model.training is True
+

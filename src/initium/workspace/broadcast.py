@@ -1351,7 +1351,12 @@ class WorkspaceBroadcast(nn.Module):
                     projected_write_keys = self.key(write_candidates.float())
                     if not bypass_broadcast:
                         projected_read_queries = self.query(selected_deltas.float())
-                projected_write_values = self.value(write_candidates.float())
+                projected_write_values = self.value(write_candidates.float()).contiguous()
+                if projected_read_queries is not None:
+                    # Canonicalize the time-major read tensor before the
+                    # recurrent compiler sees one token slice at a time. Its
+                    # per-step batch strides must not depend on sequence length.
+                    projected_read_queries = projected_read_queries.contiguous()
         compiled_step = None
         # The fused recurrence is a training optimization. Curriculum and
         # periodic evaluations use variable/partial batch sizes, which would

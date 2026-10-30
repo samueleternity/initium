@@ -2,6 +2,7 @@ import csv
 import io
 import random
 from collections import Counter
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -446,6 +447,58 @@ def test_transactional_metadata_defers_swap_pair_and_marks_boundary():
     query = dataset.workspace_permutation_query_metadata(inputs, [episode])
     assert query["permutation_query_kind"][0, len(episode.inputs)].item() == 1
     assert query["permutation_query_ids"][0, len(episode.inputs)].item() == 2
+
+
+def test_all_track_semantic_addresses_write_only_at_supported_event_boundaries():
+    dataset = WorkspaceCapabilityDataset("all", batch_size_hint=5)
+    episodes = [
+        dataset._make_episode(track, 1, random.Random(810 + index))
+        for index, track in enumerate(GENERATORS)
+    ]
+    inputs, _, _ = dataset._collate(episodes)
+
+    metadata = dataset.workspace_entity_address_metadata(
+        inputs, paired_swap_commits=True
+    )
+    state_metadata = dataset.workspace_state_supervision_metadata(inputs, episodes)
+
+    for row, episode in enumerate(episodes):
+        write_steps = torch.nonzero(
+            metadata["entity_write_mask"][row], as_tuple=False
+        ).flatten()
+        assert write_steps.numel() > 0, episode.track
+        assert metadata["entity_ids"][row, write_steps].ge(0).all()
+        query_step = episode.inputs.index(QUERY)
+        assert not metadata["entity_write_mask"][row, query_step:].any()
+        for step in range(query_step + 1, len(episode.inputs)):
+            token = episode.inputs[step]
+            if ENTITY_BASE <= token < ENTITY_BASE + ENTITY_COUNT:
+                assert metadata["entity_ids"][row, step].item() == token - ENTITY_BASE
+                assert not metadata["entity_write_mask"][row, step]
+        if episode.track == "permutation":
+            assert metadata["pair_swap_mask"][row].any()
+            assert state_metadata["state_supervision_mask"][row].any()
+        else:
+            assert not metadata["pair_swap_mask"][row].any()
+            assert not state_metadata["state_supervision_mask"][row].any()
+
+
+def test_kv_evaluation_microbatches_long_episodes_by_attention_workspace():
+    episodes = [
+        SimpleNamespace(sequence=tuple(range(length)))
+        for length in (4096, 64, 4096, 64)
+    ]
+
+    groups = list(
+        WorkspaceCapabilityDataset._evaluation_groups(
+            episodes, 16, kv_attention_heads=4
+        )
+    )
+
+    assert [len(group) for group in groups] == [2, 1, 1]
+    assert [len(episode.sequence) for group in groups for episode in group] == [
+        64, 64, 4096, 4096
+    ]
 
 
 def test_transactional_workspace_swaps_payloads_and_emits_query_readout():

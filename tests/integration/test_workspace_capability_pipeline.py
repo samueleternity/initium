@@ -1,3 +1,5 @@
+import random
+
 import torch
 from torch import nn
 
@@ -133,6 +135,50 @@ def test_dataset_evaluation_runs_full_bypass_and_shuffled_workspace_paths():
     assert model.workspace_eval_bypass is False
     assert model.workspace_eval_shuffle_readback is False
     assert model.training is True
+
+
+def test_all_track_transactional_workspace_forward_supports_mixed_metadata():
+    torch.manual_seed(18)
+    tracks = (
+        "permutation",
+        "entity_state",
+        "relational_join",
+        "nth_farthest",
+        "retrieval_aggregation",
+    )
+    dataset = WorkspaceCapabilityDataset("all", batch_size_hint=len(tracks))
+    episodes = [
+        dataset._make_episode(track, 1, random.Random(900 + index))
+        for index, track in enumerate(tracks)
+    ]
+    inputs, _targets, _mask = dataset._collate(episodes)
+    entity_metadata = dataset.workspace_entity_address_metadata(
+        inputs, paired_swap_commits=True
+    )
+    entity_metadata.update(dataset.workspace_permutation_query_metadata(inputs, episodes))
+    state_metadata = dataset.workspace_state_supervision_metadata(inputs, episodes)
+    entity_metadata.update(
+        {
+            "state_supervision_entity_ids": state_metadata[
+                "state_supervision_entity_ids"
+            ],
+            "state_supervision_mask": state_metadata["state_supervision_mask"],
+            "state_supervision_steps": state_metadata["state_supervision_steps"],
+        }
+    )
+
+    model = TransactionalPermutationPipeline().eval()
+    output, _ = model(
+        inputs,
+        (None, None, None),
+        reset_experience=True,
+        **entity_metadata,
+    )
+
+    assert output.shape[:2] == (inputs.shape[1], inputs.shape[0])
+    assert model.workspace.pop_semantic_pair_commits()
+    assert model.workspace.pop_semantic_query_predictions()
+    assert model.workspace.pop_semantic_state_predictions()
 
 
 def test_permutation_generalization_evaluation_reports_independent_axes():

@@ -1023,6 +1023,8 @@ def run(
     workspace_reconsideration_enabled: bool = False,
     workspace_reconsideration_surprise_threshold: float = 0.5,
     workspace_reconsideration_trigger_mode: str = "innovation",
+    workspace_write_to_kv: bool = False,
+    workspace_kv_read_scale: float = 0.1,
     workspace_bistable_deterministic: bool = False,
     workspace_stability_max_activation: float = 100_000.0,
     eval_only: bool = False,
@@ -1091,6 +1093,18 @@ def run(
         raise ValueError("memory_read_lag must be 0 or 1")
     if not math.isfinite(memory_inter_layer_read_scale) or memory_inter_layer_read_scale < 0:
         raise ValueError("memory_inter_layer_read_scale must be finite and >= 0")
+    if not math.isfinite(workspace_kv_read_scale) or workspace_kv_read_scale < 0:
+        raise ValueError("workspace_kv_read_scale must be finite and >= 0")
+    if workspace_write_to_kv and not (
+        workspace_enabled
+        and workspace_num_slots >= 1
+        and memory_type == "kv"
+        and memory_inter_layer_read_every_block
+    ):
+        raise ValueError(
+            "workspace_write_to_kv requires --workspace, --memory-type kv, and "
+            "--memory-inter-layer-read-every-block with at least one workspace slot"
+        )
     if memory_position not in {"none", "rope"}:
         raise ValueError("memory_position must be none or rope")
     if memory_position != "none" and memory_type != "kv":
@@ -1164,6 +1178,15 @@ def run(
                 raise ValueError(
                     "workspace state loss is supervised only on the permutation track"
                 )
+        if (
+            workspace_semantic_entity_addressing
+            and workspace_task_track == "all"
+            and workspace_num_slots < 64
+        ):
+            raise ValueError(
+                "semantic entity addressing on the all track requires at least 64 "
+                "workspace slots to cover every entity ID in the generated episodes"
+            )
         if workspace_permutation_transactional:
             if not (
                 workspace_enabled
@@ -2501,6 +2524,8 @@ def run(
                 workspace_reconsideration_surprise_threshold
             ),
             workspace_reconsideration_trigger_mode=(workspace_reconsideration_trigger_mode),
+            workspace_write_to_kv=workspace_write_to_kv,
+            workspace_kv_read_scale=workspace_kv_read_scale,
             device=device,
         ).to(device)
 
@@ -2735,6 +2760,7 @@ def run(
                 f"gate={workspace_gate_variant} | "
                 f"bistable_gradient={workspace_bistable_gradient_mode} | "
                 f"workspace_bptt_horizon={workspace_bptt_horizon or 'full'} | "
+                f"workspace_to_kv={'on(two-pass, lag=1, read_scale=' + format(workspace_kv_read_scale, 'g') + ')' if workspace_write_to_kv else 'off'} | "
                 f"reconsideration={'on' if workspace_reconsideration_enabled else 'off'}"
                 f"(trigger={workspace_reconsideration_trigger_mode}, "
                 f"threshold={workspace_reconsideration_surprise_threshold:g}) | "
@@ -2837,6 +2863,8 @@ def run(
             workspace_reconsideration_surprise_threshold
         ),
         "workspace_reconsideration_trigger_mode": (workspace_reconsideration_trigger_mode),
+        "workspace_write_to_kv": workspace_write_to_kv,
+        "workspace_kv_read_scale": workspace_kv_read_scale,
         "workspace_bistable_deterministic": workspace_bistable_deterministic,
         "workspace_stability_max_activation": workspace_stability_max_activation,
     }
@@ -3181,6 +3209,9 @@ def run(
         else:
             for parameter in rnn.workspace.parameters():
                 parameter.requires_grad_(True)
+            if rnn.workspace_kv_memory is not None:
+                for parameter in rnn.workspace_kv_memory.parameters():
+                    parameter.requires_grad_(True)
         for parameter in output_proj.parameters():
             parameter.requires_grad_(False)
     trainable_named_parameters = [
@@ -3428,6 +3459,9 @@ def run(
             else:
                 for parameter in rnn.workspace.parameters():
                     parameter.requires_grad_(True)
+                if rnn.workspace_kv_memory is not None:
+                    for parameter in rnn.workspace_kv_memory.parameters():
+                        parameter.requires_grad_(True)
             # Model construction and checkpoint loading consume RNG state.
             # Start the new workspace experiment from the requested seed.
             random.seed(seed)
@@ -3687,6 +3721,16 @@ def run(
     t_run_start = time.time()
 
     while step < total_steps and not eval_only:
+        if isinstance(rnn, SplitGraphDNC) and rnn.workspace is not None:
+            # Workspace health reductions are only consumed at the normal
+            # logging cadence. Keep reconsideration/write-salience telemetry
+            # continuous because it is accumulated per training step.
+            workspace_diag_due = running_log_steps + 1 >= log_every
+            workspace_diagnostics_enabled = workspace_telemetry_enabled or (
+                moe_diagnostics_enabled and workspace_diag_due
+            )
+            if rnn.workspace.diagnostics_enabled != workspace_diagnostics_enabled:
+                rnn.workspace.set_diagnostics_enabled(workspace_diagnostics_enabled)
         if split_graph_forward_trace is not None:
             split_graph_forward_trace.begin_step(step)
         dnc_trace_this_step = (
@@ -3943,29 +3987,43 @@ def run(
                 if workspace_module is None:
                     raise RuntimeError("workspace state supervision has no active workspace module")
                 event_predictions = workspace_module.pop_semantic_state_predictions()
-                event_losses = []
-                state_correct = task_loss.new_zeros(())
-                state_count = task_loss.new_zeros(())
-                for event_step, position_logits in event_predictions:
-                    valid_states = state_supervision_mask[:, event_step]
-                    if bool(valid_states.any()):
-                        position_targets = state_supervision_positions[:, event_step]
-                        selected_logits = position_logits[valid_states].float()
-                        selected_targets = position_targets[valid_states]
-                        event_losses.append(
-                            nn.functional.cross_entropy(
-                                selected_logits,
-                                selected_targets,
-                            )
-                        )
-                        state_correct = state_correct + (
-                            selected_logits.argmax(dim=-1) == selected_targets
-                        ).sum().to(state_correct.dtype)
-                        state_count = state_count + selected_targets.numel()
-                if event_losses:
-                    workspace_state_loss = torch.stack(event_losses).mean()
+                if event_predictions:
+                    event_steps = torch.tensor(
+                        [event_step for event_step, _ in event_predictions],
+                        device=device,
+                        dtype=torch.long,
+                    )
+                    position_logits = torch.stack(
+                        [logits for _, logits in event_predictions], dim=1
+                    ).float()
+                    position_targets = state_supervision_positions.index_select(
+                        1, event_steps
+                    )
+                    valid_states = state_supervision_mask.index_select(1, event_steps)
+                    masked_targets = position_targets.masked_fill(~valid_states, -100)
+                    num_positions = position_logits.shape[-1]
+                    per_state_loss = nn.functional.cross_entropy(
+                        position_logits.reshape(-1, num_positions),
+                        masked_targets.reshape(-1),
+                        reduction="none",
+                        ignore_index=-100,
+                    ).reshape_as(position_targets)
+                    event_counts = valid_states.sum(dim=(0, 2)).to(per_state_loss.dtype)
+                    active_events = event_counts.gt(0).to(per_state_loss.dtype)
+                    event_losses = per_state_loss.sum(dim=(0, 2)) / event_counts.clamp_min(1.0)
+                    workspace_state_loss = (event_losses * active_events).sum() / (
+                        active_events.sum().clamp_min(1.0)
+                    )
+                    state_correct = (
+                        ((position_logits.argmax(dim=-1) == position_targets) & valid_states)
+                        .sum()
+                        .to(task_loss.dtype)
+                    )
+                    state_count = valid_states.sum().to(task_loss.dtype)
                 else:
                     workspace_state_loss = task_loss.new_zeros(())
+                    state_correct = task_loss.new_zeros(())
+                    state_count = task_loss.new_zeros(())
             if split_graph_forward_trace is not None and split_graph_forward_trace.active:
                 split_graph_forward_trace.observe("task_output.loss", task_loss)
             if (
@@ -4637,6 +4695,15 @@ def run(
                                     for value in workspace_diag["writer_frequency"].tolist()
                                 )
                                 print(f"[{run_id}] [workspace] writer_frequency={writer_frequency}")
+                    workspace_kv_diag = rnn.workspace_kv_diagnostics
+                    if workspace_write_to_kv and workspace_kv_diag:
+                        parts.append(
+                            "workspace_kv["
+                            f"commit_rate {workspace_kv_diag['workspace_kv_commit_fraction'].item():.1%} "
+                            f"records {workspace_kv_diag['workspace_kv_committed_records'].item():.0f} "
+                            f"history {workspace_kv_diag['workspace_kv_history_records'].item():.1f} "
+                            f"read_rms {workspace_kv_diag['workspace_kv_read_rms'].item():.3f}]"
+                        )
             if dyn_n_str:
                 parts.append(dyn_n_str.strip(" |"))
             if bistable_grad_probe is not None:
@@ -6276,6 +6343,24 @@ if __name__ == "__main__":
         help="Persistent workspace slot count (0 is the plumbing/bypass control).",
     )
     parser.add_argument(
+        "--workspace-write-to-kv",
+        action="store_true",
+        help=(
+            "Enable a causal workspace-to-KV side channel. A warm-up pass collects "
+            "committed slot-content updates; a replay pass lets later tokens read "
+            "earlier records between every Mamba block. Requires workspace, KV "
+            "memory, and --memory-inter-layer-read-every-block. Adds a second "
+            "backbone pass when enabled."
+        ),
+    )
+    parser.add_argument(
+        "--workspace-kv-read-scale",
+        type=float,
+        default=0.1,
+        metavar="SCALE",
+        help="Residual scale for workspace-written KV reads (default: 0.1).",
+    )
+    parser.add_argument(
         "--workspace-entity-keyed-writes",
         action="store_true",
         help=(
@@ -6289,9 +6374,10 @@ if __name__ == "__main__":
         "--workspace-semantic-entity-addressing",
         action="store_true",
         help=(
-            "Use fixed one-hot entity-token addresses and event-only workspace writes "
-            "for workspace-capability permutation episodes. Requires "
-            "--workspace-entity-keyed-writes; values remain learned specialist payloads."
+            "Use fixed one-hot entity-token addresses and causal event-only workspace "
+            "writes for workspace-capability episodes. On the all track, all five task "
+            "grammars provide entity-keyed event writes and require at least 64 slots. "
+            "Requires --workspace-entity-keyed-writes; payloads remain learned."
         ),
     )
     parser.add_argument(
@@ -7186,6 +7272,18 @@ if __name__ == "__main__":
         parser.error("--workspace requires --split-graph")
     if args.workspace and not args.moe:
         parser.error("--workspace requires --moe")
+    if not math.isfinite(args.workspace_kv_read_scale) or args.workspace_kv_read_scale < 0:
+        parser.error("--workspace-kv-read-scale must be finite and >= 0")
+    if args.workspace_write_to_kv and not (
+        args.workspace
+        and args.workspace_num_slots >= 1
+        and args.memory_type == "kv"
+        and args.memory_inter_layer_read_every_block
+    ):
+        parser.error(
+            "--workspace-write-to-kv requires --workspace, --memory-type kv, and "
+            "--memory-inter-layer-read-every-block with at least one workspace slot"
+        )
     if args.moe_placement != "all" and not args.moe:
         parser.error("--moe-placement backbone/combiner requires --moe")
     if args.moe_placement != "all" and not args.split_graph:
@@ -7257,6 +7355,15 @@ if __name__ == "__main__":
             "--workspace-semantic-entity-addressing requires "
             "--dataset-type workspace-capability and "
             "--workspace-task-track permutation or all"
+        )
+    if (
+        args.workspace_semantic_entity_addressing
+        and args.workspace_task_track == "all"
+        and args.workspace_num_slots < 64
+    ):
+        parser.error(
+            "--workspace-semantic-entity-addressing with --workspace-task-track all "
+            "requires --workspace-num-slots >= 64 to cover every entity ID"
         )
     if args.workspace_semantic_state_diagnostics and not args.workspace_semantic_entity_addressing:
         parser.error(
@@ -7404,6 +7511,8 @@ if __name__ == "__main__":
                 run_id += "_interlayer"
         if args.memory_inter_layer_read or args.memory_inter_layer_read_every_block:
             run_id += f"_readscale{args.memory_inter_layer_read_scale:g}"
+        if args.workspace_write_to_kv:
+            run_id += f"_workspacekv_readscale{args.workspace_kv_read_scale:g}"
         if args.controller == "mamba":
             run_id = f"{run_id}_mambactrl"
         elif args.controller == "mamba2":
@@ -7608,6 +7717,8 @@ if __name__ == "__main__":
                 args.workspace_reconsideration_surprise_threshold
             ),
             workspace_reconsideration_trigger_mode=(args.workspace_reconsideration_trigger),
+            workspace_write_to_kv=args.workspace_write_to_kv,
+            workspace_kv_read_scale=args.workspace_kv_read_scale,
             workspace_bistable_deterministic=args.workspace_bistable_deterministic,
             workspace_stability_max_activation=args.workspace_stability_max_activation,
             eval_only=args.eval_only,

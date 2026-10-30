@@ -36,8 +36,8 @@ work. Set the count to the largest simultaneously live set the task needs.
 | `--workspace-no-selection` | Uses random, unweighted specialist writes instead of MoE-selected writes. | Control whether learned routing is responsible for useful writes. Keep the rest of the setup matched to the selected-write run. |
 | `--workspace-entity-keyed-writes` | Stores address/value pairs and reads by address similarity. Addresses are learned from specialist representations. | Test whether persistent per-entity bindings help beyond shared content slots. It needs `--workspace` and at least one slot. |
 | `--workspace-key-match-threshold VALUE` | Cosine-match threshold for treating an address as an existing slot; a weaker match allocates a free slot when available. Default: `0.5`. | Sweep when learned addresses merge unrelated items or fragment one item's writes. Use the same value across matched runs. |
-| `--workspace-semantic-entity-addressing` | For workspace-capability permutation episodes, uses fixed one-hot entity-token IDs as addresses and event masks for writes. Slot payloads remain learned. Requires entity-keyed writes. | Diagnose entity-to-state binding with stable keys. Use `--workspace-task-track permutation` or `all`; do not treat this as a generic language-task address mode. |
-| `--workspace-permutation-transactional` | Suppresses the two ordinary swap-commit writes, reads both addressed slot payloads from the same pre-commit state, then exchanges them together at the pair boundary. The semantic decoder supplies the actual query answer logits for both object→position and position→object queries. | A swap-aware permutation experiment testing paired state composition and decoder use. Requires semantic addressing, at least 16 slots, and the `permutation` or `all` task track. This is a distinct algorithmic variant. |
+| `--workspace-semantic-entity-addressing` | Uses fixed one-hot entity-token IDs as addresses. Permutation retains its initialization/swap write schedule; entity-state, relational-join, nth-farthest, and retrieval-aggregation write at complete event boundaries. Slot payloads remain learned. Requires entity-keyed writes. The `all` track requires 64 slots to cover its maximum 64 distinct entities in a retrieval episode. | Test stable per-entity bindings across the workspace capability suite. This metadata is specific to the typed workspace-capability task grammars. |
+| `--workspace-permutation-transactional` | On permutation examples, suppresses the two ordinary swap-commit writes, reads both addressed slot payloads from the same pre-commit state, and exchanges them together at the pair boundary. The semantic decoder supplies answer logits for both object→position and position→object queries. Other tracks use normal semantic event writes and ordinary task logits. | A swap-aware permutation experiment that can be included in an `all`-track run. Requires semantic addressing and at least 16 slots; all-track semantic addressing requires 64 slots. This is a distinct algorithmic variant. |
 | `--workspace-reset-each-step` | Clears the slot state before every token's write/read cycle, removing persistence between tokens. | Persistence ablation. It is not a useful setting for normal memory training. |
 
 Semantic entity addressing uses entity IDs present in the input stream as
@@ -89,6 +89,24 @@ coadapted run as if only the memory mechanism changed.
 For prediction-error consumers, `--sgr-pred-loss-weight` must be positive so the
 causal predictor is trained. Keep the predictor loss weight and signal settings
 matched when comparing reconsideration and salience variants.
+
+## Workspace writes to causal KV memory
+
+| Option | What it changes | When to use it |
+| --- | --- | --- |
+| `--workspace-write-to-kv` | Adds a separate masked KV channel for workspace writes. A warm-up pass collects up to two changed slots per token as separate records; a causal replay pass makes only earlier records readable at every between-block Mamba memory boundary. The replay pass's accepted writes become the returned persistent KV state. | Test whether workspace state becomes more useful when it is also available as sequence memory. Requires `--workspace`, `--memory-type kv`, and `--memory-inter-layer-read-every-block`. This experimental path runs the backbone twice, so expect lower throughput. |
+| `--workspace-kv-read-scale SCALE` | Scales the workspace-record read residual independently of the ordinary KV read. Default: `0.1`. | Start matched with the ordinary inter-layer read scale, then tune separately. |
+
+The side channel commits up to two changed slots per token as separate records,
+ranked by content-change magnitude; entity-keyed mode includes each slot's
+address and content in its record. It masks tokens with no committed update.
+`--memory-read-lag 1`
+applies to this channel: a token cannot read its own write, while later tokens
+in the replay can. It reuses the caller's workspace/KV state across inference
+calls when the caller does not reset the episode. Training continues to reset
+state between generated episodes, preventing cross-example leakage. The
+workspace-write records are collected in a causal warm-up pass and consumed in
+the second pass; only the second pass's records are kept as persistent state.
 
 ## State supervision and evaluation
 

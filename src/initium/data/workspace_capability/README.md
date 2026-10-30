@@ -61,6 +61,17 @@ another entity's binding. Keep at least as many slots as the lesson's entity
 count. This mode supports `--workspace-compile-recurrence` and requires a
 model width of at least 64 for the fixed entity-ID key basis.
 
+On `--workspace-task-track all`, the same fixed entity keys are populated for
+every track at causal event boundaries: entity-state writes after an update,
+relational-join writes the subject edge when its object arrives and the object
+context at the fact boundary, nth-farthest writes after a complete vector, and
+retrieval-aggregation writes after each key/value payload. These event writes
+do not use answer labels. The all-track generator can expose all 64 entity IDs
+in one retrieval episode, so semantic-address mode requires
+`--workspace-num-slots 64` to avoid dropping writes on capacity overflow.
+Permutation-specific state loss and pair commits remain active only on
+permutation examples in the mixed track.
+
 Semantic entity keys identify addresses; the first occurrence of each ID is
 assigned to the next free slot. Slot numbers are therefore episode-local and
 should not be compared across episodes. The binding report checks every active
@@ -86,8 +97,10 @@ loss target uses the episode's oracle snapshot; the model input and workspace
 payload remain the normal causal token stream and learned specialist values.
 The console reports `L_ws_state`, accuracy over supervised entity states, and
 the task loss separately. This option requires semantic entity addressing and
-the `permutation` or `all` track. A fresh run is recommended because the
-auxiliary decoder is a trainable model component.
+the `permutation` or `all` track. In an `all`-track run it applies only to
+permutation examples; other tracks have no entity-to-location oracle target and
+continue to train through their task loss. A fresh run is recommended because
+the auxiliary decoder is a trainable model component.
 
 Semantic-address mode also bounds each stored content vector to RMS 1.0 and
 clips each readback vector to at most the corresponding routed writer's RMS.
@@ -111,6 +124,9 @@ score the corresponding entity address. Its class logits replace the normal
 task logits only at the answer token, so the task loss trains the same decoder
 that is evaluated. It supports `--workspace-compile-recurrence`; pair commits
 are applied at event boundaries around the compiled per-token recurrence.
+In an `all`-track run, this update rule applies only to permutation examples;
+the remaining four tracks retain their regular task output and use causal
+event-boundary semantic writes.
 
 Transactional evaluations write separate `permutation_query/` rows for the
 two query directions and `permutation_state/swap_depth_N` rows in the workspace

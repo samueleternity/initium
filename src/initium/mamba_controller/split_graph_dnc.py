@@ -139,6 +139,7 @@ from initium.mamba_controller.mamba_controller import MambaControllerWrapper
 from initium.memory_manipulation.dnc_mechanisms import build_memory
 from initium.memory_manipulation.sequence_memories import CausalKVMemory, GatedDeltaMemory
 from initium.workspace.broadcast import WorkspaceBroadcast
+from initium.workspace.kv_bridge import WorkspaceKVBridge, WorkspaceKVState
 
 
 class _ModelCapacityMetadata:
@@ -262,6 +263,8 @@ class SplitGraphDNC(nn.Module):
         workspace_reconsideration_enabled: bool = False,
         workspace_reconsideration_surprise_threshold: float = 0.5,
         workspace_reconsideration_trigger_mode: str = "innovation",
+        workspace_write_to_kv: bool = False,
+        workspace_kv_read_scale: float = 0.1,
         sgr_write_salience_enabled: bool = False,
         sgr_workspace_salience_enabled: bool = False,
     ):
@@ -310,6 +313,21 @@ class SplitGraphDNC(nn.Module):
         if not math.isfinite(memory_inter_layer_read_scale) or memory_inter_layer_read_scale < 0:
             raise ValueError("memory_inter_layer_read_scale must be finite and >= 0")
         self.memory_inter_layer_read_scale = float(memory_inter_layer_read_scale)
+        self.workspace_write_to_kv = bool(workspace_write_to_kv)
+        if not math.isfinite(workspace_kv_read_scale) or workspace_kv_read_scale < 0:
+            raise ValueError("workspace_kv_read_scale must be finite and >= 0")
+        self.workspace_kv_read_scale = float(workspace_kv_read_scale)
+        if self.workspace_write_to_kv and not (
+            workspace_enabled
+            and workspace_num_slots > 0
+            and memory_type == "kv"
+            and inter_layer_memory_enabled
+            and memory_inter_layer_read_every_block
+        ):
+            raise ValueError(
+                "workspace-to-KV writes require workspace, KV memory, and "
+                "--memory-inter-layer-read-every-block"
+            )
         self.sequence_memory = None
         if memory_type in {"kv", "delta"}:
             rng_state = torch.random.get_rng_state()
@@ -327,6 +345,8 @@ class SplitGraphDNC(nn.Module):
                     )
             finally:
                 torch.random.set_rng_state(rng_state)
+        self.workspace_kv_memory = None
+        self.workspace_kv_diagnostics: dict[str, torch.Tensor] = {}
         self.dnc_enabled = bool(dnc_enabled and memory_type in {"dnc", "none"})
         if memory_type == "none":
             self.dnc_enabled = False
@@ -729,6 +749,20 @@ class SplitGraphDNC(nn.Module):
         )
         if rng_state is not None:
             torch.random.set_rng_state(rng_state)
+        if self.workspace_write_to_kv:
+            # Keep this optional sidecar from changing the random stream used
+            # by existing modules or matched-seed controls.
+            rng_state = torch.random.get_rng_state()
+            self.workspace_kv_memory = WorkspaceKVBridge(
+                hidden_size,
+                memory_heads,
+                memory_dk,
+                memory_dv,
+                position_mode=memory_position,
+                record_size=hidden_size * (2 if workspace_entity_keyed_writes else 1),
+                records_per_token=min(2, workspace_num_slots),
+            )
+            torch.random.set_rng_state(rng_state)
 
         # Keep a flat list of every active MoE block so the training loop can
         # collect auxiliary losses and routing diagnostics uniformly.
@@ -782,16 +816,18 @@ class SplitGraphDNC(nn.Module):
         timespans: torch.Tensor | None = None,
         return_backbone_features: bool = False,
         return_prediction_logits: bool = False,
+        _workspace_kv_replay_records: tuple[torch.Tensor, torch.Tensor] | None = None,
+        _workspace_kv_base_state: WorkspaceKVState | None = None,
     ):
         """
         input: (B, T, input_size) -- batch-first, the whole padded episode
             at once (this project always calls rnn(input_seq, ...) with the
             full sequence already assembled -- see Alter_PHASE3_mamba.py's
             training loop and evaluate_traversal()).
-        hx: (chx, mhx, last_read). chx is unused by this controller (the
-            combiner has no recurrent state of its own -- it's a plain
-            per-timestep Linear, not a cell) and is passed through
-            untouched. Sequence-memory mhx is a list of recurrent states;
+        hx: (chx, mhx, last_read). chx normally carries the workspace slot
+            state; when workspace-to-KV is enabled it also carries the
+            separate workspace KV sidecar state. Sequence-memory mhx is a
+            list of recurrent states;
             repeated inter-layer reads keep one independent state per
             inter-block boundary to preserve causal sequence order.
         pass_through_memory: when False, skips Memory read AND write for
@@ -810,6 +846,7 @@ class SplitGraphDNC(nn.Module):
         (T, B, input_size) -- see module docstring for why this shape,
         not (B, T, input_size).
         """
+        original_hx = hx
         chx, mhx, last_read = hx
         B, T, _ = input.shape
         if self.workspace_semantic_entity_addressing:
@@ -834,6 +871,30 @@ class SplitGraphDNC(nn.Module):
                 raise ValueError("workspace state supervision metadata must have shape (batch, time, 16)")
         combiner_hx_in = chx
         workspace_state = None
+        workspace_kv_state = None
+        workspace_kv_replay_state = None
+        workspace_kv_query_start = 0
+        workspace_kv_read_rms: list[torch.Tensor] = []
+        if self.workspace_kv_memory is not None:
+            if isinstance(chx, dict):
+                workspace_kv_state = chx.get("_initium_workspace_kv_state")
+            if workspace_kv_state is None or reset_experience:
+                workspace_kv_state = self.workspace_kv_memory.reset_state(
+                    B, device=input.device, dtype=input.dtype
+                )
+            if _workspace_kv_base_state is not None:
+                workspace_kv_state = _workspace_kv_base_state
+            if _workspace_kv_replay_records is not None:
+                replay_records, replay_commit_mask = _workspace_kv_replay_records
+                if not pass_through_memory:
+                    replay_commit_mask = torch.zeros_like(replay_commit_mask)
+                workspace_kv_query_start = workspace_kv_state.keys.shape[-2]
+                workspace_kv_replay_state = self.workspace_kv_memory.append(
+                    replay_records, replay_commit_mask, workspace_kv_state
+                )
+        workspace_kv_write_records = None
+        if self.workspace_kv_memory is not None:
+            self.workspace_kv_diagnostics = {}
         if self.workspace is not None:
             if isinstance(chx, dict) and "_initium_workspace_state" in chx:
                 workspace_state = chx["_initium_workspace_state"]
@@ -923,6 +984,24 @@ class SplitGraphDNC(nn.Module):
                 enriched[:, start_step:]
                 + self.memory_inter_layer_read_scale * inter_layer_memory_read
             )
+            if (
+                pass_through_memory
+                and workspace_kv_replay_state is not None
+                and self.workspace_kv_memory is not None
+            ):
+                workspace_read = self.workspace_kv_memory.read_prior(
+                    memory_features,
+                    workspace_kv_replay_state,
+                    query_start_position=workspace_kv_query_start,
+                )
+                enriched[:, start_step:] = (
+                    enriched[:, start_step:]
+                    + self.workspace_kv_read_scale * workspace_read
+                )
+                workspace_kv_read_rms.append(
+                    workspace_read.detach().float().square().mean().sqrt()
+                )
+                observe_tensor("workspace_kv.read", workspace_read)
             return enriched
 
         def observe_tensor(label: str, value: torch.Tensor) -> None:
@@ -1063,7 +1142,7 @@ class SplitGraphDNC(nn.Module):
             # state exposed to unscaled expert outputs and defeats this
             # stability control on the write path.
             specialists = specialists[:, start_step:] * self.moe_backbone_residual_scale
-            broadcast_delta, workspace_state = self.workspace(
+            workspace_result = self.workspace(
                 specialists,
                 route_indices[:, start_step:],
                 route_weights[:, start_step:],
@@ -1132,7 +1211,21 @@ class SplitGraphDNC(nn.Module):
                     if state_supervision_entity_ids is not None
                     else None
                 ),
+                collect_kv_records=self.workspace_kv_memory is not None,
             )
+            if self.workspace_kv_memory is not None:
+                (
+                    broadcast_delta,
+                    workspace_state,
+                    workspace_kv_write_records,
+                    workspace_kv_write_mask,
+                ) = workspace_result
+                workspace_kv_write_records = (
+                    workspace_kv_write_records,
+                    workspace_kv_write_mask,
+                )
+            else:
+                broadcast_delta, workspace_state = workspace_result
             H = base.clone()
             # The workspace returns a selected, broadcast-enriched MoE delta
             # whose candidate inputs have already been residual-scaled, just
@@ -1232,8 +1325,70 @@ class SplitGraphDNC(nn.Module):
             else:
                 output = (memory_features + memory_read).transpose(0, 1)
             last_read = memory_read[:, -1] if memory_read.shape[1] else None
+            if self.workspace_kv_memory is not None:
+                if _workspace_kv_replay_records is None:
+                    if workspace_kv_write_records is None:
+                        raise RuntimeError(
+                            "workspace-to-KV path did not receive committed workspace records"
+                        )
+                    # Warm-up pass records the causal workspace transitions.
+                    # Replay the original episode from its original state so
+                    # the ordinary KV histories are not double-written. The
+                    # replay's lag-1 workspace channel exposes only earlier
+                    # warm-up records to each token at every block boundary.
+                    return self.forward(
+                        input,
+                        hx=original_hx,
+                        reset_experience=reset_experience,
+                        pass_through_memory=pass_through_memory,
+                        combiner_skip_stages=combiner_skip_stages,
+                        start_step=start_step,
+                        sequence_valid_mask=sequence_valid_mask,
+                        prediction_valid_mask=prediction_valid_mask,
+                        entity_ids=entity_ids,
+                        entity_write_mask=entity_write_mask,
+                        pair_swap_entity_ids=pair_swap_entity_ids,
+                        pair_swap_mask=pair_swap_mask,
+                        pair_swap_steps=pair_swap_steps,
+                        permutation_query_kind=permutation_query_kind,
+                        permutation_query_ids=permutation_query_ids,
+                        permutation_query_steps=permutation_query_steps,
+                        state_supervision_entity_ids=state_supervision_entity_ids,
+                        state_supervision_mask=state_supervision_mask,
+                        state_supervision_steps=state_supervision_steps,
+                        timespans=timespans,
+                        return_backbone_features=return_backbone_features,
+                        return_prediction_logits=return_prediction_logits,
+                        _workspace_kv_replay_records=workspace_kv_write_records,
+                        _workspace_kv_base_state=workspace_kv_state,
+                    )
+                if workspace_kv_write_records is None:
+                    raise RuntimeError("workspace-to-KV replay failed to collect committed records")
+                records, commit_mask = workspace_kv_write_records
+                if pass_through_memory:
+                    workspace_kv_state = self.workspace_kv_memory.append(
+                        records, commit_mask, workspace_kv_state
+                    )
+                else:
+                    commit_mask = torch.zeros_like(commit_mask)
+                committed_count = commit_mask.sum().float()
+                commit_fraction = commit_mask.float().mean() if commit_mask.numel() else committed_count
+                history_records = workspace_kv_state.valid.sum(dim=-1).float().mean()
+                read_rms = (
+                    torch.stack(workspace_kv_read_rms).mean()
+                    if workspace_kv_read_rms
+                    else records.new_zeros((), dtype=torch.float32)
+                )
+                self.workspace_kv_diagnostics = {
+                    "workspace_kv_commit_fraction": commit_fraction.detach(),
+                    "workspace_kv_committed_records": committed_count.detach(),
+                    "workspace_kv_history_records": history_records.detach(),
+                    "workspace_kv_read_rms": read_rms.detach(),
+                }
             if self.workspace is not None:
                 chx = {"_initium_workspace_state": workspace_state}
+                if self.workspace_kv_memory is not None:
+                    chx["_initium_workspace_kv_state"] = workspace_kv_state
             state = (chx, memory_states, last_read)
             if return_backbone_features:
                 assert backbone_features is not None

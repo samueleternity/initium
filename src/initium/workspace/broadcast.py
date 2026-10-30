@@ -638,6 +638,11 @@ class WorkspaceBroadcast(nn.Module):
                 # is a small per-token graph; exhaustive GEMM tuning adds
                 # compile-time work and can select unsupported Triton paths
                 # on the small SM-count GPUs commonly assigned by Colab.
+                # CUDA graph replay is intentionally disabled for this inner
+                # recurrence: many token calls retain autograd state before
+                # the sequence-level backward, preventing CUDAGraph Trees from
+                # reclaiming the prior call's graph pool. Keep the compiled
+                # Triton transition while avoiding that ineffective fast path.
                 options={"max_autotune": False},
             )
         return self._compiled_recurrence_step
@@ -1003,7 +1008,14 @@ class WorkspaceBroadcast(nn.Module):
         if self.diagnostics_enabled and reconsideration_trigger is not None:
             triggered_count_raw = reconsideration_trigger.sum().float()
             triggered_count = triggered_count_raw.clamp_min(1.0)
-            actual_change = torch.linalg.vector_norm((next_state - old_inputs).float(), dim=-1)
+            # Reconsideration telemetry measures the committed slot content
+            # change. Entity-keyed state also contains an address vector, so
+            # comparing the full concatenated state (2 * d_model) against
+            # old_inputs (d_model) both misreports the metric and fails during
+            # eager evaluation. Keep this consistent with the compiled path.
+            actual_change = torch.linalg.vector_norm(
+                (next_content - old_inputs).float(), dim=-1
+            )
             changed_count = (reconsideration_trigger & (actual_change > 1e-6)).sum().float()
             state_delta_sq_sum = (actual_change * reconsideration_trigger).square().sum()
             reconsideration_diag["reconsideration_changed_frac"] = (
@@ -1164,9 +1176,12 @@ class WorkspaceBroadcast(nn.Module):
         state_supervision_entity_ids: torch.Tensor | None = None,
         state_supervision_mask: torch.Tensor | None = None,
         state_supervision_steps: tuple[int, ...] | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        collect_kv_records: bool = False,
+    ):
         """Process time-major specialists ``(B,T,E,D)`` sequentially."""
         outputs: list[torch.Tensor] = []
+        kv_records: list[torch.Tensor] = []
+        kv_commit_masks: list[torch.Tensor] = []
         self._last_semantic_state_predictions = []
         self._last_semantic_query_predictions = []
         self._last_semantic_pair_commits = []
@@ -1418,6 +1433,7 @@ class WorkspaceBroadcast(nn.Module):
             # read trajectory; zero keeps the historical full-sequence BPTT.
             if self.bptt_horizon and step and step % self.bptt_horizon == 0:
                 state = state.detach()
+            state_before_step = torch.zeros_like(state) if reset_each_step else state
             step_prediction_error = (
                 prediction_error[:, step] if prediction_error is not None else None
             )
@@ -1707,6 +1723,33 @@ class WorkspaceBroadcast(nn.Module):
                 )
                 if not self.training:
                     self._last_semantic_pair_commits.append((step, committed))
+            if collect_kv_records:
+                old_content = (
+                    state_before_step.split(self.d_model, dim=-1)[1]
+                    if self.entity_keyed_writes
+                    else state_before_step
+                )
+                new_content = (
+                    state.split(self.d_model, dim=-1)[1]
+                    if self.entity_keyed_writes
+                    else state
+                )
+                change = torch.linalg.vector_norm(
+                    (new_content - old_content).float(), dim=-1
+                ).detach()
+                accepted = change > 1e-6
+                weights = change * accepted.to(change.dtype)
+                record_payload = state if self.entity_keyed_writes else new_content
+                record_count = min(2, record_payload.shape[1])
+                top_weights, top_slots = weights.topk(record_count, dim=1)
+                record = record_payload.gather(
+                    1,
+                    top_slots.unsqueeze(-1).expand(
+                        -1, -1, record_payload.shape[-1]
+                    ),
+                )
+                kv_records.append(record.to(dtype=specialist_deltas.dtype))
+                kv_commit_masks.append(top_weights > 1e-6)
             if state_observer is not None:
                 state_observer(state, call_index=step)
             if (
@@ -1824,7 +1867,29 @@ class WorkspaceBroadcast(nn.Module):
                     (histograms * candidate_counts.unsqueeze(-1)).sum(dim=0) / candidate_denom
                 ).detach()
             self._accumulate_bistable_diagnostics(self._last_diag)
-        return torch.stack(outputs, dim=1), state
+        result = (torch.stack(outputs, dim=1), state)
+        if collect_kv_records:
+            records = (
+                torch.stack(kv_records, dim=1)
+                if kv_records
+                else specialist_deltas.new_zeros(
+                    specialist_deltas.shape[0],
+                    0,
+                    min(2, self.num_slots),
+                    self.d_model * (2 if self.entity_keyed_writes else 1),
+                )
+            )
+            commit_mask = (
+                torch.stack(kv_commit_masks, dim=1)
+                if kv_commit_masks
+                else torch.zeros(
+                    specialist_deltas.shape[0], 0, min(2, self.num_slots),
+                    device=specialist_deltas.device,
+                    dtype=torch.bool,
+                )
+            )
+            return (*result, records, commit_mask)
+        return result
 
     def last_diagnostics(self) -> dict[str, torch.Tensor]:
         """Detached activity metrics for the most recent sequence pass."""

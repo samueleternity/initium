@@ -19,12 +19,25 @@ from initium.data.workspace_capability.episode import (
     ENTITY_BASE,
     ENTITY_COUNT,
     EV_COMMIT,
+    EV_FACT,
+    EV_KV,
+    EV_MOVE,
+    EV_PUT,
+    EV_ASSERT,
+    EV_REMOVE,
+    EV_SUPERSEDE,
+    EV_UPDATE,
+    EV_VECTOR,
     EOS,
     EV_INIT,
     EV_SWAP,
     LOCATION_BASE,
     LOCATION_COUNT,
     QUERY,
+    RELATION_BASE,
+    RELATION_COUNT,
+    SCALAR_BASE,
+    SCALAR_COUNT,
     SEP,
     TRACK_BASE,
     TaskEpisode,
@@ -49,6 +62,14 @@ _GENERATORS = {
 }
 TRACKS = tuple(_GENERATORS)
 ALL_TRACK = "all"
+_EVAL_KV_ATTENTION_BUDGET_BYTES = 512 * 1024 * 1024
+_SDPA_MATH_WORKSPACE_MULTIPLIER = 2
+_ENTITY_ADDRESS_EVENT_TOKENS = {
+    "entity_state": {EV_PUT, EV_ASSERT, EV_MOVE, EV_REMOVE, EV_SUPERSEDE},
+    "relational_join": {EV_FACT},
+    "nth_farthest": {EV_VECTOR},
+    "retrieval_aggregation": {EV_KV, EV_UPDATE},
+}
 
 
 class WorkspaceCapabilityDataset(BaseDataset):
@@ -163,18 +184,56 @@ class WorkspaceCapabilityDataset(BaseDataset):
             mask[row, :length] = torch.tensor(episode.answer_mask, dtype=torch.float32)
         return inputs, targets, mask
 
+    @staticmethod
+    def _evaluation_groups(episodes, max_batch_size, *, kv_attention_heads=0):
+        """Microbatch long KV evaluation streams within a conservative budget.
+
+        The unfused SDPA fallback can materialize both scores and probabilities
+        with shape ``[batch, heads, query, key]``. Estimate that workspace in
+        fp32, sort by length to avoid padding short tasks to a long episode, and
+        preserve the ordinary evaluation batch size for non-KV models.
+        """
+        if max_batch_size < 1:
+            raise ValueError("evaluation batch size must be positive")
+        if kv_attention_heads <= 0:
+            for offset in range(0, len(episodes), max_batch_size):
+                yield episodes[offset : offset + max_batch_size]
+            return
+
+        ordered = sorted(episodes, key=lambda episode: len(episode.sequence))
+        offset = 0
+        while offset < len(ordered):
+            group = []
+            maximum_length = 0
+            while offset < len(ordered) and len(group) < max_batch_size:
+                episode = ordered[offset]
+                candidate_length = max(maximum_length, len(episode.sequence))
+                estimated_bytes = (
+                    (len(group) + 1)
+                    * kv_attention_heads
+                    * candidate_length
+                    * candidate_length
+                    * 4
+                    * _SDPA_MATH_WORKSPACE_MULTIPLIER
+                )
+                if group and estimated_bytes > _EVAL_KV_ATTENTION_BUDGET_BYTES:
+                    break
+                group.append(episode)
+                maximum_length = candidate_length
+                offset += 1
+            yield group
+
     def workspace_entity_address_metadata(
         self, input_vectors: torch.Tensor, *, paired_swap_commits: bool = False
     ) -> dict[str, torch.Tensor]:
-        """Return causal token-ID keys and state-event write masks for permutation.
+        """Build causal entity keys and event-boundary writes for each task track.
 
         Entity IDs are used only as workspace address/read metadata; they are
         not concatenated into backbone or specialist-value features and do not
-        use answer labels. Initialization writes are delayed until the
-        entity's location token; swap writes are limited to the two entities in
-        each swap event. Both operands are read first; their writes are deferred
-        to the commit operands after the complete pair is visible. Query entity
-        tokens may read their slot but never write.
+        use answer labels. Permutation keeps its specialized initialization and
+        paired-swap schedule. Other tracks write a selected entity address at a
+        complete input-event boundary, after the event payload is visible.
+        Query entity tokens never write.
         """
         if input_vectors.ndim != 3 or input_vectors.shape[-1] != VOCAB_SIZE:
             raise ValueError(
@@ -193,11 +252,19 @@ class WorkspaceCapabilityDataset(BaseDataset):
         pair_swap_mask = torch.zeros(
             input_vectors.shape[:2], dtype=torch.bool, device=input_vectors.device
         )
-        permutation_track_id = TRACK_BASE + TRACKS.index("permutation")
         for row, tokens in enumerate(token_ids):
-            if self.task_track == ALL_TRACK and (
-                len(tokens) < 2 or int(tokens[1]) != permutation_track_id
-            ):
+            if self.task_track == ALL_TRACK:
+                track_marker = int(tokens[1]) if len(tokens) > 1 else -1
+                track_index = track_marker - TRACK_BASE
+                if not 0 <= track_index < len(TRACKS):
+                    continue
+                track = TRACKS[track_index]
+            else:
+                track = self.task_track
+            if track != "permutation":
+                self._add_event_boundary_entity_writes(
+                    row, tokens, track, entity_ids, write_mask
+                )
                 continue
             phase = "none"
             pending_entity = -1
@@ -270,6 +337,81 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 .tolist()
             )
         return metadata
+
+    @staticmethod
+    def _add_event_boundary_entity_writes(
+        row: int,
+        tokens: list[int],
+        track: str,
+        entity_ids: torch.Tensor,
+        write_mask: torch.Tensor,
+    ) -> None:
+        """Address the entity represented by each complete, supported event.
+
+        One entity slot is used per task entity. Relational facts write the
+        subject address when the object token completes the edge, then write
+        the object address at the separator. This exposes both the forward
+        edge and its contextual reverse without adding oracle targets.
+        """
+        event_tokens = _ENTITY_ADDRESS_EVENT_TOKENS.get(track, set())
+        if not event_tokens:
+            return
+
+        active_event = None
+        event_entities = []
+        has_location = False
+        has_scalar = False
+        has_relation = False
+        for position, token_value in enumerate(tokens):
+            token = int(token_value)
+            if ENTITY_BASE <= token < ENTITY_BASE + ENTITY_COUNT:
+                # Semantic IDs select reads everywhere in the stream, while
+                # the separate write mask stays limited to valid event commits.
+                entity_ids[row, position] = token - ENTITY_BASE
+            if token == QUERY:
+                active_event = None
+                event_entities.clear()
+                continue
+            if active_event is None:
+                if token in event_tokens:
+                    active_event = token
+                    event_entities.clear()
+                    has_location = False
+                    has_scalar = False
+                    has_relation = False
+                continue
+            if token == SEP:
+                if event_entities:
+                    if track == "entity_state":
+                        valid_event = has_location
+                    elif track == "relational_join":
+                        valid_event = len(event_entities) >= 2 and has_relation
+                    elif track == "nth_farthest":
+                        valid_event = has_scalar
+                    else:
+                        valid_event = has_scalar
+                    if valid_event:
+                        entity_ids[row, position] = (
+                            event_entities[-1]
+                            if track == "relational_join"
+                            else event_entities[0]
+                        )
+                        write_mask[row, position] = True
+                active_event = None
+                event_entities.clear()
+                continue
+            if ENTITY_BASE <= token < ENTITY_BASE + ENTITY_COUNT:
+                event_entities.append(token - ENTITY_BASE)
+                if track == "relational_join" and len(event_entities) == 2:
+                    # The causal representation now contains the complete edge.
+                    entity_ids[row, position] = event_entities[0]
+                    write_mask[row, position] = True
+            elif LOCATION_BASE <= token < LOCATION_BASE + LOCATION_COUNT:
+                has_location = True
+            elif SCALAR_BASE <= token < SCALAR_BASE + SCALAR_COUNT:
+                has_scalar = True
+            elif RELATION_BASE <= token < RELATION_BASE + RELATION_COUNT:
+                has_relation = True
 
     def workspace_permutation_query_metadata(
         self,
@@ -489,8 +631,17 @@ class WorkspaceCapabilityDataset(BaseDataset):
             model.eval()
             with torch.no_grad():
                 batch_size = min(self.batch_size_hint, max(1, len(episodes)))
-                for offset in range(0, len(episodes), batch_size):
-                    group = episodes[offset : offset + batch_size]
+                sequence_memory = getattr(model, "sequence_memory", None)
+                kv_attention_heads = (
+                    int(getattr(sequence_memory, "heads", 0))
+                    if getattr(model, "memory_type", None) == "kv"
+                    else 0
+                )
+                for group in self._evaluation_groups(
+                    episodes,
+                    batch_size,
+                    kv_attention_heads=kv_attention_heads,
+                ):
                     x, _targets, _mask = self._collate(group)
                     workspace_forward_kwargs = {}
                     binding_entity_metadata = None

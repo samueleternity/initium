@@ -67,11 +67,43 @@ def difficulty_for(
             "queries": (1, 1, 2, 3, 4, 8)[level],
             "aggregate": ("recall", "recall", "sum_mod16", "count_even", "parity", "recall")[level],
         }
+    elif track == "capacity_bottleneck":
+        config = {
+            "set_size": (1, 2, 3, 4, 6, 8)[level],
+            "target_count": (1, 2, 3, 4, 6, 8)[level],
+            "tracking_frames": (2, 2, 3, 3, 4, 5)[level],
+            "n_back": (1, 1, 2, 2, 3, 4)[level],
+        }
+    elif track == "belief_tracking":
+        config = {
+            "agents": (2, 2, 3, 3, 4, 4)[level],
+            "objects": (1, 2, 2, 3, 4, 8)[level],
+            "moves": (1, 2, 3, 4, 6, 8)[level],
+        }
+    elif track == "mixed_skill":
+        config = {
+            "operations": (2, 2, 3, 3, 4, 4)[level],
+            "keys": (4, 4, 5, 6, 7, 8)[level],
+        }
+    elif track == "rule_switching":
+        config = {
+            "evidence_trials": (2, 3, 4, 5, 6, 8)[level],
+            "switch": level >= 2,
+        }
+    elif track == "attentional_blink":
+        config = {"maximum_lag": (1, 2, 3, 4, 6, 8)[level]}
+    elif track == "variable_binding":
+        config = {
+            "variables": (2, 3, 4, 5, 6, 8)[level],
+            # Leave room for the mandatory copy-then-reassignment probe at
+            # every lesson; later lessons add longer assignment chains.
+            "assignments": (4, 5, 7, 9, 12, 16)[level],
+        }
     else:
         raise ValueError(f"unknown workspace capability track {track!r}")
     if ood and track != "permutation":
-        # OOD increases temporal interference while keeping each generator's
-        # schema bounds valid and uses its held-out identifier band where able.
+        # OOD increases task-specific load beyond the ID lesson while keeping
+        # each generator's token and sequence bounds valid.
         if track == "entity_state":
             updates = config["updates"]
             distractors = config["distractors"]
@@ -86,6 +118,21 @@ def difficulty_for(
             distractors = config["distractors"]
             assert isinstance(distractors, int)
             config["distractors"] = min(distractors * 2 + 2, 24)
+        elif track == "capacity_bottleneck":
+            config["set_size"] = min(int(config["set_size"]) + 1, 9)
+            config["target_count"] = min(int(config["target_count"]) + 1, 9)
+            config["n_back"] = min(int(config["n_back"]) + 1, 5)
+            config["tracking_frames"] = min(int(config["tracking_frames"]) + 1, 6)
+        elif track == "belief_tracking":
+            config["moves"] = min(int(config["moves"]) + 2, 10)
+        elif track == "mixed_skill":
+            config["keys"] = min(int(config["keys"]) + 2, 10)
+        elif track == "rule_switching":
+            config["evidence_trials"] = min(int(config["evidence_trials"]) + 1, 9)
+        elif track == "attentional_blink":
+            config["maximum_lag"] = min(int(config["maximum_lag"]) + 1, 9)
+        elif track == "variable_binding":
+            config["assignments"] = min(int(config["assignments"]) + 2, 20)
         else:
             updates = config["updates"]
             distractors = config["distractors"]

@@ -44,19 +44,28 @@ from initium.data.workspace_capability.episode import (
     RELATION_COUNT,
     SCALAR_BASE,
     SCALAR_COUNT,
+    SOURCE_BASE,
+    SOURCE_COUNT,
     SEP,
-    TRACK_BASE,
+    track_index,
+    track_token,
     VOCAB_SIZE,
     TaskEpisode,
     entity_token,
     validate_episode,
 )
 from initium.data.workspace_capability.tracks import (
+    attentional_blink,
+    belief_tracking,
+    capacity_bottleneck,
     entity_state,
+    mixed_skill,
     nth_farthest,
     permutation,
     relational_join,
     retrieval_aggregation,
+    rule_switching,
+    variable_binding,
 )
 
 _GENERATORS = {
@@ -65,12 +74,21 @@ _GENERATORS = {
     "relational_join": relational_join.generate,
     "nth_farthest": nth_farthest.generate,
     "retrieval_aggregation": retrieval_aggregation.generate,
+    "capacity_bottleneck": capacity_bottleneck.generate,
+    "belief_tracking": belief_tracking.generate,
+    "mixed_skill": mixed_skill.generate,
+    "rule_switching": rule_switching.generate,
+    "attentional_blink": attentional_blink.generate,
+    "variable_binding": variable_binding.generate,
 }
 TRACKS = tuple(_GENERATORS)
 ALL_TRACK = "all"
 _EVAL_KV_ATTENTION_BUDGET_BYTES = 512 * 1024 * 1024
 _SDPA_MATH_WORKSPACE_MULTIPLIER = 2
 _ENTITY_ADDRESS_EVENT_TOKENS = {
+    "capacity_bottleneck": {EV_INIT, EV_MOVE},
+    "rule_switching": {EV_ASSERT, EV_VECTOR},
+    "variable_binding": {EV_INIT, EV_KV, EV_UPDATE},
     "entity_state": {EV_PUT, EV_ASSERT, EV_MOVE, EV_REMOVE, EV_SUPERSEDE},
     "relational_join": {EV_FACT},
     "nth_farthest": {EV_VECTOR},
@@ -79,7 +97,7 @@ _ENTITY_ADDRESS_EVENT_TOKENS = {
 
 
 class WorkspaceCapabilityDataset(BaseDataset):
-    """Synthetic benchmark isolating state, correction, join, and comparison skills."""
+    """Synthetic benchmark isolating state, belief, capacity, and coordination skills."""
 
     name = "workspace-capability"
     input_dim = VOCAB_SIZE
@@ -141,7 +159,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
             track_id = TRACKS.index(track)
             episode = TaskEpisode(
                 episode.track,
-                (BOS, TRACK_BASE + track_id, SEP) + episode.inputs[1:],
+                (BOS, track_token(track_id), SEP) + episode.inputs[1:],
                 episode.answer,
                 {
                     **episode.metadata,
@@ -166,8 +184,8 @@ class WorkspaceCapabilityDataset(BaseDataset):
             raise ValueError("batch_size must be >= 1")
         level = int(curriculum.lesson)
         tracks = self._tracks()
-        # Balanced assignment per batch prevents small batches from omitting a
-        # task entirely and preserves a uniform multi-track objective.
+        # Cycle through the track list so each track is represented evenly over
+        # batches; every track appears in each batch when batch_size >= len(tracks).
         start_track = random.randrange(len(tracks))
         selected_tracks = [tracks[(start_track + i) % len(tracks)] for i in range(batch_size)]
         random.shuffle(selected_tracks)
@@ -276,10 +294,10 @@ class WorkspaceCapabilityDataset(BaseDataset):
         for row, tokens in enumerate(token_ids):
             if self.task_track == ALL_TRACK:
                 track_marker = int(tokens[1]) if len(tokens) > 1 else -1
-                track_index = track_marker - TRACK_BASE
-                if not 0 <= track_index < len(TRACKS):
+                decoded_track_index = track_index(track_marker)
+                if decoded_track_index is None or decoded_track_index >= len(TRACKS):
                     continue
-                track = TRACKS[track_index]
+                track = TRACKS[decoded_track_index]
             else:
                 track = self.task_track
             if track != "permutation":
@@ -375,6 +393,16 @@ class WorkspaceCapabilityDataset(BaseDataset):
         the object address at the separator. This exposes both the forward
         edge and its contextual reverse without adding oracle targets.
         """
+        if track == "belief_tracking":
+            WorkspaceCapabilityDataset._add_belief_address_writes(
+                row, tokens, entity_ids, write_mask
+            )
+            return
+        if track == "mixed_skill":
+            WorkspaceCapabilityDataset._add_mixed_skill_address_writes(
+                row, tokens, entity_ids, write_mask
+            )
+            return
         event_tokens = _ENTITY_ADDRESS_EVENT_TOKENS.get(track, set())
         if not event_tokens:
             return
@@ -384,6 +412,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
         has_location = False
         has_scalar = False
         has_relation = False
+        has_boolean = False
         for position, token_value in enumerate(tokens):
             token = int(token_value)
             if ENTITY_BASE <= token < ENTITY_BASE + ENTITY_COUNT:
@@ -401,6 +430,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
                     has_location = False
                     has_scalar = False
                     has_relation = False
+                    has_boolean = False
                 continue
             if token == SEP:
                 if event_entities:
@@ -410,6 +440,12 @@ class WorkspaceCapabilityDataset(BaseDataset):
                         valid_event = len(event_entities) >= 2 and has_relation
                     elif track == "nth_farthest":
                         valid_event = has_scalar
+                    elif track == "capacity_bottleneck":
+                        valid_event = has_location
+                    elif track == "rule_switching":
+                        valid_event = has_scalar or has_boolean
+                    elif track == "variable_binding":
+                        valid_event = has_scalar or len(event_entities) >= 2
                     else:
                         valid_event = has_scalar
                     if valid_event:
@@ -432,6 +468,118 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 has_scalar = True
             elif RELATION_BASE <= token < RELATION_BASE + RELATION_COUNT:
                 has_relation = True
+            elif token in (BOOL_FALSE, BOOL_TRUE):
+                has_boolean = True
+
+    @staticmethod
+    def _add_belief_address_writes(row, tokens, entity_ids, write_mask) -> None:
+        """Address world state separately from each agent/object belief pair."""
+        active_event = None
+        event_agent = None
+        event_object = None
+        has_location = False
+        query_agent = None
+        querying = False
+        for position, token_value in enumerate(tokens):
+            token = int(token_value)
+            if token == QUERY:
+                active_event = None
+                event_agent = None
+                event_object = None
+                has_location = False
+                querying = True
+                query_agent = None
+                continue
+            if token in (EV_INIT, EV_MOVE, EV_ASSERT):
+                active_event = token
+                event_agent = None
+                event_object = None
+                has_location = False
+                querying = False
+                continue
+            if querying and SOURCE_BASE <= token < SOURCE_BASE + SOURCE_COUNT:
+                query_agent = token - SOURCE_BASE
+                continue
+            if active_event == EV_ASSERT and SOURCE_BASE <= token < SOURCE_BASE + SOURCE_COUNT:
+                event_agent = token - SOURCE_BASE
+                continue
+            if ENTITY_BASE <= token < ENTITY_BASE + ENTITY_COUNT:
+                object_id = token - ENTITY_BASE
+                if querying:
+                    key = 8 + query_agent * 8 + object_id if query_agent is not None else object_id
+                elif active_event == EV_ASSERT and event_agent is not None:
+                    key = 8 + event_agent * 8 + object_id
+                    event_object = object_id
+                else:
+                    key = object_id
+                    event_object = object_id
+                if 0 <= key < ENTITY_COUNT:
+                    entity_ids[row, position] = key
+            elif LOCATION_BASE <= token < LOCATION_BASE + LOCATION_COUNT:
+                has_location = True
+            elif token == SEP:
+                if active_event in (EV_INIT, EV_MOVE) and event_object is not None and has_location:
+                    entity_ids[row, position] = event_object
+                    write_mask[row, position] = True
+                elif (
+                    active_event == EV_ASSERT
+                    and event_agent is not None
+                    and event_object is not None
+                    and has_location
+                ):
+                    key = 8 + event_agent * 8 + event_object
+                    entity_ids[row, position] = key
+                    write_mask[row, position] = True
+                active_event = None
+                event_agent = None
+                event_object = None
+                has_location = False
+                querying = False
+                query_agent = None
+
+    @staticmethod
+    def _add_mixed_skill_address_writes(row, tokens, entity_ids, write_mask) -> None:
+        """Store initial table values and each operation result by stage ID."""
+        active_event = None
+        event_entities = []
+        has_scalar = False
+        has_source = False
+        for position, token_value in enumerate(tokens):
+            token = int(token_value)
+            if ENTITY_BASE <= token < ENTITY_BASE + ENTITY_COUNT:
+                entity_id = token - ENTITY_BASE
+                entity_ids[row, position] = entity_id
+                if active_event is not None:
+                    event_entities.append(entity_id)
+            if token == QUERY:
+                active_event = None
+                event_entities.clear()
+                continue
+            if active_event is None:
+                if token in (EV_KV, EV_VECTOR):
+                    active_event = token
+                    event_entities.clear()
+                    has_scalar = False
+                    has_source = False
+                continue
+            if SOURCE_BASE <= token < SOURCE_BASE + SOURCE_COUNT:
+                has_source = True
+            elif SCALAR_BASE <= token < SCALAR_BASE + SCALAR_COUNT:
+                has_scalar = True
+            elif token == SEP:
+                if event_entities:
+                    if active_event == EV_KV and has_scalar:
+                        address = event_entities[0]
+                        entity_ids[row, position] = address
+                        write_mask[row, position] = True
+                    elif active_event == EV_VECTOR and has_source:
+                        address = event_entities[0]
+                        entity_ids[row, position] = address
+                        write_mask[row, position] = True
+                active_event = None
+                event_entities.clear()
+                has_scalar = False
+                has_source = False
 
     def workspace_permutation_query_metadata(
         self,

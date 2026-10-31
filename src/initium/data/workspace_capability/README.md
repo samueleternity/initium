@@ -202,11 +202,69 @@ even values, and parity. Multi-query episodes place all requested keys at the
 end. This tests associative retrieval, update precedence, multi-item retrieval,
 and simple aggregation as context and interference grow.
 
+### `capacity_bottleneck` — set size, tracking load, and n-back controls
+
+Balanced subconditions cover symbolic change detection with set size `k`,
+symbolic identity tracking with `k` marked objects and moving distractors, and
+n-back lag. The change-detection and tracking conditions directly vary the
+number of simultaneously relevant items; n-back varies lag and is reported as
+a separate control. The tracking stream uses explicit symbolic object IDs, so
+it is an event-based tracking analogue rather than a visual MOT replication.
+
+### `belief_tracking` — agent-specific state and reality controls
+
+The generator presents an initial world state, subsequent object moves, and
+which agents observed each move. It balances false-belief queries (the queried
+agent misses the final move), true-belief queries (the agent observes it), and
+current-world controls. This is a typed
+symbolic false-belief task informed by the ToM-bAbI/ToMi belief-question
+families, not a reproduction of either natural-language benchmark.
+
+### `mixed_skill` — composed lookup, arithmetic, copy, and sort
+
+An episode provides a small key/value table followed by a shuffled pipeline of
+skill-marked operations. The answer concatenates the intermediate results in
+pipeline order, including both values emitted by sort. Operation results are
+not included in the input; workspace address metadata marks table keys and
+pipeline stages only.
+
+### `rule_switching` — card-feature feedback and task-set revision
+
+Evidence trials show cards, a simulated category choice, and exact correct or
+incorrect feedback. The hidden active feature can change mid-episode. Half of
+the switch episodes include an explicit cue, while the rest require inferring
+the new rule from feedback; the final query asks for the active feature value
+on a novel card. This is a compact symbolic switch task, not a full human WCST
+protocol.
+
+### `attentional_blink` — RSVP lag and symbolic mask conditions
+
+Each stream contains two scalar-coded targets among relation-coded
+distractors. T2 lag varies from immediate succession through the later
+recovery range, and symbolic mask items are varied in the gap. Both targets
+must be reported in order. This controls temporal spacing and report accuracy;
+it is not a visual display or a unique test of global-workspace ignition.
+
+### `variable_binding` — sequential assignment and copy-by-value
+
+Variables receive scalar values, are reassigned, or copy another variable's
+current value. Every episode begins with a copy followed by a source
+reassignment, then queries the copied variable; later curriculum levels add
+more assignment operations. Copies take effect at the assignment point, so
+later reassignment of the source does not change the destination's value.
+
+Each new family is selectable directly through `--workspace-task-track` and
+is included in `all`. Episodes for these six families are kept shorter than
+the existing long permutation track, so they do not raise its full-BPTT
+sequence-length peak. The existing lesson-5 activation-memory limit remains;
+compact token-ID inputs reduce batch storage but do not remove that limit.
+
 ## Curriculum, evaluation, and metrics
 
-Each track has six difficulty levels. `all` rotates a balanced set of tracks
-through each batch and advances only after the overall answer-accuracy
-threshold and every track's threshold are met. The dataset can also be run
+Each track has six difficulty levels. `all` rotates tracks evenly across batches;
+every batch contains each of the eleven tracks when `batch_size` is at least 11.
+The curriculum advances only after the overall answer-accuracy threshold and
+every track's threshold are met. The dataset can also be run
 with `--workspace-task-track <track>` to study one skill without dilution from
 the others. Evaluation uses locally seeded ID and OOD episode generators so
 the episode set is reproducible for paired model conditions.

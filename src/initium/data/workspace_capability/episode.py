@@ -13,7 +13,24 @@ EOS = 2
 SEP = 3
 QUERY = 4
 ANSWER = 5
+# Keep the original five all-track markers stable for old checkpoints. New
+# tracks use otherwise-unused vocabulary entries so their markers never collide
+# with entity, event, scalar, relation, location, or fact token ranges.
 TRACK_BASE = 24
+TRACK_TOKEN_IDS = (24, 25, 26, 27, 28, 29, 30, 31, 6, 7, 189)
+
+
+def track_token(index: int) -> int:
+    if not 0 <= int(index) < len(TRACK_TOKEN_IDS):
+        raise ValueError(f"track index must be in [0,{len(TRACK_TOKEN_IDS)}), got {index}")
+    return TRACK_TOKEN_IDS[int(index)]
+
+
+def track_index(token: int) -> int | None:
+    try:
+        return TRACK_TOKEN_IDS.index(int(token))
+    except ValueError:
+        return None
 
 # Event tokens occupy a dedicated range; fields use disjoint typed ranges.
 EV_INIT = 8

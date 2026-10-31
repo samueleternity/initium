@@ -165,7 +165,7 @@ def test_permutation_oracle_composes_swaps_and_answers_both_directions():
         elif event == QUERY:
             query = segment[1:]
     assert query is not None
-    if query[0] >= ENTITY_BASE:
+    if ENTITY_BASE <= query[0] < ENTITY_BASE + ENTITY_COUNT:
         expected = LOCATION_BASE + state[query[0] - ENTITY_BASE]
     else:
         expected = ENTITY_BASE + inverse[query[0] - LOCATION_BASE]
@@ -406,7 +406,7 @@ def test_all_track_curriculum_has_separate_schedules_and_requires_each_track(mon
             "tracks": {track: {"accuracy": 90.0} for track in GENERATORS}
         }
         dataset.last_eval_diagnostics["tracks"]["nth_farthest"]["accuracy"] = 40.0
-        return 0, 88.0, 70.0
+        return 88.0, 88.0, {}
 
     monkeypatch.setattr(dataset, "evaluate_id", mocked_evaluate)
     curriculum.maybe_advance(None, torch.device("cpu"), step=10)
@@ -416,7 +416,7 @@ def test_all_track_curriculum_has_separate_schedules_and_requires_each_track(mon
         dataset.last_eval_diagnostics = {
             "tracks": {track: {"accuracy": 90.0} for track in GENERATORS}
         }
-        return 0, 88.0, 70.0
+        return 90.0, 88.0, {}
 
     monkeypatch.setattr(dataset, "evaluate_id", all_ready)
     curriculum.maybe_advance(None, torch.device("cpu"), step=20)
@@ -482,6 +482,7 @@ def test_transactional_metadata_defers_swap_pair_and_marks_boundary():
     episode = TaskEpisode(
         "permutation",
         (
+            BOS,
             EV_INIT,
             ENTITY_BASE + 2,
             LOCATION_BASE + 1,
@@ -510,9 +511,9 @@ def test_transactional_metadata_defers_swap_pair_and_marks_boundary():
     )
     inputs, _, _ = dataset._collate([episode])
     metadata = dataset.workspace_entity_address_metadata(inputs, paired_swap_commits=True)
-    commit_positions = [12, 13]
+    commit_positions = [13, 14]
     assert not metadata["entity_write_mask"][0, commit_positions].any()
-    boundary = 14
+    boundary = 15
     assert metadata["pair_swap_mask"][0, boundary]
     assert metadata["pair_swap_entity_ids"][0, boundary].tolist() == [2, 5]
     assert metadata["pair_swap_steps"] == (boundary,)

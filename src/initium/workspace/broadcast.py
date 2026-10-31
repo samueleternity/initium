@@ -107,6 +107,7 @@ class WorkspaceBroadcast(nn.Module):
         nth_farthest_exact_readout: bool = False,
         retrieval_exact_readout: bool = False,
         key_match_threshold: float = 0.5,
+        diagnostics_enabled: bool = True,
     ):
         super().__init__()
         if d_model < 1 or num_experts < 1:
@@ -227,7 +228,7 @@ class WorkspaceBroadcast(nn.Module):
             if gate_variant == "bistable"
             else None
         )
-        self.diagnostics_enabled = True
+        self.diagnostics_enabled = bool(diagnostics_enabled)
         self._last_step_diag: dict[str, torch.Tensor] = {}
         self._last_diag: dict[str, torch.Tensor] = {}
         self._bistable_diagnostic_totals: dict[str, torch.Tensor] = {}

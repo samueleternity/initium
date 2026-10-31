@@ -470,7 +470,11 @@ class CausalKVMemory(SequenceMemory):
             allowed[..., n_old:] = False
         read = self._attention(q, keys, values, allowed)
         read = read.transpose(1, 2).reshape(h_t.shape[0], 1, -1).squeeze(1)
-        return self.output(read), KVState(keys, values)
+        output = self.output(read)
+        has_context = state.keys.shape[-2] > 0 or lag == 0
+        if not has_context:
+            output = torch.zeros_like(output)
+        return output, KVState(keys, values)
 
     def forward(self, h_seq: torch.Tensor, state=None, lag: int = 1):
         if h_seq.ndim != 3 or h_seq.shape[-1] != self.input_size:
@@ -495,4 +499,8 @@ class CausalKVMemory(SequenceMemory):
             self._record_head_usage("kv_value_rms", values.square().mean(dim=(-1, -2)).sqrt())
             self._record_head_usage("kv_read_rms", reads.square().mean(dim=(-1, -2)).sqrt())
         reads = reads.transpose(1, 2).reshape(b, t, -1)
-        return self.output(reads), KVState(keys, values), {}
+        output = self.output(reads)
+        if lag:
+            has_context = positions.gt(0).view(1, t, 1)
+            output = torch.where(has_context, output, torch.zeros_like(output))
+        return output, KVState(keys, values), {}

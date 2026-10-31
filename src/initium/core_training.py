@@ -287,7 +287,7 @@ def _attach_memory_usage_hooks(model):
     seen = set()
 
     def add_scalar(name, value):
-        value = value.detach().float().mean()
+        value = torch.as_tensor(value).detach().float().mean()
         total, count = stats["scalars"].get(name, (None, 0))
         stats["scalars"][name] = (value if total is None else total + value, count + 1)
 

@@ -500,10 +500,18 @@ def _print_ood_analysis(
         f"perfect {components['ood_perfect_frac']:.4f}]"
     )
     if beta > 0 and kl_diag:
-        raw_kl = float(kl_loss.detach())
+        raw_kl = (
+            float(kl_loss.detach())
+            if torch.is_tensor(kl_loss)
+            else float(kl_loss)
+            if kl_loss is not None
+            else None
+        )
+        kl_loss_text = "n/a" if raw_kl is None else f"{raw_kl:.6g}"
+        kl_contribution_text = "n/a" if raw_kl is None else f"{beta * raw_kl:.6g}"
         print(
             f"[{run_id}] Step {step} KL attribution: beta {beta:.6g} | "
-            f"L_KL {raw_kl:.6g} | beta*L_KL {beta * raw_kl:.6g} | "
+            f"L_KL {kl_loss_text} | beta*L_KL {kl_contribution_text} | "
             f"KL mean {kl_diag.get('kl_mean', float('nan')):.6g} | "
             f"clamp fraction {kl_diag.get('clamp_frac', float('nan')):.4f} | "
             f"prior snapshot {kl_diag.get('snapshot_step', 'n/a')}"
@@ -4004,6 +4012,7 @@ def run(
     # whatever LR was saved inside optimizer_state_dict at checkpoint time
     # (potentially still reflecting the old buggy drifted value).
     running_task_loss, running_kl_loss, running_div, running_grad_norm = 0.0, 0.0, 0, 0.0
+    avg_kl = 0.0
     running_sgr_prediction_loss: Any = 0.0
     running_workspace_state_loss: Any = 0.0
     running_workspace_state_correct: Any = 0.0
@@ -6048,7 +6057,7 @@ def run(
                 ood_ablated_acc,
                 ogs_weights,
                 beta_eff,
-                kl_loss,
+                avg_kl,
                 kl_diag,
             )
             dataset.write_field_log(
@@ -6690,7 +6699,7 @@ def run(
         final_ood_ablated_acc,
         ogs_weights,
         beta_eff,
-        kl_loss,
+        avg_kl,
         kl_diag,
     )
 

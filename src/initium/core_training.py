@@ -149,6 +149,10 @@ from initium.config.train_config import (
     USE_AMP,
     WARMUP_STEPS,
 )
+from initium.data.common.causal_prediction import (
+    CausalInputPredictionHead,
+    masked_input_prediction_loss,
+)
 from initium.data.dataset_registry import get_dataset
 from initium.data.graph_traversal.order_probe import (
     build_q99_probe_batch,
@@ -160,10 +164,6 @@ from initium.data.graph_traversal.relational_probe import (
     score_probe_cases,
 )
 from initium.data.prepared_dataset import load_prepared_dataset, save_prepared_dataset
-from initium.data.common.causal_prediction import (
-    CausalInputPredictionHead,
-    masked_input_prediction_loss,
-)
 from initium.data.surprise_recall.next_token_prediction import (
     SurprisePredictionHead,
     evaluate_prediction_signals,
@@ -311,9 +311,7 @@ def _attach_memory_usage_hooks(model):
                 add_scalar(f"memory_{index}_active_cell_fraction", (cell_norm > 1e-8).float())
             if torch.is_tensor(usage):
                 add_scalar(f"memory_{index}_usage_mean", usage)
-                add_scalar(
-                    f"memory_{index}_usage_active_fraction", (usage > 1e-6).float()
-                )
+                add_scalar(f"memory_{index}_usage_active_fraction", (usage > 1e-6).float())
             for key, weights, dims in (
                 ("cell_read", read_weights, (0, 1)),
                 ("cell_write", write_weights, (0, 1)),
@@ -1193,18 +1191,22 @@ def run(
     if memory_type not in {"none", "dnc", "kv", "delta"}:
         raise ValueError("memory_type must be none, dnc, kv, or delta")
     if workspace_token_id_input and dataset_type != "workspace-capability":
-        raise ValueError(
-            "workspace token-ID input requires --dataset-type workspace-capability"
-        )
+        raise ValueError("workspace token-ID input requires --dataset-type workspace-capability")
     if activation_offload_to_cpu and device.type != "cuda":
         raise ValueError("activation offload to CPU requires CUDA training")
     if activation_offload_cpu_budget_mb <= 0:
         raise ValueError("activation offload CPU budget must be positive")
     if not math.isfinite(workspace_state_loss_weight) or workspace_state_loss_weight < 0:
         raise ValueError("workspace_state_loss_weight must be finite and >= 0")
-    if not math.isfinite(workspace_nth_farthest_vector_loss_weight) or workspace_nth_farthest_vector_loss_weight < 0:
+    if (
+        not math.isfinite(workspace_nth_farthest_vector_loss_weight)
+        or workspace_nth_farthest_vector_loss_weight < 0
+    ):
         raise ValueError("workspace_nth_farthest_vector_loss_weight must be finite and >= 0")
-    if not math.isfinite(workspace_retrieval_value_loss_weight) or workspace_retrieval_value_loss_weight < 0:
+    if (
+        not math.isfinite(workspace_retrieval_value_loss_weight)
+        or workspace_retrieval_value_loss_weight < 0
+    ):
         raise ValueError("workspace_retrieval_value_loss_weight must be finite and >= 0")
     if memory_read_lag not in (0, 1):
         raise ValueError("memory_read_lag must be 0 or 1")
@@ -1236,9 +1238,7 @@ def run(
             "compiled workspace recurrence requires active slots, continuous gating, "
             "and routed writes; bistable gating and random writes are unsupported"
         )
-    inter_layer_memory_enabled = (
-        memory_inter_layer_read or memory_inter_layer_read_every_block
-    )
+    inter_layer_memory_enabled = memory_inter_layer_read or memory_inter_layer_read_every_block
     if inter_layer_memory_enabled and (
         memory_type not in {"kv", "delta"}
         or not split_graph_enabled
@@ -1274,7 +1274,11 @@ def run(
             raise ValueError("workspace-capability training requires split-graph Mamba-1")
         if memory_type not in {"none", "kv"}:
             raise ValueError("workspace-capability comparison supports memory_type='none' or 'kv'")
-        if dataset_link is not None or test_dataset_link is not None or prepared_dataset is not None:
+        if (
+            dataset_link is not None
+            or test_dataset_link is not None
+            or prepared_dataset is not None
+        ):
             raise ValueError(
                 "workspace-capability uses generated episodes and does not accept dataset links/prepared data"
             )
@@ -1293,15 +1297,16 @@ def run(
             if workspace_num_slots < 1:
                 raise ValueError("workspace state loss requires at least one workspace slot")
             if workspace_task_track not in {"all", "permutation"}:
-                raise ValueError(
-                    "workspace state loss is supervised only on the permutation track"
-                )
+                raise ValueError("workspace state loss is supervised only on the permutation track")
         if workspace_nth_farthest_exact_readout:
             if not workspace_enabled or not workspace_semantic_entity_addressing:
                 raise ValueError(
                     "Nth-farthest exact readout requires --workspace and semantic entity addressing"
                 )
-            if dataset_type != "workspace-capability" or workspace_task_track not in ("all", "nth_farthest"):
+            if dataset_type != "workspace-capability" or workspace_task_track not in (
+                "all",
+                "nth_farthest",
+            ):
                 raise ValueError(
                     "Nth-farthest exact readout requires workspace-capability track all or nth_farthest"
                 )
@@ -1392,7 +1397,9 @@ def run(
         if not split_graph_enabled:
             raise ValueError("next-input prediction loss requires --split-graph backbone features")
         if (moe_enabled or workspace_enabled) and not sgr_phase4_enabled:
-            raise ValueError("prediction-signal isolation requires MoE and workspace to be disabled")
+            raise ValueError(
+                "prediction-signal isolation requires MoE and workspace to be disabled"
+            )
         if getattr(dataset, "name", None) == "surprise-recall" and sgr_prediction_eval_episodes < 1:
             raise ValueError("sgr_prediction_eval_episodes must be positive")
     # Resolve the split-graph Mamba hyperparameters before model selection.
@@ -1475,7 +1482,9 @@ def run(
             )
     if sgr_phase4_enabled:
         if not split_graph_enabled or split_graph_variant != "mamba1" or split_graph_num_blocks < 2:
-            raise ValueError("prediction-error consumers require split-graph Mamba-1 with at least two blocks")
+            raise ValueError(
+                "prediction-error consumers require split-graph Mamba-1 with at least two blocks"
+            )
         if not sgr_prediction_enabled:
             raise ValueError("prediction-error consumers require --sgr-pred-loss-weight > 0")
         if sgr_dnc_write_salience and dnc_compile_memory:
@@ -1501,9 +1510,7 @@ def run(
             )
         if sgr_phase2_arm is not None:
             raise ValueError("Phase 2 backbone-only arms cannot be combined with Phase 4 consumers")
-    has_dnc = (
-        not split_graph_backbone_only and sgr_phase2_arm is None and memory_type == "dnc"
-    )
+    has_dnc = not split_graph_backbone_only and sgr_phase2_arm is None and memory_type == "dnc"
     has_memory = (
         not split_graph_backbone_only
         and sgr_phase2_arm is None
@@ -1877,23 +1884,28 @@ def run(
             with open(mem_check_path, newline="") as existing_file:
                 existing_header = next(csv.reader(existing_file), [])
             if existing_header != mem_check_header:
-                mem_check_path = os.path.join(
-                    LOG_DIR, f"run_{run_id}_memory_dependency_v2.csv"
-                )
+                mem_check_path = os.path.join(LOG_DIR, f"run_{run_id}_memory_dependency_v2.csv")
         mem_check_file = open(mem_check_path, "a" if resuming else "w", newline="")
         mem_check_writer = csv.writer(mem_check_file)
-        if not resuming or not os.path.exists(mem_check_path) or os.path.getsize(mem_check_path) == 0:
+        if (
+            not resuming
+            or not os.path.exists(mem_check_path)
+            or os.path.getsize(mem_check_path) == 0
+        ):
             mem_check_writer.writerow(mem_check_header)
 
     workspace_check_file: TextIO | None = None
     workspace_check_writer: Any | None = None
     if workspace_enabled and callable(getattr(dataset, "evaluate_workspace_ablated", None)):
-        workspace_check_path = os.path.join(
-            LOG_DIR, f"run_{run_id}_workspace_dependency.csv"
-        )
+        workspace_check_path = os.path.join(LOG_DIR, f"run_{run_id}_workspace_dependency.csv")
         workspace_check_header = [
-            "step", "lesson", "track", "condition", "answer_accuracy_pct",
-            "episode_exact_match_pct", "accuracy_drop_vs_full_pp",
+            "step",
+            "lesson",
+            "track",
+            "condition",
+            "answer_accuracy_pct",
+            "episode_exact_match_pct",
+            "accuracy_drop_vs_full_pp",
             "exact_match_drop_vs_full_pp",
         ]
         if resuming and os.path.exists(workspace_check_path):
@@ -1903,9 +1915,7 @@ def run(
                 workspace_check_path = os.path.join(
                     LOG_DIR, f"run_{run_id}_workspace_dependency_v2.csv"
                 )
-        workspace_check_file = open(
-            workspace_check_path, "a" if resuming else "w", newline=""
-        )
+        workspace_check_file = open(workspace_check_path, "a" if resuming else "w", newline="")
         workspace_check_writer = csv.writer(workspace_check_file)
         if not resuming or os.path.getsize(workspace_check_path) == 0:
             workspace_check_writer.writerow(workspace_check_header)
@@ -1913,20 +1923,27 @@ def run(
     workspace_task_file: TextIO | None = None
     workspace_task_writer: Any | None = None
     if getattr(dataset, "name", None) == "workspace-capability":
-        workspace_task_path = os.path.join(
-            LOG_DIR, f"run_{run_id}_workspace_task_metrics.csv"
-        )
-        workspace_task_file = open(
-            workspace_task_path, "a" if resuming else "w", newline=""
-        )
+        workspace_task_path = os.path.join(LOG_DIR, f"run_{run_id}_workspace_task_metrics.csv")
+        workspace_task_file = open(workspace_task_path, "a" if resuming else "w", newline="")
         workspace_task_writer = csv.writer(workspace_task_file)
         if not resuming or os.path.getsize(workspace_task_path) == 0:
             workspace_task_writer.writerow(
                 [
-                    "step", "lesson", "eval_type", "track", "answer_accuracy_pct",
-                    "episode_exact_match_pct", "episodes", "answers", "mean_context_tokens",
-                    "mean_relevant_updates", "mean_distractors", "correction_episode_fraction",
-                    "novelty_episode_fraction", "mean_sources", "candidate_baseline_pct",
+                    "step",
+                    "lesson",
+                    "eval_type",
+                    "track",
+                    "answer_accuracy_pct",
+                    "episode_exact_match_pct",
+                    "episodes",
+                    "answers",
+                    "mean_context_tokens",
+                    "mean_relevant_updates",
+                    "mean_distractors",
+                    "correction_episode_fraction",
+                    "novelty_episode_fraction",
+                    "mean_sources",
+                    "candidate_baseline_pct",
                     "priority_tie_episode_fraction",
                 ]
             )
@@ -1990,9 +2007,7 @@ def run(
         if workspace_task_writer is None or workspace_task_file is None or not diagnostics:
             return
         overall_track = (
-            "permutation/all_conditions"
-            if diagnostics.get("permutation_generalization")
-            else "all"
+            "permutation/all_conditions" if diagnostics.get("permutation_generalization") else "all"
         )
         workspace_task_writer.writerow(
             [
@@ -2040,11 +2055,14 @@ def run(
         ):
             workspace_task_writer.writerow(
                 [
-                    step_value, lesson_value, eval_type,
+                    step_value,
+                    lesson_value,
+                    eval_type,
                     f"permutation_query/{query_type}",
                     100.0 * values.get("exact_accuracy", 0.0),
                     100.0 * values.get("exact_accuracy", 0.0),
-                    values.get("episodes", 0), values.get("episodes", 0),
+                    values.get("episodes", 0),
+                    values.get("episodes", 0),
                     *([None] * 8),
                 ]
             )
@@ -2054,10 +2072,15 @@ def run(
         ):
             workspace_task_writer.writerow(
                 [
-                    step_value, lesson_value, eval_type,
+                    step_value,
+                    lesson_value,
+                    eval_type,
                     f"permutation_state/swap_depth_{depth}",
-                    100.0 * values.get("accuracy", 0.0), None,
-                    None, values.get("entities", 0), *([None] * 8),
+                    100.0 * values.get("accuracy", 0.0),
+                    None,
+                    None,
+                    values.get("entities", 0),
+                    *([None] * 8),
                 ]
             )
         if "permutation_pair_commit_attempts" in diagnostics:
@@ -2065,10 +2088,15 @@ def run(
             successes = int(diagnostics.get("permutation_pair_commit_successes", 0))
             workspace_task_writer.writerow(
                 [
-                    step_value, lesson_value, eval_type,
+                    step_value,
+                    lesson_value,
+                    eval_type,
                     "permutation_pair_commit",
                     100.0 * diagnostics.get("permutation_pair_commit_success_rate", 0.0),
-                    None, attempts, successes, *([None] * 8),
+                    None,
+                    attempts,
+                    successes,
+                    *([None] * 8),
                 ]
             )
         for split, values in sorted(diagnostics.get("permutation_generalization", {}).items()):
@@ -2121,7 +2149,11 @@ def run(
                     )
         nth_metrics = diagnostics.get("nth_farthest_workspace", {})
         for metric_name, accuracy_key, total_key in (
-            ("vector_coordinate_accuracy", "vector_coordinate_accuracy", "vector_coordinates_total"),
+            (
+                "vector_coordinate_accuracy",
+                "vector_coordinate_accuracy",
+                "vector_coordinates_total",
+            ),
             ("candidate_vector_exact_accuracy", "vector_exact_accuracy", "vectors_total"),
             ("direct_exact_readout_accuracy", "exact_readout_accuracy", "readouts_total"),
         ):
@@ -2130,29 +2162,43 @@ def run(
             if accuracy_key in nth_metrics:
                 workspace_task_writer.writerow(
                     [
-                        step_value, lesson_value, eval_type,
+                        step_value,
+                        lesson_value,
+                        eval_type,
                         f"nth_farthest_workspace/{metric_name}",
-                        nth_metrics.get(accuracy_key), nth_metrics.get(accuracy_key),
-                        nth_metrics.get(total_key), nth_metrics.get(total_key),
+                        nth_metrics.get(accuracy_key),
+                        nth_metrics.get(accuracy_key),
+                        nth_metrics.get(total_key),
+                        nth_metrics.get(total_key),
                         *([None] * 8),
                     ]
                 )
         for stratum, values in sorted(nth_metrics.get("readout_by_query_stratum", {}).items()):
             workspace_task_writer.writerow(
                 [
-                    step_value, lesson_value, eval_type,
+                    step_value,
+                    lesson_value,
+                    eval_type,
                     f"nth_farthest_readout/{stratum}",
-                    values.get("accuracy"), values.get("accuracy"),
-                    values.get("episodes"), values.get("episodes"), *([None] * 8),
+                    values.get("accuracy"),
+                    values.get("accuracy"),
+                    values.get("episodes"),
+                    values.get("episodes"),
+                    *([None] * 8),
                 ]
             )
         if nth_metrics:
             workspace_task_writer.writerow(
                 [
-                    step_value, lesson_value, eval_type,
+                    step_value,
+                    lesson_value,
+                    eval_type,
                     "nth_farthest_workspace/invalid_readout_count",
-                    None, None, nth_metrics.get("readouts_total"),
-                    nth_metrics.get("invalid_readouts"), *([None] * 8),
+                    None,
+                    None,
+                    nth_metrics.get("readouts_total"),
+                    nth_metrics.get("invalid_readouts"),
+                    *([None] * 8),
                 ]
             )
         retrieval_metrics = diagnostics.get("retrieval_workspace", {})
@@ -2161,8 +2207,16 @@ def run(
             ("initial_value_count", "initial_write_value_accuracy", "initial_write_value_accuracy"),
             ("update_value_count", "update_write_value_accuracy", "update_write_value_accuracy"),
             ("query_values_count", "queried_value_accuracy", "queried_value_accuracy"),
-            ("updated_query_values_count", "updated_query_value_accuracy", "updated_query_value_accuracy"),
-            ("untouched_query_values_count", "untouched_query_value_accuracy", "untouched_query_value_accuracy"),
+            (
+                "updated_query_values_count",
+                "updated_query_value_accuracy",
+                "updated_query_value_accuracy",
+            ),
+            (
+                "untouched_query_values_count",
+                "untouched_query_value_accuracy",
+                "untouched_query_value_accuracy",
+            ),
             ("query_slots_total", "query_slot_lookup_rate", "query_slot_lookup_rate"),
             ("readout_count", "exact_readout_accuracy", "exact_readout_accuracy"),
         ):
@@ -2244,9 +2298,24 @@ def run(
             for track in sorted(set(base_tracks) & set(ablated_tracks) & set(shuffled_tracks)):
                 rows.extend(
                     [
-                        (track, "full", base_tracks[track]["accuracy"], base_tracks[track]["exact_match"]),
-                        (track, "readback_bypassed", ablated_tracks[track]["accuracy"], ablated_tracks[track]["exact_match"]),
-                        (track, "readback_shuffled", shuffled_tracks[track]["accuracy"], shuffled_tracks[track]["exact_match"]),
+                        (
+                            track,
+                            "full",
+                            base_tracks[track]["accuracy"],
+                            base_tracks[track]["exact_match"],
+                        ),
+                        (
+                            track,
+                            "readback_bypassed",
+                            ablated_tracks[track]["accuracy"],
+                            ablated_tracks[track]["exact_match"],
+                        ),
+                        (
+                            track,
+                            "readback_shuffled",
+                            shuffled_tracks[track]["accuracy"],
+                            shuffled_tracks[track]["exact_match"],
+                        ),
                     ]
                 )
             for track, condition, accuracy, exact in rows:
@@ -2277,10 +2346,7 @@ def run(
         if memory_path_writer is None or memory_path_file is None:
             return
         diagnostic_seed = (int(seed) * 1_000_003 + int(step_value)) % (2**32)
-        include_inter_layer = (
-            split_graph_variant == "mamba1"
-            and split_graph_num_blocks >= 2
-        )
+        include_inter_layer = split_graph_variant == "mamba1" and split_graph_num_blocks >= 2
         path_results = dataset.evaluate_memory_path_conditions(
             rnn,
             device,
@@ -2337,8 +2403,8 @@ def run(
                 "lesson",
                 "stage_index",
                 "stage_kind",
-            "triple_acc",
-            "perfect_frac",
+                "triple_acc",
+                "perfect_frac",
                 "ablated_triple_acc",
                 "ablated_perfect_frac",
                 "stage_dependency_triple",
@@ -2974,10 +3040,7 @@ def run(
             )
         )
         if paired_graph_memory_diagnostics:
-            inter_layer_probe = (
-                split_graph_variant == "mamba1"
-                and split_graph_num_blocks >= 2
-            )
+            inter_layer_probe = split_graph_variant == "mamba1" and split_graph_num_blocks >= 2
             print(
                 f"[{run_id}] paired graph memory-path probes every "
                 f"{max(EVAL_EVERY * 10, 1)} steps: shuffle + read-lag 0/1; "
@@ -4011,9 +4074,7 @@ def run(
     t_run_start = time.time()
 
     while step < total_steps and not eval_only:
-        moe_diagnostics_due = bool(
-            moe_diagnostics_enabled and running_log_steps + 1 >= log_every
-        )
+        moe_diagnostics_due = bool(moe_diagnostics_enabled and running_log_steps + 1 >= log_every)
         for module in moe_diagnostic_modules:
             if module.diagnostics_enabled != moe_diagnostics_due:
                 module.set_diagnostics_enabled(moe_diagnostics_due)
@@ -4051,9 +4112,7 @@ def run(
             or running_log_steps + 1 >= log_every
         )
         segment_diagnostics.set_channel(
-            "train"
-            if segment_diagnostics_enabled and segment_sample_due
-            else None
+            "train" if segment_diagnostics_enabled and segment_sample_due else None
         )
         segment_diagnostics.set_step(step)
         if isinstance(rnn, SplitGraphDNC):
@@ -4099,7 +4158,8 @@ def run(
                     {
                         key: value
                         for key, value in retrieval_metadata.items()
-                        if key not in (
+                        if key
+                        not in (
                             "retrieval_value_targets",
                             "retrieval_query_targets",
                             "retrieval_value_is_update",
@@ -4108,9 +4168,7 @@ def run(
                     }
                 )
             if workspace_permutation_transactional:
-                workspace_metadata.update(
-                    dataset.workspace_permutation_query_metadata(input_seq)
-                )
+                workspace_metadata.update(dataset.workspace_permutation_query_metadata(input_seq))
             workspace_forward_kwargs = {
                 key: value.to(device, non_blocking=True)
                 if isinstance(value, torch.Tensor)
@@ -4144,9 +4202,7 @@ def run(
             nth_vector_targets = nth_metadata["nth_farthest_vector_targets"].to(
                 device, non_blocking=True
             )
-            nth_vector_mask = nth_metadata["nth_farthest_vector_mask"].to(
-                device, non_blocking=True
-            )
+            nth_vector_mask = nth_metadata["nth_farthest_vector_mask"].to(device, non_blocking=True)
         retrieval_value_targets = None
         retrieval_value_mask = None
         retrieval_query_targets = None
@@ -4171,9 +4227,7 @@ def run(
         # are never part of its target. Nonzero input rows are the generic
         # padding contract, independent of dataset-specific answer masks.
         prediction_valid_mask = (
-            input_seq.ne(0)
-            if input_seq.ndim == 2
-            else input_seq.ne(0).any(dim=-1)
+            input_seq.ne(0) if input_seq.ndim == 2 else input_seq.ne(0).any(dim=-1)
         )
         dataset_stream_lengths = getattr(dataset, "last_stream_lengths", None)
         if dataset_stream_lengths is not None:
@@ -4208,8 +4262,9 @@ def run(
             if activation_offload_to_cpu and torch.is_grad_enabled()
             else nullcontext(None)
         )
-        with saved_tensor_context as activation_offload_stats, torch.amp.autocast(
-            "cuda", enabled=amp_enabled
+        with (
+            saved_tensor_context as activation_offload_stats,
+            torch.amp.autocast("cuda", enabled=amp_enabled),
         ):
             if isinstance(rnn, SurpriseRecallBackboneOnly):
                 oracle_flags = None
@@ -4370,9 +4425,7 @@ def run(
                     position_logits = torch.stack(
                         [logits for _, logits in event_predictions], dim=1
                     ).float()
-                    position_targets = state_supervision_positions.index_select(
-                        1, event_steps
-                    )
+                    position_targets = state_supervision_positions.index_select(1, event_steps)
                     valid_states = state_supervision_mask.index_select(1, event_steps)
                     masked_targets = position_targets.masked_fill(~valid_states, -100)
                     num_positions = position_logits.shape[-1]
@@ -4401,27 +4454,46 @@ def run(
             nth_vector_loss = None
             if workspace_nth_farthest_exact_readout:
                 workspace_module = getattr(rnn, "workspace", None)
-                if workspace_module is None or nth_vector_targets is None or nth_vector_mask is None:
-                    raise RuntimeError("Nth-farthest vector supervision is missing workspace metadata")
+                if (
+                    workspace_module is None
+                    or nth_vector_targets is None
+                    or nth_vector_mask is None
+                ):
+                    raise RuntimeError(
+                        "Nth-farthest vector supervision is missing workspace metadata"
+                    )
                 vector_predictions = workspace_module.pop_nth_farthest_vector_predictions()
                 if vector_predictions:
                     vector_steps = torch.tensor(
                         [event_step for event_step, _ in vector_predictions],
-                        device=device, dtype=torch.long,
+                        device=device,
+                        dtype=torch.long,
                     )
-                    vector_logits = torch.stack([value for _, value in vector_predictions], dim=1).float()
+                    vector_logits = torch.stack(
+                        [value for _, value in vector_predictions], dim=1
+                    ).float()
                     vector_targets = nth_vector_targets.index_select(1, vector_steps)
                     vector_valid = nth_vector_mask.index_select(1, vector_steps).unsqueeze(-1)
                     vector_valid = vector_valid.expand_as(vector_targets) & vector_targets.ne(-100)
                     per_coordinate_loss = nn.functional.cross_entropy(
-                        vector_logits.reshape(-1, 16), vector_targets.reshape(-1),
-                        reduction="none", ignore_index=-100,
+                        vector_logits.reshape(-1, 16),
+                        vector_targets.reshape(-1),
+                        reduction="none",
+                        ignore_index=-100,
                     ).reshape_as(vector_targets)
                     per_event_counts = vector_valid.sum(dim=(0, 2, 3)).to(per_coordinate_loss.dtype)
                     active_events = per_event_counts.gt(0).to(per_coordinate_loss.dtype)
-                    per_event_loss = per_coordinate_loss.sum(dim=(0, 2, 3)) / per_event_counts.clamp_min(1.0)
-                    nth_vector_loss = (per_event_loss * active_events).sum() / active_events.sum().clamp_min(1.0)
-                    nth_vector_correct = (vector_logits.argmax(dim=-1).eq(vector_targets) & vector_valid).sum().to(task_loss.dtype)
+                    per_event_loss = per_coordinate_loss.sum(
+                        dim=(0, 2, 3)
+                    ) / per_event_counts.clamp_min(1.0)
+                    nth_vector_loss = (
+                        per_event_loss * active_events
+                    ).sum() / active_events.sum().clamp_min(1.0)
+                    nth_vector_correct = (
+                        (vector_logits.argmax(dim=-1).eq(vector_targets) & vector_valid)
+                        .sum()
+                        .to(task_loss.dtype)
+                    )
                     nth_vector_count = vector_valid.sum().to(task_loss.dtype)
                 else:
                     nth_vector_loss = task_loss.new_zeros(())
@@ -4483,18 +4555,23 @@ def run(
                 else:
                     retrieval_value_loss = task_loss.new_zeros(())
                 if query_predictions:
-                    for query_step, query_logits, query_found_mask, active_mask in query_predictions:
+                    for (
+                        query_step,
+                        query_logits,
+                        query_found_mask,
+                        active_mask,
+                    ) in query_predictions:
                         active = active_mask.bool()
                         targets = retrieval_query_targets[:, query_step]
                         predicted_values = query_logits.argmax(dim=-1)
                         valid_targets = active & targets.ge(0)
                         retrieval_query_correct += (
-                            predicted_values.eq(targets) & valid_targets
-                        ).sum().to(task_loss.dtype)
+                            (predicted_values.eq(targets) & valid_targets).sum().to(task_loss.dtype)
+                        )
                         retrieval_query_count += valid_targets.sum().to(task_loss.dtype)
                         retrieval_query_found += (
-                            query_found_mask.bool() & active
-                        ).sum().to(task_loss.dtype)
+                            (query_found_mask.bool() & active).sum().to(task_loss.dtype)
+                        )
                         retrieval_query_slots += active.sum().to(task_loss.dtype)
             if split_graph_forward_trace is not None and split_graph_forward_trace.active:
                 split_graph_forward_trace.observe("task_output.loss", task_loss)
@@ -5018,34 +5095,84 @@ def run(
                 else None
             )
             avg_nth_vector_loss = (
-                (running_nth_vector_loss.item() if torch.is_tensor(running_nth_vector_loss) else running_nth_vector_loss)
+                (
+                    running_nth_vector_loss.item()
+                    if torch.is_tensor(running_nth_vector_loss)
+                    else running_nth_vector_loss
+                )
                 / window_steps
-                if workspace_nth_farthest_exact_readout else None
+                if workspace_nth_farthest_exact_readout
+                else None
             )
             avg_nth_vector_accuracy = (
-                (running_nth_vector_correct.item() if torch.is_tensor(running_nth_vector_correct) else running_nth_vector_correct)
-                / max(running_nth_vector_count.item() if torch.is_tensor(running_nth_vector_count) else running_nth_vector_count, 1)
-                if workspace_nth_farthest_exact_readout else None
+                (
+                    running_nth_vector_correct.item()
+                    if torch.is_tensor(running_nth_vector_correct)
+                    else running_nth_vector_correct
+                )
+                / max(
+                    running_nth_vector_count.item()
+                    if torch.is_tensor(running_nth_vector_count)
+                    else running_nth_vector_count,
+                    1,
+                )
+                if workspace_nth_farthest_exact_readout
+                else None
             )
             avg_retrieval_value_loss = (
-                (running_retrieval_value_loss.item() if torch.is_tensor(running_retrieval_value_loss) else running_retrieval_value_loss)
+                (
+                    running_retrieval_value_loss.item()
+                    if torch.is_tensor(running_retrieval_value_loss)
+                    else running_retrieval_value_loss
+                )
                 / window_steps
-                if workspace_retrieval_exact_readout else None
+                if workspace_retrieval_exact_readout
+                else None
             )
             avg_retrieval_value_accuracy = (
-                (running_retrieval_value_correct.item() if torch.is_tensor(running_retrieval_value_correct) else running_retrieval_value_correct)
-                / max(running_retrieval_value_count.item() if torch.is_tensor(running_retrieval_value_count) else running_retrieval_value_count, 1)
-                if workspace_retrieval_exact_readout else None
+                (
+                    running_retrieval_value_correct.item()
+                    if torch.is_tensor(running_retrieval_value_correct)
+                    else running_retrieval_value_correct
+                )
+                / max(
+                    running_retrieval_value_count.item()
+                    if torch.is_tensor(running_retrieval_value_count)
+                    else running_retrieval_value_count,
+                    1,
+                )
+                if workspace_retrieval_exact_readout
+                else None
             )
             avg_retrieval_query_accuracy = (
-                (running_retrieval_query_correct.item() if torch.is_tensor(running_retrieval_query_correct) else running_retrieval_query_correct)
-                / max(running_retrieval_query_count.item() if torch.is_tensor(running_retrieval_query_count) else running_retrieval_query_count, 1)
-                if workspace_retrieval_exact_readout else None
+                (
+                    running_retrieval_query_correct.item()
+                    if torch.is_tensor(running_retrieval_query_correct)
+                    else running_retrieval_query_correct
+                )
+                / max(
+                    running_retrieval_query_count.item()
+                    if torch.is_tensor(running_retrieval_query_count)
+                    else running_retrieval_query_count,
+                    1,
+                )
+                if workspace_retrieval_exact_readout
+                else None
             )
             avg_retrieval_lookup_rate = (
-                (running_retrieval_query_found.item() if torch.is_tensor(running_retrieval_query_found) else running_retrieval_query_found)
-                / max(running_retrieval_query_slots.item() if torch.is_tensor(running_retrieval_query_slots) else running_retrieval_query_slots, 1)
-                if workspace_retrieval_exact_readout else None
+                (
+                    running_retrieval_query_found.item()
+                    if torch.is_tensor(running_retrieval_query_found)
+                    else running_retrieval_query_found
+                )
+                / max(
+                    running_retrieval_query_slots.item()
+                    if torch.is_tensor(running_retrieval_query_slots)
+                    else running_retrieval_query_slots,
+                    1,
+                )
+                if workspace_retrieval_exact_readout
+                else None
             )
             avg_sgr_prediction_loss = (
                 (
@@ -5598,9 +5725,7 @@ def run(
                 rnn, device, step=step, optimizer=optimizer
             )
             id_task_diagnostics = getattr(dataset, "last_eval_diagnostics", None)
-            write_workspace_task_metrics(
-                step, pre_advance_lesson + 1, "id", id_task_diagnostics
-            )
+            write_workspace_task_metrics(step, pre_advance_lesson + 1, "id", id_task_diagnostics)
             if surprise_recall_logger is not None:
                 surprise_recall_logger.write_evaluation(
                     step, pre_advance_lesson + 1, "id", dataset.last_eval_diagnostics
@@ -5624,7 +5749,9 @@ def run(
                 if hasattr(id_stage_memory, "finish_stage_diagnostics")
                 else {}
             )
-            id_stage_diagnostics.update(_finish_memory_usage_hooks(id_usage_handles, id_usage_capture))
+            id_stage_diagnostics.update(
+                _finish_memory_usage_hooks(id_usage_handles, id_usage_capture)
+            )
             write_memory_usage(step, pre_advance_lesson + 1, "id", id_stage_diagnostics)
             if (
                 has_dnc
@@ -5745,10 +5872,9 @@ def run(
                     )
                 segment_diagnostics.emit("eval-ood-memory-off")
 
-            if (
-                callable(getattr(dataset, "evaluate_permutation_generalization", None))
-                and getattr(dataset, "task_track", None) in {"all", "permutation"}
-            ):
+            if callable(getattr(dataset, "evaluate_permutation_generalization", None)) and getattr(
+                dataset, "task_track", None
+            ) in {"all", "permutation"}:
                 permutation_eval_seed = int(seed) * 1_000_003 + int(step) + 0x5045524D
                 permutation_episodes_per_split = max(8, periodic_ood_episodes // 4)
                 permutation_torch_rng = _capture_torch_rng()
@@ -5786,9 +5912,7 @@ def run(
                         "permutation-generalization-memory-off",
                         dataset.last_eval_diagnostics,
                     )
-                    segment_diagnostics.emit(
-                        "eval-permutation-generalization-memory-off"
-                    )
+                    segment_diagnostics.emit("eval-permutation-generalization-memory-off")
 
             ood_log_writer.writerow(
                 [
@@ -6067,9 +6191,7 @@ def run(
                 )
 
             if workspace_semantic_state_diagnostics:
-                state_rng = random.Random(
-                    int(seed) * 1_000_003 + int(step) + 0x53544154
-                )
+                state_rng = random.Random(int(seed) * 1_000_003 + int(step) + 0x53544154)
                 state_torch_rng = _capture_torch_rng()
                 segment_diagnostics.set_channel("eval-permutation-state-diagnostics")
                 with _replay_torch_rng(state_torch_rng):
@@ -6213,9 +6335,7 @@ def run(
         rnn, device, step=step, optimizer=optimizer, allow_advance=not eval_only
     )
     final_id_task_diagnostics = getattr(dataset, "last_eval_diagnostics", None)
-    write_workspace_task_metrics(
-        step, final_eval_lesson + 1, "final-id", final_id_task_diagnostics
-    )
+    write_workspace_task_metrics(step, final_eval_lesson + 1, "final-id", final_id_task_diagnostics)
     if surprise_recall_logger is not None:
         surprise_recall_logger.write_evaluation(
             step, curriculum.lesson + 1, "final-id", dataset.last_eval_diagnostics
@@ -6435,10 +6555,9 @@ def run(
             )
         segment_diagnostics.emit("eval-final-ood-memory-off")
 
-    if (
-        callable(getattr(dataset, "evaluate_permutation_generalization", None))
-        and getattr(dataset, "task_track", None) in {"all", "permutation"}
-    ):
+    if callable(getattr(dataset, "evaluate_permutation_generalization", None)) and getattr(
+        dataset, "task_track", None
+    ) in {"all", "permutation"}:
         permutation_eval_seed = int(seed) * 1_000_003 + int(step) + 0x5045524D
         permutation_episodes_per_split = max(8, final_ood_episodes // 4)
         permutation_torch_rng = _capture_torch_rng()
@@ -6459,9 +6578,7 @@ def run(
         )
         segment_diagnostics.emit("eval-final-permutation-generalization")
         if has_memory:
-            segment_diagnostics.set_channel(
-                "eval-final-permutation-generalization-memory-off"
-            )
+            segment_diagnostics.set_channel("eval-final-permutation-generalization-memory-off")
             with _replay_torch_rng(permutation_torch_rng):
                 dataset.evaluate_permutation_generalization(
                     rnn,
@@ -6477,14 +6594,10 @@ def run(
                 "final-permutation-generalization-memory-off",
                 dataset.last_eval_diagnostics,
             )
-            segment_diagnostics.emit(
-                "eval-final-permutation-generalization-memory-off"
-            )
+            segment_diagnostics.emit("eval-final-permutation-generalization-memory-off")
 
     if workspace_semantic_state_diagnostics:
-        state_rng = random.Random(
-            int(seed) * 1_000_003 + int(step) + 0x53544154
-        )
+        state_rng = random.Random(int(seed) * 1_000_003 + int(step) + 0x53544154)
         state_torch_rng = _capture_torch_rng()
         segment_diagnostics.set_channel("eval-final-permutation-state-diagnostics")
         with _replay_torch_rng(state_torch_rng):
@@ -6978,8 +7091,9 @@ if __name__ == "__main__":
         action="store_true",
         help=(
             "Use fixed one-hot entity-token addresses and causal event-only workspace "
-            "writes for workspace-capability episodes. On the all track, all five task "
-            "grammars provide entity-keyed event writes and require at least 64 slots. "
+            "writes for workspace-capability episodes. Each of the five task tracks "
+            "provides entity-keyed event writes; retrieval_aggregation and all require "
+            "at least 64 slots. "
             "Requires --workspace-entity-keyed-writes; payloads remain learned."
         ),
     )
@@ -7383,9 +7497,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--memory-topk", type=int, default=None)
     parser.add_argument("--memory-position", choices=("none", "rope"), default="none")
-    parser.add_argument(
-        "--delta-gate", action=argparse.BooleanOptionalAction, default=True
-    )
+    parser.add_argument("--delta-gate", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--delta-chunk", type=int, default=64)
     parser.add_argument("--delta-use-fla", action="store_true")
     parser.add_argument(
@@ -7651,18 +7763,26 @@ if __name__ == "__main__":
         parser.error("--prepare-only cannot be combined with --load-prepared")
     if args.dataset_type == "workspace-capability":
         if not args.split_graph or args.split_graph_variant != "mamba1":
-            parser.error(
-                "workspace-capability requires --split-graph --split-graph-variant mamba1"
-            )
+            parser.error("workspace-capability requires --split-graph --split-graph-variant mamba1")
         if args.memory_type not in {"none", "kv"}:
             parser.error(
                 "workspace-capability primary comparisons support --memory-type none or kv"
             )
-        if any(
-            value is not None
-            for value in (args.dataset_link, args.test_dataset_link, args.load_prepared, args.save)
-        ) or args.prepare_only:
-            parser.error("workspace-capability is generated on demand; dataset links/prepared data are unsupported")
+        if (
+            any(
+                value is not None
+                for value in (
+                    args.dataset_link,
+                    args.test_dataset_link,
+                    args.load_prepared,
+                    args.save,
+                )
+            )
+            or args.prepare_only
+        ):
+            parser.error(
+                "workspace-capability is generated on demand; dataset links/prepared data are unsupported"
+            )
     elif args.workspace_task_track != "all":
         parser.error("--workspace-task-track requires --dataset-type workspace-capability")
     if args.workspace_token_id_input and args.dataset_type != "workspace-capability":
@@ -7684,10 +7804,12 @@ if __name__ == "__main__":
         parser.error("non-DNC memory types require --split-graph")
     if args.memory_inter_layer_read and args.memory_inter_layer_read_every_block:
         parser.error(
-            "choose either --memory-inter-layer-read or "
-            "--memory-inter-layer-read-every-block"
+            "choose either --memory-inter-layer-read or --memory-inter-layer-read-every-block"
         )
-    if not math.isfinite(args.memory_inter_layer_read_scale) or args.memory_inter_layer_read_scale < 0:
+    if (
+        not math.isfinite(args.memory_inter_layer_read_scale)
+        or args.memory_inter_layer_read_scale < 0
+    ):
         parser.error("--memory-inter-layer-read-scale must be finite and >= 0")
     if (args.memory_inter_layer_read or args.memory_inter_layer_read_every_block) and (
         args.memory_type not in {"kv", "delta"}
@@ -7715,9 +7837,7 @@ if __name__ == "__main__":
     if args.memory_type != "dnc" and (
         args.dnc_compile_memory or args.dnc_backward_trace or args.dnc_implementation != "base"
     ):
-        parser.error(
-            "DNC compilation, tracing, and implementation flags require --memory-type dnc"
-        )
+        parser.error("DNC compilation, tracing, and implementation flags require --memory-type dnc")
     if args.memory_type != "dnc" and (
         args.link_matrix_mode != "dense"
         or args.isolate_link_ablation
@@ -7975,12 +8095,8 @@ if __name__ == "__main__":
         parser.error("--workspace requires backbone MoE; use --moe-placement backbone or all")
     if args.workspace_num_slots < 0:
         parser.error("--workspace-num-slots must be >= 0")
-    if args.workspace_entity_keyed_writes and (
-        not args.workspace or args.workspace_num_slots < 1
-    ):
-        parser.error(
-            "--workspace-entity-keyed-writes requires --workspace and at least one slot"
-        )
+    if args.workspace_entity_keyed_writes and (not args.workspace or args.workspace_num_slots < 1):
+        parser.error("--workspace-entity-keyed-writes requires --workspace and at least one slot")
     if args.workspace_semantic_entity_addressing and not args.workspace_entity_keyed_writes:
         parser.error(
             "--workspace-semantic-entity-addressing requires --workspace-entity-keyed-writes"
@@ -7994,7 +8110,9 @@ if __name__ == "__main__":
                 "--workspace-semantic-entity-addressing"
             )
         if args.workspace_num_slots < 16:
-            parser.error("--workspace-permutation-transactional requires --workspace-num-slots >= 16")
+            parser.error(
+                "--workspace-permutation-transactional requires --workspace-num-slots >= 16"
+            )
         if args.dataset_type != "workspace-capability" or args.workspace_task_track not in (
             "permutation",
             "all",
@@ -8003,16 +8121,10 @@ if __name__ == "__main__":
                 "--workspace-permutation-transactional requires workspace-capability "
                 "permutation episodes"
             )
-    if args.workspace_semantic_entity_addressing and (
-        args.dataset_type != "workspace-capability"
-        or args.workspace_task_track not in (
-            "permutation", "nth_farthest", "retrieval_aggregation", "all"
-        )
-    ):
+    if args.workspace_semantic_entity_addressing and args.dataset_type != "workspace-capability":
         parser.error(
-            "--workspace-semantic-entity-addressing requires "
-            "--dataset-type workspace-capability and "
-            "--workspace-task-track permutation, nth_farthest, retrieval_aggregation, or all"
+            "--workspace-semantic-entity-addressing currently requires "
+            "--dataset-type workspace-capability, whose tracks provide semantic entity IDs"
         )
     if (
         args.workspace_semantic_entity_addressing
@@ -8025,8 +8137,7 @@ if __name__ == "__main__":
         )
     if args.workspace_semantic_state_diagnostics and not args.workspace_semantic_entity_addressing:
         parser.error(
-            "--workspace-semantic-state-diagnostics requires "
-            "--workspace-semantic-entity-addressing"
+            "--workspace-semantic-state-diagnostics requires --workspace-semantic-entity-addressing"
         )
     if args.workspace_state_diagnostic_max_events < 0:
         parser.error("--workspace-state-diagnostic-max-events must be >= 0")
@@ -8055,14 +8166,17 @@ if __name__ == "__main__":
                 "--workspace-semantic-entity-addressing"
             )
         if args.dataset_type != "workspace-capability" or args.workspace_task_track not in (
-            "nth_farthest", "all"
+            "nth_farthest",
+            "all",
         ):
             parser.error(
                 "--workspace-nth-farthest-exact-readout requires workspace-capability "
                 "track nth_farthest or all"
             )
         if args.workspace_num_slots < 16:
-            parser.error("--workspace-nth-farthest-exact-readout requires --workspace-num-slots >= 16")
+            parser.error(
+                "--workspace-nth-farthest-exact-readout requires --workspace-num-slots >= 16"
+            )
         if args.workspace_nth_farthest_vector_loss_weight <= 0:
             parser.error(
                 "--workspace-nth-farthest-exact-readout requires a positive "
@@ -8080,16 +8194,15 @@ if __name__ == "__main__":
                 "--workspace-semantic-entity-addressing"
             )
         if args.dataset_type != "workspace-capability" or args.workspace_task_track not in (
-            "retrieval_aggregation", "all"
+            "retrieval_aggregation",
+            "all",
         ):
             parser.error(
                 "--workspace-retrieval-exact-readout requires workspace-capability "
                 "track retrieval_aggregation or all"
             )
         if args.workspace_num_slots < 64:
-            parser.error(
-                "--workspace-retrieval-exact-readout requires --workspace-num-slots >= 64"
-            )
+            parser.error("--workspace-retrieval-exact-readout requires --workspace-num-slots >= 64")
         if args.workspace_retrieval_value_loss_weight <= 0:
             parser.error(
                 "--workspace-retrieval-exact-readout requires a positive "
@@ -8266,10 +8379,14 @@ if __name__ == "__main__":
             if args.workspace_permutation_transactional:
                 run_id += "_pairtransaction"
             if args.workspace_nth_farthest_exact_readout:
-                vector_loss_tag = f"{args.workspace_nth_farthest_vector_loss_weight:g}".replace(".", "p")
+                vector_loss_tag = f"{args.workspace_nth_farthest_vector_loss_weight:g}".replace(
+                    ".", "p"
+                )
                 run_id += f"_nthfarthestexact_vec{vector_loss_tag}"
             if args.workspace_retrieval_exact_readout:
-                retrieval_loss_tag = f"{args.workspace_retrieval_value_loss_weight:g}".replace(".", "p")
+                retrieval_loss_tag = f"{args.workspace_retrieval_value_loss_weight:g}".replace(
+                    ".", "p"
+                )
                 run_id += f"_retrievalexact_val{retrieval_loss_tag}"
             if args.workspace_compile_recurrence:
                 run_id += "_compiledrecurrence"
@@ -8358,9 +8475,7 @@ if __name__ == "__main__":
                 if args.dataset_type == "surprise-recall"
                 else "input-relative"
             )
-            run_id += (
-                f"_sgrreconsider-{args.workspace_reconsideration_trigger}_{signal_tag}"
-            )
+            run_id += f"_sgrreconsider-{args.workspace_reconsideration_trigger}_{signal_tag}"
         if args.batch_size != BATCH_SIZE:
             run_id += f"_bs{args.batch_size}"
         if args.run_id_suffix:
@@ -8419,12 +8534,8 @@ if __name__ == "__main__":
             workspace_compile_recurrence=args.workspace_compile_recurrence,
             workspace_token_id_input=args.workspace_token_id_input,
             workspace_entity_keyed_writes=args.workspace_entity_keyed_writes,
-            workspace_semantic_entity_addressing=(
-                args.workspace_semantic_entity_addressing
-            ),
-            workspace_permutation_transactional=(
-                args.workspace_permutation_transactional
-            ),
+            workspace_semantic_entity_addressing=(args.workspace_semantic_entity_addressing),
+            workspace_permutation_transactional=(args.workspace_permutation_transactional),
             workspace_key_match_threshold=args.workspace_key_match_threshold,
             workspace_no_selection=args.workspace_no_selection,
             workspace_reset_each_step=args.workspace_reset_each_step,

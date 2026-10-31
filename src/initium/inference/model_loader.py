@@ -200,9 +200,7 @@ def _build_split_graph(c: _Cfg, input_dim, hidden, nr_cells, cell_size, read_hea
         memory_dv=c.get("memory_dv", 64),
         memory_read_lag=c.get("memory_read_lag", 1),
         memory_inter_layer_read=c.get("memory_inter_layer_read", False),
-        memory_inter_layer_read_every_block=c.get(
-            "memory_inter_layer_read_every_block", False
-        ),
+        memory_inter_layer_read_every_block=c.get("memory_inter_layer_read_every_block", False),
         # Historical checkpoints injected full-strength inter-layer reads.
         memory_inter_layer_read_scale=c.get("memory_inter_layer_read_scale", 1.0),
         memory_topk=c.get("memory_topk"),
@@ -228,9 +226,7 @@ def _build_split_graph(c: _Cfg, input_dim, hidden, nr_cells, cell_size, read_hea
         workspace_num_slots=c.get("workspace_num_slots", cc.WORKSPACE_NUM_SLOTS),
         workspace_compile_recurrence=c.get("workspace_compile_recurrence", False),
         workspace_entity_keyed_writes=c.get("workspace_entity_keyed_writes", False),
-        workspace_semantic_entity_addressing=c.get(
-            "workspace_semantic_entity_addressing", False
-        ),
+        workspace_semantic_entity_addressing=c.get("workspace_semantic_entity_addressing", False),
         workspace_key_match_threshold=c.get("workspace_key_match_threshold", 0.5),
         workspace_no_selection=c.get("workspace_no_selection", cc.WORKSPACE_NO_SELECTION),
         workspace_reset_each_step=c.get("workspace_reset_each_step", cc.WORKSPACE_RESET_EACH_STEP),
@@ -296,9 +292,8 @@ def load_model(ckpt: dict, device: torch.device, deterministic_write: bool = Fal
         # Backward compatibility: pre-metadata DNC checkpoints installed the
         # Gaussian head, while pre-KV-beta checkpoints did not. Do not infer
         # KV stochasticity from beta alone.
-        stochastic_heads_enabled = (
-            raw.get("memory_type", "dnc") == "dnc"
-            and getattr(rnn, "dnc_enabled", True)
+        stochastic_heads_enabled = raw.get("memory_type", "dnc") == "dnc" and getattr(
+            rnn, "dnc_enabled", True
         )
     heads = (
         install_stochastic_write_heads(rnn, device=device, sample=(beta > 0.0))

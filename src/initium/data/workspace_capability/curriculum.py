@@ -5,7 +5,6 @@ from __future__ import annotations
 import random
 from collections.abc import Iterable
 
-
 _LEVELS = 6
 
 
@@ -119,15 +118,14 @@ class WorkspaceCapabilityCurriculum:
         writer = getattr(self, "field_log_writer", None)
         file = getattr(self, "field_log_file", None)
         if writer is not None and file is not None:
-            self.dataset.write_field_log(
-                writer, file, step, self.lesson + 1, "id", field_log
-            )
+            self.dataset.write_field_log(writer, file, step, self.lesson + 1, "id", field_log)
         per_track = (self.dataset.last_eval_diagnostics or {}).get("tracks", {})
-        all_tracks_ready = (
-            self.dataset.task_track != "all"
-            or (len(per_track) == len(self.dataset._tracks())
-                and all(item["accuracy"] / 100.0 >= self.dataset.advance_threshold
-                        for item in per_track.values()))
+        all_tracks_ready = self.dataset.task_track != "all" or (
+            len(per_track) == len(self.dataset._tracks())
+            and all(
+                item["accuracy"] / 100.0 >= self.dataset.advance_threshold
+                for item in per_track.values()
+            )
         )
         if (
             allow_advance

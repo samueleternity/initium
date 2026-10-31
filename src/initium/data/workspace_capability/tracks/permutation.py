@@ -8,10 +8,10 @@ from collections.abc import Iterable
 from initium.data.workspace_capability.episode import (
     BOS,
     ENTITY_COUNT,
+    EOS,
     EV_COMMIT,
     EV_INIT,
     EV_SWAP,
-    EOS,
     QUERY,
     SEP,
     TaskEpisode,

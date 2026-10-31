@@ -7,9 +7,9 @@ import random
 from initium.data.workspace_capability.episode import (
     BOS,
     ENTITY_COUNT,
-    EV_VECTOR,
-    EV_NOISE,
     EOS,
+    EV_NOISE,
+    EV_VECTOR,
     QUERY,
     SEP,
     TaskEpisode,
@@ -43,18 +43,17 @@ def generate(difficulty: dict, rng: random.Random, *, ood: bool = False) -> Task
     query = [rng.randrange(16) for _ in range(dimensions)]
     vectors = {entity: [rng.randrange(16) for _ in range(dimensions)] for entity in candidates}
     # Regenerate rare exact ties to keep the target unique and the oracle crisp.
-    distances = {entity: sum((a - b) ** 2 for a, b in zip(vectors[entity], query))
-                 for entity in candidates}
+    distances = {
+        entity: sum((a - b) ** 2 for a, b in zip(vectors[entity], query)) for entity in candidates
+    }
     if len(set(distances.values())) != count:
         # Deterministic no-tie fallback; extra dimensions remain represented,
         # while the first coordinate provides an unambiguous distance order.
         query = [0] * dimensions
-        vectors = {
-            entity: [entity - start] + [0] * (dimensions - 1)
-            for entity in candidates
+        vectors = {entity: [entity - start] + [0] * (dimensions - 1) for entity in candidates}
+        distances = {
+            entity: sum(value * value for value in vectors[entity]) for entity in candidates
         }
-        distances = {entity: sum(value * value for value in vectors[entity])
-                     for entity in candidates}
     ordered = sorted(candidates, key=lambda entity: (-distances[entity], entity))
     answer_entity = ordered[rank - 1]
 

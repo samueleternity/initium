@@ -89,6 +89,7 @@ if TYPE_CHECKING:
     )
     from initium.mamba_controller.mamba_controller import MambaDNC as MambaDNC
     from initium.mamba_controller.split_graph_dnc import SplitGraphDNC as SplitGraphDNC
+    from initium.memory_manipulation.dynamic_memory_resize import resize_memory as resize_memory
     from initium.memory_manipulation.sequence_memories import (
         CausalKVMemory as CausalKVMemory,
     )
@@ -96,7 +97,6 @@ if TYPE_CHECKING:
         GatedDeltaMemory as GatedDeltaMemory,
     )
     from initium.memory_manipulation.sequence_memories import SequenceMemory as SequenceMemory
-    from initium.memory_manipulation.dynamic_memory_resize import resize_memory as resize_memory
     from initium.memory_manipulation.stochastic_write_head_v2 import (
         StochasticWriteHead as StochasticWriteHead,
     )

@@ -294,15 +294,13 @@ class SplitGraphDNC(nn.Module):
             raise ValueError("memory_type must be one of none, dnc, kv, delta")
         if memory_read_lag not in (0, 1):
             raise ValueError("memory_read_lag must be 0 or 1")
-        inter_layer_memory_enabled = (
-            memory_inter_layer_read or memory_inter_layer_read_every_block
-        )
+        inter_layer_memory_enabled = memory_inter_layer_read or memory_inter_layer_read_every_block
         if inter_layer_memory_enabled and memory_type not in {"kv", "delta"}:
             raise ValueError("inter-layer memory reads require KV or delta sequence memory")
-        if inter_layer_memory_enabled and (
-            mamba_variant != "mamba1" or num_backbone_blocks < 2
-        ):
-            raise ValueError("inter-layer memory reads require at least two Mamba-1 backbone blocks")
+        if inter_layer_memory_enabled and (mamba_variant != "mamba1" or num_backbone_blocks < 2):
+            raise ValueError(
+                "inter-layer memory reads require at least two Mamba-1 backbone blocks"
+            )
         if memory_type == "kv" and memory_topk is not None and memory_topk <= 0:
             raise ValueError("memory_topk must be positive")
         if memory_position not in {"none", "rope"}:
@@ -337,13 +335,21 @@ class SplitGraphDNC(nn.Module):
             try:
                 if memory_type == "kv":
                     self.sequence_memory = CausalKVMemory(
-                        hidden_size, memory_heads, memory_dk, memory_dv,
-                        topk=memory_topk, position_mode=memory_position,
+                        hidden_size,
+                        memory_heads,
+                        memory_dk,
+                        memory_dv,
+                        topk=memory_topk,
+                        position_mode=memory_position,
                     )
                 else:
                     self.sequence_memory = GatedDeltaMemory(
-                        hidden_size, memory_heads, memory_dk, memory_dv,
-                        chunk_size=delta_chunk, gate=delta_gate,
+                        hidden_size,
+                        memory_heads,
+                        memory_dk,
+                        memory_dv,
+                        chunk_size=delta_chunk,
+                        gate=delta_gate,
                         use_fla=delta_use_fla,
                     )
             finally:
@@ -400,9 +406,7 @@ class SplitGraphDNC(nn.Module):
         if workspace_semantic_entity_addressing and not (
             workspace_enabled and workspace_entity_keyed_writes
         ):
-            raise ValueError(
-                "semantic entity addressing requires an active entity-keyed workspace"
-            )
+            raise ValueError("semantic entity addressing requires an active entity-keyed workspace")
         if workspace_permutation_transactional and not (
             workspace_enabled and workspace_semantic_entity_addressing
         ):
@@ -411,27 +415,17 @@ class SplitGraphDNC(nn.Module):
             )
         self.workspace_enabled = workspace_enabled
         self.workspace_token_id_input = bool(workspace_token_id_input)
-        if self.workspace_token_id_input and not (
-            mamba_variant == "mamba1" and input_size == 320
-        ):
+        if self.workspace_token_id_input and not (mamba_variant == "mamba1" and input_size == 320):
             raise ValueError(
                 "token-ID input is currently supported only for the 320-token "
                 "workspace-capability vocabulary with Mamba-1"
             )
         self.workspace_num_slots = workspace_num_slots
         self.workspace_entity_keyed_writes = bool(workspace_entity_keyed_writes)
-        self.workspace_semantic_entity_addressing = bool(
-            workspace_semantic_entity_addressing
-        )
-        self.workspace_permutation_transactional = bool(
-            workspace_permutation_transactional
-        )
-        self.workspace_nth_farthest_exact_readout = bool(
-            workspace_nth_farthest_exact_readout
-        )
-        self.workspace_retrieval_exact_readout = bool(
-            workspace_retrieval_exact_readout
-        )
+        self.workspace_semantic_entity_addressing = bool(workspace_semantic_entity_addressing)
+        self.workspace_permutation_transactional = bool(workspace_permutation_transactional)
+        self.workspace_nth_farthest_exact_readout = bool(workspace_nth_farthest_exact_readout)
+        self.workspace_retrieval_exact_readout = bool(workspace_retrieval_exact_readout)
         self.workspace_key_match_threshold = float(workspace_key_match_threshold)
         self.workspace_no_selection = workspace_no_selection
         self.workspace_reset_each_step = workspace_reset_each_step
@@ -719,16 +713,13 @@ class SplitGraphDNC(nn.Module):
             self.output = None
         if workspace_num_slots < 0:
             raise ValueError("workspace_num_slots must be >= 0")
-        if workspace_compile_recurrence and (
-            not workspace_enabled or workspace_num_slots < 1
-        ):
+        if workspace_compile_recurrence and (not workspace_enabled or workspace_num_slots < 1):
             raise ValueError(
                 "compiled workspace recurrence requires workspace_enabled=True "
                 "and workspace_num_slots >= 1"
             )
         if workspace_compile_recurrence and (
-            workspace_gate_variant != "continuous"
-            or workspace_no_selection
+            workspace_gate_variant != "continuous" or workspace_no_selection
         ):
             raise ValueError(
                 "compiled workspace recurrence currently supports the continuous "
@@ -895,9 +886,7 @@ class SplitGraphDNC(nn.Module):
             recurrent_state_dtype = torch.float32
         else:
             if input.ndim != 3 or input.shape[-1] != self.input_size:
-                raise ValueError(
-                    "split-graph input must have shape (batch,time,input_size)"
-                )
+                raise ValueError("split-graph input must have shape (batch,time,input_size)")
             B, T, _ = input.shape
             input_token_ids = None
             input_valid_mask = None
@@ -921,7 +910,9 @@ class SplitGraphDNC(nn.Module):
                 or state_supervision_entity_ids.shape != expected_state_shape
                 or state_supervision_mask.shape != expected_state_shape
             ):
-                raise ValueError("workspace state supervision metadata must have shape (batch, time, 16)")
+                raise ValueError(
+                    "workspace state supervision metadata must have shape (batch, time, 16)"
+                )
         combiner_hx_in = chx
         workspace_state = None
         workspace_kv_state = None
@@ -992,14 +983,10 @@ class SplitGraphDNC(nn.Module):
             if not self.sequence_memory_enabled or self.sequence_memory is None:
                 raise ValueError("inter-layer reads require KV/delta sequence memory")
             memory_path_count = (
-                len(self.backbone.blocks) - 1
-                if inter_layer_memory_every_block
-                else 1
+                len(self.backbone.blocks) - 1 if inter_layer_memory_every_block else 1
             )
             prior_memory_states = (
-                mhx
-                if not reset_experience and isinstance(mhx, (list, tuple))
-                else ()
+                mhx if not reset_experience and isinstance(mhx, list | tuple) else ()
             )
             inter_layer_memory_states = []
             for path_index in range(memory_path_count):
@@ -1014,9 +1001,7 @@ class SplitGraphDNC(nn.Module):
                     else self.sequence_memory.reset_state(B, device=device)
                 )
 
-        def inject_inter_layer_read(
-            features: torch.Tensor, block_index: int = 0
-        ) -> torch.Tensor:
+        def inject_inter_layer_read(features: torch.Tensor, block_index: int = 0) -> torch.Tensor:
             nonlocal inter_layer_memory_read
             if inter_layer_memory_states is None:
                 raise RuntimeError("inter-layer memory state was not initialized")
@@ -1048,12 +1033,9 @@ class SplitGraphDNC(nn.Module):
                     query_start_position=workspace_kv_query_start,
                 )
                 enriched[:, start_step:] = (
-                    enriched[:, start_step:]
-                    + self.workspace_kv_read_scale * workspace_read
+                    enriched[:, start_step:] + self.workspace_kv_read_scale * workspace_read
                 )
-                workspace_kv_read_rms.append(
-                    workspace_read.detach().float().square().mean().sqrt()
-                )
+                workspace_kv_read_rms.append(workspace_read.detach().float().square().mean().sqrt())
                 observe_tensor("workspace_kv.read", workspace_read)
             return enriched
 
@@ -1130,9 +1112,9 @@ class SplitGraphDNC(nn.Module):
                 )
                 token_ids = input if input.ndim == 2 else input.argmax(dim=-1)
                 positions = torch.arange(token_ids.shape[1], device=input.device).unsqueeze(0)
-                stream_lengths = torch.where(
-                    token_ids.eq(20), positions, token_ids.shape[1]
-                ).amin(dim=1)
+                stream_lengths = torch.where(token_ids.eq(20), positions, token_ids.shape[1]).amin(
+                    dim=1
+                )
                 stream_mask = positions < stream_lengths.unsqueeze(1)
             detached_signal = prediction_error.detach()
             valid_signal = detached_signal[stream_mask]
@@ -1191,9 +1173,7 @@ class SplitGraphDNC(nn.Module):
                         "with workspace specialist support"
                     )
                 specialist_kwargs["inter_layer_read"] = inject_inter_layer_read
-                specialist_kwargs["inter_layer_read_every_block"] = (
-                    inter_layer_memory_every_block
-                )
+                specialist_kwargs["inter_layer_read_every_block"] = inter_layer_memory_every_block
             selected_specialists_only = not self.workspace_no_selection
             specialist_kwargs["selected_specialists_only"] = selected_specialists_only
             base, specialists, route_indices, route_weights = forward_with_specialists(
@@ -1228,9 +1208,7 @@ class SplitGraphDNC(nn.Module):
                 selected_specialists_only=selected_specialists_only,
                 entity_ids=(entity_ids[:, start_step:] if entity_ids is not None else None),
                 entity_write_mask=(
-                    entity_write_mask[:, start_step:]
-                    if entity_write_mask is not None
-                    else None
+                    entity_write_mask[:, start_step:] if entity_write_mask is not None else None
                 ),
                 pair_swap_entity_ids=(
                     pair_swap_entity_ids[:, start_step:]
@@ -1238,12 +1216,12 @@ class SplitGraphDNC(nn.Module):
                     else None
                 ),
                 pair_swap_mask=(
-                    pair_swap_mask[:, start_step:]
-                    if pair_swap_mask is not None
-                    else None
+                    pair_swap_mask[:, start_step:] if pair_swap_mask is not None else None
                 ),
                 pair_swap_steps=(
-                    tuple(step - start_step for step in (pair_swap_steps or ()) if step >= start_step)
+                    tuple(
+                        step - start_step for step in (pair_swap_steps or ()) if step >= start_step
+                    )
                     if pair_swap_entity_ids is not None
                     else None
                 ),
@@ -1258,7 +1236,11 @@ class SplitGraphDNC(nn.Module):
                     else None
                 ),
                 permutation_query_steps=(
-                    tuple(step - start_step for step in (permutation_query_steps or ()) if step >= start_step)
+                    tuple(
+                        step - start_step
+                        for step in (permutation_query_steps or ())
+                        if step >= start_step
+                    )
                     if permutation_query_kind is not None
                     else None
                 ),
@@ -1273,69 +1255,104 @@ class SplitGraphDNC(nn.Module):
                     else None
                 ),
                 state_supervision_steps=(
-                    tuple(step - start_step for step in (state_supervision_steps or ()) if step >= start_step)
+                    tuple(
+                        step - start_step
+                        for step in (state_supervision_steps or ())
+                        if step >= start_step
+                    )
                     if state_supervision_entity_ids is not None
                     else None
                 ),
                 nth_farthest_vector_entity_ids=(
                     nth_farthest_vector_entity_ids[:, start_step:]
-                    if nth_farthest_vector_entity_ids is not None else None
+                    if nth_farthest_vector_entity_ids is not None
+                    else None
                 ),
                 nth_farthest_vector_mask=(
                     nth_farthest_vector_mask[:, start_step:]
-                    if nth_farthest_vector_mask is not None else None
+                    if nth_farthest_vector_mask is not None
+                    else None
                 ),
                 nth_farthest_vector_steps=(
-                    tuple(step - start_step for step in (nth_farthest_vector_steps or ()) if step >= start_step)
-                    if nth_farthest_vector_entity_ids is not None else None
+                    tuple(
+                        step - start_step
+                        for step in (nth_farthest_vector_steps or ())
+                        if step >= start_step
+                    )
+                    if nth_farthest_vector_entity_ids is not None
+                    else None
                 ),
                 nth_farthest_query_candidate_ids=(
                     nth_farthest_query_candidate_ids[:, start_step:]
-                    if nth_farthest_query_candidate_ids is not None else None
+                    if nth_farthest_query_candidate_ids is not None
+                    else None
                 ),
                 nth_farthest_query_candidate_mask=(
                     nth_farthest_query_candidate_mask[:, start_step:]
-                    if nth_farthest_query_candidate_mask is not None else None
+                    if nth_farthest_query_candidate_mask is not None
+                    else None
                 ),
                 nth_farthest_query_vectors=(
                     nth_farthest_query_vectors[:, start_step:]
-                    if nth_farthest_query_vectors is not None else None
+                    if nth_farthest_query_vectors is not None
+                    else None
                 ),
                 nth_farthest_query_ranks=(
                     nth_farthest_query_ranks[:, start_step:]
-                    if nth_farthest_query_ranks is not None else None
+                    if nth_farthest_query_ranks is not None
+                    else None
                 ),
                 nth_farthest_query_steps=(
-                    tuple(step - start_step for step in (nth_farthest_query_steps or ()) if step >= start_step)
-                    if nth_farthest_query_candidate_ids is not None else None
+                    tuple(
+                        step - start_step
+                        for step in (nth_farthest_query_steps or ())
+                        if step >= start_step
+                    )
+                    if nth_farthest_query_candidate_ids is not None
+                    else None
                 ),
                 retrieval_value_steps=(
-                    tuple(step - start_step for step in (retrieval_value_steps or ()) if step >= start_step)
-                    if retrieval_value_entity_ids is not None else None
+                    tuple(
+                        step - start_step
+                        for step in (retrieval_value_steps or ())
+                        if step >= start_step
+                    )
+                    if retrieval_value_entity_ids is not None
+                    else None
                 ),
                 retrieval_value_entity_ids=(
                     retrieval_value_entity_ids[:, start_step:]
-                    if retrieval_value_entity_ids is not None else None
+                    if retrieval_value_entity_ids is not None
+                    else None
                 ),
                 retrieval_value_mask=(
                     retrieval_value_mask[:, start_step:]
-                    if retrieval_value_mask is not None else None
+                    if retrieval_value_mask is not None
+                    else None
                 ),
                 retrieval_query_entity_ids=(
                     retrieval_query_entity_ids[:, start_step:]
-                    if retrieval_query_entity_ids is not None else None
+                    if retrieval_query_entity_ids is not None
+                    else None
                 ),
                 retrieval_query_mask=(
                     retrieval_query_mask[:, start_step:]
-                    if retrieval_query_mask is not None else None
+                    if retrieval_query_mask is not None
+                    else None
                 ),
                 retrieval_query_operation=(
                     retrieval_query_operation[:, start_step:]
-                    if retrieval_query_operation is not None else None
+                    if retrieval_query_operation is not None
+                    else None
                 ),
                 retrieval_query_steps=(
-                    tuple(step - start_step for step in (retrieval_query_steps or ()) if step >= start_step)
-                    if retrieval_query_entity_ids is not None else None
+                    tuple(
+                        step - start_step
+                        for step in (retrieval_query_steps or ())
+                        if step >= start_step
+                    )
+                    if retrieval_query_entity_ids is not None
+                    else None
                 ),
                 collect_kv_records=self.workspace_kv_memory is not None,
             )
@@ -1374,9 +1391,7 @@ class SplitGraphDNC(nn.Module):
             )
             forward_with_intermediate = getattr(self.backbone, "forward_with_intermediate", None)
             if inter_layer_memory_enabled:
-                if not callable(
-                    getattr(self.backbone, "forward_with_inter_layer_memory", None)
-                ):
+                if not callable(getattr(self.backbone, "forward_with_inter_layer_memory", None)):
                     raise ValueError(
                         "inter-layer reads require KV/delta memory and a supported parallel backbone"
                     )
@@ -1517,7 +1532,9 @@ class SplitGraphDNC(nn.Module):
                 else:
                     commit_mask = torch.zeros_like(commit_mask)
                 committed_count = commit_mask.sum().float()
-                commit_fraction = commit_mask.float().mean() if commit_mask.numel() else committed_count
+                commit_fraction = (
+                    commit_mask.float().mean() if commit_mask.numel() else committed_count
+                )
                 history_records = workspace_kv_state.valid.sum(dim=-1).float().mean()
                 read_rms = (
                     torch.stack(workspace_kv_read_rms).mean()

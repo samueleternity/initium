@@ -15,25 +15,28 @@ from initium.data.workspace_capability.curriculum import (
     difficulty_for,
 )
 from initium.data.workspace_capability.episode import (
+    BOOL_FALSE,
+    BOOL_TRUE,
     BOS,
+    COUNT_BASE,
     ENTITY_BASE,
     ENTITY_COUNT,
+    EOS,
+    EV_ASSERT,
     EV_COMMIT,
-    EV_FACT,
     EV_COUNT_QUERY,
+    EV_FACT,
+    EV_INIT,
     EV_KV,
     EV_MOVE,
+    EV_PARITY_QUERY,
     EV_PUT,
-    EV_ASSERT,
     EV_REMOVE,
+    EV_SUM_QUERY,
     EV_SUPERSEDE,
+    EV_SWAP,
     EV_UPDATE,
     EV_VECTOR,
-    EOS,
-    EV_INIT,
-    EV_SWAP,
-    EV_SUM_QUERY,
-    EV_PARITY_QUERY,
     LOCATION_BASE,
     LOCATION_COUNT,
     QUERY,
@@ -41,13 +44,10 @@ from initium.data.workspace_capability.episode import (
     RELATION_COUNT,
     SCALAR_BASE,
     SCALAR_COUNT,
-    COUNT_BASE,
-    BOOL_FALSE,
-    BOOL_TRUE,
     SEP,
     TRACK_BASE,
-    TaskEpisode,
     VOCAB_SIZE,
+    TaskEpisode,
     entity_token,
     validate_episode,
 )
@@ -283,9 +283,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
             else:
                 track = self.task_track
             if track != "permutation":
-                self._add_event_boundary_entity_writes(
-                    row, tokens, track, entity_ids, write_mask
-                )
+                self._add_event_boundary_entity_writes(row, tokens, track, entity_ids, write_mask)
                 continue
             phase = "none"
             pending_entity = -1
@@ -413,9 +411,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
                         valid_event = has_scalar
                     if valid_event:
                         entity_ids[row, position] = (
-                            event_entities[-1]
-                            if track == "relational_join"
-                            else event_entities[0]
+                            event_entities[-1] if track == "relational_join" else event_entities[0]
                         )
                         write_mask[row, position] = True
                 active_event = None
@@ -440,14 +436,11 @@ class WorkspaceCapabilityDataset(BaseDataset):
         episodes: list[TaskEpisode] | None = None,
     ) -> dict[str, torch.Tensor]:
         """Mark the first answer position with its causal permutation query."""
-        token_ids = self._input_token_ids(input_vectors)
         examples = self.last_batch_examples if episodes is None else episodes
         batch, time = input_vectors.shape[:2]
         if len(examples) != batch:
             raise RuntimeError("permutation query metadata lost batch/episode alignment")
-        query_kind = torch.zeros(
-            (batch, time), dtype=torch.long, device=input_vectors.device
-        )
+        query_kind = torch.zeros((batch, time), dtype=torch.long, device=input_vectors.device)
         query_id = torch.full_like(query_kind, -1)
         query_steps = set()
         for row, episode in enumerate(examples):
@@ -486,23 +479,15 @@ class WorkspaceCapabilityDataset(BaseDataset):
             position_logits = position_logits.to(device=logits.device, dtype=logits.dtype)
             entity_logits = entity_logits.to(device=logits.device, dtype=logits.dtype)
             query_kind = query_kind.to(device=logits.device)
-            position_vocab_logits = result.new_full(
-                (result.shape[0], result.shape[-1]), -1e4
+            position_vocab_logits = result.new_full((result.shape[0], result.shape[-1]), -1e4)
+            position_vocab_logits[:, LOCATION_BASE : LOCATION_BASE + LOCATION_COUNT] = (
+                position_logits
             )
-            position_vocab_logits[
-                :, LOCATION_BASE : LOCATION_BASE + LOCATION_COUNT
-            ] = position_logits
-            entity_vocab_logits = result.new_full(
-                (result.shape[0], result.shape[-1]), -1e4
-            )
+            entity_vocab_logits = result.new_full((result.shape[0], result.shape[-1]), -1e4)
             entity_vocab_logits[:, ENTITY_BASE : ENTITY_BASE + ENTITY_COUNT] = entity_logits
             original = logits[:, int(step)]
-            updated = torch.where(
-                query_kind.eq(1).unsqueeze(-1), position_vocab_logits, original
-            )
-            updated = torch.where(
-                query_kind.eq(2).unsqueeze(-1), entity_vocab_logits, updated
-            )
+            updated = torch.where(query_kind.eq(1).unsqueeze(-1), position_vocab_logits, original)
+            updated = torch.where(query_kind.eq(2).unsqueeze(-1), entity_vocab_logits, updated)
             result[:, int(step)] = updated
         return result
 
@@ -535,7 +520,6 @@ class WorkspaceCapabilityDataset(BaseDataset):
         result = logits.clone()
         targets = metadata["retrieval_query_targets"]
         was_updated = metadata["retrieval_query_was_updated"]
-        query_mask = metadata["retrieval_query_mask"]
         operations = metadata["retrieval_query_operation"]
         for step, value_logits, found, active_mask in query_predictions:
             value_ids = value_logits.argmax(dim=-1)
@@ -666,25 +650,32 @@ class WorkspaceCapabilityDataset(BaseDataset):
             raise RuntimeError("Nth-farthest metadata lost batch/episode alignment")
         tokens_by_row = token_ids.detach().cpu().tolist()
         event_ids = torch.full((batch, time, 16), -1, dtype=torch.long, device=input_vectors.device)
-        event_targets = torch.full((batch, time, 16, 6), -100, dtype=torch.long, device=input_vectors.device)
+        event_targets = torch.full(
+            (batch, time, 16, 6), -100, dtype=torch.long, device=input_vectors.device
+        )
         event_mask = torch.zeros((batch, time, 16), dtype=torch.bool, device=input_vectors.device)
         query_ids = torch.full_like(event_ids, -1)
         query_mask = torch.zeros_like(event_mask)
-        query_vectors = torch.full((batch, time, 6), -1, dtype=torch.long, device=input_vectors.device)
+        query_vectors = torch.full(
+            (batch, time, 6), -1, dtype=torch.long, device=input_vectors.device
+        )
         query_ranks = torch.full((batch, time), -1, dtype=torch.long, device=input_vectors.device)
         vector_steps: set[int] = set()
         query_steps: set[int] = set()
         for row, episode in enumerate(examples):
             if episode.track != "nth_farthest":
                 continue
-            tokens = [int(token) for token in tokens_by_row[row][:len(episode.inputs)]]
+            tokens = [int(token) for token in tokens_by_row[row][: len(episode.inputs)]]
             candidates: list[int] = []
             index = 0
             while index < len(tokens):
                 if tokens[index] != EV_VECTOR:
                     index += 1
                     continue
-                if index + 1 >= len(tokens) or not ENTITY_BASE <= tokens[index + 1] < ENTITY_BASE + ENTITY_COUNT:
+                if (
+                    index + 1 >= len(tokens)
+                    or not ENTITY_BASE <= tokens[index + 1] < ENTITY_BASE + ENTITY_COUNT
+                ):
                     raise ValueError("malformed Nth-farthest vector event: missing entity ID")
                 entity_id = tokens[index + 1] - ENTITY_BASE
                 end = index + 2
@@ -697,7 +688,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
                     raise ValueError("malformed or oversized Nth-farthest vector event")
                 candidates.append(entity_id)
                 event_ids[row, end, 0] = entity_id
-                event_targets[row, end, 0, :len(values)] = torch.tensor(
+                event_targets[row, end, 0, : len(values)] = torch.tensor(
                     values, dtype=torch.long, device=input_vectors.device
                 )
                 event_mask[row, end, 0] = True
@@ -708,24 +699,27 @@ class WorkspaceCapabilityDataset(BaseDataset):
             if query_index is None:
                 raise ValueError("Nth-farthest episode is missing its query")
             query_end = tokens.index(SEP, query_index + 1)
-            query_tokens = tokens[query_index + 1:query_end]
+            query_tokens = tokens[query_index + 1 : query_end]
             if not query_tokens or not candidates:
                 raise ValueError("Nth-farthest query has no rank or candidate vectors")
             rank_token = query_tokens[0]
             if not SCALAR_BASE <= rank_token < SCALAR_BASE + SCALAR_COUNT:
                 raise ValueError("Nth-farthest query rank is not a scalar token")
-            coords = [token - SCALAR_BASE for token in query_tokens[1:]
-                      if SCALAR_BASE <= token < SCALAR_BASE + SCALAR_COUNT]
+            coords = [
+                token - SCALAR_BASE
+                for token in query_tokens[1:]
+                if SCALAR_BASE <= token < SCALAR_BASE + SCALAR_COUNT
+            ]
             if not 1 <= len(coords) <= 6:
                 raise ValueError("Nth-farthest query must contain 1..6 coordinates")
             answer_step = len(episode.inputs)
             if not 0 <= answer_step < time:
                 raise RuntimeError("Nth-farthest answer step exceeds collated sequence")
-            query_ids[row, answer_step, :len(candidates)] = torch.tensor(
+            query_ids[row, answer_step, : len(candidates)] = torch.tensor(
                 candidates, dtype=torch.long, device=input_vectors.device
             )
-            query_mask[row, answer_step, :len(candidates)] = True
-            query_vectors[row, answer_step, :len(coords)] = torch.tensor(
+            query_mask[row, answer_step, : len(candidates)] = True
+            query_vectors[row, answer_step, : len(coords)] = torch.tensor(
                 coords, dtype=torch.long, device=input_vectors.device
             )
             query_ranks[row, answer_step] = rank_token - SCALAR_BASE
@@ -760,23 +754,15 @@ class WorkspaceCapabilityDataset(BaseDataset):
         value_targets = torch.full(
             (batch, time), -100, dtype=torch.long, device=input_vectors.device
         )
-        value_mask = torch.zeros(
-            (batch, time), dtype=torch.bool, device=input_vectors.device
-        )
+        value_mask = torch.zeros((batch, time), dtype=torch.bool, device=input_vectors.device)
         query_entity_ids = torch.full(
             (batch, time, 8), -1, dtype=torch.long, device=input_vectors.device
         )
-        query_mask = torch.zeros(
-            (batch, time, 8), dtype=torch.bool, device=input_vectors.device
-        )
+        query_mask = torch.zeros((batch, time, 8), dtype=torch.bool, device=input_vectors.device)
         query_targets = torch.full_like(query_entity_ids, -100)
-        value_is_update = torch.zeros(
-            (batch, time), dtype=torch.bool, device=input_vectors.device
-        )
+        value_is_update = torch.zeros((batch, time), dtype=torch.bool, device=input_vectors.device)
         query_was_updated = torch.zeros_like(query_mask)
-        query_operation = torch.zeros(
-            (batch, time), dtype=torch.long, device=input_vectors.device
-        )
+        query_operation = torch.zeros((batch, time), dtype=torch.long, device=input_vectors.device)
         value_steps: set[int] = set()
         query_steps: set[int] = set()
         operation_by_token = {
@@ -937,20 +923,25 @@ class WorkspaceCapabilityDataset(BaseDataset):
         prior_workspace_bypass = getattr(model, "workspace_eval_bypass", None)
         prior_workspace_shuffle = getattr(model, "workspace_eval_shuffle_readback", None)
         workspace = getattr(model, "workspace", None)
-        prior_assignment_observer = getattr(
-            workspace, "_initium_address_assignment_observer", None
-        )
+        prior_assignment_observer = getattr(workspace, "_initium_address_assignment_observer", None)
         collect_entity_bindings = bool(
-            workspace is not None
-            and getattr(workspace, "entity_keyed_writes", False)
+            workspace is not None and getattr(workspace, "entity_keyed_writes", False)
         )
         if ablate_workspace:
-            if not hasattr(model, "workspace_eval_bypass") or getattr(model, "workspace", None) is None:
+            if (
+                not hasattr(model, "workspace_eval_bypass")
+                or getattr(model, "workspace", None) is None
+            ):
                 raise ValueError("workspace ablation requires a model with active workspace")
             model.workspace_eval_bypass = True
         if shuffle_workspace_readback:
-            if not hasattr(model, "workspace_eval_shuffle_readback") or getattr(model, "workspace", None) is None:
-                raise ValueError("workspace readback shuffle requires a model with active workspace")
+            if (
+                not hasattr(model, "workspace_eval_shuffle_readback")
+                or getattr(model, "workspace", None) is None
+            ):
+                raise ValueError(
+                    "workspace readback shuffle requires a model with active workspace"
+                )
             model.workspace_eval_shuffle_readback = True
         totals: dict[str, list[int]] = defaultdict(lambda: [0, 0, 0, 0])
         split_totals: dict[str, list[float]] = defaultdict(lambda: [0.0] * 7)
@@ -1006,15 +997,11 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 ):
                     x, _targets, _mask = self._collate(
                         group,
-                        token_ids_only=bool(
-                            getattr(model, "workspace_token_id_input", False)
-                        ),
+                        token_ids_only=bool(getattr(model, "workspace_token_id_input", False)),
                     )
                     workspace_forward_kwargs = {}
                     binding_entity_metadata = None
-                    if bool(
-                        getattr(model, "workspace_semantic_entity_addressing", False)
-                    ):
+                    if bool(getattr(model, "workspace_semantic_entity_addressing", False)):
                         transactional = bool(
                             getattr(model, "workspace_permutation_transactional", False)
                         )
@@ -1047,7 +1034,8 @@ class WorkspaceCapabilityDataset(BaseDataset):
                                 {
                                     key: value
                                     for key, value in retrieval_metadata.items()
-                                    if key not in (
+                                    if key
+                                    not in (
                                         "retrieval_value_targets",
                                         "retrieval_query_targets",
                                         "retrieval_value_is_update",
@@ -1084,7 +1072,9 @@ class WorkspaceCapabilityDataset(BaseDataset):
                     )
                     if observe_group:
                         workspace._initium_address_assignment_observer = (
-                            lambda step, assignments: assignment_trace.append(
+                            lambda step,
+                            assignments,
+                            assignment_trace=assignment_trace: assignment_trace.append(
                                 (step, assignments.detach())
                             )
                         )
@@ -1117,12 +1107,9 @@ class WorkspaceCapabilityDataset(BaseDataset):
                         # Copy the full trace once per batch; the observer is
                         # evaluation-only and does not add per-token GPU syncs.
                         trace_steps = [entry[0] for entry in assignment_trace]
-                        trace = torch.stack(
-                            [entry[1] for entry in assignment_trace], dim=0
-                        ).cpu()
+                        trace = torch.stack([entry[1] for entry in assignment_trace], dim=0).cpu()
                         trace_by_step = {
-                            step: trace[index]
-                            for index, step in enumerate(trace_steps)
+                            step: trace[index] for index, step in enumerate(trace_steps)
                         }
                         for row, episode in enumerate(group):
                             if episode.track != "permutation":
@@ -1134,9 +1121,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
                                         binding_entity_metadata["entity_write_mask"][row, step]
                                     ):
                                         continue
-                                    entity = int(
-                                        binding_entity_metadata["entity_ids"][row, step]
-                                    )
+                                    entity = int(binding_entity_metadata["entity_ids"][row, step])
                                     if entity < 0:
                                         continue
                                 else:
@@ -1157,13 +1142,9 @@ class WorkspaceCapabilityDataset(BaseDataset):
                                 # depend on expert ordering.
                                 unique_route_slots = torch.unique(valid_slots)
                                 binding_write_mentions_with_routes += 1
-                                binding_write_route_splits += int(
-                                    unique_route_slots.numel() > 1
-                                )
+                                binding_write_route_splits += int(unique_route_slots.numel() > 1)
                                 route_counts = Counter(valid_slots.tolist())
-                                entity_slots[entity].append(
-                                    route_counts.most_common(1)[0][0]
-                                )
+                                entity_slots[entity].append(route_counts.most_common(1)[0][0])
                                 binding_assigned_mentions += 1
                             if not entity_slots:
                                 continue
@@ -1174,14 +1155,12 @@ class WorkspaceCapabilityDataset(BaseDataset):
                                 dominant_slots[entity] = counts.most_common(1)[0][0]
                                 binding_fragmented_entities += int(len(counts) > 1)
                                 if len(slots) >= 2:
-                                    binding_repeated_entity_consistency += (
-                                        counts.most_common(1)[0][1] / len(slots)
-                                    )
+                                    binding_repeated_entity_consistency += counts.most_common(1)[0][
+                                        1
+                                    ] / len(slots)
                                     binding_repeated_entities += 1
                             unique_slots = len(set(dominant_slots.values()))
-                            binding_unique_slot_fraction += (
-                                unique_slots / len(dominant_slots)
-                            )
+                            binding_unique_slot_fraction += unique_slots / len(dominant_slots)
                             slots = list(dominant_slots.values())
                             for left in range(len(slots)):
                                 for right in range(left + 1, len(slots)):
@@ -1235,9 +1214,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
                     nth_predictions_by_step = {}
                     if bool(getattr(model, "workspace_nth_farthest_exact_readout", False)):
                         query_predictions = workspace.pop_nth_farthest_query_predictions()
-                        vector_predictions = dict(
-                            workspace.pop_nth_farthest_vector_predictions()
-                        )
+                        vector_predictions = dict(workspace.pop_nth_farthest_vector_predictions())
                         nth_predictions_by_step = {
                             step: (selected, active)
                             for step, _query_logits, selected, active in query_predictions
@@ -1250,7 +1227,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
                                 entity_logits = logits.new_full(
                                     (logits.shape[0], logits.shape[-1]), -1e4
                                 )
-                                entity_logits[:, ENTITY_BASE:ENTITY_BASE + ENTITY_COUNT] = (
+                                entity_logits[:, ENTITY_BASE : ENTITY_BASE + ENTITY_COUNT] = (
                                     query_logits.to(device=logits.device, dtype=logits.dtype)
                                 )
                                 invalid_readout = active.to(device=logits.device) & selected.to(
@@ -1276,8 +1253,10 @@ class WorkspaceCapabilityDataset(BaseDataset):
                             nth_vector_coordinate_correct += int(equal.sum().item())
                             nth_vector_coordinate_count += int(valid_coordinates.sum().item())
                             valid_vectors = valid_coordinates.any(dim=-1)
-                            vector_exact = ((prediction.eq(target) | ~valid_coordinates).all(dim=-1))
-                            nth_vector_exact_correct += int((vector_exact & valid_vectors).sum().item())
+                            vector_exact = (prediction.eq(target) | ~valid_coordinates).all(dim=-1)
+                            nth_vector_exact_correct += int(
+                                (vector_exact & valid_vectors).sum().item()
+                            )
                             nth_vector_exact_count += int(valid_vectors.sum().item())
                         for row, episode in enumerate(group):
                             if episode.track != "nth_farthest":
@@ -1310,18 +1289,18 @@ class WorkspaceCapabilityDataset(BaseDataset):
                         if retrieval_metadata is None:
                             raise RuntimeError("retrieval supervision metadata was not constructed")
                         for value_step, value_logits, found in value_predictions:
-                            targets = retrieval_metadata["retrieval_value_targets"][:, value_step].to(
-                                device=value_logits.device
-                            )
+                            targets = retrieval_metadata["retrieval_value_targets"][
+                                :, value_step
+                            ].to(device=value_logits.device)
                             mask = retrieval_metadata["retrieval_value_mask"][:, value_step].to(
                                 device=value_logits.device
                             )
                             correct = value_logits.argmax(dim=-1).eq(targets) & mask & found
                             retrieval_totals["write_value_correct"] += int(correct.sum().item())
                             retrieval_totals["write_value_count"] += int(mask.sum().item())
-                            is_update = retrieval_metadata["retrieval_value_is_update"][:, value_step].to(
-                                device=value_logits.device
-                            )
+                            is_update = retrieval_metadata["retrieval_value_is_update"][
+                                :, value_step
+                            ].to(device=value_logits.device)
                             for label, selection in (
                                 ("update", is_update),
                                 ("initial", ~is_update),
@@ -1332,7 +1311,9 @@ class WorkspaceCapabilityDataset(BaseDataset):
                                 retrieval_totals.setdefault(correct_key, 0)
                                 selected = mask & selection
                                 retrieval_totals[correct_key] += int(
-                                    (value_logits.argmax(dim=-1).eq(targets) & selected & found).sum().item()
+                                    (value_logits.argmax(dim=-1).eq(targets) & selected & found)
+                                    .sum()
+                                    .item()
                                 )
                                 retrieval_totals[count_key] += int(selected.sum().item())
                         logits, query_totals = self.apply_workspace_retrieval_query_logits(
@@ -1392,7 +1373,9 @@ class WorkspaceCapabilityDataset(BaseDataset):
                         track_meta[4] += int(bool(episode.metadata["novelty_distractor"]))
                         track_meta[5] += int(episode.metadata["source_count"])
                         track_meta[6] += float(episode.metadata["candidate_baseline_pct"])
-                        track_meta[7] += int(bool(episode.metadata.get("equal_priority_conflict", False)))
+                        track_meta[7] += int(
+                            bool(episode.metadata.get("equal_priority_conflict", False))
+                        )
                         self._record_field(field_log, episode, n_correct, n_answers, exact)
                         if len(totals) == 1 and totals[episode.track][2] <= verbose_n:
                             print(
@@ -1401,9 +1384,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
                             )
         finally:
             if collect_entity_bindings:
-                workspace._initium_address_assignment_observer = (
-                    prior_assignment_observer
-                )
+                workspace._initium_address_assignment_observer = prior_assignment_observer
             if ablate_workspace:
                 model.workspace_eval_bypass = prior_workspace_bypass
             if shuffle_workspace_readback:
@@ -1412,7 +1393,9 @@ class WorkspaceCapabilityDataset(BaseDataset):
 
         accuracy = 100.0 * correct_total / max(answer_total, 1)
         perfect = 100.0 * exact_total / max(len(episodes), 1)
-        total_meta = [sum(values[index] for values in metadata_totals.values()) for index in range(8)]
+        total_meta = [
+            sum(values[index] for values in metadata_totals.values()) for index in range(8)
+        ]
         total_episodes = max(len(episodes), 1)
         # Task-specific strata are emitted through the dataset-owned field log;
         # the shared hop CSV calls its accuracy column "triple_acc" and is
@@ -1472,10 +1455,14 @@ class WorkspaceCapabilityDataset(BaseDataset):
         }
         if bool(getattr(model, "workspace_nth_farthest_exact_readout", False)):
             diagnostics["nth_farthest_workspace"] = {
-                "vector_coordinate_accuracy": 100.0 * nth_vector_coordinate_correct / max(nth_vector_coordinate_count, 1),
+                "vector_coordinate_accuracy": 100.0
+                * nth_vector_coordinate_correct
+                / max(nth_vector_coordinate_count, 1),
                 "vector_coordinates_correct": nth_vector_coordinate_correct,
                 "vector_coordinates_total": nth_vector_coordinate_count,
-                "vector_exact_accuracy": 100.0 * nth_vector_exact_correct / max(nth_vector_exact_count, 1),
+                "vector_exact_accuracy": 100.0
+                * nth_vector_exact_correct
+                / max(nth_vector_exact_count, 1),
                 "vectors_exact": nth_vector_exact_correct,
                 "vectors_total": nth_vector_exact_count,
                 "exact_readout_accuracy": 100.0 * nth_readout_correct / max(nth_readout_count, 1),
@@ -1483,8 +1470,11 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 "readouts_total": nth_readout_count,
                 "invalid_readouts": nth_invalid_readout_count,
                 "readout_by_query_stratum": {
-                    key: {"accuracy": 100.0 * counts[0] / max(counts[1], 1),
-                          "correct": counts[0], "episodes": counts[1]}
+                    key: {
+                        "accuracy": 100.0 * counts[0] / max(counts[1], 1),
+                        "correct": counts[0],
+                        "episodes": counts[1],
+                    }
                     for key, counts in nth_readout_by_stratum.items()
                 },
             }
@@ -1518,12 +1508,9 @@ class WorkspaceCapabilityDataset(BaseDataset):
             }
         if binding_entity_mentions:
             binding_metrics = {
-                "entity_write_coverage": (
-                    binding_assigned_mentions / binding_entity_mentions
-                ),
+                "entity_write_coverage": (binding_assigned_mentions / binding_entity_mentions),
                 "same_entity_slot_consistency": (
-                    binding_repeated_entity_consistency
-                    / max(binding_repeated_entities, 1)
+                    binding_repeated_entity_consistency / max(binding_repeated_entities, 1)
                 ),
                 "repeated_entities": binding_repeated_entities,
                 "distinct_entity_slot_collision": (
@@ -1532,8 +1519,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 "distinct_entity_pairs": binding_entity_pairs,
                 "fragmented_entities": binding_fragmented_entities,
                 "write_route_split_fraction": (
-                    binding_write_route_splits
-                    / max(binding_write_mentions_with_routes, 1)
+                    binding_write_route_splits / max(binding_write_mentions_with_routes, 1)
                 ),
                 "write_mentions_with_routes": binding_write_mentions_with_routes,
                 "unique_entity_slots_fraction": (
@@ -1599,9 +1585,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 f"({retrieval_metrics['readout_exact']}/{retrieval_metrics['readout_count']}) | "
                 f"invalid={retrieval_metrics['invalid_readouts']}"
             )
-            for query_type, values in sorted(
-                retrieval_metrics["readout_by_query_type"].items()
-            ):
+            for query_type, values in sorted(retrieval_metrics["readout_by_query_type"].items()):
                 print(
                     f"    [workspace-retrieval/{query_type}] exact readout="
                     f"{100.0 * values['correct'] / max(values['episodes'], 1):.1f}% "
@@ -1728,17 +1712,14 @@ class WorkspaceCapabilityDataset(BaseDataset):
         it oracle state or adding a training objective.
         """
         if not bool(getattr(model, "workspace_semantic_entity_addressing", False)):
-            raise ValueError(
-                "permutation state diagnostics require semantic entity addressing"
-            )
+            raise ValueError("permutation state diagnostics require semantic entity addressing")
         if getattr(model, "workspace", None) is None:
             raise ValueError("permutation state diagnostics require an active workspace")
         if int(num_episodes) < 1 or int(max_events_per_episode) < 0:
             raise ValueError("state diagnostic episode/event limits are invalid")
         rng = rng or random.Random(190_001 + int(lesson_idx))
         source_episodes = [
-            self._make_episode("permutation", lesson_idx, rng)
-            for _ in range(int(num_episodes))
+            self._make_episode("permutation", lesson_idx, rng) for _ in range(int(num_episodes))
         ]
         probes = []
         for episode_index, episode in enumerate(source_episodes):
@@ -1792,12 +1773,8 @@ class WorkspaceCapabilityDataset(BaseDataset):
             raise RuntimeError("permutation state diagnostic generated no valid state probes")
 
         workspace = model.workspace
-        prior_assignment_observer = getattr(
-            workspace, "_initium_address_assignment_observer", None
-        )
-        prior_state_observer = getattr(
-            workspace, "_initium_recurrent_state_observer", None
-        )
+        prior_assignment_observer = getattr(workspace, "_initium_address_assignment_observer", None)
+        prior_state_observer = getattr(workspace, "_initium_recurrent_state_observer", None)
         prior_workspace_bypass = getattr(model, "workspace_eval_bypass", None)
         was_training = model.training
         rows = []
@@ -1810,9 +1787,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
                     episodes = [item["probe"] for item in group]
                     x, _targets, _mask = self._collate(
                         episodes,
-                        token_ids_only=bool(
-                            getattr(model, "workspace_token_id_input", False)
-                        ),
+                        token_ids_only=bool(getattr(model, "workspace_token_id_input", False)),
                     )
                     transactional = bool(
                         getattr(model, "workspace_permutation_transactional", False)
@@ -1839,7 +1814,8 @@ class WorkspaceCapabilityDataset(BaseDataset):
                             {
                                 key: value
                                 for key, value in retrieval_metadata.items()
-                                if key not in (
+                                if key
+                                not in (
                                     "retrieval_value_targets",
                                     "retrieval_query_targets",
                                     "retrieval_query_was_updated",
@@ -1861,16 +1837,21 @@ class WorkspaceCapabilityDataset(BaseDataset):
                     recurrent_state_trace = []
                     event_steps_needed = {item["event_step"] for item in group}
                     workspace._initium_address_assignment_observer = (
-                        lambda step, assignments: assignment_trace.append(
+                        lambda step,
+                        assignments,
+                        assignment_trace=assignment_trace: assignment_trace.append(
                             (step, assignments.detach())
                         )
                     )
 
-                    def capture_event_state(state, call_index):
+                    def capture_event_state(
+                        state,
+                        call_index,
+                        event_steps_needed=event_steps_needed,
+                        recurrent_state_trace=recurrent_state_trace,
+                    ):
                         if call_index in event_steps_needed:
-                            recurrent_state_trace.append(
-                                (call_index, state.detach().cpu())
-                            )
+                            recurrent_state_trace.append((call_index, state.detach().cpu()))
 
                     workspace._initium_recurrent_state_observer = capture_event_state
                     output, _ = model(
@@ -1897,44 +1878,39 @@ class WorkspaceCapabilityDataset(BaseDataset):
                         pass_through_memory=True,
                         **forward_metadata,
                     )
-                    bypass_logits = self._output_proj(
-                        bypass_output.transpose(0, 1).contiguous()
-                    )
+                    bypass_logits = self._output_proj(bypass_output.transpose(0, 1).contiguous())
                     if transactional:
                         bypass_logits = self.apply_workspace_permutation_query_logits(
                             bypass_logits, workspace.pop_semantic_query_predictions()
                         )
                     bypass_predictions = bypass_logits.argmax(dim=-1)
                     workspace._initium_address_assignment_observer = (
-                        lambda step, assignments: assignment_trace.append(
+                        lambda step,
+                        assignments,
+                        assignment_trace=assignment_trace: assignment_trace.append(
                             (step, assignments.detach())
                         )
                     )
 
-                    def capture_event_state(state, call_index):
+                    def capture_event_state(
+                        state,
+                        call_index,
+                        event_steps_needed=event_steps_needed,
+                        recurrent_state_trace=recurrent_state_trace,
+                    ):
                         if call_index in event_steps_needed:
-                            recurrent_state_trace.append(
-                                (call_index, state.detach().cpu())
-                            )
+                            recurrent_state_trace.append((call_index, state.detach().cpu()))
 
                     workspace._initium_recurrent_state_observer = capture_event_state
                     if prior_workspace_bypass is not None:
                         model.workspace_eval_bypass = prior_workspace_bypass
-                    assignments_by_step = {
-                        step: value.cpu()
-                        for step, value in assignment_trace
-                    }
-                    states_by_step = {
-                        step: value
-                        for step, value in recurrent_state_trace
-                    }
+                    assignments_by_step = {step: value.cpu() for step, value in assignment_trace}
+                    states_by_step = {step: value for step, value in recurrent_state_trace}
                     for row_index, item in enumerate(group):
                         probe = item["probe"]
                         answer_index = len(probe.inputs)
                         predicted_token = int(predictions[row_index, answer_index])
-                        bypass_predicted_token = int(
-                            bypass_predictions[row_index, answer_index]
-                        )
+                        bypass_predicted_token = int(bypass_predictions[row_index, answer_index])
                         predicted_position = (
                             predicted_token - LOCATION_BASE
                             if LOCATION_BASE <= predicted_token < LOCATION_BASE + LOCATION_COUNT
@@ -1947,11 +1923,15 @@ class WorkspaceCapabilityDataset(BaseDataset):
                             < LOCATION_BASE + LOCATION_COUNT
                             else -1
                         )
-                        write_steps = torch.nonzero(
-                            entity_write_mask[row_index]
-                            & entity_ids[row_index].eq(item["entity_id"]),
-                            as_tuple=False,
-                        ).flatten().tolist()
+                        write_steps = (
+                            torch.nonzero(
+                                entity_write_mask[row_index]
+                                & entity_ids[row_index].eq(item["entity_id"]),
+                                as_tuple=False,
+                            )
+                            .flatten()
+                            .tolist()
+                        )
                         last_write_step = write_steps[-1] if write_steps else None
                         accepted_slots = []
                         if last_write_step is not None:
@@ -1963,19 +1943,17 @@ class WorkspaceCapabilityDataset(BaseDataset):
                                     if int(slot) >= 0
                                 ]
                         slot_counts = Counter(accepted_slots)
-                        assigned_slot = (
-                            slot_counts.most_common(1)[0][0] if slot_counts else -1
-                        )
+                        assigned_slot = slot_counts.most_common(1)[0][0] if slot_counts else -1
                         slot_route_split = len(slot_counts) > 1
                         slot_rms = None
                         state = states_by_step.get(item["event_step"])
                         if state is not None and assigned_slot >= 0:
                             state_row = state[row_index].float()
                             if getattr(workspace, "entity_keyed_writes", False):
-                                state_row = torch.split(state_row, (workspace._address_dim, workspace.d_model), dim=-1)[1]
-                            slot_rms = float(
-                                state_row[assigned_slot].square().mean().sqrt().cpu()
-                            )
+                                state_row = torch.split(
+                                    state_row, (workspace._address_dim, workspace.d_model), dim=-1
+                                )[1]
+                            slot_rms = float(state_row[assigned_slot].square().mean().sqrt().cpu())
                         rows.append(
                             {
                                 "episode": item["episode"],
@@ -2028,9 +2006,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 {
                     "name": f"episode-{episode_index}/{event}-{event_index}",
                     "accuracy": 100.0 * event_correct / max(len(event_rows), 1),
-                    "bypass_accuracy": (
-                        100.0 * event_bypass_correct / max(len(event_rows), 1)
-                    ),
+                    "bypass_accuracy": (100.0 * event_bypass_correct / max(len(event_rows), 1)),
                     "accepted_fraction": event_accepted / max(len(event_rows), 1),
                     "queries": len(event_rows),
                 }
@@ -2104,9 +2080,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
             self._make_episode(track, lesson_idx, rng)
             for track in (tracks[i % len(tracks)] for i in range(64))
         ]
-        return self._evaluate_episodes(
-            model, device, episodes, shuffle_workspace_readback=True
-        )[:2]
+        return self._evaluate_episodes(model, device, episodes, shuffle_workspace_readback=True)[:2]
 
     def evaluate_id_combiner_stage_ablated(
         self, model, device, curriculum, lesson_idx, skip_stages
@@ -2126,10 +2100,21 @@ class WorkspaceCapabilityDataset(BaseDataset):
 
     def field_log_header(self):
         return [
-            "track", "query_type", "sequence_length_bucket", "relevant_updates_bucket",
-            "hop_count", "source_count", "correction_relevant", "novelty_distractor",
-            "equal_priority_conflict", "distractor_count_bucket", "candidate_count_bucket", "answers",
-            "correct_answers", "episodes", "exact_episodes",
+            "track",
+            "query_type",
+            "sequence_length_bucket",
+            "relevant_updates_bucket",
+            "hop_count",
+            "source_count",
+            "correction_relevant",
+            "novelty_distractor",
+            "equal_priority_conflict",
+            "distractor_count_bucket",
+            "candidate_count_bucket",
+            "answers",
+            "correct_answers",
+            "episodes",
+            "exact_episodes",
         ]
 
     def write_field_log(self, writer, file, step, lesson, eval_type, field_log):

@@ -7,13 +7,13 @@ import random
 from initium.data.workspace_capability.episode import (
     BOS,
     ENTITY_COUNT,
+    EOS,
     EV_ASSERT,
     EV_MOVE,
     EV_PUT,
     EV_REMOVE,
     EV_RETRACT,
     EV_SUPERSEDE,
-    EOS,
     FACT_COUNT,
     LOCATION_COUNT,
     NONE_TOKEN,
@@ -23,11 +23,13 @@ from initium.data.workspace_capability.episode import (
     SOURCE_COUNT,
     SOURCE_PRIORITY_POLICY,
     TaskEpisode,
-    fact_token as encode_fact_token,
     entity_token,
     location_token,
     relation_token,
     source_token,
+)
+from initium.data.workspace_capability.episode import (
+    fact_token as encode_fact_token,
 )
 
 Fact = tuple[int, int, int, int]  # fact-id, source-id, value, logical timestamp
@@ -60,8 +62,8 @@ def generate(difficulty: dict, rng: random.Random, *, ood: bool = False) -> Task
         and rng.random() < float(difficulty.get("novelty_probability", 0.5))
     )
     noise = max_noise if novelty_distractor else 0
-    entity_ids = list(range(ENTITY_COUNT - n_entities, ENTITY_COUNT)) if ood else list(
-        range(n_entities)
+    entity_ids = (
+        list(range(ENTITY_COUNT - n_entities, ENTITY_COUNT)) if ood else list(range(n_entities))
     )
     sources = list(range(SOURCE_COUNT)) if ood else list(range(n_sources))
     if ood:
@@ -130,10 +132,7 @@ def generate(difficulty: dict, rng: random.Random, *, ood: bool = False) -> Task
         query_facts = active[query_entity]
         existing_source = query_facts[0][1]
         alternatives = [source for source in sources if source != existing_source]
-        tie_pairs = [
-            source for source in alternatives
-            if source % 3 == existing_source % 3
-        ]
+        tie_pairs = [source for source in alternatives if source % 3 == existing_source % 3]
         if tie_pairs and rng.random() < 0.5:
             second_source = rng.choice(tie_pairs)
             # Same logical timestamp deliberately exercises the source-ID tie break.
@@ -271,7 +270,13 @@ def generate(difficulty: dict, rng: random.Random, *, ood: bool = False) -> Task
     else:
         answer = (NONE_TOKEN, EOS)
     stream.extend(
-        (QUERY, SOURCE_PRIORITY_POLICY, entity_token(query_entity), relation_token(target_relation), SEP)
+        (
+            QUERY,
+            SOURCE_PRIORITY_POLICY,
+            entity_token(query_entity),
+            relation_token(target_relation),
+            SEP,
+        )
     )
     return TaskEpisode(
         "entity_state",

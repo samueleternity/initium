@@ -590,9 +590,7 @@ def evaluate_traversal_batched(
         if inter_layer_read is not None:
             model._initium_eval_inter_layer_read = bool(inter_layer_read)
         if inter_layer_read_every_block is not None:
-            model._initium_eval_inter_layer_read_every_block = bool(
-                inter_layer_read_every_block
-            )
+            model._initium_eval_inter_layer_read_every_block = bool(inter_layer_read_every_block)
         if shuffle_memory:
             seen = set()
 
@@ -668,9 +666,7 @@ def evaluate_traversal_batched(
             if hasattr(model, "_initium_eval_inter_layer_read_every_block"):
                 delattr(model, "_initium_eval_inter_layer_read_every_block")
         else:
-            model._initium_eval_inter_layer_read_every_block = (
-                prior_inter_layer_every_block
-            )
+            model._initium_eval_inter_layer_read_every_block = prior_inter_layer_every_block
         model.train(was_training)
 
     return (
@@ -947,40 +943,78 @@ class GraphTraversalDataset(BaseDataset):
         if configured_lag not in (0, 1):
             raise ValueError("memory path diagnostics require a model with read lag 0 or 1")
         configured_inter_layer = bool(getattr(model, "memory_inter_layer_read", False))
-        configured_every_block = bool(
-            getattr(model, "memory_inter_layer_read_every_block", False)
-        )
+        configured_every_block = bool(getattr(model, "memory_inter_layer_read_every_block", False))
         conditions = [
-            ("configured", dict(memory_read_lag=configured_lag,
-                                 inter_layer_read=configured_inter_layer,
-                                 inter_layer_read_every_block=configured_every_block)),
-            ("memory_off", dict(memory_read_lag=configured_lag,
-                                 inter_layer_read=configured_inter_layer,
-                                 inter_layer_read_every_block=configured_every_block,
-                                 ablate_memory=True)),
-            ("memory_shuffled", dict(memory_read_lag=configured_lag,
-                                      inter_layer_read=configured_inter_layer,
-                                      inter_layer_read_every_block=configured_every_block,
-                                      shuffle_memory=True)),
-            ("read_lag_0", dict(memory_read_lag=0,
-                                 inter_layer_read=configured_inter_layer,
-                                 inter_layer_read_every_block=configured_every_block)),
-            ("read_lag_1", dict(memory_read_lag=1,
-                                 inter_layer_read=configured_inter_layer,
-                                 inter_layer_read_every_block=configured_every_block)),
+            (
+                "configured",
+                dict(
+                    memory_read_lag=configured_lag,
+                    inter_layer_read=configured_inter_layer,
+                    inter_layer_read_every_block=configured_every_block,
+                ),
+            ),
+            (
+                "memory_off",
+                dict(
+                    memory_read_lag=configured_lag,
+                    inter_layer_read=configured_inter_layer,
+                    inter_layer_read_every_block=configured_every_block,
+                    ablate_memory=True,
+                ),
+            ),
+            (
+                "memory_shuffled",
+                dict(
+                    memory_read_lag=configured_lag,
+                    inter_layer_read=configured_inter_layer,
+                    inter_layer_read_every_block=configured_every_block,
+                    shuffle_memory=True,
+                ),
+            ),
+            (
+                "read_lag_0",
+                dict(
+                    memory_read_lag=0,
+                    inter_layer_read=configured_inter_layer,
+                    inter_layer_read_every_block=configured_every_block,
+                ),
+            ),
+            (
+                "read_lag_1",
+                dict(
+                    memory_read_lag=1,
+                    inter_layer_read=configured_inter_layer,
+                    inter_layer_read_every_block=configured_every_block,
+                ),
+            ),
         ]
         if include_inter_layer:
             conditions.extend(
                 [
-                    ("final_layer_read", dict(memory_read_lag=configured_lag,
-                                               inter_layer_read=False,
-                                               inter_layer_read_every_block=False)),
-                    ("inter_layer_read", dict(memory_read_lag=configured_lag,
-                                              inter_layer_read=True,
-                                              inter_layer_read_every_block=False)),
-                    ("inter_layer_every_block", dict(memory_read_lag=configured_lag,
-                                                      inter_layer_read=True,
-                                                      inter_layer_read_every_block=True)),
+                    (
+                        "final_layer_read",
+                        dict(
+                            memory_read_lag=configured_lag,
+                            inter_layer_read=False,
+                            inter_layer_read_every_block=False,
+                        ),
+                    ),
+                    (
+                        "inter_layer_read",
+                        dict(
+                            memory_read_lag=configured_lag,
+                            inter_layer_read=True,
+                            inter_layer_read_every_block=False,
+                        ),
+                    ),
+                    (
+                        "inter_layer_every_block",
+                        dict(
+                            memory_read_lag=configured_lag,
+                            inter_layer_read=True,
+                            inter_layer_read_every_block=True,
+                        ),
+                    ),
                 ]
             )
         results = []

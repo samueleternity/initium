@@ -13,16 +13,17 @@ from initium.data.workspace_capability.curriculum import (
     WorkspaceCapabilityCurriculum,
     difficulty_for,
 )
+from initium.data.workspace_capability.dataset import WorkspaceCapabilityDataset
 from initium.data.workspace_capability.episode import (
-    BOS,
     BOOL_FALSE,
     BOOL_TRUE,
+    BOS,
     COUNT_BASE,
     ENTITY_BASE,
     ENTITY_COUNT,
-    EV_COMMIT,
     EOS,
     EV_ASSERT,
+    EV_COMMIT,
     EV_COUNT_QUERY,
     EV_FACT,
     EV_INIT,
@@ -44,8 +45,8 @@ from initium.data.workspace_capability.episode import (
     SCALAR_BASE,
     SEP,
     SOURCE_BASE,
-    TaskEpisode,
     VOCAB_SIZE,
+    TaskEpisode,
     validate_episode,
 )
 from initium.data.workspace_capability.tracks import (
@@ -57,7 +58,6 @@ from initium.data.workspace_capability.tracks import (
 )
 from initium.workspace.broadcast import WorkspaceBroadcast
 from initium.workspace.nth_farthest import select_nth_farthest
-
 
 GENERATORS = {
     "permutation": permutation.generate,
@@ -103,26 +103,22 @@ def test_track_generators_are_seed_reproducible_and_emit_valid_masked_episodes(t
 
 @pytest.mark.parametrize("track,generator", GENERATORS.items())
 def test_ood_track_generation_stays_inside_the_shared_vocabulary(track, generator):
-    episode = validate_episode(generator(difficulty_for(track, 5, ood=True), random.Random(901), ood=True))
+    episode = validate_episode(
+        generator(difficulty_for(track, 5, ood=True), random.Random(901), ood=True)
+    )
     assert episode.track == track
     assert min(episode.inputs + episode.answer) >= 0
     assert max(episode.inputs + episode.answer) < VOCAB_SIZE
 
 
 def _permutation_initial_entity_ids(episode):
-    return {
-        segment[1] - ENTITY_BASE
-        for segment in _segments(episode)
-        if segment[0] == EV_INIT
-    }
+    return {segment[1] - ENTITY_BASE for segment in _segments(episode) if segment[0] == EV_INIT}
 
 
 def test_permutation_id_and_ood_entity_labels_are_disjoint():
     difficulty = difficulty_for("permutation", 5)
     id_episode = permutation.generate(difficulty, random.Random(481))
-    ood_episode = permutation.generate(
-        difficulty, random.Random(481), ood_axes=("labels",)
-    )
+    ood_episode = permutation.generate(difficulty, random.Random(481), ood_axes=("labels",))
 
     id_labels = _permutation_initial_entity_ids(id_episode)
     ood_labels = _permutation_initial_entity_ids(ood_episode)
@@ -135,19 +131,13 @@ def test_permutation_id_and_ood_entity_labels_are_disjoint():
 def test_permutation_label_and_length_shifts_are_independent():
     lesson = 2
     base_difficulty = difficulty_for("permutation", lesson)
-    longer_difficulty = difficulty_for(
-        "permutation", lesson, ood_axes=("length",)
-    )
+    longer_difficulty = difficulty_for("permutation", lesson, ood_axes=("length",))
     assert longer_difficulty["entities"] == base_difficulty["entities"]
     assert longer_difficulty["swaps"] > base_difficulty["swaps"]
 
     baseline = permutation.generate(base_difficulty, random.Random(902))
-    label_only = permutation.generate(
-        base_difficulty, random.Random(902), ood_axes=("labels",)
-    )
-    length_only = permutation.generate(
-        longer_difficulty, random.Random(902), ood_axes=("length",)
-    )
+    label_only = permutation.generate(base_difficulty, random.Random(902), ood_axes=("labels",))
+    length_only = permutation.generate(longer_difficulty, random.Random(902), ood_axes=("length",))
     assert len(label_only.inputs) == len(baseline.inputs)
     assert label_only.metadata["query_type"] == baseline.metadata["query_type"]
     assert label_only.metadata["relevant_updates"] == baseline.metadata["relevant_updates"]
@@ -202,22 +192,37 @@ def test_entity_state_oracle_uses_priority_and_applies_retract_supersede():
         if event in (EV_PUT, EV_ASSERT):
             source, fact_id, entity, relation, value = segment[1:]
             sequence += 1
-            facts[fact_id] = (source - SOURCE_BASE, entity - ENTITY_BASE,
-                              relation, value - LOCATION_BASE, sequence)
+            facts[fact_id] = (
+                source - SOURCE_BASE,
+                entity - ENTITY_BASE,
+                relation,
+                value - LOCATION_BASE,
+                sequence,
+            )
         elif event == EV_RETRACT:
             facts.pop(segment[2], None)
         elif event == EV_MOVE:
             source, old_id, entity, relation, old_value, new_source, new_id, new_value = segment[1:]
             facts.pop(old_id, None)
             sequence += 1
-            facts[new_id] = (new_source - SOURCE_BASE, entity - ENTITY_BASE,
-                             relation, new_value - LOCATION_BASE, sequence)
+            facts[new_id] = (
+                new_source - SOURCE_BASE,
+                entity - ENTITY_BASE,
+                relation,
+                new_value - LOCATION_BASE,
+                sequence,
+            )
         elif event == EV_SUPERSEDE:
             source, old_id, new_id, entity, relation, value = segment[1:]
             facts.pop(old_id, None)
             sequence += 1
-            facts[new_id] = (source - SOURCE_BASE, entity - ENTITY_BASE,
-                             relation, value - LOCATION_BASE, sequence)
+            facts[new_id] = (
+                source - SOURCE_BASE,
+                entity - ENTITY_BASE,
+                relation,
+                value - LOCATION_BASE,
+                sequence,
+            )
         elif event == EV_REMOVE:
             facts.pop(segment[2], None)
         elif event == QUERY:
@@ -248,17 +253,15 @@ def test_entity_state_oracle_uses_priority_and_applies_retract_supersede():
 def test_entity_source_priority_then_timestamp_then_source_id_tie_break():
     facts = [
         (10, 3, 0, 100),  # priority 0
-        (11, 2, 1, 1),    # priority 2 wins despite older time
-        (12, 5, 2, 2),    # same priority, newer time wins
-        (13, 2, 3, 2),    # exact priority/time tie; lower source ID wins
+        (11, 2, 1, 1),  # priority 2 wins despite older time
+        (12, 5, 2, 2),  # same priority, newer time wins
+        (13, 2, 3, 2),  # exact priority/time tie; lower source ID wins
     ]
     assert entity_state._winner(facts) == facts[3]
 
 
 def test_relational_join_oracle_follows_the_requested_relation_chain():
-    episode = relational_join.generate(
-        {"hops": 3, "distractors": 11}, random.Random(91)
-    )
+    episode = relational_join.generate({"hops": 3, "distractors": 11}, random.Random(91))
     facts = []
     query = None
     for segment in _segments(episode):
@@ -270,7 +273,9 @@ def test_relational_join_oracle_follows_the_requested_relation_chain():
     assert query is not None
     current = query[0]
     for relation in query[1:]:
-        next_entities = [obj for subject, edge, obj in facts if subject == current and edge == relation]
+        next_entities = [
+            obj for subject, edge, obj in facts if subject == current and edge == relation
+        ]
         assert len(next_entities) == 1
         current = next_entities[0]
     assert episode.answer == (current, EOS)
@@ -305,9 +310,7 @@ def test_nth_farthest_exact_readout_uses_descending_distance_and_entity_id_ties(
     query = torch.zeros(1, 2)
     entity_ids = torch.tensor([[9, 2, 5, -1]])
     mask = torch.tensor([[True, True, True, False]])
-    selected, distances = select_nth_farthest(
-        vectors, query, entity_ids, torch.tensor([0]), mask
-    )
+    selected, distances = select_nth_farthest(vectors, query, entity_ids, torch.tensor([0]), mask)
     # The two distance-9 candidates tie; entity ID 2 wins the oracle tie-break.
     assert selected.tolist() == [2]
     assert distances.tolist() == [[9.0, 9.0, 1.0, 19602.0]]
@@ -355,7 +358,10 @@ def test_nth_farthest_workspace_metadata_is_input_only_and_handles_all_track():
     assert metadata["nth_farthest_vector_steps"]
     assert metadata["nth_farthest_query_steps"] == (len(episodes[0].inputs),)
     query_step = len(episodes[0].inputs)
-    assert int(metadata["nth_farthest_query_candidate_mask"][0, query_step].sum()) == episodes[0].metadata["candidate_count"]
+    assert (
+        int(metadata["nth_farthest_query_candidate_mask"][0, query_step].sum())
+        == episodes[0].metadata["candidate_count"]
+    )
     assert not bool(metadata["nth_farthest_query_candidate_mask"][1].any())
     assert metadata["nth_farthest_query_vectors"][0, query_step].ge(0).any()
     assert metadata["nth_farthest_query_vectors"][1].eq(-1).all()
@@ -367,8 +373,7 @@ def test_nth_farthest_workspace_metadata_is_input_only_and_handles_all_track():
 )
 def test_retrieval_aggregation_oracle_uses_latest_values(aggregate, op_token):
     episode = retrieval_aggregation.generate(
-        {"keys": 9, "updates": 12, "distractors": 7, "queries": 5,
-         "aggregate": aggregate},
+        {"keys": 9, "updates": 12, "distractors": 7, "queries": 5, "aggregate": aggregate},
         random.Random(81),
     )
     state, query_keys = {}, None
@@ -435,9 +440,7 @@ def test_batch_collation_is_one_hot_and_loss_uses_only_answer_tokens():
     assert max(counts.values()) - min(counts.values()) <= 1
     assert inputs.shape[:2] == targets.shape == mask.shape
     assert inputs.shape[-1] == VOCAB_SIZE
-    torch.testing.assert_close(
-        inputs.sum(-1), (inputs.sum(-1) > 0).to(inputs.dtype)
-    )
+    torch.testing.assert_close(inputs.sum(-1), (inputs.sum(-1) > 0).to(inputs.dtype))
     assert set(mask.unique().tolist()) <= {0.0, 1.0}
     for row, episode in enumerate(dataset.last_batch_examples):
         assert mask[row, : len(episode.inputs)].sum() == 0
@@ -455,13 +458,9 @@ def test_batch_collation_is_one_hot_and_loss_uses_only_answer_tokens():
 
 def test_task_field_log_rows_match_dataset_owned_header():
     dataset = capability_dataset.WorkspaceCapabilityDataset("entity_state")
-    episode = entity_state.generate(
-        difficulty_for("entity_state", 3), random.Random(72)
-    )
+    episode = entity_state.generate(difficulty_for("entity_state", 3), random.Random(72))
     field_log = {}
-    dataset._record_field(
-        field_log, episode, correct_count=1, answer_count=1, exact=True
-    )
+    dataset._record_field(field_log, episode, correct_count=1, answer_count=1, exact=True)
     buffer = io.StringIO()
     writer = csv.writer(buffer)
     dataset.write_field_log(writer, buffer, 500, 3, "ood", field_log)
@@ -483,11 +482,24 @@ def test_transactional_metadata_defers_swap_pair_and_marks_boundary():
     episode = TaskEpisode(
         "permutation",
         (
-            EV_INIT, ENTITY_BASE + 2, LOCATION_BASE + 1, SEP,
-            EV_INIT, ENTITY_BASE + 5, LOCATION_BASE + 3, SEP,
-            EV_SWAP, ENTITY_BASE + 2, ENTITY_BASE + 5,
-            EV_COMMIT, ENTITY_BASE + 2, ENTITY_BASE + 5, SEP,
-            QUERY, ENTITY_BASE + 2, SEP,
+            EV_INIT,
+            ENTITY_BASE + 2,
+            LOCATION_BASE + 1,
+            SEP,
+            EV_INIT,
+            ENTITY_BASE + 5,
+            LOCATION_BASE + 3,
+            SEP,
+            EV_SWAP,
+            ENTITY_BASE + 2,
+            ENTITY_BASE + 5,
+            EV_COMMIT,
+            ENTITY_BASE + 2,
+            ENTITY_BASE + 5,
+            SEP,
+            QUERY,
+            ENTITY_BASE + 2,
+            SEP,
         ),
         (LOCATION_BASE + 3, EOS),
         {
@@ -497,9 +509,7 @@ def test_transactional_metadata_defers_swap_pair_and_marks_boundary():
         },
     )
     inputs, _, _ = dataset._collate([episode])
-    metadata = dataset.workspace_entity_address_metadata(
-        inputs, paired_swap_commits=True
-    )
+    metadata = dataset.workspace_entity_address_metadata(inputs, paired_swap_commits=True)
     commit_positions = [12, 13]
     assert not metadata["entity_write_mask"][0, commit_positions].any()
     boundary = 14
@@ -519,15 +529,11 @@ def test_all_track_semantic_addresses_write_only_at_supported_event_boundaries()
     ]
     inputs, _, _ = dataset._collate(episodes)
 
-    metadata = dataset.workspace_entity_address_metadata(
-        inputs, paired_swap_commits=True
-    )
+    metadata = dataset.workspace_entity_address_metadata(inputs, paired_swap_commits=True)
     state_metadata = dataset.workspace_state_supervision_metadata(inputs, episodes)
 
     for row, episode in enumerate(episodes):
-        write_steps = torch.nonzero(
-            metadata["entity_write_mask"][row], as_tuple=False
-        ).flatten()
+        write_steps = torch.nonzero(metadata["entity_write_mask"][row], as_tuple=False).flatten()
         assert write_steps.numel() > 0, episode.track
         assert metadata["entity_ids"][row, write_steps].ge(0).all()
         query_step = episode.inputs.index(QUERY)
@@ -546,21 +552,12 @@ def test_all_track_semantic_addresses_write_only_at_supported_event_boundaries()
 
 
 def test_kv_evaluation_microbatches_long_episodes_by_attention_workspace():
-    episodes = [
-        SimpleNamespace(sequence=tuple(range(length)))
-        for length in (4096, 64, 4096, 64)
-    ]
+    episodes = [SimpleNamespace(sequence=tuple(range(length))) for length in (4096, 64, 4096, 64)]
 
-    groups = list(
-        WorkspaceCapabilityDataset._evaluation_groups(
-            episodes, 16, kv_attention_heads=4
-        )
-    )
+    groups = list(WorkspaceCapabilityDataset._evaluation_groups(episodes, 16, kv_attention_heads=4))
 
     assert [len(group) for group in groups] == [2, 1, 1]
-    assert [len(episode.sequence) for group in groups for episode in group] == [
-        64, 64, 4096, 4096
-    ]
+    assert [len(episode.sequence) for group in groups for episode in group] == [64, 64, 4096, 4096]
 
 
 def test_transactional_workspace_swaps_payloads_and_emits_query_readout():
@@ -645,4 +642,3 @@ def test_workspace_query_logits_replace_answer_class_and_keep_gradient():
     assert mapped[0, 0].argmax().item() == LOCATION_BASE + 7
     mapped[0, 0, LOCATION_BASE + 7].backward()
     assert position_logits.grad[0, 7].item() == 1.0
-

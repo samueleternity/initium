@@ -34,8 +34,15 @@ class TinyWorkspacePipeline(nn.Module):
             self.workspace.write_gate.bias.fill_(8.0)
             self.workspace.read_gate.fill_(1.0)
 
-    def forward(self, inputs, hidden=None, *, reset_experience=False,
-                pass_through_memory=True, combiner_skip_stages=None):
+    def forward(
+        self,
+        inputs,
+        hidden=None,
+        *,
+        reset_experience=False,
+        pass_through_memory=True,
+        combiner_skip_stages=None,
+    ):
         batch, steps, _ = inputs.shape
         state = None if hidden is None else hidden[2]
         if reset_experience or state is None:
@@ -88,9 +95,7 @@ class TransactionalPermutationPipeline(nn.Module):
         batch, steps, _ = inputs.shape
         state = None if hidden is None else hidden[2]
         if reset_experience or state is None:
-            state = self.workspace.init_state(
-                batch, device=inputs.device, dtype=inputs.dtype
-            )
+            state = self.workspace.init_state(batch, device=inputs.device, dtype=inputs.dtype)
         specialists = self.input_projection(inputs).unsqueeze(2)
         routes = torch.zeros(batch, steps, 1, dtype=torch.long, device=inputs.device)
         weights = torch.ones(batch, steps, 1, dtype=inputs.dtype, device=inputs.device)
@@ -127,8 +132,14 @@ class NthFarthestWorkspacePipeline(nn.Module):
         self.input_projection = nn.Linear(VOCAB_SIZE, 64, bias=False)
 
     def forward(
-        self, inputs, hidden=None, *, reset_experience=False,
-        pass_through_memory=True, combiner_skip_stages=None, **workspace_metadata,
+        self,
+        inputs,
+        hidden=None,
+        *,
+        reset_experience=False,
+        pass_through_memory=True,
+        combiner_skip_stages=None,
+        **workspace_metadata,
     ):
         batch, steps, _ = inputs.shape
         state = None if hidden is None else hidden[2]
@@ -138,7 +149,10 @@ class NthFarthestWorkspacePipeline(nn.Module):
         routes = torch.zeros(batch, steps, 1, dtype=torch.long, device=inputs.device)
         weights = torch.ones(batch, steps, 1, dtype=inputs.dtype, device=inputs.device)
         output, state = self.workspace(
-            specialists, routes, weights, state,
+            specialists,
+            routes,
+            weights,
+            state,
             bypass_broadcast=self.workspace_eval_bypass,
             shuffle_readback_across_batch=self.workspace_eval_shuffle_readback,
             selected_specialists_only=True,
@@ -192,16 +206,12 @@ def test_all_track_transactional_workspace_forward_supports_mixed_metadata():
         for index, track in enumerate(tracks)
     ]
     inputs, _targets, _mask = dataset._collate(episodes)
-    entity_metadata = dataset.workspace_entity_address_metadata(
-        inputs, paired_swap_commits=True
-    )
+    entity_metadata = dataset.workspace_entity_address_metadata(inputs, paired_swap_commits=True)
     entity_metadata.update(dataset.workspace_permutation_query_metadata(inputs, episodes))
     state_metadata = dataset.workspace_state_supervision_metadata(inputs, episodes)
     entity_metadata.update(
         {
-            "state_supervision_entity_ids": state_metadata[
-                "state_supervision_entity_ids"
-            ],
+            "state_supervision_entity_ids": state_metadata["state_supervision_entity_ids"],
             "state_supervision_mask": state_metadata["state_supervision_mask"],
             "state_supervision_steps": state_metadata["state_supervision_steps"],
         }
@@ -235,12 +245,16 @@ def test_permutation_generalization_evaluation_reports_independent_axes():
     )
     splits = dataset.last_eval_diagnostics["permutation_generalization"]
 
-    assert set(splits) == {
-        "in_distribution", "label_only", "length_only", "combined"
-    }
+    assert set(splits) == {"in_distribution", "label_only", "length_only", "combined"}
     assert all(item["episodes"] == 3 for item in splits.values())
-    assert splits["label_only"]["mean_context_tokens"] == splits["in_distribution"]["mean_context_tokens"]
-    assert splits["length_only"]["mean_context_tokens"] > splits["in_distribution"]["mean_context_tokens"]
+    assert (
+        splits["label_only"]["mean_context_tokens"]
+        == splits["in_distribution"]["mean_context_tokens"]
+    )
+    assert (
+        splits["length_only"]["mean_context_tokens"]
+        > splits["in_distribution"]["mean_context_tokens"]
+    )
     assert model.training is True
 
 
@@ -263,9 +277,10 @@ def test_transactional_evaluation_logs_query_directions_state_depth_and_commits(
         "position_to_object",
     }
     assert diagnostics["permutation_pair_commit_attempts"] > 0
-    assert diagnostics["permutation_pair_commit_successes"] == diagnostics[
-        "permutation_pair_commit_attempts"
-    ]
+    assert (
+        diagnostics["permutation_pair_commit_successes"]
+        == diagnostics["permutation_pair_commit_attempts"]
+    )
     assert diagnostics["permutation_state_accuracy_by_swap_depth"]
     assert all(
         0.0 <= item["accuracy"] <= 1.0
@@ -317,8 +332,7 @@ def test_nth_farthest_exact_readout_evaluation_reports_vector_and_rank_metrics()
     torch.manual_seed(37)
     dataset = WorkspaceCapabilityDataset("all", batch_size_hint=4)
     episodes = [
-        dataset._make_episode("nth_farthest", 2, random.Random(100 + index))
-        for index in range(4)
+        dataset._make_episode("nth_farthest", 2, random.Random(100 + index)) for index in range(4)
     ]
     model = NthFarthestWorkspacePipeline().train()
     dataset.set_output_proj(nn.Linear(64, VOCAB_SIZE))
@@ -338,7 +352,8 @@ def test_nth_farthest_exact_readout_evaluation_reports_vector_and_rank_metrics()
     forward_metadata.update(dataset.workspace_nth_farthest_metadata(inputs, [episodes[0]]))
     target_vectors = forward_metadata["nth_farthest_vector_targets"]
     model_metadata = {
-        key: value for key, value in forward_metadata.items()
+        key: value
+        for key, value in forward_metadata.items()
         if key != "nth_farthest_vector_targets"
     }
     output, _state = model(
@@ -379,4 +394,3 @@ def test_nth_farthest_mode_keeps_permutation_state_diagnostics_compatible():
 
     assert result["queries"] > 0
     assert model.training is True
-

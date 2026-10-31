@@ -431,9 +431,9 @@ class MambaBackboneParallel(nn.Module):
             # There is no projection to turn into a gather when in_dim ==
             # d_model; materialize the one-hot values only for this degenerate
             # configuration, preserving the public input feature shape.
-            encoded = torch.nn.functional.one_hot(
-                input_token_ids, num_classes=self.input_dim
-            ).to(dtype=torch.float32)
+            encoded = torch.nn.functional.one_hot(input_token_ids, num_classes=self.input_dim).to(
+                dtype=torch.float32
+            )
             return encoded.masked_fill(~input_valid_mask.unsqueeze(-1), 0)
         if not isinstance(self.in_adapter, nn.Linear):
             raise RuntimeError("token-ID input requires a Linear or Identity input adapter")
@@ -470,9 +470,7 @@ class MambaBackboneParallel(nn.Module):
         # training step (not once per DNC timestep, unlike
         # MambaControllerWrapper) -- this single call is the entire
         # "backbone half" of the Option 5 split.
-        h = self._adapt_input(
-            x, input_token_ids=input_token_ids, input_valid_mask=input_valid_mask
-        )
+        h = self._adapt_input(x, input_token_ids=input_token_ids, input_valid_mask=input_valid_mask)
         numeric_observer = getattr(self, "_initium_forward_numeric_observer", None)
         if numeric_observer is not None:
             numeric_observer("input_adapter.output", h)
@@ -497,9 +495,7 @@ class MambaBackboneParallel(nn.Module):
         input_valid_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run the normal stack and expose block-0 features without a second pass."""
-        h = self._adapt_input(
-            x, input_token_ids=input_token_ids, input_valid_mask=input_valid_mask
-        )
+        h = self._adapt_input(x, input_token_ids=input_token_ids, input_valid_mask=input_valid_mask)
         numeric_observer = getattr(self, "_initium_forward_numeric_observer", None)
         if numeric_observer is not None:
             numeric_observer("input_adapter.output", h)
@@ -536,9 +532,7 @@ class MambaBackboneParallel(nn.Module):
         """
         if len(self.blocks) < 2:
             raise ValueError("inter-layer memory requires at least two backbone blocks")
-        h = self._adapt_input(
-            x, input_token_ids=input_token_ids, input_valid_mask=input_valid_mask
-        )
+        h = self._adapt_input(x, input_token_ids=input_token_ids, input_valid_mask=input_valid_mask)
         numeric_observer = getattr(self, "_initium_forward_numeric_observer", None)
         if numeric_observer is not None:
             numeric_observer("input_adapter.output", h)
@@ -551,9 +545,7 @@ class MambaBackboneParallel(nn.Module):
                 h = moe_blocks[index](h, token_mask=token_mask)
                 if numeric_observer is not None:
                     numeric_observer(f"block.{index}.moe_output", h)
-            if index == 0 or (
-                inter_layer_read_every_block and index < len(self.blocks) - 1
-            ):
+            if index == 0 or (inter_layer_read_every_block and index < len(self.blocks) - 1):
                 if index == 0 and intermediate_observer is not None:
                     intermediate_observer(h)
                 h = inter_layer_read(h, index)
@@ -707,9 +699,7 @@ class MambaBackboneParallel(nn.Module):
         """
         if not self.moe_enabled or self.moe_blocks is None:
             raise RuntimeError("workspace broadcast requires an enabled MoE expert pool")
-        h = self._adapt_input(
-            x, input_token_ids=input_token_ids, input_valid_mask=input_valid_mask
-        )
+        h = self._adapt_input(x, input_token_ids=input_token_ids, input_valid_mask=input_valid_mask)
         numeric_observer = getattr(self, "_initium_forward_numeric_observer", None)
         if numeric_observer is not None:
             numeric_observer("input_adapter.output", h)

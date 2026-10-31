@@ -311,8 +311,7 @@ class SegmentDiagnostics:
         if detached.is_contiguous():
             flat = detached.view(-1)
             chunks = (
-                flat[start : start + chunk_elements]
-                for start in range(0, numel, chunk_elements)
+                flat[start : start + chunk_elements] for start in range(0, numel, chunk_elements)
             )
         elif detached.ndim > 1:
             row_elements = max(1, detached[0].numel()) if detached.shape[0] else 1
@@ -324,8 +323,7 @@ class SegmentDiagnostics:
         else:
             flat = detached.reshape(-1)
             chunks = (
-                flat[start : start + chunk_elements]
-                for start in range(0, numel, chunk_elements)
+                flat[start : start + chunk_elements] for start in range(0, numel, chunk_elements)
             )
 
         sum_sq = torch.zeros((), device=detached.device, dtype=torch.float64)

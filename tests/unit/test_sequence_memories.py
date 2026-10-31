@@ -40,9 +40,7 @@ def test_delta_forward_matches_step_reference_and_gradients(lag, chunk):
 @pytest.mark.parametrize("position_mode", ["none", "rope"])
 def test_kv_forward_matches_step_reference_with_and_without_cached_state(lag, position_mode):
     torch.manual_seed(4)
-    memory = CausalKVMemory(
-        8, heads=2, key_size=4, value_size=3, position_mode=position_mode
-    )
+    memory = CausalKVMemory(8, heads=2, key_size=4, value_size=3, position_mode=position_mode)
     torch.nn.init.normal_(memory.output.weight)
     prefix = torch.randn(2, 3, 8)
     suffix = torch.randn(2, 5, 8)
@@ -80,7 +78,8 @@ def test_kv_lag_one_first_read_is_zero_with_trained_output_projection():
 
 
 @pytest.mark.parametrize(
-    "memory", [
+    "memory",
+    [
         GatedDeltaMemory(8, heads=2, key_size=4, value_size=3, chunk_size=2),
         CausalKVMemory(8, heads=2, key_size=4, value_size=3),
     ],

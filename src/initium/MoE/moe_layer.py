@@ -386,9 +386,7 @@ class SwitchMoE(nn.Module):
             with torch.no_grad():
                 accepted_selected = selected_outputs.detach()[keep]
                 total_route_values = max(1, keep.numel() * selected_outputs.shape[-1])
-                accepted_output_sq_mean = (
-                    accepted_selected.square().sum() / total_route_values
-                )
+                accepted_output_sq_mean = accepted_selected.square().sum() / total_route_values
                 accepted_output_absmax = (
                     accepted_selected.abs().amax()
                     if accepted_selected.numel()

@@ -161,10 +161,16 @@ class GatedDeltaMemory(SequenceMemory):
         nn.init.zeros_(self.output.bias)
 
     def reset_state(self, batch_size: int, *, device=None) -> DeltaState:
-        return DeltaState(torch.zeros(
-            batch_size, self.heads, self.value_size, self.key_size,
-            device=device, dtype=torch.float32,
-        ))
+        return DeltaState(
+            torch.zeros(
+                batch_size,
+                self.heads,
+                self.value_size,
+                self.key_size,
+                device=device,
+                dtype=torch.float32,
+            )
+        )
 
     def _project(self, h_t: torch.Tensor):
         b = h_t.shape[0]
@@ -211,21 +217,25 @@ class GatedDeltaMemory(SequenceMemory):
         v = self.value(h_seq).view(b, t, self.heads, self.value_size).float().transpose(1, 2)
         beta = torch.sigmoid(self.write_gate(h_seq).float()).transpose(1, 2).unsqueeze(-1)
         if self.use_gate:
-            alpha = torch.exp(
-                -F.softplus(self.decay_gate(h_seq).float()) * self.decay_scale
-            ).transpose(1, 2).unsqueeze(-1)
+            alpha = (
+                torch.exp(-F.softplus(self.decay_gate(h_seq).float()) * self.decay_scale)
+                .transpose(1, 2)
+                .unsqueeze(-1)
+            )
         else:
             alpha = torch.ones_like(beta)
-        fast_result = (
-            self._fla_forward(q, k, v, beta, alpha, state, lag) if t > 0 else None
-        )
+        fast_result = self._fla_forward(q, k, v, beta, alpha, state, lag) if t > 0 else None
         if fast_result is not None:
             reads, state = fast_result
             if self._collect_memory_usage:
-                shaped_reads = reads.float().reshape(
-                    b, h_seq.shape[1], self.heads, self.value_size
-                ).transpose(1, 2)
-                self._record_head_usage("delta_read_rms", shaped_reads.square().mean(dim=(-1, -2)).sqrt())
+                shaped_reads = (
+                    reads.float()
+                    .reshape(b, h_seq.shape[1], self.heads, self.value_size)
+                    .transpose(1, 2)
+                )
+                self._record_head_usage(
+                    "delta_read_rms", shaped_reads.square().mean(dim=(-1, -2)).sqrt()
+                )
                 self._record_head_usage("delta_write_strength", beta.squeeze(-1))
                 self._record_head_usage("delta_decay_alpha", alpha.squeeze(-1))
                 self._record_head_usage(
@@ -245,21 +255,21 @@ class GatedDeltaMemory(SequenceMemory):
                 prediction = torch.einsum("bhvk,bhk->bhv", matrix, k_t)
                 delta = beta_t * (v_t - alpha_t * prediction)
                 updated = alpha_t.unsqueeze(-1) * matrix + delta.unsqueeze(-1) @ k_t.unsqueeze(-2)
-                read = (
-                    torch.einsum("bhvk,bhk->bhv", updated, q_t)
-                    if lag == 0
-                    else read_before
-                )
+                read = torch.einsum("bhvk,bhk->bhv", updated, q_t) if lag == 0 else read_before
                 read_sequence.append(read.flatten(1).to(h_seq.dtype))
                 state = DeltaState(updated)
         if not read_sequence:
             return h_seq.new_zeros(b, 0, self.input_size), state, {}
         reads = torch.stack(read_sequence, dim=1)
         if self._collect_memory_usage:
-            shaped_reads = reads.float().reshape(
-                b, h_seq.shape[1], self.heads, self.value_size
-            ).transpose(1, 2)
-            self._record_head_usage("delta_read_rms", shaped_reads.square().mean(dim=(-1, -2)).sqrt())
+            shaped_reads = (
+                reads.float()
+                .reshape(b, h_seq.shape[1], self.heads, self.value_size)
+                .transpose(1, 2)
+            )
+            self._record_head_usage(
+                "delta_read_rms", shaped_reads.square().mean(dim=(-1, -2)).sqrt()
+            )
             self._record_head_usage("delta_write_strength", beta.squeeze(-1))
             self._record_head_usage("delta_decay_alpha", alpha.squeeze(-1))
             self._record_head_usage(
@@ -408,9 +418,12 @@ class CausalKVMemory(SequenceMemory):
         if self._collect_memory_usage:
             self._record_usage_scalar("kv_history_tokens", keys.shape[-2])
             query_count = min(q.shape[-2], 16)
-            query_indices = torch.linspace(
-                0, max(q.shape[-2] - 1, 0), steps=query_count, device=q.device
-            ).round().long().unique()
+            query_indices = (
+                torch.linspace(0, max(q.shape[-2] - 1, 0), steps=query_count, device=q.device)
+                .round()
+                .long()
+                .unique()
+            )
             diagnostic_q = q.index_select(-2, query_indices).float()
             diagnostic_allowed = allowed.index_select(-2, query_indices)
             scores = torch.matmul(diagnostic_q, keys.float().transpose(-2, -1))
@@ -480,8 +493,6 @@ class CausalKVMemory(SequenceMemory):
         if self._collect_memory_usage:
             self._record_head_usage("kv_key_rms", keys.square().mean(dim=(-1, -2)).sqrt())
             self._record_head_usage("kv_value_rms", values.square().mean(dim=(-1, -2)).sqrt())
-            self._record_head_usage(
-                "kv_read_rms", reads.square().mean(dim=(-1, -2)).sqrt()
-            )
+            self._record_head_usage("kv_read_rms", reads.square().mean(dim=(-1, -2)).sqrt())
         reads = reads.transpose(1, 2).reshape(b, t, -1)
         return self.output(reads), KVState(keys, values), {}

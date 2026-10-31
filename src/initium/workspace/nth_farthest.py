@@ -41,4 +41,3 @@ def select_nth_farthest(
     selected_index = ordered_indices.gather(1, rank.unsqueeze(1)).squeeze(1)
     selected_entity = entity_ids.gather(1, selected_index.unsqueeze(1)).squeeze(1)
     return selected_entity, distances
-

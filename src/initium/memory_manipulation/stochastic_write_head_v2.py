@@ -278,9 +278,7 @@ class StochasticWriteHead(nn.Module):
         previous_count = self._recent_write_count
         combined_count = previous_count + batch_count
         delta = batch_mean - self._recent_write_mean
-        self._recent_write_mean = self._recent_write_mean + delta * (
-            batch_count / combined_count
-        )
+        self._recent_write_mean = self._recent_write_mean + delta * (batch_count / combined_count)
         self._recent_write_m2 = (
             self._recent_write_m2
             + batch_m2
@@ -501,9 +499,7 @@ def install_stochastic_write_heads(
             heads.append(stochastic)
 
     if not heads:
-        raise RuntimeError(
-            "No supported DNC or sequence-memory write projection found on model."
-        )
+        raise RuntimeError("No supported DNC or sequence-memory write projection found on model.")
     return heads
 
 

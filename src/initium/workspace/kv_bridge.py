@@ -73,9 +73,7 @@ class WorkspaceKVBridge(nn.Module):
     def _rope(self, x: torch.Tensor, start: int) -> torch.Tensor:
         if self.position_mode == "none" or x.shape[-2] == 0:
             return x
-        positions = torch.arange(
-            start, start + x.shape[-2], device=x.device, dtype=torch.float32
-        )
+        positions = torch.arange(start, start + x.shape[-2], device=x.device, dtype=torch.float32)
         inv = torch.exp(
             torch.arange(0, self.key_size, 2, device=x.device, dtype=torch.float32)
             * (-torch.log(torch.tensor(10_000.0, device=x.device)) / self.key_size)
@@ -93,29 +91,37 @@ class WorkspaceKVBridge(nn.Module):
         state: WorkspaceKVState | None,
     ) -> WorkspaceKVState:
         if records.ndim != 4 or records.shape[-1] != self.record_size:
-            raise ValueError(
-                f"records must have shape [B, T, K, {self.record_size}]"
-            )
+            raise ValueError(f"records must have shape [B, T, K, {self.record_size}]")
         if records.shape[2] != self.records_per_token:
             raise ValueError("records_per_token does not match workspace record tensor")
         if commit_mask.shape != records.shape[:3]:
             raise ValueError("commit_mask must match record batch/time axes")
         batch, time, records_per_token, _ = records.shape
-        state = self.reset_state(batch, device=records.device, dtype=records.dtype) if state is None else state
+        state = (
+            self.reset_state(batch, device=records.device, dtype=records.dtype)
+            if state is None
+            else state
+        )
         if state.keys.shape[:2] != (batch, self.heads):
             raise ValueError("workspace KV state batch/head dimensions do not match records")
         old = state.keys.shape[-2]
         flat_records = records.reshape(batch, time * records_per_token, self.record_size)
         flat_mask = commit_mask.reshape(batch, time * records_per_token)
         safe_records = flat_records * flat_mask.unsqueeze(-1).to(records.dtype)
-        keys = self.key(safe_records).view(
-            batch, time * records_per_token, self.heads, self.key_size
-        ).transpose(1, 2)
-        values = self.value(safe_records).view(
-            batch, time * records_per_token, self.heads, self.value_size
-        ).transpose(1, 2)
+        keys = (
+            self.key(safe_records)
+            .view(batch, time * records_per_token, self.heads, self.key_size)
+            .transpose(1, 2)
+        )
+        values = (
+            self.value(safe_records)
+            .view(batch, time * records_per_token, self.heads, self.value_size)
+            .transpose(1, 2)
+        )
         keys = self._rope(keys, old)
-        valid = torch.cat((state.valid, flat_mask.to(device=records.device, dtype=torch.bool)), dim=-1)
+        valid = torch.cat(
+            (state.valid, flat_mask.to(device=records.device, dtype=torch.bool)), dim=-1
+        )
         return WorkspaceKVState(
             torch.cat((state.keys.to(keys.dtype), keys), dim=-2),
             torch.cat((state.values.to(values.dtype), values), dim=-2),
@@ -144,13 +150,11 @@ class WorkspaceKVBridge(nn.Module):
             time, device=queries.device
         )
         key_positions = torch.arange(key_count, device=queries.device)
-        allowed = (
-            key_positions[None, :] < query_positions[:, None]
-        )[None, None, :, :] & state.valid[:, None, None, :]
+        allowed = (key_positions[None, :] < query_positions[:, None])[
+            None, None, :, :
+        ] & state.valid[:, None, None, :]
         has_prior = allowed.any(dim=-1, keepdim=True)
-        safe_allowed = allowed | (
-            ~has_prior & (key_positions == 0)[None, None, None, :]
-        )
+        safe_allowed = allowed | (~has_prior & (key_positions == 0)[None, None, None, :])
         read = F.scaled_dot_product_attention(
             query,
             state.keys.to(query.dtype),

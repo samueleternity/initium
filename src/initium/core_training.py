@@ -7120,8 +7120,8 @@ if __name__ == "__main__":
         action="store_true",
         help=(
             "Use fixed one-hot entity-token addresses and causal event-only workspace "
-            "writes for workspace-capability episodes. Each of the five task tracks "
-            "provides entity-keyed event writes; retrieval_aggregation and all require "
+            "writes for workspace-capability episodes. Tracks with entity-valued state "
+            "provide entity-keyed event writes; retrieval_aggregation and all require "
             "at least 64 slots. "
             "Requires --workspace-entity-keyed-writes; payloads remain learned."
         ),
@@ -7687,11 +7687,18 @@ if __name__ == "__main__":
             "relational_join",
             "nth_farthest",
             "retrieval_aggregation",
+            "capacity_bottleneck",
+            "belief_tracking",
+            "mixed_skill",
+            "rule_switching",
+            "attentional_blink",
+            "variable_binding",
         ],
         default="all",
         help=(
-            "Track for --dataset-type workspace-capability. 'all' balances all five "
-            "tracks in each batch; individual tracks get independent curricula."
+            "Track for --dataset-type workspace-capability. 'all' balances the eleven "
+            "tracks across batches (all appear in a batch when batch size >= 11); "
+            "individual tracks get independent curricula."
         ),
     )
     parser.add_argument(

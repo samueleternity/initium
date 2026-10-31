@@ -486,15 +486,18 @@ def install_stochastic_write_heads(
             module.write_vector_transform = stochastic  # submodule swap
             heads.append(stochastic)
         elif module.__class__.__name__ in {"GatedDeltaMemory", "CausalKVMemory"}:
-            orig = getattr(module, "value", None)
-            if not isinstance(orig, nn.Linear):
+            sequence_value = getattr(module, "value", None)
+            if not isinstance(sequence_value, nn.Linear):
                 raise RuntimeError(f"Sequence memory '{name}' has no linear value projection")
             stochastic = StochasticWriteHead(
-                orig.in_features, orig.out_features, device=device, sample=sample
+                sequence_value.in_features,
+                sequence_value.out_features,
+                device=device,
+                sample=sample,
             )
             with torch.no_grad():
-                stochastic.mu_transform.weight.copy_(orig.weight)
-                stochastic.mu_transform.bias.copy_(orig.bias)
+                stochastic.mu_transform.weight.copy_(sequence_value.weight)
+                stochastic.mu_transform.bias.copy_(sequence_value.bias)
             module.value = stochastic
             heads.append(stochastic)
 

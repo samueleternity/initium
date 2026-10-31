@@ -250,7 +250,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
 
     def workspace_entity_address_metadata(
         self, input_vectors: torch.Tensor, *, paired_swap_commits: bool = False
-    ) -> dict[str, torch.Tensor]:
+    ) -> dict[str, Any]:
         """Build causal entity keys and event-boundary writes for each task track.
 
         Entity IDs are used only as workspace address/read metadata; they are
@@ -345,7 +345,10 @@ class WorkspaceCapabilityDataset(BaseDataset):
                     pending_entity = -1
                     swap_entities_seen = 0
                     pending_commit_entities = []
-        metadata = {"entity_ids": entity_ids, "entity_write_mask": write_mask}
+        metadata: dict[str, Any] = {
+            "entity_ids": entity_ids,
+            "entity_write_mask": write_mask,
+        }
         if paired_swap_commits:
             metadata["pair_swap_entity_ids"] = pair_swap_ids
             metadata["pair_swap_mask"] = pair_swap_mask
@@ -377,7 +380,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
             return
 
         active_event = None
-        event_entities = []
+        event_entities: list[int] = []
         has_location = False
         has_scalar = False
         has_relation = False
@@ -434,7 +437,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
         self,
         input_vectors: torch.Tensor,
         episodes: list[TaskEpisode] | None = None,
-    ) -> dict[str, torch.Tensor]:
+    ) -> dict[str, Any]:
         """Mark the first answer position with its causal permutation query."""
         examples = self.last_batch_examples if episodes is None else episodes
         batch, time = input_vectors.shape[:2]
@@ -499,7 +502,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
         episodes: list[TaskEpisode],
     ):
         """Apply exact aggregation to values decoded from addressed workspace slots."""
-        totals = {
+        totals: dict[str, Any] = {
             "write_value_correct": 0,
             "write_value_count": 0,
             "query_values_correct": 0,

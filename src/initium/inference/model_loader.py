@@ -54,7 +54,7 @@ class _Cfg:
         self.cfg = cfg
         self.defaulted: list[str] = []
 
-    def get(self, key: str, default: Any):
+    def get(self, key: str, default: Any = None) -> Any:
         v = self.cfg.get(key)
         if v is None:
             self.defaulted.append(key)

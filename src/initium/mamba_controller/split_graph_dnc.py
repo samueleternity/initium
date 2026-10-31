@@ -329,7 +329,7 @@ class SplitGraphDNC(nn.Module):
                 "workspace-to-KV writes require workspace, KV memory, and "
                 "--memory-inter-layer-read-every-block"
             )
-        self.sequence_memory = None
+        self.sequence_memory: CausalKVMemory | GatedDeltaMemory | None = None
         if memory_type in {"kv", "delta"}:
             rng_state = torch.random.get_rng_state()
             try:
@@ -729,7 +729,7 @@ class SplitGraphDNC(nn.Module):
         # Build the optional module last so enabling it leaves the existing
         # backbone, combiner, DNC, and output-projection initializations and
         # subsequent global RNG stream intact for matched-seed controls.
-        rng_state = (
+        workspace_rng_state = (
             torch.random.get_rng_state() if workspace_enabled and workspace_num_slots > 0 else None
         )
         self.workspace = (
@@ -757,8 +757,8 @@ class SplitGraphDNC(nn.Module):
             if workspace_enabled and workspace_num_slots > 0
             else None
         )
-        if rng_state is not None:
-            torch.random.set_rng_state(rng_state)
+        if workspace_rng_state is not None:
+            torch.random.set_rng_state(workspace_rng_state)
         if self.workspace_write_to_kv:
             # Keep this optional sidecar from changing the random stream used
             # by existing modules or matched-seed controls.
@@ -988,7 +988,7 @@ class SplitGraphDNC(nn.Module):
             prior_memory_states = (
                 mhx if not reset_experience and isinstance(mhx, list | tuple) else ()
             )
-            inter_layer_memory_states = []
+            inter_layer_memory_states: list[Any] = []
             for path_index in range(memory_path_count):
                 prior_state = (
                     prior_memory_states[path_index]
@@ -1009,6 +1009,7 @@ class SplitGraphDNC(nn.Module):
             memory_state = inter_layer_memory_states[memory_path_index]
             memory_features = features[:, start_step:]
             if pass_through_memory:
+                assert self.sequence_memory is not None
                 inter_layer_memory_read, memory_state, _aux = self.sequence_memory(
                     memory_features,
                     state=memory_state,
@@ -1151,7 +1152,7 @@ class SplitGraphDNC(nn.Module):
                 raise RuntimeError(
                     "workspace requires the final parallel-backbone stage to expose its MoE specialists"
                 )
-            specialist_kwargs = {
+            specialist_kwargs: dict[str, Any] = {
                 "token_mask": sequence_valid_mask,
                 "intermediate_observer": (
                     observe_prediction_features
@@ -1461,6 +1462,7 @@ class SplitGraphDNC(nn.Module):
                 else:
                     memory_read = torch.zeros_like(memory_features)
                 memory_states = [memory_state]
+            assert memory_read is not None
             # The adapter in each sequence memory is zero-initialized, so the
             # initial output is exactly the backbone-only path. Reads are
             # applied after the parallel controller and never fed back into
@@ -1535,6 +1537,7 @@ class SplitGraphDNC(nn.Module):
                 commit_fraction = (
                     commit_mask.float().mean() if commit_mask.numel() else committed_count
                 )
+                assert workspace_kv_state is not None
                 history_records = workspace_kv_state.valid.sum(dim=-1).float().mean()
                 read_rms = (
                     torch.stack(workspace_kv_read_rms).mean()

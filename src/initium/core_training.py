@@ -4264,6 +4264,14 @@ def run(
             rnn.memories[0].set_backward_trace(True, step=step)
         bistable_forward_debug = ""
         prediction_loss = None
+        event_predictions = vector_predictions = value_predictions = query_predictions = None
+        position_logits: torch.Tensor | None = None
+        vector_logits: torch.Tensor | None = None
+        value_logits: torch.Tensor | None = None
+        query_logits: torch.Tensor | None = None
+        per_state_loss: torch.Tensor | None = None
+        per_coordinate_loss: torch.Tensor | None = None
+        per_value_loss: torch.Tensor | None = None
         saved_tensor_context = (
             _saved_activations_on_cpu_preserve_strides(
                 activation_offload_cpu_budget_mb * 1024 * 1024
@@ -4424,6 +4432,8 @@ def run(
                 workspace_module = getattr(rnn, "workspace", None)
                 if workspace_module is None:
                     raise RuntimeError("workspace state supervision has no active workspace module")
+                if state_supervision_positions is None or state_supervision_mask is None:
+                    raise RuntimeError("workspace state supervision metadata was not initialized")
                 event_predictions = workspace_module.pop_semantic_state_predictions()
                 if event_predictions:
                     event_steps = torch.tensor(
@@ -5285,6 +5295,8 @@ def run(
                 parts.append(f"amp_scale {amp_scale:.1f}")
             parts.append(f"gpu_mem_peak_mb {gpu_mem_peak_mb:.1f}")
             if activation_offload_to_cpu:
+                if activation_offload_stats is None:
+                    raise RuntimeError("activation offload statistics were not collected")
                 offload_mb = activation_offload_stats["offloaded_bytes"] / (1024 * 1024)
                 resident_mb = activation_offload_stats["resident_bytes"] / (1024 * 1024)
                 host_rss_mb, host_peak_mb, host_pinned_mb = _host_memory_snapshot_mb()
@@ -5717,9 +5729,17 @@ def run(
         output = hidden = loss = task_loss = None
         prediction_loss = workspace_state_loss = nth_vector_loss = None
         retrieval_value_loss = kl_loss = moe_aux_loss = None
-        event_predictions = vector_predictions = value_predictions = query_predictions = None
-        position_logits = vector_logits = value_logits = query_logits = None
-        per_state_loss = per_coordinate_loss = per_value_loss = None
+        event_predictions = None
+        vector_predictions = None
+        value_predictions = None
+        query_predictions = None
+        position_logits = None
+        vector_logits = None
+        value_logits = None
+        query_logits = None
+        per_state_loss = None
+        per_coordinate_loss = None
+        per_value_loss = None
         prediction_logits = backbone_features = None
 
         if step % EVAL_EVERY == 0:

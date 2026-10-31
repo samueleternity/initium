@@ -273,7 +273,7 @@ class WorkspaceBroadcast(nn.Module):
     ) -> torch.Tensor:
         if self.semantic_vector_decoder is None:
             raise RuntimeError("Nth-farthest vector decoding is not enabled")
-        address_state, content_state = torch.split(state, (self._address_dim, self.d_model), dim=-1)
+        address_state, content_state = torch.split(state, [self._address_dim, self.d_model], dim=-1)
         safe_ids = entity_ids.clamp(min=0, max=self._SEMANTIC_ENTITY_COUNT - 1)
         queries = F.one_hot(safe_ids, num_classes=self._SEMANTIC_ENTITY_COUNT).to(
             device=state.device, dtype=torch.float32
@@ -310,7 +310,7 @@ class WorkspaceBroadcast(nn.Module):
         """Read scalar values from exact semantic entity addresses."""
         if self.semantic_retrieval_value_decoder is None:
             raise RuntimeError("retrieval exact readout is not enabled")
-        address_state, content_state = torch.split(state, (self._address_dim, self.d_model), dim=-1)
+        address_state, content_state = torch.split(state, [self._address_dim, self.d_model], dim=-1)
         safe_ids = entity_ids.clamp(min=0, max=self._SEMANTIC_ENTITY_COUNT - 1)
         queries = F.one_hot(safe_ids, num_classes=self._SEMANTIC_ENTITY_COUNT).to(
             device=state.device, dtype=torch.float32
@@ -340,7 +340,7 @@ class WorkspaceBroadcast(nn.Module):
         dimensions = query_vector.ne(-1).sum(dim=-1).clamp(min=1, max=6)
         dimension_mask = torch.arange(6, device=state.device).unsqueeze(0) < dimensions.unsqueeze(1)
         expected_candidates = candidate_mask & candidate_ids.ge(0)
-        address_state = torch.split(state, (self._address_dim, self.d_model), dim=-1)[0].float()
+        address_state = torch.split(state, [self._address_dim, self.d_model], dim=-1)[0].float()
         address_queries = F.one_hot(
             candidate_ids.clamp(min=0, max=self._SEMANTIC_ENTITY_COUNT - 1),
             num_classes=self._SEMANTIC_ENTITY_COUNT,
@@ -385,7 +385,7 @@ class WorkspaceBroadcast(nn.Module):
         self, state: torch.Tensor, entity_ids: torch.Tensor, active: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Exchange two addressed payloads from the same pre-commit state."""
-        address_state, content_state = torch.split(state, (self._address_dim, self.d_model), dim=-1)
+        address_state, content_state = torch.split(state, [self._address_dim, self.d_model], dim=-1)
         safe_ids = entity_ids.clamp(min=0, max=self._SEMANTIC_ENTITY_COUNT - 1)
         keys = F.one_hot(safe_ids, num_classes=self._SEMANTIC_ENTITY_COUNT).to(
             device=state.device, dtype=torch.float32
@@ -421,7 +421,7 @@ class WorkspaceBroadcast(nn.Module):
         """Decode object->position and position->object answers from slot values."""
         if self.semantic_state_decoder is None:
             raise RuntimeError("semantic query readout requires semantic entity addressing")
-        address_state, content_state = torch.split(state, (self._address_dim, self.d_model), dim=-1)
+        address_state, content_state = torch.split(state, [self._address_dim, self.d_model], dim=-1)
         occupied = address_state.detach().float().square().sum(dim=-1) > 1e-12
         entity_to_position = self._semantic_state_logits(
             state, query_ids[:, None], query_kind.eq(1)[:, None]
@@ -451,7 +451,7 @@ class WorkspaceBroadcast(nn.Module):
     ) -> torch.Tensor:
         if self.semantic_state_decoder is None:
             raise RuntimeError("semantic state decoding requires semantic entity addressing")
-        address_state, content_state = torch.split(state, (self._address_dim, self.d_model), dim=-1)
+        address_state, content_state = torch.split(state, [self._address_dim, self.d_model], dim=-1)
         safe_ids = entity_ids.clamp(min=0, max=self._SEMANTIC_ENTITY_COUNT - 1)
         queries = F.one_hot(safe_ids, num_classes=self._SEMANTIC_ENTITY_COUNT).to(
             device=state.device, dtype=torch.float32
@@ -597,7 +597,7 @@ class WorkspaceBroadcast(nn.Module):
             write_weights = write_weights * entity_write_mask.reshape(-1, 1).to(write_weights.dtype)
         if self.entity_keyed_writes:
             address_state, content_state = torch.split(
-                state, (self._address_dim, self.d_model), dim=-1
+                state, [self._address_dim, self.d_model], dim=-1
             )
             proposal, mass, address_proposal, address_diagnostics = (
                 self._entity_keyed_write_proposals(
@@ -681,6 +681,8 @@ class WorkspaceBroadcast(nn.Module):
             next_content = _cap_vector_rms(next_content, self._SEMANTIC_CONTENT_RMS_LIMIT)
         if self.entity_keyed_writes:
             address_update = update[..., : self._address_dim]
+            assert address_proposal is not None and address_state is not None
+            assert address_diagnostics is not None
             next_address = address_update.mul(address_proposal).add(
                 (1.0 - address_update).mul(address_state)
             )
@@ -919,7 +921,7 @@ class WorkspaceBroadcast(nn.Module):
             state = torch.zeros_like(state)
         if self.entity_keyed_writes:
             address_state, content_state = torch.split(
-                state, (self._address_dim, self.d_model), dim=-1
+                state, [self._address_dim, self.d_model], dim=-1
             )
         else:
             address_state, content_state = None, state
@@ -956,8 +958,8 @@ class WorkspaceBroadcast(nn.Module):
         # Entity-keyed mode stores a separate address per slot and routes each
         # candidate to its nearest matching address, allocating free slots for
         # novel addresses while capacity remains.
-        address_proposal = None
-        address_diagnostics = {}
+        address_proposal: torch.Tensor | None = None
+        address_diagnostics: dict[str, torch.Tensor] = {}
         if self.entity_keyed_writes:
             assert address_state is not None
             (
@@ -1205,7 +1207,7 @@ class WorkspaceBroadcast(nn.Module):
         )
         if self.entity_keyed_writes:
             read_addresses, read_content = torch.split(
-                read_state, (self._address_dim, self.d_model), dim=-1
+                read_state, [self._address_dim, self.d_model], dim=-1
             )
             read_scores = torch.einsum(
                 "bed,bsd->bes",
@@ -1726,6 +1728,15 @@ class WorkspaceBroadcast(nn.Module):
                     else compiled_zero_reconsideration_error
                 )
                 previous_state = state
+                assert time_major_deltas is not None
+                assert time_major_route_weights is not None
+                assert time_major_route_indices is not None
+                assert projected_write_keys is not None
+                assert projected_write_values is not None
+                assert projected_read_queries is not None
+                assert compiled_prediction_error is not None
+                assert compiled_reconsideration_error is not None
+                assert reconsideration_random_scores is not None
                 try:
                     with torch.autocast(device_type="cuda", enabled=False):
                         (
@@ -1760,7 +1771,7 @@ class WorkspaceBroadcast(nn.Module):
                         "SubprocException",
                         "TritonError",
                     }
-                    cause = exc
+                    cause: BaseException | None = exc
                     is_compile_error = False
                     while cause is not None:
                         if type(cause).__name__ in compile_error_names:
@@ -1838,13 +1849,16 @@ class WorkspaceBroadcast(nn.Module):
                     observer(step, assignments.detach())
             else:
                 if self.diagnostics_enabled:
+                    assert time_major_route_weights is not None
+                    assert time_major_route_indices is not None
+                    assert time_major_deltas is not None
                     step_weights = time_major_route_weights[step].detach().float()
                     step_routes = time_major_route_indices[step]
                     write_mass = step_weights.sum(dim=-1).mean()
                     active_write_frac = (step_weights.sum(dim=-1) > 0).float().mean()
                     write_gate_mean = compiled_update.detach().float().mean()
                     diagnostic_state = (
-                        torch.split(state, (self._address_dim, self.d_model), dim=-1)[1]
+                        torch.split(state, [self._address_dim, self.d_model], dim=-1)[1]
                         if self.entity_keyed_writes
                         else state
                     )
@@ -1898,10 +1912,10 @@ class WorkspaceBroadcast(nn.Module):
                         surprise_mean = (surprise * eligible).sum() / eligible_count
                         if self.entity_keyed_writes:
                             state_content = torch.split(
-                                state, (self._address_dim, self.d_model), dim=-1
+                                state, [self._address_dim, self.d_model], dim=-1
                             )[1]
                             previous_content = torch.split(
-                                previous_state, (self._address_dim, self.d_model), dim=-1
+                                previous_state, [self._address_dim, self.d_model], dim=-1
                             )[1]
                             actual_change = state_content.detach() - previous_content.detach()
                         else:
@@ -1929,6 +1943,7 @@ class WorkspaceBroadcast(nn.Module):
                             }
                         )
                     if self.prediction_error_to_write_gate is not None:
+                        assert compiled_prediction_error is not None
                         error_mean = compiled_prediction_error.detach().float().mean()
                         write_scale_rms = (
                             self.prediction_error_to_write_gate.weight.detach()
@@ -1956,12 +1971,12 @@ class WorkspaceBroadcast(nn.Module):
                     self._last_semantic_pair_commits.append((step, committed))
             if collect_kv_records:
                 old_content = (
-                    torch.split(state_before_step, (self._address_dim, self.d_model), dim=-1)[1]
+                    torch.split(state_before_step, [self._address_dim, self.d_model], dim=-1)[1]
                     if self.entity_keyed_writes
                     else state_before_step
                 )
                 new_content = (
-                    torch.split(state, (self._address_dim, self.d_model), dim=-1)[1]
+                    torch.split(state, [self._address_dim, self.d_model], dim=-1)[1]
                     if self.entity_keyed_writes
                     else state
                 )
@@ -1972,7 +1987,7 @@ class WorkspaceBroadcast(nn.Module):
                 weights = change * accepted.to(change.dtype)
                 if self.entity_keyed_writes and self.semantic_entity_addressing:
                     record_address, record_content = torch.split(
-                        state, (self._address_dim, self.d_model), dim=-1
+                        state, [self._address_dim, self.d_model], dim=-1
                     )
                     record_payload = torch.cat(
                         (

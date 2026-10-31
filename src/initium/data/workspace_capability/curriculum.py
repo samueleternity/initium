@@ -14,7 +14,7 @@ def difficulty_for(
     *,
     ood: bool = False,
     ood_axes: Iterable[str] | None = None,
-) -> dict:
+) -> dict[str, int | float | str | bool | tuple[str, ...]]:
     """Return a fresh serializable configuration for a track/lesson."""
     level = max(0, min(int(level), _LEVELS - 1))
     if ood_axes is None:
@@ -29,6 +29,7 @@ def difficulty_for(
             raise ValueError(f"unknown OOD axes for {track!r}: {sorted(unknown_axes)}")
         if track != "permutation":
             raise ValueError("explicit OOD axes are currently supported only for permutation")
+    config: dict[str, int | float | str | bool | tuple[str, ...]]
     if track == "permutation":
         config = {
             "entities": (4, 6, 8, 10, 12, 16)[level],
@@ -72,18 +73,31 @@ def difficulty_for(
         # OOD increases temporal interference while keeping each generator's
         # schema bounds valid and uses its held-out identifier band where able.
         if track == "entity_state":
-            config["updates"] = min(config["updates"] + 8, 32)
-            config["distractors"] = min(config["distractors"] * 2 + 2, 24)
+            updates = config["updates"]
+            distractors = config["distractors"]
+            assert isinstance(updates, int) and isinstance(distractors, int)
+            config["updates"] = min(updates + 8, 32)
+            config["distractors"] = min(distractors * 2 + 2, 24)
         elif track == "relational_join":
-            config["distractors"] = min(config["distractors"] * 2 + 4, 64)
+            distractors = config["distractors"]
+            assert isinstance(distractors, int)
+            config["distractors"] = min(distractors * 2 + 4, 64)
         elif track == "nth_farthest":
-            config["distractors"] = min(config["distractors"] * 2 + 2, 24)
+            distractors = config["distractors"]
+            assert isinstance(distractors, int)
+            config["distractors"] = min(distractors * 2 + 2, 24)
         else:
-            config["updates"] = min(config["updates"] + 8, 24)
-            config["distractors"] = min(config["distractors"] * 2 + 4, 64)
+            updates = config["updates"]
+            distractors = config["distractors"]
+            assert isinstance(updates, int) and isinstance(distractors, int)
+            config["updates"] = min(updates + 8, 24)
+            config["distractors"] = min(distractors * 2 + 4, 64)
     if track == "permutation" and "length" in axes:
-        config["swaps"] = min(config["swaps"] * 2, 512)
-        config["distractors"] = min(config["distractors"] * 2 + 4, 64)
+        swaps = config["swaps"]
+        distractors = config["distractors"]
+        assert isinstance(swaps, int) and isinstance(distractors, int)
+        config["swaps"] = min(swaps * 2, 512)
+        config["distractors"] = min(distractors * 2 + 4, 64)
     return config
 
 

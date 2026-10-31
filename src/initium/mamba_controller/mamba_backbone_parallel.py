@@ -442,20 +442,21 @@ class MambaBackboneParallel(nn.Module):
         # exactly as autocast would cast the Linear operands; this avoids
         # materializing the one-hot sequence while keeping the same parameters.
         weight = self.in_adapter.weight
-        bias = self.in_adapter.bias
+        bias_parameter = self.in_adapter.bias
+        bias_value: torch.Tensor | None = bias_parameter
         if torch.is_autocast_enabled(x.device.type):
             autocast_dtype = torch.get_autocast_dtype(x.device.type)
             weight = weight.to(dtype=autocast_dtype)
-            if bias is not None:
-                bias = bias.to(dtype=autocast_dtype)
+            if bias_value is not None:
+                bias_value = bias_value.to(dtype=autocast_dtype)
         embedding_weight = weight.transpose(0, 1).contiguous()
         adapted = torch.nn.functional.embedding(input_token_ids, embedding_weight)
         # The established collator represents padding as an all-zero feature
         # row, whose Linear output is bias (not zero). Apply the same semantics:
         # mask the gathered weight contribution, then add the shared bias.
         adapted = adapted.masked_fill(~input_valid_mask.unsqueeze(-1), 0)
-        if bias is not None:
-            adapted = adapted + bias
+        if bias_value is not None:
+            adapted = adapted + bias_value
         return adapted
 
     def forward(

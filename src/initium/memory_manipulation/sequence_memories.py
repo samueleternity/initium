@@ -29,6 +29,7 @@ class SequenceMemory(nn.Module):
 
     def __init__(self):
         super().__init__()
+        self.nr_cells: int = 0
         self._collect_memory_usage = False
         self._usage_head_sums: dict[str, torch.Tensor] = {}
         self._usage_scalar_sums: dict[str, torch.Tensor] = {}
@@ -81,23 +82,27 @@ class SequenceMemory(nn.Module):
                 )
         for name, total in self._usage_scalar_sums.items():
             result[f"{name}_mean"] = float((total / max(self._usage_counts[name], 1)).cpu().item())
-        if hasattr(self, "heads"):
-            for head in range(self.heads):
-                prefix = f"kv_head_{head}_relative_position_bin_"
-                bin_keys = sorted(
-                    name
-                    for name in self._usage_scalar_sums
-                    if name.startswith(prefix) and name.endswith("_mass")
+        relative_position_heads = {
+            int(name.split("_", 3)[2])
+            for name in self._usage_scalar_sums
+            if name.startswith("kv_head_") and "_relative_position_bin_" in name
+        }
+        for head in relative_position_heads:
+            prefix = f"kv_head_{head}_relative_position_bin_"
+            bin_keys = sorted(
+                name
+                for name in self._usage_scalar_sums
+                if name.startswith(prefix) and name.endswith("_mass")
+            )
+            if bin_keys:
+                indices = [int(name[len(prefix) : len(prefix) + 2]) for name in bin_keys]
+                masses = [result[f"{name}_mean"] for name in bin_keys]
+                result[f"kv_head_{head}_most_used_relative_position_bin"] = float(
+                    indices[max(range(len(masses)), key=masses.__getitem__)]
                 )
-                if bin_keys:
-                    indices = [int(name[len(prefix) : len(prefix) + 2]) for name in bin_keys]
-                    masses = [result[f"{name}_mean"] for name in bin_keys]
-                    result[f"kv_head_{head}_most_used_relative_position_bin"] = float(
-                        indices[max(range(len(masses)), key=masses.__getitem__)]
-                    )
-                    result[f"kv_head_{head}_least_used_relative_position_bin"] = float(
-                        indices[min(range(len(masses)), key=masses.__getitem__)]
-                    )
+                result[f"kv_head_{head}_least_used_relative_position_bin"] = float(
+                    indices[min(range(len(masses)), key=masses.__getitem__)]
+                )
         result["diagnostic_steps"] = float(max(self._usage_counts.values(), default=0))
         self._usage_head_sums = {}
         self._usage_scalar_sums = {}
@@ -287,7 +292,9 @@ class GatedDeltaMemory(SequenceMemory):
         if not q.is_cuda:
             raise RuntimeError("The FLA delta backend requires CUDA tensors")
         try:
-            from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+            from fla.ops.gated_delta_rule import (
+                chunk_gated_delta_rule,  # type: ignore[import-not-found]
+            )
         except ImportError as exc:
             raise RuntimeError(
                 "delta_use_fla=True requires flash-linear-attention to be installed"

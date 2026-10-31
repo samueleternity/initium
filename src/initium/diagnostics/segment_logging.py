@@ -289,27 +289,64 @@ class SegmentDiagnostics:
         self,
         record: dict[str, Any],
         prefix: str,
-        tensor: torch.Tensor,
+        tensor: torch.Tensor | None,
         *,
         location: tuple[int, int] | None = None,
         context: dict[str, torch.Tensor] | None = None,
     ) -> None:
-        value = tensor.detach().float().reshape(-1)
-        finite = torch.isfinite(value)
+        # Compiled multi-output forwards can invoke a registered tensor hook
+        # with ``None`` when that output is unused by the loss. It carries no
+        # gradient statistics to record, and returning None from the hook
+        # preserves the original autograd behavior.
+        if tensor is None:
+            return
+        detached = tensor.detach()
+        numel = detached.numel()
+        # Large recurrent activations can be several million elements. A full
+        # fp32 conversion, finite mask, and torch.where copy at a backward hook
+        # can add hundreds of MiB exactly when the training graph is at peak.
+        # Reduce bounded slices so diagnostics have a predictable temporary
+        # memory ceiling independent of curriculum sequence length.
+        chunk_elements = 262144
+        if detached.is_contiguous():
+            flat = detached.view(-1)
+            chunks = (
+                flat[start : start + chunk_elements] for start in range(0, numel, chunk_elements)
+            )
+        elif detached.ndim > 1:
+            row_elements = max(1, detached[0].numel()) if detached.shape[0] else 1
+            rows_per_chunk = max(1, chunk_elements // row_elements)
+            chunks = (
+                detached[start : start + rows_per_chunk].reshape(-1)
+                for start in range(0, detached.shape[0], rows_per_chunk)
+            )
+        else:
+            flat = detached.reshape(-1)
+            chunks = (
+                flat[start : start + chunk_elements] for start in range(0, numel, chunk_elements)
+            )
+
+        sum_sq = torch.zeros((), device=detached.device, dtype=torch.float64)
+        max_abs = torch.zeros((), device=detached.device, dtype=torch.float32)
+        bad_count = torch.zeros((), device=detached.device, dtype=torch.float32)
+        finite_absmax = torch.zeros((), device=detached.device, dtype=torch.float32)
+        for chunk in chunks:
+            value = chunk.float()
+            finite = torch.isfinite(value)
+            safe = torch.where(finite, value, torch.zeros_like(value))
+            sum_sq = sum_sq + _stable_sum_squares(safe)
+            chunk_max = safe.abs().amax() if safe.numel() else max_abs.new_zeros(())
+            max_abs = torch.maximum(max_abs, chunk_max)
+            bad_count = bad_count + (~finite).sum().float()
+            finite_absmax = torch.maximum(finite_absmax, chunk_max)
         if (
             prefix.startswith("grad")
             and self._nonfinite_trace_enabled
             and not self._nonfinite_trace_reported
         ):
-            bad_count = (~finite).sum()
             if bool(bad_count):
-                finite_values = value[finite]
-                bad_fraction = float((bad_count.float() / max(1, value.numel())).cpu())
-                finite_max = (
-                    float(finite_values.abs().max().cpu())
-                    if finite_values.numel()
-                    else float("nan")
-                )
+                bad_fraction = float((bad_count / max(1, numel)).cpu())
+                finite_max = float(finite_absmax.cpu())
                 call_location = f" step={location[0]} call={location[1]}" if location else ""
                 print(
                     f"[segment-first-nonfinite] {record['path']} {prefix}"
@@ -317,11 +354,10 @@ class SegmentDiagnostics:
                     f"finite_absmax={finite_max:.4g} shape={tuple(tensor.shape)}"
                 )
                 self._nonfinite_trace_reported = True
-        safe = torch.where(finite, value, torch.zeros_like(value))
         values = {
-            f"{prefix}_sum_sq": _stable_sum_squares(safe),
-            f"{prefix}_max": safe.abs().amax() if safe.numel() else safe.new_zeros(()),
-            f"{prefix}_bad": (~finite).sum().float(),
+            f"{prefix}_sum_sq": sum_sq,
+            f"{prefix}_max": max_abs,
+            f"{prefix}_bad": bad_count,
         }
         for key, item in values.items():
             if key in record and key.endswith("_max"):
@@ -352,7 +388,7 @@ class SegmentDiagnostics:
                     record[f"{key}_call"] = torch.full_like(item, location[1], dtype=torch.long)
                     for context_name, context_value in (context or {}).items():
                         record[f"{key}_context_{context_name}"] = context_value.detach().clone()
-        record[f"{prefix}_numel"] = record.get(f"{prefix}_numel", 0) + value.numel()
+        record[f"{prefix}_numel"] = record.get(f"{prefix}_numel", 0) + numel
 
     def set_nonfinite_trace(self, enabled: bool) -> None:
         """Print the first bad segment-boundary gradient for one diagnostic step."""

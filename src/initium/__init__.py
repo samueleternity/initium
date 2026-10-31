@@ -21,6 +21,10 @@ __all__ = [
     # DNC architectures
     "SplitGraphDNC",
     "MambaDNC",
+    # Sequence-parallel memory modules
+    "SequenceMemory",
+    "GatedDeltaMemory",
+    "CausalKVMemory",
     # Controller mechanisms and compositions
     "MambaControllerWrapper",
     "Mamba2ControllerWrapper",
@@ -43,6 +47,9 @@ __all__ = [
 _EXPORTS = {
     "SplitGraphDNC": "initium.mamba_controller.split_graph_dnc",
     "MambaDNC": "initium.mamba_controller.mamba_controller",
+    "SequenceMemory": "initium.memory_manipulation.sequence_memories",
+    "GatedDeltaMemory": "initium.memory_manipulation.sequence_memories",
+    "CausalKVMemory": "initium.memory_manipulation.sequence_memories",
     "MambaControllerWrapper": "initium.mamba_controller.mamba_controller",
     "Mamba2ControllerWrapper": "initium.mamba_controller.mamba2_controller",
     "Mamba3ControllerWrapper": "initium.mamba_controller.mamba3_controller",
@@ -83,6 +90,13 @@ if TYPE_CHECKING:
     from initium.mamba_controller.mamba_controller import MambaDNC as MambaDNC
     from initium.mamba_controller.split_graph_dnc import SplitGraphDNC as SplitGraphDNC
     from initium.memory_manipulation.dynamic_memory_resize import resize_memory as resize_memory
+    from initium.memory_manipulation.sequence_memories import (
+        CausalKVMemory as CausalKVMemory,
+    )
+    from initium.memory_manipulation.sequence_memories import (
+        GatedDeltaMemory as GatedDeltaMemory,
+    )
+    from initium.memory_manipulation.sequence_memories import SequenceMemory as SequenceMemory
     from initium.memory_manipulation.stochastic_write_head_v2 import (
         StochasticWriteHead as StochasticWriteHead,
     )

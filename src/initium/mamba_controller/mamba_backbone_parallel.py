@@ -341,6 +341,7 @@ class MambaBackboneParallel(nn.Module):
         super().__init__()
         _require_variant(variant)
         self.variant = variant
+        self.input_dim = int(in_dim)
         self.d_model = d_model
         self.moe_enabled = moe_enabled
         self.moe_blocks: nn.ModuleList | None = None
@@ -411,12 +412,66 @@ class MambaBackboneParallel(nn.Module):
                 ]
             )
 
-    def forward(self, x: torch.Tensor, *, token_mask: torch.Tensor | None = None) -> torch.Tensor:
+    def _adapt_input(
+        self,
+        x: torch.Tensor,
+        *,
+        input_token_ids: torch.Tensor | None = None,
+        input_valid_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if input_token_ids is None:
+            return self.in_adapter(x)
+        if input_token_ids.ndim != 2:
+            raise ValueError("input_token_ids must have shape (batch, time)")
+        if input_valid_mask is None:
+            input_valid_mask = input_token_ids.ne(0)
+        if input_valid_mask.shape != input_token_ids.shape:
+            raise ValueError("input_valid_mask must match input_token_ids")
+        if isinstance(self.in_adapter, nn.Identity):
+            # There is no projection to turn into a gather when in_dim ==
+            # d_model; materialize the one-hot values only for this degenerate
+            # configuration, preserving the public input feature shape.
+            encoded = torch.nn.functional.one_hot(input_token_ids, num_classes=self.input_dim).to(
+                dtype=torch.float32
+            )
+            return encoded.masked_fill(~input_valid_mask.unsqueeze(-1), 0)
+        if not isinstance(self.in_adapter, nn.Linear):
+            raise RuntimeError("token-ID input requires a Linear or Identity input adapter")
+
+        # Linear(one_hot(id), W, b) == embedding(id, W.T) + b. Cast weights
+        # exactly as autocast would cast the Linear operands; this avoids
+        # materializing the one-hot sequence while keeping the same parameters.
+        weight = self.in_adapter.weight
+        bias_parameter = self.in_adapter.bias
+        bias_value: torch.Tensor | None = bias_parameter
+        if torch.is_autocast_enabled(x.device.type):
+            autocast_dtype = torch.get_autocast_dtype(x.device.type)
+            weight = weight.to(dtype=autocast_dtype)
+            if bias_value is not None:
+                bias_value = bias_value.to(dtype=autocast_dtype)
+        embedding_weight = weight.transpose(0, 1).contiguous()
+        adapted = torch.nn.functional.embedding(input_token_ids, embedding_weight)
+        # The established collator represents padding as an all-zero feature
+        # row, whose Linear output is bias (not zero). Apply the same semantics:
+        # mask the gathered weight contribution, then add the shared bias.
+        adapted = adapted.masked_fill(~input_valid_mask.unsqueeze(-1), 0)
+        if bias_value is not None:
+            adapted = adapted + bias_value
+        return adapted
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        token_mask: torch.Tensor | None = None,
+        input_token_ids: torch.Tensor | None = None,
+        input_valid_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         # x: (B, L, in_dim) -> (B, L, d_model). Called EXACTLY ONCE per
         # training step (not once per DNC timestep, unlike
         # MambaControllerWrapper) -- this single call is the entire
         # "backbone half" of the Option 5 split.
-        h = self.in_adapter(x)
+        h = self._adapt_input(x, input_token_ids=input_token_ids, input_valid_mask=input_valid_mask)
         numeric_observer = getattr(self, "_initium_forward_numeric_observer", None)
         if numeric_observer is not None:
             numeric_observer("input_adapter.output", h)
@@ -437,9 +492,11 @@ class MambaBackboneParallel(nn.Module):
         *,
         token_mask: torch.Tensor | None = None,
         intermediate_observer=None,
+        input_token_ids: torch.Tensor | None = None,
+        input_valid_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run the normal stack and expose block-0 features without a second pass."""
-        h = self.in_adapter(x)
+        h = self._adapt_input(x, input_token_ids=input_token_ids, input_valid_mask=input_valid_mask)
         numeric_observer = getattr(self, "_initium_forward_numeric_observer", None)
         if numeric_observer is not None:
             numeric_observer("input_adapter.output", h)
@@ -453,6 +510,48 @@ class MambaBackboneParallel(nn.Module):
                 h = self.moe_blocks[index](h, token_mask=token_mask)
                 if numeric_observer is not None:
                     numeric_observer(f"block.{index}.moe_output", h)
+        return self.normalize_output(h)
+
+    def forward_with_inter_layer_memory(
+        self,
+        x: torch.Tensor,
+        *,
+        inter_layer_read,
+        inter_layer_read_every_block: bool = False,
+        token_mask: torch.Tensor | None = None,
+        intermediate_observer=None,
+        input_token_ids: torch.Tensor | None = None,
+        input_valid_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Inject sequence-memory reads between parallel backbone blocks.
+
+        By default the callback runs once after block 0. With
+        ``inter_layer_read_every_block``, it runs after each non-final block.
+        The callback receives features after that block's MoE residual and
+        returns features of the same shape. It is deliberately separate from
+        ``forward`` so the default split-graph path remains unchanged.
+        """
+        if len(self.blocks) < 2:
+            raise ValueError("inter-layer memory requires at least two backbone blocks")
+        h = self._adapt_input(x, input_token_ids=input_token_ids, input_valid_mask=input_valid_mask)
+        numeric_observer = getattr(self, "_initium_forward_numeric_observer", None)
+        if numeric_observer is not None:
+            numeric_observer("input_adapter.output", h)
+        moe_blocks = self.moe_blocks
+        for index, block in enumerate(self.blocks):
+            h = block(h)
+            if numeric_observer is not None:
+                numeric_observer(f"block.{index}.output", h)
+            if moe_blocks is not None and isinstance(moe_blocks[index], MoEBlock):
+                h = moe_blocks[index](h, token_mask=token_mask)
+                if numeric_observer is not None:
+                    numeric_observer(f"block.{index}.moe_output", h)
+            if index == 0 or (inter_layer_read_every_block and index < len(self.blocks) - 1):
+                if index == 0 and intermediate_observer is not None:
+                    intermediate_observer(h)
+                h = inter_layer_read(h, index)
+                if numeric_observer is not None:
+                    numeric_observer("inter_layer_memory.output", h)
         return self.normalize_output(h)
 
     def forward_sgr(
@@ -582,18 +681,26 @@ class MambaBackboneParallel(nn.Module):
         *,
         token_mask: torch.Tensor | None = None,
         intermediate_observer=None,
+        inter_layer_read=None,
+        inter_layer_read_every_block: bool = False,
+        selected_specialists_only: bool = True,
+        input_token_ids: torch.Tensor | None = None,
+        input_valid_mask: torch.Tensor | None = None,
     ):
         """Return final MoE candidates and sparse routes for workspace use.
 
-        Earlier backbone/MoE blocks remain unchanged. The final MoE block
-        exposes expert deltas before routing so the workspace can broadcast
-        context to every specialist, then reuse the original sparse route.
-        The split-graph caller applies this block's configured residual scale
-        to the combined routed and broadcast delta.
+        Earlier backbone/MoE blocks remain unchanged unless an explicit
+        ``inter_layer_read`` callback is supplied. The callback runs after
+        block 0 by default, or after each non-final block when
+        ``inter_layer_read_every_block`` is true. The final MoE block exposes expert deltas before routing so
+        the workspace can broadcast context to every specialist, then reuse
+        the original sparse route. The split-graph caller applies this
+        block's configured residual scale to the combined routed and
+        broadcast delta.
         """
         if not self.moe_enabled or self.moe_blocks is None:
             raise RuntimeError("workspace broadcast requires an enabled MoE expert pool")
-        h = self.in_adapter(x)
+        h = self._adapt_input(x, input_token_ids=input_token_ids, input_valid_mask=input_valid_mask)
         numeric_observer = getattr(self, "_initium_forward_numeric_observer", None)
         if numeric_observer is not None:
             numeric_observer("input_adapter.output", h)
@@ -602,6 +709,8 @@ class MambaBackboneParallel(nn.Module):
             raise RuntimeError(
                 "workspace broadcast requires the final backbone block to have an active MoE bank"
             )
+        if inter_layer_read is not None and final_index < 1:
+            raise ValueError("inter-layer workspace reads require at least two backbone blocks")
         for i, block in enumerate(self.blocks):
             h = block(h)
             if i == 0 and intermediate_observer is not None:
@@ -611,7 +720,10 @@ class MambaBackboneParallel(nn.Module):
             if i == final_index:
                 base = h
                 _, experts, indices, weights = self.moe_blocks[i](
-                    h, return_details=True, token_mask=token_mask
+                    h,
+                    return_details=not selected_specialists_only,
+                    return_selected_details=selected_specialists_only,
+                    token_mask=token_mask,
                 )
                 if numeric_observer is not None:
                     numeric_observer(f"block.{i}.specialists", experts)
@@ -621,4 +733,12 @@ class MambaBackboneParallel(nn.Module):
                 h = self.moe_blocks[i](h, token_mask=token_mask)
                 if numeric_observer is not None:
                     numeric_observer(f"block.{i}.moe_output", h)
+            if (
+                inter_layer_read is not None
+                and i < final_index
+                and (i == 0 or inter_layer_read_every_block)
+            ):
+                h = inter_layer_read(h, i)
+                if numeric_observer is not None:
+                    numeric_observer("inter_layer_memory.output", h)
         raise RuntimeError("parallel backbone has no blocks")

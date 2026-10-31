@@ -110,13 +110,20 @@ the opposite order, this is the one line to fix.
 
 from __future__ import annotations
 
+import math
 import weakref
 from typing import Any
 
 import torch
 import torch.nn as nn
 
-from initium.data.surprise_recall.next_token_prediction import prediction_error_signal
+from initium.data.common.causal_prediction import (
+    CausalInputPredictionHead,
+    causal_input_prediction_error,
+)
+from initium.data.surprise_recall.next_token_prediction import (
+    prediction_error_signal,
+)
 from initium.LNN_controller.cfc_backbone_parallel import (
     build_parallel_backbone,
     collect_backbone_moe_layers,
@@ -130,7 +137,9 @@ from initium.mamba_controller.mamba2_controller import Mamba2ControllerWrapper
 from initium.mamba_controller.mamba3_controller import Mamba3ControllerWrapper
 from initium.mamba_controller.mamba_controller import MambaControllerWrapper
 from initium.memory_manipulation.dnc_mechanisms import build_memory
+from initium.memory_manipulation.sequence_memories import CausalKVMemory, GatedDeltaMemory
 from initium.workspace.broadcast import WorkspaceBroadcast
+from initium.workspace.kv_bridge import WorkspaceKVBridge, WorkspaceKVState
 
 
 class _ModelCapacityMetadata:
@@ -195,6 +204,19 @@ class SplitGraphDNC(nn.Module):
         combiner_ngroups: int = 1,  # mamba2 combiner_variant only
         independent_linears: bool = True,
         dnc_enabled: bool = True,
+        memory_type: str = "dnc",
+        memory_heads: int = 4,
+        memory_dk: int = 64,
+        memory_dv: int = 64,
+        memory_read_lag: int = 1,
+        memory_inter_layer_read: bool = False,
+        memory_inter_layer_read_every_block: bool = False,
+        memory_inter_layer_read_scale: float = 1.0,
+        memory_topk: int | None = None,
+        memory_position: str = "none",
+        delta_gate: bool = True,
+        delta_chunk: int = 64,
+        delta_use_fla: bool = False,
         device: torch.device | None = None,
         moe_enabled: bool = False,
         moe_placement: str = "all",
@@ -225,6 +247,13 @@ class SplitGraphDNC(nn.Module):
         dnc_implementation: str = "base",
         workspace_enabled: bool = False,
         workspace_num_slots: int = 5,
+        workspace_compile_recurrence: bool = False,
+        workspace_entity_keyed_writes: bool = False,
+        workspace_semantic_entity_addressing: bool = False,
+        workspace_permutation_transactional: bool = False,
+        workspace_nth_farthest_exact_readout: bool = False,
+        workspace_retrieval_exact_readout: bool = False,
+        workspace_key_match_threshold: float = 0.5,
         workspace_no_selection: bool = False,
         workspace_reset_each_step: bool = False,
         workspace_train_mode: str = "coadapted",
@@ -236,6 +265,9 @@ class SplitGraphDNC(nn.Module):
         workspace_reconsideration_enabled: bool = False,
         workspace_reconsideration_surprise_threshold: float = 0.5,
         workspace_reconsideration_trigger_mode: str = "innovation",
+        workspace_write_to_kv: bool = False,
+        workspace_kv_read_scale: float = 0.1,
+        workspace_token_id_input: bool = False,
         sgr_write_salience_enabled: bool = False,
         sgr_workspace_salience_enabled: bool = False,
     ):
@@ -258,7 +290,81 @@ class SplitGraphDNC(nn.Module):
         self.w = cell_size
         self.r = read_heads
         self.read_vectors_size = read_heads * cell_size
-        self.dnc_enabled = bool(dnc_enabled)
+        if memory_type not in {"none", "dnc", "kv", "delta"}:
+            raise ValueError("memory_type must be one of none, dnc, kv, delta")
+        if memory_read_lag not in (0, 1):
+            raise ValueError("memory_read_lag must be 0 or 1")
+        inter_layer_memory_enabled = memory_inter_layer_read or memory_inter_layer_read_every_block
+        if inter_layer_memory_enabled and memory_type not in {"kv", "delta"}:
+            raise ValueError("inter-layer memory reads require KV or delta sequence memory")
+        if inter_layer_memory_enabled and (mamba_variant != "mamba1" or num_backbone_blocks < 2):
+            raise ValueError(
+                "inter-layer memory reads require at least two Mamba-1 backbone blocks"
+            )
+        if memory_type == "kv" and memory_topk is not None and memory_topk <= 0:
+            raise ValueError("memory_topk must be positive")
+        if memory_position not in {"none", "rope"}:
+            raise ValueError("memory_position must be 'none' or 'rope'")
+        if memory_position != "none" and memory_type != "kv":
+            raise ValueError("memory_position is only supported by KV memory")
+        self.memory_type = memory_type
+        self.memory_read_lag = int(memory_read_lag)
+        self.memory_inter_layer_read = bool(inter_layer_memory_enabled)
+        self.memory_inter_layer_read_every_block = bool(memory_inter_layer_read_every_block)
+        if not math.isfinite(memory_inter_layer_read_scale) or memory_inter_layer_read_scale < 0:
+            raise ValueError("memory_inter_layer_read_scale must be finite and >= 0")
+        self.memory_inter_layer_read_scale = float(memory_inter_layer_read_scale)
+        self.workspace_write_to_kv = bool(workspace_write_to_kv)
+        if not math.isfinite(workspace_kv_read_scale) or workspace_kv_read_scale < 0:
+            raise ValueError("workspace_kv_read_scale must be finite and >= 0")
+        self.workspace_kv_read_scale = float(workspace_kv_read_scale)
+        if self.workspace_write_to_kv and not (
+            workspace_enabled
+            and workspace_num_slots > 0
+            and memory_type == "kv"
+            and inter_layer_memory_enabled
+            and memory_inter_layer_read_every_block
+        ):
+            raise ValueError(
+                "workspace-to-KV writes require workspace, KV memory, and "
+                "--memory-inter-layer-read-every-block"
+            )
+        self.sequence_memory: CausalKVMemory | GatedDeltaMemory | None = None
+        if memory_type in {"kv", "delta"}:
+            rng_state = torch.random.get_rng_state()
+            try:
+                if memory_type == "kv":
+                    self.sequence_memory = CausalKVMemory(
+                        hidden_size,
+                        memory_heads,
+                        memory_dk,
+                        memory_dv,
+                        topk=memory_topk,
+                        position_mode=memory_position,
+                    )
+                else:
+                    self.sequence_memory = GatedDeltaMemory(
+                        hidden_size,
+                        memory_heads,
+                        memory_dk,
+                        memory_dv,
+                        chunk_size=delta_chunk,
+                        gate=delta_gate,
+                        use_fla=delta_use_fla,
+                    )
+            finally:
+                torch.random.set_rng_state(rng_state)
+        self.workspace_kv_memory = None
+        self.workspace_kv_diagnostics: dict[str, torch.Tensor] = {}
+        self.dnc_enabled = bool(dnc_enabled and memory_type in {"dnc", "none"})
+        if memory_type == "none":
+            self.dnc_enabled = False
+        self.sequence_memory_enabled = self.sequence_memory is not None
+        if self.sequence_memory is not None:
+            # Trainer/checkpoint metadata historically reports this field for
+            # every configured memory, although sequence memories do not use
+            # a cell capacity.
+            self.sequence_memory.nr_cells = int(nr_cells)
         self.nn_output_size = (
             hidden_size + self.read_vectors_size if self.dnc_enabled else hidden_size
         )
@@ -297,8 +403,30 @@ class SplitGraphDNC(nn.Module):
             raise ValueError("workspace_train_mode must be 'coadapted' or 'frozen'")
         if workspace_enabled and workspace_train_mode == "frozen" and workspace_num_slots == 0:
             raise ValueError("frozen workspace training requires workspace_num_slots > 0")
+        if workspace_semantic_entity_addressing and not (
+            workspace_enabled and workspace_entity_keyed_writes
+        ):
+            raise ValueError("semantic entity addressing requires an active entity-keyed workspace")
+        if workspace_permutation_transactional and not (
+            workspace_enabled and workspace_semantic_entity_addressing
+        ):
+            raise ValueError(
+                "transactional permutation commits require semantic entity-addressed workspace"
+            )
         self.workspace_enabled = workspace_enabled
+        self.workspace_token_id_input = bool(workspace_token_id_input)
+        if self.workspace_token_id_input and not (mamba_variant == "mamba1" and input_size == 320):
+            raise ValueError(
+                "token-ID input is currently supported only for the 320-token "
+                "workspace-capability vocabulary with Mamba-1"
+            )
         self.workspace_num_slots = workspace_num_slots
+        self.workspace_entity_keyed_writes = bool(workspace_entity_keyed_writes)
+        self.workspace_semantic_entity_addressing = bool(workspace_semantic_entity_addressing)
+        self.workspace_permutation_transactional = bool(workspace_permutation_transactional)
+        self.workspace_nth_farthest_exact_readout = bool(workspace_nth_farthest_exact_readout)
+        self.workspace_retrieval_exact_readout = bool(workspace_retrieval_exact_readout)
+        self.workspace_key_match_threshold = float(workspace_key_match_threshold)
         self.workspace_no_selection = workspace_no_selection
         self.workspace_reset_each_step = workspace_reset_each_step
         self.workspace_train_mode = workspace_train_mode
@@ -321,6 +449,7 @@ class SplitGraphDNC(nn.Module):
         # part of checkpoint config/state so a saved model can be scored with
         # and without workspace readback using identical learned weights.
         self.workspace_eval_bypass = False
+        self.workspace_eval_shuffle_readback = False
 
         # Mamba bookkeeping, for checkpoint self-description -- same
         # rationale/convention as MambaDNC (mamba_controller.py).
@@ -574,6 +703,9 @@ class SplitGraphDNC(nn.Module):
             self.rnn_layer_memory_shared = self.memories[0]
             self.output = nn.Linear(self.nn_output_size, self.input_size, device=device)
             torch.nn.init.kaiming_uniform_(self.output.weight)
+        elif self.sequence_memory_enabled:
+            self.memories = [self.sequence_memory]
+            self.output = None
         else:
             # This non-module metadata preserves generic trainer reporting;
             # it owns no DNC state, parameters, or forward computation.
@@ -581,10 +713,23 @@ class SplitGraphDNC(nn.Module):
             self.output = None
         if workspace_num_slots < 0:
             raise ValueError("workspace_num_slots must be >= 0")
+        if workspace_compile_recurrence and (not workspace_enabled or workspace_num_slots < 1):
+            raise ValueError(
+                "compiled workspace recurrence requires workspace_enabled=True "
+                "and workspace_num_slots >= 1"
+            )
+        if workspace_compile_recurrence and (
+            workspace_gate_variant != "continuous" or workspace_no_selection
+        ):
+            raise ValueError(
+                "compiled workspace recurrence currently supports the continuous "
+                "gate with routed writes, reconsideration, and workspace write salience; "
+                "bistable gating and random writes are unsupported"
+            )
         # Build the optional module last so enabling it leaves the existing
         # backbone, combiner, DNC, and output-projection initializations and
         # subsequent global RNG stream intact for matched-seed controls.
-        rng_state = (
+        workspace_rng_state = (
             torch.random.get_rng_state() if workspace_enabled and workspace_num_slots > 0 else None
         )
         self.workspace = (
@@ -601,11 +746,32 @@ class SplitGraphDNC(nn.Module):
                 reconsideration_surprise_threshold=(workspace_reconsideration_surprise_threshold),
                 reconsideration_trigger_mode=(workspace_reconsideration_trigger_mode),
                 prediction_error_salience_enabled=sgr_workspace_salience_enabled,
+                compile_recurrence=workspace_compile_recurrence,
+                entity_keyed_writes=workspace_entity_keyed_writes,
+                semantic_entity_addressing=workspace_semantic_entity_addressing,
+                permutation_transactional=workspace_permutation_transactional,
+                nth_farthest_exact_readout=workspace_nth_farthest_exact_readout,
+                retrieval_exact_readout=workspace_retrieval_exact_readout,
+                key_match_threshold=workspace_key_match_threshold,
             )
             if workspace_enabled and workspace_num_slots > 0
             else None
         )
-        if rng_state is not None:
+        if workspace_rng_state is not None:
+            torch.random.set_rng_state(workspace_rng_state)
+        if self.workspace_write_to_kv:
+            # Keep this optional sidecar from changing the random stream used
+            # by existing modules or matched-seed controls.
+            rng_state = torch.random.get_rng_state()
+            self.workspace_kv_memory = WorkspaceKVBridge(
+                hidden_size,
+                memory_heads,
+                memory_dk,
+                memory_dv,
+                position_mode=memory_position,
+                record_size=hidden_size * (2 if workspace_entity_keyed_writes else 1),
+                records_per_token=min(2, workspace_num_slots),
+            )
             torch.random.set_rng_state(rng_state)
 
         # Keep a flat list of every active MoE block so the training loop can
@@ -645,21 +811,52 @@ class SplitGraphDNC(nn.Module):
         combiner_skip_stages=None,
         start_step: int = 0,  # v20: resume the sequential loop mid-sequence (inference caching)
         sequence_valid_mask: torch.Tensor | None = None,
+        prediction_valid_mask: torch.Tensor | None = None,
+        entity_ids: torch.Tensor | None = None,
+        entity_write_mask: torch.Tensor | None = None,
+        pair_swap_entity_ids: torch.Tensor | None = None,
+        pair_swap_mask: torch.Tensor | None = None,
+        pair_swap_steps: tuple[int, ...] | None = None,
+        permutation_query_kind: torch.Tensor | None = None,
+        permutation_query_ids: torch.Tensor | None = None,
+        permutation_query_steps: tuple[int, ...] | None = None,
+        state_supervision_entity_ids: torch.Tensor | None = None,
+        state_supervision_mask: torch.Tensor | None = None,
+        state_supervision_steps: tuple[int, ...] | None = None,
+        nth_farthest_vector_entity_ids: torch.Tensor | None = None,
+        nth_farthest_vector_mask: torch.Tensor | None = None,
+        nth_farthest_vector_steps: tuple[int, ...] | None = None,
+        nth_farthest_query_candidate_ids: torch.Tensor | None = None,
+        nth_farthest_query_candidate_mask: torch.Tensor | None = None,
+        nth_farthest_query_vectors: torch.Tensor | None = None,
+        nth_farthest_query_ranks: torch.Tensor | None = None,
+        nth_farthest_query_steps: tuple[int, ...] | None = None,
+        retrieval_value_entity_ids: torch.Tensor | None = None,
+        retrieval_value_mask: torch.Tensor | None = None,
+        retrieval_value_steps: tuple[int, ...] | None = None,
+        retrieval_query_entity_ids: torch.Tensor | None = None,
+        retrieval_query_mask: torch.Tensor | None = None,
+        retrieval_query_operation: torch.Tensor | None = None,
+        retrieval_query_steps: tuple[int, ...] | None = None,
         timespans: torch.Tensor | None = None,
         return_backbone_features: bool = False,
         return_prediction_logits: bool = False,
+        _workspace_kv_replay_records: tuple[torch.Tensor, torch.Tensor] | None = None,
+        _workspace_kv_base_state: WorkspaceKVState | None = None,
     ):
         """
-        input: (B, T, input_size) -- batch-first, the whole padded episode
+        input: (B, T, input_size) one-hot or (B, T) token IDs when the
+            opt-in workspace token-ID input path is enabled -- batch-first
+            whole padded episode
             at once (this project always calls rnn(input_seq, ...) with the
             full sequence already assembled -- see Alter_PHASE3_mamba.py's
             training loop and evaluate_traversal()).
-        hx: (chx, mhx, last_read). chx is unused by this controller (the
-            combiner has no recurrent state of its own -- it's a plain
-            per-timestep Linear, not a cell) and is passed through
-            untouched. mhx follows dnc.DNC's own convention: None on a
-            fresh call, or a single-entry list `[mem_state_dict]` on a
-            resumed/continuing call.
+        hx: (chx, mhx, last_read). chx normally carries the workspace slot
+            state; when workspace-to-KV is enabled it also carries the
+            separate workspace KV sidecar state. Sequence-memory mhx is a
+            list of recurrent states;
+            repeated inter-layer reads keep one independent state per
+            inter-block boundary to preserve causal sequence order.
         pass_through_memory: when False, skips Memory read AND write for
             EVERY timestep and substitutes zero read-vectors -- this is
             the functional-usage ablation check
@@ -676,10 +873,72 @@ class SplitGraphDNC(nn.Module):
         (T, B, input_size) -- see module docstring for why this shape,
         not (B, T, input_size).
         """
+        original_hx = hx
         chx, mhx, last_read = hx
-        B, T, _ = input.shape
+        if self.workspace_token_id_input:
+            if input.ndim != 2 or input.dtype not in (torch.int32, torch.int64):
+                raise ValueError(
+                    "workspace token-ID input requires integer input shaped (batch,time)"
+                )
+            B, T = input.shape
+            input_token_ids = input.to(dtype=torch.long)
+            input_valid_mask = input_token_ids.ne(0)
+            recurrent_state_dtype = torch.float32
+        else:
+            if input.ndim != 3 or input.shape[-1] != self.input_size:
+                raise ValueError("split-graph input must have shape (batch,time,input_size)")
+            B, T, _ = input.shape
+            input_token_ids = None
+            input_valid_mask = None
+            recurrent_state_dtype = input.dtype
+        if self.workspace_semantic_entity_addressing:
+            if entity_ids is None or entity_write_mask is None:
+                raise ValueError(
+                    "semantic workspace addressing requires entity_ids and entity_write_mask"
+                )
+            if entity_ids.shape != (B, T) or entity_write_mask.shape != (B, T):
+                raise ValueError(
+                    "entity_ids and entity_write_mask must match the model batch/time axes"
+                )
+        if state_supervision_entity_ids is not None or state_supervision_mask is not None:
+            if not self.workspace_semantic_entity_addressing:
+                raise ValueError("workspace state supervision requires semantic entity addressing")
+            expected_state_shape = (B, T, 16)
+            if (
+                state_supervision_entity_ids is None
+                or state_supervision_mask is None
+                or state_supervision_entity_ids.shape != expected_state_shape
+                or state_supervision_mask.shape != expected_state_shape
+            ):
+                raise ValueError(
+                    "workspace state supervision metadata must have shape (batch, time, 16)"
+                )
         combiner_hx_in = chx
         workspace_state = None
+        workspace_kv_state = None
+        workspace_kv_replay_state = None
+        workspace_kv_query_start = 0
+        workspace_kv_read_rms: list[torch.Tensor] = []
+        if self.workspace_kv_memory is not None:
+            if isinstance(chx, dict):
+                workspace_kv_state = chx.get("_initium_workspace_kv_state")
+            if workspace_kv_state is None or reset_experience:
+                workspace_kv_state = self.workspace_kv_memory.reset_state(
+                    B, device=input.device, dtype=recurrent_state_dtype
+                )
+            if _workspace_kv_base_state is not None:
+                workspace_kv_state = _workspace_kv_base_state
+            if _workspace_kv_replay_records is not None:
+                replay_records, replay_commit_mask = _workspace_kv_replay_records
+                if not pass_through_memory:
+                    replay_commit_mask = torch.zeros_like(replay_commit_mask)
+                workspace_kv_query_start = workspace_kv_state.keys.shape[-2]
+                workspace_kv_replay_state = self.workspace_kv_memory.append(
+                    replay_records, replay_commit_mask, workspace_kv_state
+                )
+        workspace_kv_write_records = None
+        if self.workspace_kv_memory is not None:
+            self.workspace_kv_diagnostics = {}
         if self.workspace is not None:
             if isinstance(chx, dict) and "_initium_workspace_state" in chx:
                 workspace_state = chx["_initium_workspace_state"]
@@ -688,16 +947,98 @@ class SplitGraphDNC(nn.Module):
                 raise ValueError("workspace-enabled start_step>0 requires workspace state in hx[0]")
             if workspace_state is None or reset_experience:
                 workspace_state = self.workspace.init_state(
-                    B, device=input.device, dtype=input.dtype
+                    B, device=input.device, dtype=recurrent_state_dtype
                 )
         if start_step:
             if not (0 < start_step < T):
                 raise ValueError(f"start_step={start_step} must be in (0, T={T})")
-            if self.dnc_enabled and mhx is None:
+            if (self.dnc_enabled or self.sequence_memory_enabled) and mhx is None:
                 # The DNC path skips the sequential memory loop before this
                 # index and therefore requires its saved memory state.
                 raise ValueError("start_step>0 requires a resumed hx=(chx, mhx, last_read)")
         device = input.device
+
+        # Runtime-only overrides let paired evaluation compare final-layer,
+        # single inter-layer, and repeated inter-layer paths on the same
+        # episodes/checkpoint. Training arms use the saved configuration.
+        eval_inter_layer_override = getattr(self, "_initium_eval_inter_layer_read", None)
+        inter_layer_memory_enabled = bool(
+            self.memory_inter_layer_read
+            if eval_inter_layer_override is None
+            else eval_inter_layer_override
+        )
+        eval_inter_layer_every_block_override = getattr(
+            self, "_initium_eval_inter_layer_read_every_block", None
+        )
+        inter_layer_memory_every_block = bool(
+            self.memory_inter_layer_read_every_block
+            if eval_inter_layer_every_block_override is None
+            else eval_inter_layer_every_block_override
+        )
+        inter_layer_memory_read_done = False
+        inter_layer_memory_states: list[Any] | None = None
+        inter_layer_memory_read = None
+
+        if inter_layer_memory_enabled:
+            if not self.sequence_memory_enabled or self.sequence_memory is None:
+                raise ValueError("inter-layer reads require KV/delta sequence memory")
+            memory_path_count = (
+                len(self.backbone.blocks) - 1 if inter_layer_memory_every_block else 1
+            )
+            prior_memory_states = (
+                mhx if not reset_experience and isinstance(mhx, list | tuple) else ()
+            )
+            inter_layer_memory_states = []
+            for path_index in range(memory_path_count):
+                prior_state = (
+                    prior_memory_states[path_index]
+                    if path_index < len(prior_memory_states)
+                    else None
+                )
+                inter_layer_memory_states.append(
+                    prior_state
+                    if prior_state is not None
+                    else self.sequence_memory.reset_state(B, device=device)
+                )
+
+        def inject_inter_layer_read(features: torch.Tensor, block_index: int = 0) -> torch.Tensor:
+            nonlocal inter_layer_memory_read
+            if inter_layer_memory_states is None:
+                raise RuntimeError("inter-layer memory state was not initialized")
+            memory_path_index = block_index if inter_layer_memory_every_block else 0
+            memory_state = inter_layer_memory_states[memory_path_index]
+            memory_features = features[:, start_step:]
+            if pass_through_memory:
+                assert self.sequence_memory is not None
+                inter_layer_memory_read, memory_state, _aux = self.sequence_memory(
+                    memory_features,
+                    state=memory_state,
+                    lag=self.memory_read_lag,
+                )
+                inter_layer_memory_states[memory_path_index] = memory_state
+            else:
+                inter_layer_memory_read = torch.zeros_like(memory_features)
+            enriched = features.clone()
+            enriched[:, start_step:] = (
+                enriched[:, start_step:]
+                + self.memory_inter_layer_read_scale * inter_layer_memory_read
+            )
+            if (
+                pass_through_memory
+                and workspace_kv_replay_state is not None
+                and self.workspace_kv_memory is not None
+            ):
+                workspace_read = self.workspace_kv_memory.read_prior(
+                    memory_features,
+                    workspace_kv_replay_state,
+                    query_start_position=workspace_kv_query_start,
+                )
+                enriched[:, start_step:] = (
+                    enriched[:, start_step:] + self.workspace_kv_read_scale * workspace_read
+                )
+                workspace_kv_read_rms.append(workspace_read.detach().float().square().mean().sqrt())
+                observe_tensor("workspace_kv.read", workspace_read)
+            return enriched
 
         def observe_tensor(label: str, value: torch.Tensor) -> None:
             observer = getattr(self, "_initium_segment_observer", None)
@@ -725,6 +1066,9 @@ class SplitGraphDNC(nn.Module):
             stage_kwargs = {"token_mask": sequence_valid_mask}
             if timespans is not None and getattr(stage, "supports_timespans", False):
                 stage_kwargs["timespans"] = timespans
+            if input_token_ids is not None and stage_input.ndim == 2:
+                stage_kwargs["input_token_ids"] = input_token_ids
+                stage_kwargs["input_valid_mask"] = input_valid_mask
             return stage(stage_input, **stage_kwargs)
 
         # ---- (a) PARALLEL BACKBONE ------------------------------------
@@ -744,17 +1088,36 @@ class SplitGraphDNC(nn.Module):
             nonlocal prediction_logits, prediction_error
             if sgr_decoder is None:
                 return
-            prediction_error, prediction_logits = prediction_error_signal(
-                features,
-                input,
-                sgr_decoder,
-                signal_mode=self.sgr_error_signal_mode,
+            input_vectors = (
+                input
+                if input.ndim == 3
+                else torch.nn.functional.one_hot(
+                    input.to(dtype=torch.long), num_classes=self.input_size
+                ).to(dtype=torch.float32)
             )
+            if isinstance(sgr_decoder, CausalInputPredictionHead):
+                prediction_logits = sgr_decoder(features[:, :-1]).float()
+                valid_mask = prediction_valid_mask
+                if valid_mask is None:
+                    valid_mask = input.ne(0) if input.ndim == 2 else input.ne(0).any(dim=-1)
+                prediction_error = causal_input_prediction_error(
+                    prediction_logits, input_vectors, valid_mask
+                )
+                stream_mask = valid_mask.bool()
+            else:
+                prediction_error, prediction_logits = prediction_error_signal(
+                    features,
+                    input_vectors,
+                    sgr_decoder,
+                    signal_mode=self.sgr_error_signal_mode,
+                )
+                token_ids = input if input.ndim == 2 else input.argmax(dim=-1)
+                positions = torch.arange(token_ids.shape[1], device=input.device).unsqueeze(0)
+                stream_lengths = torch.where(token_ids.eq(20), positions, token_ids.shape[1]).amin(
+                    dim=1
+                )
+                stream_mask = positions < stream_lengths.unsqueeze(1)
             detached_signal = prediction_error.detach()
-            token_ids = input.argmax(dim=-1)
-            positions = torch.arange(input.shape[1], device=input.device).unsqueeze(0)
-            stream_lengths = torch.where(token_ids.eq(20), positions, input.shape[1]).amin(dim=1)
-            stream_mask = positions < stream_lengths.unsqueeze(1)
             valid_signal = detached_signal[stream_mask]
             valid_count = stream_mask.sum().clamp_min(1)
             self.last_sgr_signal_diagnostics = {
@@ -789,7 +1152,7 @@ class SplitGraphDNC(nn.Module):
                 raise RuntimeError(
                     "workspace requires the final parallel-backbone stage to expose its MoE specialists"
                 )
-            specialist_kwargs = {
+            specialist_kwargs: dict[str, Any] = {
                 "token_mask": sequence_valid_mask,
                 "intermediate_observer": (
                     observe_prediction_features
@@ -799,11 +1162,26 @@ class SplitGraphDNC(nn.Module):
                     else None
                 ),
             }
+            if input_token_ids is not None and stage_input.ndim == 2:
+                specialist_kwargs["input_token_ids"] = input_token_ids
+                specialist_kwargs["input_valid_mask"] = input_valid_mask
             if timespans is not None and getattr(final_stage, "supports_timespans", False):
                 specialist_kwargs["timespans"] = timespans
+            if inter_layer_memory_enabled:
+                if not callable(getattr(final_stage, "forward_with_specialists", None)):
+                    raise ValueError(
+                        "inter-layer workspace reads require a parallel backbone "
+                        "with workspace specialist support"
+                    )
+                specialist_kwargs["inter_layer_read"] = inject_inter_layer_read
+                specialist_kwargs["inter_layer_read_every_block"] = inter_layer_memory_every_block
+            selected_specialists_only = not self.workspace_no_selection
+            specialist_kwargs["selected_specialists_only"] = selected_specialists_only
             base, specialists, route_indices, route_weights = forward_with_specialists(
                 stage_input, **specialist_kwargs
             )
+            if inter_layer_memory_enabled:
+                inter_layer_memory_read_done = True
             # Workspace mode bypasses MoEBlock's ordinary residual add, so
             # apply its configured residual scale to specialist candidates
             # before they are used for slot writes or workspace readback.
@@ -811,7 +1189,7 @@ class SplitGraphDNC(nn.Module):
             # state exposed to unscaled expert outputs and defeats this
             # stability control on the write path.
             specialists = specialists[:, start_step:] * self.moe_backbone_residual_scale
-            broadcast_delta, workspace_state = self.workspace(
+            workspace_result = self.workspace(
                 specialists,
                 route_indices[:, start_step:],
                 route_weights[:, start_step:],
@@ -819,6 +1197,7 @@ class SplitGraphDNC(nn.Module):
                 no_selection=self.workspace_no_selection,
                 reset_each_step=self.workspace_reset_each_step,
                 bypass_broadcast=self.workspace_eval_bypass,
+                shuffle_readback_across_batch=self.workspace_eval_shuffle_readback,
                 bistable_noise_scale=self.workspace_bistable_noise_scale,
                 bistable_selection_scale=self.workspace_bistable_selection_scale,
                 deterministic_gate=self.workspace_bistable_deterministic,
@@ -827,7 +1206,170 @@ class SplitGraphDNC(nn.Module):
                     if prediction_error is not None and workspace_error_consumer
                     else None
                 ),
+                selected_specialists_only=selected_specialists_only,
+                entity_ids=(entity_ids[:, start_step:] if entity_ids is not None else None),
+                entity_write_mask=(
+                    entity_write_mask[:, start_step:] if entity_write_mask is not None else None
+                ),
+                pair_swap_entity_ids=(
+                    pair_swap_entity_ids[:, start_step:]
+                    if pair_swap_entity_ids is not None
+                    else None
+                ),
+                pair_swap_mask=(
+                    pair_swap_mask[:, start_step:] if pair_swap_mask is not None else None
+                ),
+                pair_swap_steps=(
+                    tuple(
+                        step - start_step for step in (pair_swap_steps or ()) if step >= start_step
+                    )
+                    if pair_swap_entity_ids is not None
+                    else None
+                ),
+                permutation_query_kind=(
+                    permutation_query_kind[:, start_step:]
+                    if permutation_query_kind is not None
+                    else None
+                ),
+                permutation_query_ids=(
+                    permutation_query_ids[:, start_step:]
+                    if permutation_query_ids is not None
+                    else None
+                ),
+                permutation_query_steps=(
+                    tuple(
+                        step - start_step
+                        for step in (permutation_query_steps or ())
+                        if step >= start_step
+                    )
+                    if permutation_query_kind is not None
+                    else None
+                ),
+                state_supervision_entity_ids=(
+                    state_supervision_entity_ids[:, start_step:]
+                    if state_supervision_entity_ids is not None
+                    else None
+                ),
+                state_supervision_mask=(
+                    state_supervision_mask[:, start_step:]
+                    if state_supervision_mask is not None
+                    else None
+                ),
+                state_supervision_steps=(
+                    tuple(
+                        step - start_step
+                        for step in (state_supervision_steps or ())
+                        if step >= start_step
+                    )
+                    if state_supervision_entity_ids is not None
+                    else None
+                ),
+                nth_farthest_vector_entity_ids=(
+                    nth_farthest_vector_entity_ids[:, start_step:]
+                    if nth_farthest_vector_entity_ids is not None
+                    else None
+                ),
+                nth_farthest_vector_mask=(
+                    nth_farthest_vector_mask[:, start_step:]
+                    if nth_farthest_vector_mask is not None
+                    else None
+                ),
+                nth_farthest_vector_steps=(
+                    tuple(
+                        step - start_step
+                        for step in (nth_farthest_vector_steps or ())
+                        if step >= start_step
+                    )
+                    if nth_farthest_vector_entity_ids is not None
+                    else None
+                ),
+                nth_farthest_query_candidate_ids=(
+                    nth_farthest_query_candidate_ids[:, start_step:]
+                    if nth_farthest_query_candidate_ids is not None
+                    else None
+                ),
+                nth_farthest_query_candidate_mask=(
+                    nth_farthest_query_candidate_mask[:, start_step:]
+                    if nth_farthest_query_candidate_mask is not None
+                    else None
+                ),
+                nth_farthest_query_vectors=(
+                    nth_farthest_query_vectors[:, start_step:]
+                    if nth_farthest_query_vectors is not None
+                    else None
+                ),
+                nth_farthest_query_ranks=(
+                    nth_farthest_query_ranks[:, start_step:]
+                    if nth_farthest_query_ranks is not None
+                    else None
+                ),
+                nth_farthest_query_steps=(
+                    tuple(
+                        step - start_step
+                        for step in (nth_farthest_query_steps or ())
+                        if step >= start_step
+                    )
+                    if nth_farthest_query_candidate_ids is not None
+                    else None
+                ),
+                retrieval_value_steps=(
+                    tuple(
+                        step - start_step
+                        for step in (retrieval_value_steps or ())
+                        if step >= start_step
+                    )
+                    if retrieval_value_entity_ids is not None
+                    else None
+                ),
+                retrieval_value_entity_ids=(
+                    retrieval_value_entity_ids[:, start_step:]
+                    if retrieval_value_entity_ids is not None
+                    else None
+                ),
+                retrieval_value_mask=(
+                    retrieval_value_mask[:, start_step:]
+                    if retrieval_value_mask is not None
+                    else None
+                ),
+                retrieval_query_entity_ids=(
+                    retrieval_query_entity_ids[:, start_step:]
+                    if retrieval_query_entity_ids is not None
+                    else None
+                ),
+                retrieval_query_mask=(
+                    retrieval_query_mask[:, start_step:]
+                    if retrieval_query_mask is not None
+                    else None
+                ),
+                retrieval_query_operation=(
+                    retrieval_query_operation[:, start_step:]
+                    if retrieval_query_operation is not None
+                    else None
+                ),
+                retrieval_query_steps=(
+                    tuple(
+                        step - start_step
+                        for step in (retrieval_query_steps or ())
+                        if step >= start_step
+                    )
+                    if retrieval_query_entity_ids is not None
+                    else None
+                ),
+                collect_kv_records=self.workspace_kv_memory is not None,
             )
+            if self.workspace_kv_memory is not None:
+                (
+                    broadcast_delta,
+                    workspace_state,
+                    workspace_kv_write_records,
+                    workspace_kv_write_mask,
+                ) = workspace_result
+                workspace_kv_write_records = (
+                    workspace_kv_write_records,
+                    workspace_kv_write_mask,
+                )
+            else:
+                broadcast_delta, workspace_state = workspace_result
             H = base.clone()
             # The workspace returns a selected, broadcast-enriched MoE delta
             # whose candidate inputs have already been residual-scaled, just
@@ -849,11 +1391,30 @@ class SplitGraphDNC(nn.Module):
                 or workspace_error_consumer
             )
             forward_with_intermediate = getattr(self.backbone, "forward_with_intermediate", None)
-            if needs_prediction_features and callable(forward_with_intermediate):
+            if inter_layer_memory_enabled:
+                if not callable(getattr(self.backbone, "forward_with_inter_layer_memory", None)):
+                    raise ValueError(
+                        "inter-layer reads require KV/delta memory and a supported parallel backbone"
+                    )
+                H = self.backbone.forward_with_inter_layer_memory(
+                    input,
+                    inter_layer_read=inject_inter_layer_read,
+                    inter_layer_read_every_block=inter_layer_memory_every_block,
+                    token_mask=sequence_valid_mask,
+                    intermediate_observer=(
+                        observe_prediction_features if needs_prediction_features else None
+                    ),
+                    input_token_ids=input_token_ids,
+                    input_valid_mask=input_valid_mask,
+                )
+                inter_layer_memory_read_done = True
+            elif needs_prediction_features and callable(forward_with_intermediate):
                 H = forward_with_intermediate(
                     input,
                     token_mask=sequence_valid_mask,
                     intermediate_observer=observe_prediction_features,
+                    input_token_ids=input_token_ids,
+                    input_valid_mask=input_valid_mask,
                 )
             else:
                 if not needs_prediction_features and not isinstance(self.backbone, nn.Sequential):
@@ -882,6 +1443,127 @@ class SplitGraphDNC(nn.Module):
             backbone_features = prediction_features if prediction_features is not None else H
 
         state: tuple[Any, Any, Any]
+        if self.sequence_memory_enabled:
+            assert self.sequence_memory is not None
+            if inter_layer_memory_read_done:
+                memory_states = inter_layer_memory_states
+                memory_read = inter_layer_memory_read
+            else:
+                memory_state = None
+                if mhx is not None and len(mhx) > 0:
+                    memory_state = mhx[0]
+                if memory_state is None or reset_experience:
+                    memory_state = self.sequence_memory.reset_state(B, device=device)
+                memory_features = H[:, start_step:]
+                if pass_through_memory:
+                    memory_read, memory_state, _aux = self.sequence_memory(
+                        memory_features, state=memory_state, lag=self.memory_read_lag
+                    )
+                else:
+                    memory_read = torch.zeros_like(memory_features)
+                memory_states = [memory_state]
+            assert memory_read is not None
+            # The adapter in each sequence memory is zero-initialized, so the
+            # initial output is exactly the backbone-only path. Reads are
+            # applied after the parallel controller and never fed back into
+            # its timestep recurrence.
+            if inter_layer_memory_read_done:
+                output = H[:, start_step:].transpose(0, 1)
+            else:
+                output = (memory_features + memory_read).transpose(0, 1)
+            last_read = memory_read[:, -1] if memory_read.shape[1] else None
+            if self.workspace_kv_memory is not None:
+                if _workspace_kv_replay_records is None:
+                    if workspace_kv_write_records is None:
+                        raise RuntimeError(
+                            "workspace-to-KV path did not receive committed workspace records"
+                        )
+                    # Warm-up pass records the causal workspace transitions.
+                    # Replay the original episode from its original state so
+                    # the ordinary KV histories are not double-written. The
+                    # replay's lag-1 workspace channel exposes only earlier
+                    # warm-up records to each token at every block boundary.
+                    return self.forward(
+                        input,
+                        hx=original_hx,
+                        reset_experience=reset_experience,
+                        pass_through_memory=pass_through_memory,
+                        combiner_skip_stages=combiner_skip_stages,
+                        start_step=start_step,
+                        sequence_valid_mask=sequence_valid_mask,
+                        prediction_valid_mask=prediction_valid_mask,
+                        entity_ids=entity_ids,
+                        entity_write_mask=entity_write_mask,
+                        pair_swap_entity_ids=pair_swap_entity_ids,
+                        pair_swap_mask=pair_swap_mask,
+                        pair_swap_steps=pair_swap_steps,
+                        permutation_query_kind=permutation_query_kind,
+                        permutation_query_ids=permutation_query_ids,
+                        permutation_query_steps=permutation_query_steps,
+                        state_supervision_entity_ids=state_supervision_entity_ids,
+                        state_supervision_mask=state_supervision_mask,
+                        state_supervision_steps=state_supervision_steps,
+                        nth_farthest_vector_entity_ids=nth_farthest_vector_entity_ids,
+                        nth_farthest_vector_mask=nth_farthest_vector_mask,
+                        nth_farthest_vector_steps=nth_farthest_vector_steps,
+                        nth_farthest_query_candidate_ids=nth_farthest_query_candidate_ids,
+                        nth_farthest_query_candidate_mask=nth_farthest_query_candidate_mask,
+                        nth_farthest_query_vectors=nth_farthest_query_vectors,
+                        nth_farthest_query_ranks=nth_farthest_query_ranks,
+                        nth_farthest_query_steps=nth_farthest_query_steps,
+                        retrieval_value_steps=retrieval_value_steps,
+                        retrieval_value_entity_ids=retrieval_value_entity_ids,
+                        retrieval_value_mask=retrieval_value_mask,
+                        retrieval_query_entity_ids=retrieval_query_entity_ids,
+                        retrieval_query_mask=retrieval_query_mask,
+                        retrieval_query_operation=retrieval_query_operation,
+                        retrieval_query_steps=retrieval_query_steps,
+                        timespans=timespans,
+                        return_backbone_features=return_backbone_features,
+                        return_prediction_logits=return_prediction_logits,
+                        _workspace_kv_replay_records=workspace_kv_write_records,
+                        _workspace_kv_base_state=workspace_kv_state,
+                    )
+                if workspace_kv_write_records is None:
+                    raise RuntimeError("workspace-to-KV replay failed to collect committed records")
+                records, commit_mask = workspace_kv_write_records
+                if pass_through_memory:
+                    workspace_kv_state = self.workspace_kv_memory.append(
+                        records, commit_mask, workspace_kv_state
+                    )
+                else:
+                    commit_mask = torch.zeros_like(commit_mask)
+                committed_count = commit_mask.sum().float()
+                commit_fraction = (
+                    commit_mask.float().mean() if commit_mask.numel() else committed_count
+                )
+                assert workspace_kv_state is not None
+                history_records = workspace_kv_state.valid.sum(dim=-1).float().mean()
+                read_rms = (
+                    torch.stack(workspace_kv_read_rms).mean()
+                    if workspace_kv_read_rms
+                    else records.new_zeros((), dtype=torch.float32)
+                )
+                self.workspace_kv_diagnostics = {
+                    "workspace_kv_commit_fraction": commit_fraction.detach(),
+                    "workspace_kv_committed_records": committed_count.detach(),
+                    "workspace_kv_history_records": history_records.detach(),
+                    "workspace_kv_read_rms": read_rms.detach(),
+                }
+            if self.workspace is not None:
+                chx = {"_initium_workspace_state": workspace_state}
+                if self.workspace_kv_memory is not None:
+                    chx["_initium_workspace_kv_state"] = workspace_kv_state
+            state = (chx, memory_states, last_read)
+            if return_backbone_features:
+                assert backbone_features is not None
+                if return_prediction_logits:
+                    return output, state, backbone_features, prediction_logits
+                return output, state, backbone_features
+            if return_prediction_logits:
+                return output, state, prediction_logits
+            return output, state
+
         if not self.dnc_enabled:
             # General-purpose split-graph backbone mode: the parallel
             # backbone (and optional MoE/workspace path above) is the model.

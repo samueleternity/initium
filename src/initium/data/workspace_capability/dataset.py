@@ -1074,13 +1074,15 @@ class WorkspaceCapabilityDataset(BaseDataset):
                         episode.track == "permutation" for episode in group
                     )
                     if observe_group:
-                        workspace._initium_address_assignment_observer = (  # fmt: skip
+                        # fmt: off
+                        workspace._initium_address_assignment_observer = (
                             lambda step,
                             assignments,
                             assignment_trace=assignment_trace: assignment_trace.append(
                                 (step, assignments.detach())
                             )
                         )
+                        # fmt: on
                     try:
                         output, _ = model(
                             x,
@@ -1839,13 +1841,15 @@ class WorkspaceCapabilityDataset(BaseDataset):
                     assignment_trace = []
                     recurrent_state_trace = []
                     event_steps_needed = {item["event_step"] for item in group}
-                    workspace._initium_address_assignment_observer = (  # fmt: skip
+                    # fmt: off
+                    workspace._initium_address_assignment_observer = (
                         lambda step,
                         assignments,
                         assignment_trace=assignment_trace: assignment_trace.append(
                             (step, assignments.detach())
                         )
                     )
+                    # fmt: on
 
                     def capture_event_state(
                         state,
@@ -1887,13 +1891,15 @@ class WorkspaceCapabilityDataset(BaseDataset):
                             bypass_logits, workspace.pop_semantic_query_predictions()
                         )
                     bypass_predictions = bypass_logits.argmax(dim=-1)
-                    workspace._initium_address_assignment_observer = (  # fmt: skip
+                    # fmt: off
+                    workspace._initium_address_assignment_observer = (
                         lambda step,
                         assignments,
                         assignment_trace=assignment_trace: assignment_trace.append(
                             (step, assignments.detach())
                         )
                     )
+                    # fmt: on
 
                     def capture_event_state(
                         state,

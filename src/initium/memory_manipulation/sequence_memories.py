@@ -292,8 +292,8 @@ class GatedDeltaMemory(SequenceMemory):
         if not q.is_cuda:
             raise RuntimeError("The FLA delta backend requires CUDA tensors")
         try:
-            from fla.ops.gated_delta_rule import (
-                chunk_gated_delta_rule,  # type: ignore[import-not-found]
+            from fla.ops.gated_delta_rule import (  # type: ignore[import-not-found]
+                chunk_gated_delta_rule,
             )
         except ImportError as exc:
             raise RuntimeError(

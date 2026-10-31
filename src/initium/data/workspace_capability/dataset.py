@@ -1074,7 +1074,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
                         episode.track == "permutation" for episode in group
                     )
                     if observe_group:
-                        workspace._initium_address_assignment_observer = (
+                        workspace._initium_address_assignment_observer = (  # fmt: skip
                             lambda step,
                             assignments,
                             assignment_trace=assignment_trace: assignment_trace.append(
@@ -1839,7 +1839,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
                     assignment_trace = []
                     recurrent_state_trace = []
                     event_steps_needed = {item["event_step"] for item in group}
-                    workspace._initium_address_assignment_observer = (
+                    workspace._initium_address_assignment_observer = (  # fmt: skip
                         lambda step,
                         assignments,
                         assignment_trace=assignment_trace: assignment_trace.append(
@@ -1887,7 +1887,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
                             bypass_logits, workspace.pop_semantic_query_predictions()
                         )
                     bypass_predictions = bypass_logits.argmax(dim=-1)
-                    workspace._initium_address_assignment_observer = (
+                    workspace._initium_address_assignment_observer = (  # fmt: skip
                         lambda step,
                         assignments,
                         assignment_trace=assignment_trace: assignment_trace.append(

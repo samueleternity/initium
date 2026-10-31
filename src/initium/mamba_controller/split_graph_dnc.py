@@ -976,7 +976,7 @@ class SplitGraphDNC(nn.Module):
             else eval_inter_layer_every_block_override
         )
         inter_layer_memory_read_done = False
-        inter_layer_memory_states = None
+        inter_layer_memory_states: list[Any] | None = None
         inter_layer_memory_read = None
 
         if inter_layer_memory_enabled:
@@ -988,7 +988,7 @@ class SplitGraphDNC(nn.Module):
             prior_memory_states = (
                 mhx if not reset_experience and isinstance(mhx, list | tuple) else ()
             )
-            inter_layer_memory_states: list[Any] = []
+            inter_layer_memory_states = []
             for path_index in range(memory_path_count):
                 prior_state = (
                     prior_memory_states[path_index]

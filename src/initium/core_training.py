@@ -35,7 +35,7 @@ import random
 import shutil
 import sys
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Any, TextIO
 
 # Support both ``python -m initium.core_training`` and direct execution of
@@ -785,6 +785,10 @@ def _causal_prediction_loss(
     valid_mask: torch.Tensor,
     stream_lengths: list[int] | None = None,
 ) -> torch.Tensor:
+    if input_sequence.ndim == 2:
+        input_sequence = torch.nn.functional.one_hot(
+            input_sequence.to(dtype=torch.long), num_classes=predictions.shape[-1]
+        ).to(dtype=torch.float32)
     if isinstance(decoder, CausalInputPredictionHead):
         return masked_input_prediction_loss(predictions, input_sequence, valid_mask)
     if stream_lengths is None:
@@ -841,6 +845,9 @@ def load_frozen_workspace_warm_start(
         "workspace_reconsideration_trigger_mode",
         "workspace_bistable_deterministic",
         "workspace_stability_max_activation",
+        "workspace_token_id_input",  # exact input representation; parameters are shared
+        "activation_offload_to_cpu",  # storage policy only; exact gradients are preserved
+        "activation_offload_cpu_budget_mb",  # storage policy only
         # Exact implementation-only optimization; old checkpoints default
         # to base and remain weight/state compatible with either backend.
         "dnc_implementation",
@@ -962,6 +969,96 @@ def _filesystem_safe_run_id(run_id: str) -> str:
     return f"{prefix}_h{digest}_{suffix}"
 
 
+@contextmanager
+def _saved_activations_on_cpu_preserve_strides(max_bytes: int):
+    """Offload autograd saves while preserving layouts required by Inductor.
+
+    ``torch.autograd.graph.save_on_cpu`` packs into a contiguous CPU tensor.
+    That changes the stride of non-contiguous views, which can violate the
+    layout guards captured by AOTAutograd for the compiled workspace recurrence.
+    These hooks use strided CPU/GPU allocations so unpacked tensors preserve
+    the original size, dtype, device, and strides. Non-strided tensors remain
+    resident rather than guessing a reconstruction layout.
+    """
+
+    stats = {"offloaded_bytes": 0, "resident_bytes": 0, "offloaded_tensors": 0}
+
+    def pack(tensor: torch.Tensor):
+        tensor_bytes = tensor.numel() * tensor.element_size()
+        if tensor.device.type != "cuda" or tensor.layout != torch.strided:
+            stats["resident_bytes"] += tensor_bytes
+            return ("resident", tensor.detach())
+        # Expanded/broadcast views can have overlapping strides (often zero
+        # in an expanded axis). They cannot be reconstructed by copy_ into an
+        # empty_strided destination, so leave those views on device rather
+        # than materializing an incorrect copy on CPU.
+        dimensions = sorted(
+            (
+                int(stride),
+                int(size),
+            )
+            for size, stride in zip(tensor.size(), tensor.stride())
+            if int(size) > 1
+        )
+        required_extent = 1
+        for stride, size in dimensions:
+            if stride < required_extent:
+                stats["resident_bytes"] += tensor_bytes
+                return ("resident", tensor.detach())
+            required_extent += (size - 1) * stride
+        # Bound pinned host-memory pressure. Saves over the configured budget
+        # remain on their original device, preserving exact autograd semantics.
+        if stats["offloaded_bytes"] + tensor_bytes > max_bytes:
+            stats["resident_bytes"] += tensor_bytes
+            return ("resident", tensor.detach())
+        # Keep the host copy dense to minimize pinned-RAM use; restore the
+        # source layout only when materializing the tensor for backward.
+        cpu_copy = torch.empty(
+            tensor.size(),
+            dtype=tensor.dtype,
+            device="cpu",
+            pin_memory=True,
+        )
+        cpu_copy.copy_(tensor.detach(), non_blocking=True)
+        stats["offloaded_bytes"] += tensor_bytes
+        stats["offloaded_tensors"] += 1
+        return ("offloaded", tensor.device, tensor.size(), tensor.stride(), cpu_copy)
+
+    def unpack(packed):
+        if packed[0] == "resident":
+            return packed[1]
+        _, device, size, stride, cpu_tensor = packed
+        restored = torch.empty_strided(
+            size,
+            stride,
+            dtype=cpu_tensor.dtype,
+            device=device,
+        )
+        restored.copy_(cpu_tensor, non_blocking=True)
+        return restored
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, unpack):
+        yield stats
+
+
+def _host_memory_snapshot_mb() -> tuple[float | None, float | None, float | None]:
+    """Return current RSS, process peak RSS, and pinned RAM in MiB when available."""
+    status_path = "/proc/self/status"
+    try:
+        values: dict[str, float] = {}
+        with open(status_path, encoding="ascii") as status_file:
+            for line in status_file:
+                key, separator, value = line.partition(":")
+                if not separator or key not in {"VmRSS", "VmHWM", "VmPin"}:
+                    continue
+                fields = value.split()
+                if fields:
+                    values[key] = float(fields[0]) / 1024.0
+        return values.get("VmRSS"), values.get("VmHWM"), values.get("VmPin")
+    except (OSError, ValueError):
+        return None, None, None
+
+
 def run(
     beta_target: float,
     run_id: str,
@@ -983,6 +1080,9 @@ def run(
     moe_enabled: bool = MOE_ENABLED,
     moe_diagnostics_enabled: bool = True,
     segment_diagnostics_enabled: bool = True,
+    segment_diagnostics_every_step: bool = False,
+    activation_offload_to_cpu: bool = False,
+    activation_offload_cpu_budget_mb: int = 2048,
     split_graph_moe_placement: str = "all",
     split_graph_moe_backbone_block_isolation: int | None = None,
     split_graph_moe_backbone_residual_scale: float = 1.0,
@@ -1004,6 +1104,7 @@ def run(
     workspace_enabled: bool = WORKSPACE_ENABLED,
     workspace_num_slots: int = WORKSPACE_NUM_SLOTS,
     workspace_compile_recurrence: bool = False,
+    workspace_token_id_input: bool = False,
     workspace_entity_keyed_writes: bool = False,
     workspace_semantic_entity_addressing: bool = False,
     workspace_permutation_transactional: bool = False,
@@ -1065,6 +1166,8 @@ def run(
     workspace_state_loss_weight: float = 0.0,
     workspace_nth_farthest_exact_readout: bool = False,
     workspace_nth_farthest_vector_loss_weight: float = 0.1,
+    workspace_retrieval_exact_readout: bool = False,
+    workspace_retrieval_value_loss_weight: float = 0.1,
     prepared_dataset=None,
     ogs_weights: tuple[float, float, float] = OGS_WEIGHTS,
     batch_size: int = BATCH_SIZE,
@@ -1089,10 +1192,20 @@ def run(
         raise ValueError("log_every must be positive")
     if memory_type not in {"none", "dnc", "kv", "delta"}:
         raise ValueError("memory_type must be none, dnc, kv, or delta")
+    if workspace_token_id_input and dataset_type != "workspace-capability":
+        raise ValueError(
+            "workspace token-ID input requires --dataset-type workspace-capability"
+        )
+    if activation_offload_to_cpu and device.type != "cuda":
+        raise ValueError("activation offload to CPU requires CUDA training")
+    if activation_offload_cpu_budget_mb <= 0:
+        raise ValueError("activation offload CPU budget must be positive")
     if not math.isfinite(workspace_state_loss_weight) or workspace_state_loss_weight < 0:
         raise ValueError("workspace_state_loss_weight must be finite and >= 0")
     if not math.isfinite(workspace_nth_farthest_vector_loss_weight) or workspace_nth_farthest_vector_loss_weight < 0:
         raise ValueError("workspace_nth_farthest_vector_loss_weight must be finite and >= 0")
+    if not math.isfinite(workspace_retrieval_value_loss_weight) or workspace_retrieval_value_loss_weight < 0:
+        raise ValueError("workspace_retrieval_value_loss_weight must be finite and >= 0")
     if memory_read_lag not in (0, 1):
         raise ValueError("memory_read_lag must be 0 or 1")
     if not math.isfinite(memory_inter_layer_read_scale) or memory_inter_layer_read_scale < 0:
@@ -1156,6 +1269,7 @@ def run(
         batch_size_hint=batch_size,
     )
     if getattr(dataset, "name", None) == "workspace-capability":
+        dataset.token_id_input = bool(workspace_token_id_input)
         if not split_graph_enabled or split_graph_variant != "mamba1":
             raise ValueError("workspace-capability training requires split-graph Mamba-1")
         if memory_type not in {"none", "kv"}:
@@ -1197,13 +1311,26 @@ def run(
                 raise ValueError(
                     "Nth-farthest exact readout requires a positive vector state loss weight"
                 )
+        if workspace_retrieval_exact_readout:
+            if not workspace_enabled or not workspace_semantic_entity_addressing:
+                raise ValueError(
+                    "retrieval exact readout requires --workspace and semantic entity addressing"
+                )
+            if workspace_task_track not in {"all", "retrieval_aggregation"}:
+                raise ValueError(
+                    "retrieval exact readout is supported only on retrieval_aggregation or all"
+                )
+            if workspace_num_slots < 64:
+                raise ValueError("retrieval exact readout requires at least 64 workspace slots")
+            if workspace_retrieval_value_loss_weight <= 0:
+                raise ValueError("retrieval exact readout requires a positive value loss weight")
         if (
             workspace_semantic_entity_addressing
-            and workspace_task_track == "all"
+            and workspace_task_track in {"all", "retrieval_aggregation"}
             and workspace_num_slots < 64
         ):
             raise ValueError(
-                "semantic entity addressing on the all track requires at least 64 "
+                "semantic entity addressing on retrieval_aggregation/all requires at least 64 "
                 "workspace slots to cover every entity ID in the generated episodes"
             )
         if workspace_permutation_transactional:
@@ -1230,11 +1357,12 @@ def run(
         workspace_semantic_state_diagnostics
         or workspace_state_loss_weight > 0
         or workspace_nth_farthest_exact_readout
+        or workspace_retrieval_exact_readout
         or workspace_permutation_transactional
     ):
         raise ValueError(
-            "workspace state diagnostics, state loss, Nth-farthest exact readout, and "
-            "transactional permutation mode require workspace-capability"
+            "workspace state diagnostics/loss, Nth-farthest and retrieval exact "
+            "readouts, and transactional permutation mode require workspace-capability"
         )
     if split_graph_numeric_trace_step is not None:
         if not split_graph_enabled:
@@ -2027,6 +2155,59 @@ def run(
                     nth_metrics.get("invalid_readouts"), *([None] * 8),
                 ]
             )
+        retrieval_metrics = diagnostics.get("retrieval_workspace", {})
+        for metric_key, metric_name, accuracy in (
+            ("write_value_count", "write_value_accuracy", "write_value_accuracy"),
+            ("initial_value_count", "initial_write_value_accuracy", "initial_write_value_accuracy"),
+            ("update_value_count", "update_write_value_accuracy", "update_write_value_accuracy"),
+            ("query_values_count", "queried_value_accuracy", "queried_value_accuracy"),
+            ("updated_query_values_count", "updated_query_value_accuracy", "updated_query_value_accuracy"),
+            ("untouched_query_values_count", "untouched_query_value_accuracy", "untouched_query_value_accuracy"),
+            ("query_slots_total", "query_slot_lookup_rate", "query_slot_lookup_rate"),
+            ("readout_count", "exact_readout_accuracy", "exact_readout_accuracy"),
+        ):
+            if retrieval_metrics:
+                workspace_task_writer.writerow(
+                    [
+                        step_value,
+                        lesson_value,
+                        eval_type,
+                        f"retrieval_workspace/{metric_name}",
+                        retrieval_metrics.get(accuracy),
+                        retrieval_metrics.get(accuracy),
+                        retrieval_metrics.get(metric_key),
+                        retrieval_metrics.get(
+                            {
+                                "write_value_count": "write_value_correct",
+                                "initial_value_count": "initial_value_correct",
+                                "update_value_count": "update_value_correct",
+                                "query_values_count": "query_values_correct",
+                                "updated_query_values_count": "updated_query_values_correct",
+                                "untouched_query_values_count": "untouched_query_values_correct",
+                                "query_slots_total": "query_slots_found",
+                                "readout_count": "readout_exact",
+                            }[metric_key]
+                        ),
+                        *([None] * 8),
+                    ]
+                )
+        for query_type, values in sorted(
+            retrieval_metrics.get("readout_by_query_type", {}).items()
+        ):
+            accuracy = 100.0 * values["correct"] / max(values["episodes"], 1)
+            workspace_task_writer.writerow(
+                [
+                    step_value,
+                    lesson_value,
+                    eval_type,
+                    f"retrieval_readout/{query_type}",
+                    accuracy,
+                    accuracy,
+                    values["episodes"],
+                    values["correct"],
+                    *([None] * 8),
+                ]
+            )
         workspace_task_file.flush()
 
     def write_workspace_dependency(
@@ -2316,11 +2497,30 @@ def run(
     print(
         f"[{run_id}] diagnostics: moe={'on' if moe_diagnostics_enabled else 'off'} "
         f"segment={'on' if segment_diagnostics_enabled else 'off'}"
+        + (
+            " (every step)"
+            if segment_diagnostics_enabled
+            and (
+                segment_diagnostics_every_step
+                or workspace_train_scope == "gate"
+                or workspace_bistable_debug
+            )
+            else " (one train step per log interval)"
+            if segment_diagnostics_enabled
+            else ""
+        )
     )
+    if activation_offload_to_cpu:
+        print(
+            f"[{run_id}] autograd saved-tensor offload=CPU pinned memory | "
+            f"per-step budget={activation_offload_cpu_budget_mb} MiB | "
+            "full BPTT and forward equations are unchanged; expect host-RAM and transfer overhead"
+        )
     if moe_enabled:
         print(
             f"[{run_id}] MoE routing diagnostics="
-            f"{'on' if moe_diagnostics_enabled else 'off'} | "
+            f"{'on' if moe_diagnostics_enabled else 'off'} "
+            "(detailed metrics at log intervals) | "
             "load-balancing auxiliary loss and routing remain active"
         )
 
@@ -2563,10 +2763,12 @@ def run(
             workspace_enabled=workspace_enabled,
             workspace_num_slots=workspace_num_slots,
             workspace_compile_recurrence=workspace_compile_recurrence,
+            workspace_token_id_input=workspace_token_id_input,
             workspace_entity_keyed_writes=workspace_entity_keyed_writes,
             workspace_semantic_entity_addressing=workspace_semantic_entity_addressing,
             workspace_permutation_transactional=workspace_permutation_transactional,
             workspace_nth_farthest_exact_readout=workspace_nth_farthest_exact_readout,
+            workspace_retrieval_exact_readout=workspace_retrieval_exact_readout,
             workspace_key_match_threshold=workspace_key_match_threshold,
             workspace_no_selection=workspace_no_selection,
             workspace_reset_each_step=workspace_reset_each_step,
@@ -2585,6 +2787,12 @@ def run(
             workspace_kv_read_scale=workspace_kv_read_scale,
             device=device,
         ).to(device)
+        if workspace_token_id_input:
+            print(
+                f"[{run_id}] workspace-capability compact token-ID input enabled | "
+                "one-hot input batches are replaced with int64 IDs and the existing "
+                "split-graph input Linear is evaluated as an embedding lookup"
+            )
 
         if workspace_bistable_debug:
             assert rnn.workspace is not None and rnn.workspace.bistable_gate is not None
@@ -2899,14 +3107,19 @@ def run(
         "dnc_compute_precision": "fp32",
         "dnc_backward_trace": dnc_backward_trace,
         "batch_size": batch_size,
+        "activation_offload_to_cpu": activation_offload_to_cpu,
+        "activation_offload_cpu_budget_mb": activation_offload_cpu_budget_mb,
         "workspace_enabled": workspace_enabled,
         "workspace_num_slots": workspace_num_slots,
         "workspace_compile_recurrence": workspace_compile_recurrence,
+        "workspace_token_id_input": workspace_token_id_input,
         "workspace_entity_keyed_writes": workspace_entity_keyed_writes,
         "workspace_permutation_transactional": workspace_permutation_transactional,
         "workspace_state_loss_weight": workspace_state_loss_weight,
         "workspace_nth_farthest_exact_readout": workspace_nth_farthest_exact_readout,
         "workspace_nth_farthest_vector_loss_weight": workspace_nth_farthest_vector_loss_weight,
+        "workspace_retrieval_exact_readout": workspace_retrieval_exact_readout,
+        "workspace_retrieval_value_loss_weight": workspace_retrieval_value_loss_weight,
         "workspace_key_match_threshold": workspace_key_match_threshold,
         "workspace_no_selection": workspace_no_selection,
         "workspace_reset_each_step": workspace_reset_each_step,
@@ -2933,6 +3146,8 @@ def run(
         extra_model_config["workspace_permutation_transactional"] = True
     if workspace_nth_farthest_exact_readout:
         extra_model_config["workspace_nth_farthest_exact_readout"] = True
+    if workspace_retrieval_exact_readout:
+        extra_model_config["workspace_retrieval_exact_readout"] = True
     if sgr_prediction_enabled:
         extra_model_config["sgr_prediction_decoder_enabled"] = True
         extra_model_config["sgr_prediction_loss_weight"] = float(sgr_prediction_loss_weight)
@@ -3098,9 +3313,13 @@ def run(
     for module_name, module in rnn.named_modules():
         if id(module) in moe_layer_ids:
             module.diagnostic_name = module_name or type(module).__name__
-    for module in rnn.modules():
-        if isinstance(module, SwitchMoE):
-            module.set_diagnostics_enabled(moe_diagnostics_enabled)
+    moe_diagnostic_modules = tuple(
+        module for module in rnn.modules() if isinstance(module, SwitchMoE)
+    )
+    for module in moe_diagnostic_modules:
+        # Detailed routing summaries are consumed at the regular log cadence;
+        # auxiliary routing loss remains active on every step.
+        module.set_diagnostics_enabled(False)
     workspace_telemetry_enabled = bool(
         isinstance(rnn, SplitGraphDNC)
         and rnn.workspace is not None
@@ -3729,6 +3948,13 @@ def run(
     running_nth_vector_loss: Any = 0.0
     running_nth_vector_correct: Any = 0.0
     running_nth_vector_count: Any = 0.0
+    running_retrieval_value_loss: Any = 0.0
+    running_retrieval_value_correct: Any = 0.0
+    running_retrieval_value_count: Any = 0.0
+    running_retrieval_query_correct: Any = 0.0
+    running_retrieval_query_count: Any = 0.0
+    running_retrieval_query_found: Any = 0.0
+    running_retrieval_query_slots: Any = 0.0
     running_log_steps = 0
     last_train_sgr_signal_diagnostics: dict[str, torch.Tensor] = {}
     workspace_reconsideration_window: dict[str, torch.Tensor] | None = None
@@ -3785,14 +4011,18 @@ def run(
     t_run_start = time.time()
 
     while step < total_steps and not eval_only:
+        moe_diagnostics_due = bool(
+            moe_diagnostics_enabled and running_log_steps + 1 >= log_every
+        )
+        for module in moe_diagnostic_modules:
+            if module.diagnostics_enabled != moe_diagnostics_due:
+                module.set_diagnostics_enabled(moe_diagnostics_due)
         if isinstance(rnn, SplitGraphDNC) and rnn.workspace is not None:
             # Workspace health reductions are only consumed at the normal
             # logging cadence. Keep reconsideration/write-salience telemetry
             # continuous because it is accumulated per training step.
             workspace_diag_due = running_log_steps + 1 >= log_every
-            workspace_diagnostics_enabled = workspace_telemetry_enabled or (
-                moe_diagnostics_enabled and workspace_diag_due
-            )
+            workspace_diagnostics_enabled = workspace_telemetry_enabled or workspace_diag_due
             if rnn.workspace.diagnostics_enabled != workspace_diagnostics_enabled:
                 rnn.workspace.set_diagnostics_enabled(workspace_diagnostics_enabled)
         if split_graph_forward_trace is not None:
@@ -3813,6 +4043,19 @@ def run(
             and step == workspace_bistable_anomaly_step
         )
         segment_diagnostics.set_nonfinite_trace(anomaly_this_step)
+        segment_sample_due = (
+            segment_diagnostics_every_step
+            or workspace_train_scope == "gate"
+            or workspace_bistable_debug
+            or anomaly_this_step
+            or running_log_steps + 1 >= log_every
+        )
+        segment_diagnostics.set_channel(
+            "train"
+            if segment_diagnostics_enabled and segment_sample_due
+            else None
+        )
+        segment_diagnostics.set_step(step)
         if isinstance(rnn, SplitGraphDNC):
             combiner = rnn.combiner_wrapper
             if combiner is not None and hasattr(combiner, "set_gradient_trace"):
@@ -3835,6 +4078,7 @@ def run(
 
         workspace_forward_kwargs = {}
         nth_metadata = None
+        retrieval_metadata = None
         if workspace_semantic_entity_addressing:
             workspace_metadata = dataset.workspace_entity_address_metadata(
                 input_seq,
@@ -3847,6 +4091,20 @@ def run(
                         key: value
                         for key, value in nth_metadata.items()
                         if key != "nth_farthest_vector_targets"
+                    }
+                )
+            if workspace_retrieval_exact_readout:
+                retrieval_metadata = dataset.workspace_retrieval_metadata(input_seq)
+                workspace_metadata.update(
+                    {
+                        key: value
+                        for key, value in retrieval_metadata.items()
+                        if key not in (
+                            "retrieval_value_targets",
+                            "retrieval_query_targets",
+                            "retrieval_value_is_update",
+                            "retrieval_query_was_updated",
+                        )
                     }
                 )
             if workspace_permutation_transactional:
@@ -3889,6 +4147,21 @@ def run(
             nth_vector_mask = nth_metadata["nth_farthest_vector_mask"].to(
                 device, non_blocking=True
             )
+        retrieval_value_targets = None
+        retrieval_value_mask = None
+        retrieval_query_targets = None
+        if workspace_retrieval_exact_readout:
+            if retrieval_metadata is None:
+                raise RuntimeError("retrieval metadata requires semantic entity addressing")
+            retrieval_value_targets = retrieval_metadata["retrieval_value_targets"].to(
+                device, non_blocking=True
+            )
+            retrieval_value_mask = retrieval_metadata["retrieval_value_mask"].to(
+                device, non_blocking=True
+            )
+            retrieval_query_targets = retrieval_metadata["retrieval_query_targets"].to(
+                device, non_blocking=True
+            )
         input_seq = input_seq.to(device, non_blocking=True)
         target_digits = target_digits.to(device, non_blocking=True)
         answer_mask = answer_mask.to(device, non_blocking=True)
@@ -3897,7 +4170,11 @@ def run(
         # The auxiliary head predicts only observed input vectors; task labels
         # are never part of its target. Nonzero input rows are the generic
         # padding contract, independent of dataset-specific answer masks.
-        prediction_valid_mask = input_seq.ne(0).any(dim=-1)
+        prediction_valid_mask = (
+            input_seq.ne(0)
+            if input_seq.ndim == 2
+            else input_seq.ne(0).any(dim=-1)
+        )
         dataset_stream_lengths = getattr(dataset, "last_stream_lengths", None)
         if dataset_stream_lengths is not None:
             stream_positions = torch.arange(input_seq.shape[1], device=device).unsqueeze(0)
@@ -3920,13 +4197,20 @@ def run(
         hidden: Any = (None, None, None)
         optimizer.zero_grad(set_to_none=True)
 
-        segment_diagnostics.set_channel("train")
-        segment_diagnostics.set_step(step)
         if dnc_backward_trace and split_graph_enabled:
             rnn.memories[0].set_backward_trace(True, step=step)
         bistable_forward_debug = ""
         prediction_loss = None
-        with torch.amp.autocast("cuda", enabled=amp_enabled):
+        saved_tensor_context = (
+            _saved_activations_on_cpu_preserve_strides(
+                activation_offload_cpu_budget_mb * 1024 * 1024
+            )
+            if activation_offload_to_cpu and torch.is_grad_enabled()
+            else nullcontext(None)
+        )
+        with saved_tensor_context as activation_offload_stats, torch.amp.autocast(
+            "cuda", enabled=amp_enabled
+        ):
             if isinstance(rnn, SurpriseRecallBackboneOnly):
                 oracle_flags = None
                 if sgr_phase2_arm == "oracle":
@@ -4143,6 +4427,75 @@ def run(
                     nth_vector_loss = task_loss.new_zeros(())
                     nth_vector_correct = task_loss.new_zeros(())
                     nth_vector_count = task_loss.new_zeros(())
+            retrieval_value_loss = None
+            retrieval_value_correct = task_loss.new_zeros(())
+            retrieval_value_count = task_loss.new_zeros(())
+            retrieval_query_correct = task_loss.new_zeros(())
+            retrieval_query_count = task_loss.new_zeros(())
+            retrieval_query_found = task_loss.new_zeros(())
+            retrieval_query_slots = task_loss.new_zeros(())
+            if workspace_retrieval_exact_readout:
+                workspace_module = getattr(rnn, "workspace", None)
+                if (
+                    workspace_module is None
+                    or retrieval_value_targets is None
+                    or retrieval_value_mask is None
+                    or retrieval_query_targets is None
+                ):
+                    raise RuntimeError("retrieval value supervision metadata is missing")
+                value_predictions = workspace_module.pop_retrieval_value_predictions()
+                query_predictions = workspace_module.pop_retrieval_query_predictions()
+                if value_predictions:
+                    value_steps = torch.tensor(
+                        [event_step for event_step, _, _ in value_predictions],
+                        device=device,
+                        dtype=torch.long,
+                    )
+                    value_logits = torch.stack(
+                        [value for _, value, _ in value_predictions], dim=1
+                    ).float()
+                    value_found = torch.stack(
+                        [found for _, _, found in value_predictions], dim=1
+                    ).bool()
+                    value_targets = retrieval_value_targets.index_select(1, value_steps)
+                    value_valid = retrieval_value_mask.index_select(1, value_steps)
+                    value_supervised = value_valid & value_found
+                    supervised_targets = value_targets.masked_fill(~value_supervised, -100)
+                    per_value_loss = nn.functional.cross_entropy(
+                        value_logits.reshape(-1, 16),
+                        supervised_targets.reshape(-1),
+                        reduction="none",
+                        ignore_index=-100,
+                    ).reshape_as(value_targets)
+                    per_event_counts = value_supervised.sum(dim=0).to(per_value_loss.dtype)
+                    active_events = per_event_counts.gt(0).to(per_value_loss.dtype)
+                    event_losses = per_value_loss.sum(dim=0) / per_event_counts.clamp_min(1.0)
+                    retrieval_value_loss = (event_losses * active_events).sum() / (
+                        active_events.sum().clamp_min(1.0)
+                    )
+                    value_predicted = value_logits.argmax(dim=-1)
+                    retrieval_value_correct = (
+                        (value_predicted.eq(value_targets) & value_valid & value_found)
+                        .sum()
+                        .to(task_loss.dtype)
+                    )
+                    retrieval_value_count = value_valid.sum().to(task_loss.dtype)
+                else:
+                    retrieval_value_loss = task_loss.new_zeros(())
+                if query_predictions:
+                    for query_step, query_logits, query_found_mask, active_mask in query_predictions:
+                        active = active_mask.bool()
+                        targets = retrieval_query_targets[:, query_step]
+                        predicted_values = query_logits.argmax(dim=-1)
+                        valid_targets = active & targets.ge(0)
+                        retrieval_query_correct += (
+                            predicted_values.eq(targets) & valid_targets
+                        ).sum().to(task_loss.dtype)
+                        retrieval_query_count += valid_targets.sum().to(task_loss.dtype)
+                        retrieval_query_found += (
+                            query_found_mask.bool() & active
+                        ).sum().to(task_loss.dtype)
+                        retrieval_query_slots += active.sum().to(task_loss.dtype)
             if split_graph_forward_trace is not None and split_graph_forward_trace.active:
                 split_graph_forward_trace.observe("task_output.loss", task_loss)
             if (
@@ -4238,6 +4591,11 @@ def run(
             + (
                 workspace_nth_farthest_vector_loss_weight * nth_vector_loss
                 if nth_vector_loss is not None
+                else 0.0
+            )
+            + (
+                workspace_retrieval_value_loss_weight * retrieval_value_loss
+                if retrieval_value_loss is not None
                 else 0.0
             )
             + beta_eff * kl_loss
@@ -4527,6 +4885,14 @@ def run(
             running_nth_vector_loss += nth_vector_loss.detach()
             running_nth_vector_correct += nth_vector_correct.detach()
             running_nth_vector_count += nth_vector_count.detach()
+        if retrieval_value_loss is not None:
+            running_retrieval_value_loss += retrieval_value_loss.detach()
+            running_retrieval_value_correct += retrieval_value_correct.detach()
+            running_retrieval_value_count += retrieval_value_count.detach()
+            running_retrieval_query_correct += retrieval_query_correct.detach()
+            running_retrieval_query_count += retrieval_query_count.detach()
+            running_retrieval_query_found += retrieval_query_found.detach()
+            running_retrieval_query_slots += retrieval_query_slots.detach()
         if prediction_loss is not None:
             running_sgr_prediction_loss += prediction_loss.detach()
         running_div += dataset.diversity(output.detach(), target_digits, answer_mask)
@@ -4661,6 +5027,26 @@ def run(
                 / max(running_nth_vector_count.item() if torch.is_tensor(running_nth_vector_count) else running_nth_vector_count, 1)
                 if workspace_nth_farthest_exact_readout else None
             )
+            avg_retrieval_value_loss = (
+                (running_retrieval_value_loss.item() if torch.is_tensor(running_retrieval_value_loss) else running_retrieval_value_loss)
+                / window_steps
+                if workspace_retrieval_exact_readout else None
+            )
+            avg_retrieval_value_accuracy = (
+                (running_retrieval_value_correct.item() if torch.is_tensor(running_retrieval_value_correct) else running_retrieval_value_correct)
+                / max(running_retrieval_value_count.item() if torch.is_tensor(running_retrieval_value_count) else running_retrieval_value_count, 1)
+                if workspace_retrieval_exact_readout else None
+            )
+            avg_retrieval_query_accuracy = (
+                (running_retrieval_query_correct.item() if torch.is_tensor(running_retrieval_query_correct) else running_retrieval_query_correct)
+                / max(running_retrieval_query_count.item() if torch.is_tensor(running_retrieval_query_count) else running_retrieval_query_count, 1)
+                if workspace_retrieval_exact_readout else None
+            )
+            avg_retrieval_lookup_rate = (
+                (running_retrieval_query_found.item() if torch.is_tensor(running_retrieval_query_found) else running_retrieval_query_found)
+                / max(running_retrieval_query_slots.item() if torch.is_tensor(running_retrieval_query_slots) else running_retrieval_query_slots, 1)
+                if workspace_retrieval_exact_readout else None
+            )
             avg_sgr_prediction_loss = (
                 (
                     running_sgr_prediction_loss.item()
@@ -4714,6 +5100,13 @@ def run(
                     f"coord_acc={avg_nth_vector_accuracy:.1%} "
                     f"coords/batch={((running_nth_vector_count.item() if torch.is_tensor(running_nth_vector_count) else running_nth_vector_count) / window_steps):.1f}"
                 )
+            if avg_retrieval_value_loss is not None:
+                parts.append(
+                    f"L_ws_retrieval {avg_retrieval_value_loss:.4f} "
+                    f"write_acc={avg_retrieval_value_accuracy:.1%} "
+                    f"query_value_acc={avg_retrieval_query_accuracy:.1%} "
+                    f"slot_found={avg_retrieval_lookup_rate:.1%}"
+                )
             if avg_sgr_prediction_loss is not None:
                 parts.append(f"L_pred {avg_sgr_prediction_loss:.4f}")
             sgr_signal_values = {
@@ -4755,6 +5148,22 @@ def run(
             if amp_enabled:
                 parts.append(f"amp_scale {amp_scale:.1f}")
             parts.append(f"gpu_mem_peak_mb {gpu_mem_peak_mb:.1f}")
+            if activation_offload_to_cpu:
+                offload_mb = activation_offload_stats["offloaded_bytes"] / (1024 * 1024)
+                resident_mb = activation_offload_stats["resident_bytes"] / (1024 * 1024)
+                host_rss_mb, host_peak_mb, host_pinned_mb = _host_memory_snapshot_mb()
+                offload_report = (
+                    f"saved_cpu_mb {offload_mb:.1f}/{activation_offload_cpu_budget_mb} "
+                    f"resident_saved_mb {resident_mb:.1f} "
+                    f"offloaded_tensors {activation_offload_stats['offloaded_tensors']}"
+                )
+                if host_rss_mb is not None:
+                    offload_report += f" host_rss_mb {host_rss_mb:.0f}"
+                if host_peak_mb is not None:
+                    offload_report += f" host_peak_mb {host_peak_mb:.0f}"
+                if host_pinned_mb is not None:
+                    offload_report += f" host_pinned_mb {host_pinned_mb:.0f}"
+                parts.append(offload_report)
             if moe_enabled and moe_diagnostics_enabled:
                 parts.append(f"moe_aux {float(moe_aux_loss.detach()):.4f}")
                 parts += [
@@ -5106,6 +5515,13 @@ def run(
             running_nth_vector_loss = 0.0
             running_nth_vector_correct = 0.0
             running_nth_vector_count = 0.0
+            running_retrieval_value_loss = 0.0
+            running_retrieval_value_correct = 0.0
+            running_retrieval_value_count = 0.0
+            running_retrieval_query_correct = 0.0
+            running_retrieval_query_count = 0.0
+            running_retrieval_query_found = 0.0
+            running_retrieval_query_slots = 0.0
             running_log_steps = 0
             running_postclip_grad_norm = 0.0
             running_finite_grad_steps = 0
@@ -5157,6 +5573,18 @@ def run(
                 ]
             )
             prior_log_file.flush()
+
+        # Drop the just-backpropagated graph before periodic evaluation. Local
+        # names otherwise keep sequence outputs, auxiliary decoder logits, and
+        # the final recurrent state reachable while evaluation allocates its
+        # own long-sequence activations.
+        output = hidden = loss = task_loss = None
+        prediction_loss = workspace_state_loss = nth_vector_loss = None
+        retrieval_value_loss = kl_loss = moe_aux_loss = None
+        event_predictions = vector_predictions = value_predictions = query_predictions = None
+        position_logits = vector_logits = value_logits = query_logits = None
+        per_state_loss = per_coordinate_loss = per_value_loss = None
+        prediction_logits = backbone_features = None
 
         if step % EVAL_EVERY == 0:
             pre_advance_lesson = curriculum.lesson  # capture before maybe_advance can bump it
@@ -6447,7 +6875,35 @@ if __name__ == "__main__":
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Collect activation/gradient summaries for model segments (enabled by default; "
-        "use --no-segment-diagnostics to avoid per-module hooks in long recurrent sequences).",
+        "use --no-segment-diagnostics to remove hooks entirely). By default, training "
+        "samples one step per log interval; use --segment-diagnostics-every-step for "
+        "exhaustive per-step scans.",
+    )
+    parser.add_argument(
+        "--segment-diagnostics-every-step",
+        action="store_true",
+        help="Run segment activation/gradient reductions on every training step instead "
+        "of sampling at the normal log cadence. This adds substantial work for long sequences.",
+    )
+    parser.add_argument(
+        "--activation-offload-to-cpu",
+        action="store_true",
+        help=(
+            "Offload tensors saved for autograd to pinned CPU memory during training. "
+            "Preserves full BPTT and forward equations while reducing CUDA activation "
+            "memory; increases host-RAM use and device-transfer time. CUDA only."
+        ),
+    )
+    parser.add_argument(
+        "--activation-offload-cpu-budget-mb",
+        type=int,
+        default=2048,
+        metavar="MIB",
+        help=(
+            "Maximum saved-activation payload copied to pinned CPU memory per training "
+            "step when --activation-offload-to-cpu is enabled. Additional saves stay "
+            "on their original device; default: 2048 MiB."
+        ),
     )
     parser.add_argument(
         "--moe-placement",
@@ -6586,6 +7042,26 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--workspace-retrieval-exact-readout",
+        action="store_true",
+        help=(
+            "Enable entity-addressed scalar supervision and exact query-time recall/"
+            "sum/count/parity readout for workspace-capability retrieval episodes. "
+            "Supports track retrieval_aggregation or all."
+        ),
+    )
+    parser.add_argument(
+        "--workspace-retrieval-value-loss-weight",
+        type=float,
+        default=0.1,
+        metavar="WEIGHT",
+        help=(
+            "Auxiliary cross-entropy for decoding the current scalar from each "
+            "retrieval entity slot after every completed write; must be positive "
+            "with --workspace-retrieval-exact-readout."
+        ),
+    )
+    parser.add_argument(
         "--workspace-key-match-threshold",
         type=float,
         default=0.5,
@@ -6602,6 +7078,16 @@ if __name__ == "__main__":
             "for CUDA; preserves sequential updates and supports continuous routed writes, "
             "learned entity-keyed addressing, reconsideration, and workspace write salience; "
             "does not support random-write or bistable modes"
+        ),
+    )
+    parser.add_argument(
+        "--workspace-token-id-input",
+        action="store_true",
+        help=(
+            "Use compact token-ID batches for workspace-capability data and apply the "
+            "existing split-graph input Linear as an equivalent embedding lookup. "
+            "Keeps output targets and auxiliary prediction math unchanged; opt-in "
+            "for one-hot versus compact-input A/B runs."
         ),
     )
     parser.add_argument(
@@ -7179,6 +7665,8 @@ if __name__ == "__main__":
             parser.error("workspace-capability is generated on demand; dataset links/prepared data are unsupported")
     elif args.workspace_task_track != "all":
         parser.error("--workspace-task-track requires --dataset-type workspace-capability")
+    if args.workspace_token_id_input and args.dataset_type != "workspace-capability":
+        parser.error("--workspace-token-id-input requires --dataset-type workspace-capability")
     if args.dnc_write_observation_variance <= 0:
         parser.error("--dnc-write-observation-variance must be positive")
     if args._dnc_optimized_bundle and args.split_graph:
@@ -7246,6 +7734,8 @@ if __name__ == "__main__":
         parser.error("DNC addressing and write-salience options require --memory-type dnc")
     if args.batch_size <= 0:
         parser.error("--batch-size must be positive")
+    if args.activation_offload_cpu_budget_mb <= 0:
+        parser.error("--activation-offload-cpu-budget-mb must be positive")
     if args.log_every <= 0:
         parser.error("--log-every must be positive")
     if args.dnc_link_sharpness != 1.0 and not args.split_graph:
@@ -7515,20 +8005,22 @@ if __name__ == "__main__":
             )
     if args.workspace_semantic_entity_addressing and (
         args.dataset_type != "workspace-capability"
-        or args.workspace_task_track not in ("permutation", "nth_farthest", "all")
+        or args.workspace_task_track not in (
+            "permutation", "nth_farthest", "retrieval_aggregation", "all"
+        )
     ):
         parser.error(
             "--workspace-semantic-entity-addressing requires "
             "--dataset-type workspace-capability and "
-            "--workspace-task-track permutation or all"
+            "--workspace-task-track permutation, nth_farthest, retrieval_aggregation, or all"
         )
     if (
         args.workspace_semantic_entity_addressing
-        and args.workspace_task_track == "all"
+        and args.workspace_task_track in ("all", "retrieval_aggregation")
         and args.workspace_num_slots < 64
     ):
         parser.error(
-            "--workspace-semantic-entity-addressing with --workspace-task-track all "
+            "--workspace-semantic-entity-addressing with retrieval_aggregation/all "
             "requires --workspace-num-slots >= 64 to cover every entity ID"
         )
     if args.workspace_semantic_state_diagnostics and not args.workspace_semantic_entity_addressing:
@@ -7575,6 +8067,33 @@ if __name__ == "__main__":
             parser.error(
                 "--workspace-nth-farthest-exact-readout requires a positive "
                 "--workspace-nth-farthest-vector-loss-weight"
+            )
+    if (
+        not math.isfinite(args.workspace_retrieval_value_loss_weight)
+        or args.workspace_retrieval_value_loss_weight < 0
+    ):
+        parser.error("--workspace-retrieval-value-loss-weight must be finite and >= 0")
+    if args.workspace_retrieval_exact_readout:
+        if not args.workspace or not args.workspace_semantic_entity_addressing:
+            parser.error(
+                "--workspace-retrieval-exact-readout requires --workspace and "
+                "--workspace-semantic-entity-addressing"
+            )
+        if args.dataset_type != "workspace-capability" or args.workspace_task_track not in (
+            "retrieval_aggregation", "all"
+        ):
+            parser.error(
+                "--workspace-retrieval-exact-readout requires workspace-capability "
+                "track retrieval_aggregation or all"
+            )
+        if args.workspace_num_slots < 64:
+            parser.error(
+                "--workspace-retrieval-exact-readout requires --workspace-num-slots >= 64"
+            )
+        if args.workspace_retrieval_value_loss_weight <= 0:
+            parser.error(
+                "--workspace-retrieval-exact-readout requires a positive "
+                "--workspace-retrieval-value-loss-weight"
             )
     if not math.isfinite(args.workspace_key_match_threshold) or not (
         -1.0 <= args.workspace_key_match_threshold <= 1.0
@@ -7749,6 +8268,9 @@ if __name__ == "__main__":
             if args.workspace_nth_farthest_exact_readout:
                 vector_loss_tag = f"{args.workspace_nth_farthest_vector_loss_weight:g}".replace(".", "p")
                 run_id += f"_nthfarthestexact_vec{vector_loss_tag}"
+            if args.workspace_retrieval_exact_readout:
+                retrieval_loss_tag = f"{args.workspace_retrieval_value_loss_weight:g}".replace(".", "p")
+                run_id += f"_retrievalexact_val{retrieval_loss_tag}"
             if args.workspace_compile_recurrence:
                 run_id += "_compiledrecurrence"
             if args.workspace_gate_variant != "continuous" or args.workspace_train_scope == "gate":
@@ -7843,6 +8365,12 @@ if __name__ == "__main__":
             run_id += f"_bs{args.batch_size}"
         if args.run_id_suffix:
             run_id = f"{run_id}_{args.run_id_suffix}"
+        # Keep execution-path tags at the end so the filesystem-safe ID
+        # retains them when long architecture/config names are shortened.
+        if args.workspace_token_id_input:
+            run_id += "_tokenidinput"
+        if args.activation_offload_to_cpu:
+            run_id += f"_actoffloadcpu{args.activation_offload_cpu_budget_mb}m"
         summary = run(
             beta_target=beta,
             run_id=run_id,
@@ -7866,6 +8394,9 @@ if __name__ == "__main__":
             moe_enabled=args.moe,
             moe_diagnostics_enabled=args.moe_diagnostics,
             segment_diagnostics_enabled=args.segment_diagnostics,
+            segment_diagnostics_every_step=args.segment_diagnostics_every_step,
+            activation_offload_to_cpu=args.activation_offload_to_cpu,
+            activation_offload_cpu_budget_mb=args.activation_offload_cpu_budget_mb,
             split_graph_moe_placement=args.moe_placement,
             split_graph_moe_backbone_block_isolation=args.moe_backbone_block_isolation,
             split_graph_moe_backbone_residual_scale=args.moe_backbone_residual_scale,
@@ -7886,6 +8417,7 @@ if __name__ == "__main__":
             workspace_enabled=args.workspace,
             workspace_num_slots=args.workspace_num_slots,
             workspace_compile_recurrence=args.workspace_compile_recurrence,
+            workspace_token_id_input=args.workspace_token_id_input,
             workspace_entity_keyed_writes=args.workspace_entity_keyed_writes,
             workspace_semantic_entity_addressing=(
                 args.workspace_semantic_entity_addressing
@@ -7953,6 +8485,8 @@ if __name__ == "__main__":
             workspace_state_loss_weight=args.workspace_state_loss_weight,
             workspace_nth_farthest_exact_readout=args.workspace_nth_farthest_exact_readout,
             workspace_nth_farthest_vector_loss_weight=args.workspace_nth_farthest_vector_loss_weight,
+            workspace_retrieval_exact_readout=args.workspace_retrieval_exact_readout,
+            workspace_retrieval_value_loss_weight=args.workspace_retrieval_value_loss_weight,
             prepared_dataset=prepared_dataset,
             ogs_weights=tuple(args.ogs_weights),
             batch_size=args.batch_size,

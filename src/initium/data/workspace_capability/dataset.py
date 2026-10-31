@@ -20,6 +20,7 @@ from initium.data.workspace_capability.episode import (
     ENTITY_COUNT,
     EV_COMMIT,
     EV_FACT,
+    EV_COUNT_QUERY,
     EV_KV,
     EV_MOVE,
     EV_PUT,
@@ -31,6 +32,8 @@ from initium.data.workspace_capability.episode import (
     EOS,
     EV_INIT,
     EV_SWAP,
+    EV_SUM_QUERY,
+    EV_PARITY_QUERY,
     LOCATION_BASE,
     LOCATION_COUNT,
     QUERY,
@@ -38,6 +41,9 @@ from initium.data.workspace_capability.episode import (
     RELATION_COUNT,
     SCALAR_BASE,
     SCALAR_COUNT,
+    COUNT_BASE,
+    BOOL_FALSE,
+    BOOL_TRUE,
     SEP,
     TRACK_BASE,
     TaskEpisode,
@@ -90,6 +96,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
         self.task_track = task_track
         self.batch_size_hint = max(1, int(batch_size_hint))
         self._output_proj = None
+        self.token_id_input = False
         self.last_batch_examples: list[TaskEpisode] = []
         self.last_eval_diagnostics: dict[str, Any] = {}
         print(
@@ -166,23 +173,41 @@ class WorkspaceCapabilityDataset(BaseDataset):
         random.shuffle(selected_tracks)
         episodes = [self._make_episode(track, level, random) for track in selected_tracks]
         self.last_batch_examples = episodes
-        return self._collate(episodes)
+        return self._collate(episodes, token_ids_only=self.token_id_input)
 
     @staticmethod
-    def _collate(episodes: list[TaskEpisode]):
+    def _collate(episodes: list[TaskEpisode], *, token_ids_only: bool = False):
         sequences = [episode.sequence for episode in episodes]
         max_len = max(map(len, sequences))
         batch = len(episodes)
-        inputs = torch.zeros(batch, max_len, VOCAB_SIZE, dtype=torch.float32)
+        inputs = torch.zeros(
+            (batch, max_len) if token_ids_only else (batch, max_len, VOCAB_SIZE),
+            dtype=torch.long if token_ids_only else torch.float32,
+        )
         targets = torch.zeros(batch, max_len, dtype=torch.long)
         mask = torch.zeros(batch, max_len, dtype=torch.float32)
         for row, (episode, sequence) in enumerate(zip(episodes, sequences)):
-            token_ids = torch.tensor(sequence, dtype=torch.long)
-            length = token_ids.numel()
-            inputs[row, torch.arange(length), token_ids] = 1.0
+            row_token_ids = torch.tensor(sequence, dtype=torch.long)
+            length = row_token_ids.numel()
+            if token_ids_only:
+                inputs[row, :length] = row_token_ids
+            else:
+                inputs[row, torch.arange(length), row_token_ids] = 1.0
             targets[row, :length] = torch.tensor(episode.targets, dtype=torch.long)
             mask[row, :length] = torch.tensor(episode.answer_mask, dtype=torch.float32)
         return inputs, targets, mask
+
+    @staticmethod
+    def _input_token_ids(input_vectors: torch.Tensor) -> torch.Tensor:
+        """Accept either the standard one-hot batch or the opt-in compact IDs."""
+        if input_vectors.ndim == 2 and input_vectors.dtype in (torch.int32, torch.int64):
+            return input_vectors.to(dtype=torch.long)
+        if input_vectors.ndim == 3 and input_vectors.shape[-1] == VOCAB_SIZE:
+            return input_vectors.argmax(dim=-1)
+        raise ValueError(
+            "workspace-capability inputs must be token IDs shaped (batch,time) "
+            "or one-hot vectors shaped (batch,time,vocabulary)"
+        )
 
     @staticmethod
     def _evaluation_groups(episodes, max_batch_size, *, kv_attention_heads=0):
@@ -235,11 +260,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
         complete input-event boundary, after the event payload is visible.
         Query entity tokens never write.
         """
-        if input_vectors.ndim != 3 or input_vectors.shape[-1] != VOCAB_SIZE:
-            raise ValueError(
-                "workspace entity metadata expects one-hot inputs shaped (batch, time, vocabulary)"
-            )
-        token_ids = input_vectors.argmax(dim=-1).detach().cpu().tolist()
+        token_ids = self._input_token_ids(input_vectors).detach().cpu().tolist()
         entity_ids = torch.full(
             input_vectors.shape[:2], -1, dtype=torch.long, device=input_vectors.device
         )
@@ -419,13 +440,9 @@ class WorkspaceCapabilityDataset(BaseDataset):
         episodes: list[TaskEpisode] | None = None,
     ) -> dict[str, torch.Tensor]:
         """Mark the first answer position with its causal permutation query."""
-        if input_vectors.ndim != 3 or input_vectors.shape[-1] != VOCAB_SIZE:
-            raise ValueError(
-                "permutation query metadata expects one-hot inputs shaped "
-                "(batch, time, vocabulary)"
-            )
+        token_ids = self._input_token_ids(input_vectors)
         examples = self.last_batch_examples if episodes is None else episodes
-        batch, time, _ = input_vectors.shape
+        batch, time = input_vectors.shape[:2]
         if len(examples) != batch:
             raise RuntimeError("permutation query metadata lost batch/episode alignment")
         query_kind = torch.zeros(
@@ -489,17 +506,111 @@ class WorkspaceCapabilityDataset(BaseDataset):
             result[:, int(step)] = updated
         return result
 
+    @staticmethod
+    def apply_workspace_retrieval_query_logits(
+        logits,
+        query_predictions,
+        metadata: dict[str, torch.Tensor],
+        episodes: list[TaskEpisode],
+    ):
+        """Apply exact aggregation to values decoded from addressed workspace slots."""
+        totals = {
+            "write_value_correct": 0,
+            "write_value_count": 0,
+            "query_values_correct": 0,
+            "query_values_count": 0,
+            "query_slots_found": 0,
+            "query_slots_total": 0,
+            "updated_query_values_correct": 0,
+            "updated_query_values_count": 0,
+            "untouched_query_values_correct": 0,
+            "untouched_query_values_count": 0,
+            "readout_exact": 0,
+            "readout_count": 0,
+            "invalid_readouts": 0,
+            "readout_by_query_type": {},
+        }
+        if not query_predictions:
+            return logits, totals
+        result = logits.clone()
+        targets = metadata["retrieval_query_targets"]
+        was_updated = metadata["retrieval_query_was_updated"]
+        query_mask = metadata["retrieval_query_mask"]
+        operations = metadata["retrieval_query_operation"]
+        for step, value_logits, found, active_mask in query_predictions:
+            value_ids = value_logits.argmax(dim=-1)
+            found = found.bool() & active_mask.bool()
+            active_mask = active_mask.bool()
+            expected_values = targets[:, int(step)].to(value_ids.device)
+            compare = active_mask & expected_values.ge(0)
+            totals["query_values_correct"] += int(
+                (value_ids.eq(expected_values) & compare).sum().item()
+            )
+            totals["query_values_count"] += int(compare.sum().item())
+            updated = was_updated[:, int(step)].to(value_ids.device).bool() & compare
+            untouched = (~was_updated[:, int(step)].to(value_ids.device).bool()) & compare
+            totals["updated_query_values_correct"] += int(
+                (value_ids.eq(expected_values) & updated).sum().item()
+            )
+            totals["updated_query_values_count"] += int(updated.sum().item())
+            totals["untouched_query_values_correct"] += int(
+                (value_ids.eq(expected_values) & untouched).sum().item()
+            )
+            totals["untouched_query_values_count"] += int(untouched.sum().item())
+            totals["query_slots_found"] += int(found.sum().item())
+            totals["query_slots_total"] += int(active_mask.sum().item())
+            valid_rows = active_mask.any(dim=-1) & (~active_mask | found).all(dim=-1)
+            operation_ids = operations[:, int(step)].tolist()
+            values_cpu = value_ids.tolist()
+            active_cpu = active_mask.tolist()
+            valid_cpu = valid_rows.tolist()
+            for row, episode in enumerate(episodes):
+                if episode.track != "retrieval_aggregation" or not active_cpu[row]:
+                    continue
+                totals["readout_count"] += 1
+                query_type = str(episode.metadata.get("query_type", "unknown"))
+                stratum = totals["readout_by_query_type"].setdefault(
+                    query_type, {"correct": 0, "episodes": 0}
+                )
+                stratum["episodes"] += 1
+                if not valid_cpu[row]:
+                    totals["invalid_readouts"] += 1
+                    continue
+                values = [
+                    int(values_cpu[row][index])
+                    for index, is_active in enumerate(active_cpu[row])
+                    if is_active
+                ]
+                operation = int(operation_ids[row])
+                if operation == 1:
+                    output_tokens = [SCALAR_BASE + value for value in values] + [EOS]
+                elif operation == 2:
+                    output_tokens = [SCALAR_BASE + (sum(values) % SCALAR_COUNT), EOS]
+                elif operation == 3:
+                    output_tokens = [COUNT_BASE + sum(value % 2 == 0 for value in values), EOS]
+                elif operation == 4:
+                    output_tokens = [BOOL_TRUE if sum(values) % 2 else BOOL_FALSE, EOS]
+                else:
+                    raise ValueError(f"unknown retrieval query operation ID {operation}")
+                answer_start = int(step)
+                answer_end = answer_start + len(output_tokens)
+                if answer_end > result.shape[1]:
+                    raise RuntimeError("retrieval readout answer exceeds the output sequence")
+                for offset, token in enumerate(output_tokens):
+                    result[row, answer_start + offset].fill_(-1e4)
+                    result[row, answer_start + offset, token] = 1e4
+                correct_readout = int(tuple(output_tokens) == tuple(episode.answer))
+                totals["readout_exact"] += correct_readout
+                stratum["correct"] += correct_readout
+        return result, totals
+
     def workspace_state_supervision_metadata(
         self,
         input_vectors: torch.Tensor,
         episodes: list[TaskEpisode] | None = None,
     ) -> dict[str, Any]:
         """Pack oracle entity positions only at causal state-commit boundaries."""
-        if input_vectors.ndim != 3 or input_vectors.shape[-1] != VOCAB_SIZE:
-            raise ValueError(
-                "workspace state supervision expects one-hot inputs shaped (batch, time, vocabulary)"
-            )
-        batch, time, _ = input_vectors.shape
+        batch, time = input_vectors.shape[:2]
         examples = self.last_batch_examples if episodes is None else episodes
         if len(examples) != batch:
             raise RuntimeError("workspace state supervision lost batch/episode alignment")
@@ -548,13 +659,12 @@ class WorkspaceCapabilityDataset(BaseDataset):
         query coordinates, and zero-based rank come only from input tokens;
         answer labels are never inspected.
         """
-        if input_vectors.ndim != 3 or input_vectors.shape[-1] != VOCAB_SIZE:
-            raise ValueError("Nth-farthest metadata expects one-hot (batch,time,vocab) inputs")
+        token_ids = self._input_token_ids(input_vectors)
         examples = self.last_batch_examples if episodes is None else episodes
-        batch, time, _ = input_vectors.shape
+        batch, time = input_vectors.shape[:2]
         if len(examples) != batch:
             raise RuntimeError("Nth-farthest metadata lost batch/episode alignment")
-        tokens_by_row = input_vectors.argmax(dim=-1).detach().cpu().tolist()
+        tokens_by_row = token_ids.detach().cpu().tolist()
         event_ids = torch.full((batch, time, 16), -1, dtype=torch.long, device=input_vectors.device)
         event_targets = torch.full((batch, time, 16, 6), -100, dtype=torch.long, device=input_vectors.device)
         event_mask = torch.zeros((batch, time, 16), dtype=torch.bool, device=input_vectors.device)
@@ -630,6 +740,142 @@ class WorkspaceCapabilityDataset(BaseDataset):
             "nth_farthest_query_vectors": query_vectors,
             "nth_farthest_query_ranks": query_ranks,
             "nth_farthest_query_steps": tuple(sorted(query_steps)),
+        }
+
+    def workspace_retrieval_metadata(
+        self,
+        input_vectors: torch.Tensor,
+        episodes: list[TaskEpisode] | None = None,
+    ) -> dict[str, Any]:
+        """Build input-only value-supervision and keyed-query metadata."""
+        token_ids = self._input_token_ids(input_vectors)
+        examples = self.last_batch_examples if episodes is None else episodes
+        batch, time = input_vectors.shape[:2]
+        if len(examples) != batch:
+            raise RuntimeError("retrieval metadata lost batch/episode alignment")
+        tokens_by_row = token_ids.detach().cpu().tolist()
+        value_entity_ids = torch.full(
+            (batch, time), -1, dtype=torch.long, device=input_vectors.device
+        )
+        value_targets = torch.full(
+            (batch, time), -100, dtype=torch.long, device=input_vectors.device
+        )
+        value_mask = torch.zeros(
+            (batch, time), dtype=torch.bool, device=input_vectors.device
+        )
+        query_entity_ids = torch.full(
+            (batch, time, 8), -1, dtype=torch.long, device=input_vectors.device
+        )
+        query_mask = torch.zeros(
+            (batch, time, 8), dtype=torch.bool, device=input_vectors.device
+        )
+        query_targets = torch.full_like(query_entity_ids, -100)
+        value_is_update = torch.zeros(
+            (batch, time), dtype=torch.bool, device=input_vectors.device
+        )
+        query_was_updated = torch.zeros_like(query_mask)
+        query_operation = torch.zeros(
+            (batch, time), dtype=torch.long, device=input_vectors.device
+        )
+        value_steps: set[int] = set()
+        query_steps: set[int] = set()
+        operation_by_token = {
+            None: 1,  # ordered recall
+            EV_SUM_QUERY: 2,
+            EV_COUNT_QUERY: 3,
+            EV_PARITY_QUERY: 4,
+        }
+        for row, episode in enumerate(examples):
+            if episode.track != "retrieval_aggregation":
+                continue
+            tokens = [int(token) for token in tokens_by_row[row][: len(episode.inputs)]]
+            current_values: dict[int, int] = {}
+            updated_entities: set[int] = set()
+            index = 0
+            while index < len(tokens):
+                token = tokens[index]
+                if token in (EV_KV, EV_UPDATE):
+                    if index + 2 >= len(tokens):
+                        raise ValueError("malformed retrieval write event")
+                    entity_token_value, scalar_token_value = tokens[index + 1 : index + 3]
+                    if not ENTITY_BASE <= entity_token_value < ENTITY_BASE + ENTITY_COUNT:
+                        raise ValueError("retrieval write event has an invalid entity ID")
+                    if not SCALAR_BASE <= scalar_token_value < SCALAR_BASE + SCALAR_COUNT:
+                        raise ValueError("retrieval write event has an invalid scalar value")
+                    end = index + 3
+                    if end >= len(tokens) or tokens[end] != SEP:
+                        raise ValueError("retrieval write event is missing its separator")
+                    entity_id = entity_token_value - ENTITY_BASE
+                    value = scalar_token_value - SCALAR_BASE
+                    current_values[entity_id] = value
+                    is_update = token == EV_UPDATE
+                    if is_update:
+                        updated_entities.add(entity_id)
+                    value_entity_ids[row, end] = entity_id
+                    value_targets[row, end] = value
+                    value_mask[row, end] = True
+                    value_is_update[row, end] = is_update
+                    value_steps.add(end)
+                    index = end + 1
+                    continue
+                if token == QUERY:
+                    query_start = index + 1
+                    query_end = tokens.index(SEP, query_start)
+                    cursor = query_start
+                    operation_token = None
+                    if cursor < query_end and tokens[cursor] in (
+                        EV_SUM_QUERY,
+                        EV_COUNT_QUERY,
+                        EV_PARITY_QUERY,
+                    ):
+                        operation_token = tokens[cursor]
+                        cursor += 1
+                    operation = operation_by_token[operation_token]
+                    answer_step = len(episode.inputs)
+                    if not 0 <= answer_step < time:
+                        raise RuntimeError("retrieval answer step exceeds its collated sequence")
+                    ids = []
+                    while cursor < query_end:
+                        entity_token_value = tokens[cursor]
+                        if not ENTITY_BASE <= entity_token_value < ENTITY_BASE + ENTITY_COUNT:
+                            raise ValueError("retrieval query contains a malformed entity ID")
+                        entity_id = entity_token_value - ENTITY_BASE
+                        if entity_id not in current_values:
+                            raise ValueError("retrieval query references an entity without a value")
+                        ids.append(entity_id)
+                        cursor += 1
+                    if not ids or len(ids) > 8:
+                        raise ValueError("retrieval query must contain 1..8 entity IDs")
+                    query_entity_ids[row, answer_step, : len(ids)] = torch.tensor(
+                        ids, dtype=torch.long, device=input_vectors.device
+                    )
+                    query_mask[row, answer_step, : len(ids)] = True
+                    query_targets[row, answer_step, : len(ids)] = torch.tensor(
+                        [current_values[entity_id] for entity_id in ids],
+                        dtype=torch.long,
+                        device=input_vectors.device,
+                    )
+                    query_was_updated[row, answer_step, : len(ids)] = torch.tensor(
+                        [entity_id in updated_entities for entity_id in ids],
+                        dtype=torch.bool,
+                        device=input_vectors.device,
+                    )
+                    query_operation[row, answer_step] = operation
+                    query_steps.add(answer_step)
+                    break
+                index += 1
+        return {
+            "retrieval_value_entity_ids": value_entity_ids,
+            "retrieval_value_targets": value_targets,
+            "retrieval_value_mask": value_mask,
+            "retrieval_value_is_update": value_is_update,
+            "retrieval_value_steps": tuple(sorted(value_steps)),
+            "retrieval_query_entity_ids": query_entity_ids,
+            "retrieval_query_mask": query_mask,
+            "retrieval_query_targets": query_targets,
+            "retrieval_query_was_updated": query_was_updated,
+            "retrieval_query_operation": query_operation,
+            "retrieval_query_steps": tuple(sorted(query_steps)),
         }
 
     def loss(self, output, target, mask):
@@ -716,6 +962,22 @@ class WorkspaceCapabilityDataset(BaseDataset):
         nth_readout_correct = nth_readout_count = 0
         nth_invalid_readout_count = 0
         nth_readout_by_stratum: dict[str, list[int]] = defaultdict(lambda: [0, 0])
+        retrieval_totals = {
+            "write_value_correct": 0,
+            "write_value_count": 0,
+            "query_values_correct": 0,
+            "query_values_count": 0,
+            "query_slots_found": 0,
+            "query_slots_total": 0,
+            "updated_query_values_correct": 0,
+            "updated_query_values_count": 0,
+            "untouched_query_values_correct": 0,
+            "untouched_query_values_count": 0,
+            "readout_exact": 0,
+            "readout_count": 0,
+            "invalid_readouts": 0,
+            "readout_by_query_type": {},
+        }
         permutation_pair_commit_attempts = 0
         permutation_pair_commit_successes = 0
         correct_total = answer_total = exact_total = 0
@@ -742,7 +1004,12 @@ class WorkspaceCapabilityDataset(BaseDataset):
                     batch_size,
                     kv_attention_heads=kv_attention_heads,
                 ):
-                    x, _targets, _mask = self._collate(group)
+                    x, _targets, _mask = self._collate(
+                        group,
+                        token_ids_only=bool(
+                            getattr(model, "workspace_token_id_input", False)
+                        ),
+                    )
                     workspace_forward_kwargs = {}
                     binding_entity_metadata = None
                     if bool(
@@ -768,6 +1035,24 @@ class WorkspaceCapabilityDataset(BaseDataset):
                                     key: value
                                     for key, value in nth_metadata.items()
                                     if key != "nth_farthest_vector_targets"
+                                }
+                            )
+                        retrieval_enabled = bool(
+                            getattr(model, "workspace_retrieval_exact_readout", False)
+                        )
+                        retrieval_metadata = None
+                        if retrieval_enabled:
+                            retrieval_metadata = self.workspace_retrieval_metadata(x, group)
+                            binding_entity_metadata.update(
+                                {
+                                    key: value
+                                    for key, value in retrieval_metadata.items()
+                                    if key not in (
+                                        "retrieval_value_targets",
+                                        "retrieval_query_targets",
+                                        "retrieval_value_is_update",
+                                        "retrieval_query_was_updated",
+                                    )
                                 }
                             )
                         workspace_forward_kwargs = {
@@ -1018,6 +1303,51 @@ class WorkspaceCapabilityDataset(BaseDataset):
                             )
                             nth_readout_by_stratum[stratum][0] += correct_readout
                             nth_readout_by_stratum[stratum][1] += 1
+                    if bool(getattr(model, "workspace_retrieval_exact_readout", False)):
+                        assert binding_entity_metadata is not None
+                        retrieval_predictions = workspace.pop_retrieval_query_predictions()
+                        value_predictions = workspace.pop_retrieval_value_predictions()
+                        if retrieval_metadata is None:
+                            raise RuntimeError("retrieval supervision metadata was not constructed")
+                        for value_step, value_logits, found in value_predictions:
+                            targets = retrieval_metadata["retrieval_value_targets"][:, value_step].to(
+                                device=value_logits.device
+                            )
+                            mask = retrieval_metadata["retrieval_value_mask"][:, value_step].to(
+                                device=value_logits.device
+                            )
+                            correct = value_logits.argmax(dim=-1).eq(targets) & mask & found
+                            retrieval_totals["write_value_correct"] += int(correct.sum().item())
+                            retrieval_totals["write_value_count"] += int(mask.sum().item())
+                            is_update = retrieval_metadata["retrieval_value_is_update"][:, value_step].to(
+                                device=value_logits.device
+                            )
+                            for label, selection in (
+                                ("update", is_update),
+                                ("initial", ~is_update),
+                            ):
+                                count_key = f"{label}_value_count"
+                                correct_key = f"{label}_value_correct"
+                                retrieval_totals.setdefault(count_key, 0)
+                                retrieval_totals.setdefault(correct_key, 0)
+                                selected = mask & selection
+                                retrieval_totals[correct_key] += int(
+                                    (value_logits.argmax(dim=-1).eq(targets) & selected & found).sum().item()
+                                )
+                                retrieval_totals[count_key] += int(selected.sum().item())
+                        logits, query_totals = self.apply_workspace_retrieval_query_logits(
+                            logits, retrieval_predictions, retrieval_metadata, group
+                        )
+                        for metric, value in query_totals.items():
+                            if metric == "readout_by_query_type":
+                                for query_type, counts in value.items():
+                                    total_counts = retrieval_totals[metric].setdefault(
+                                        query_type, {"correct": 0, "episodes": 0}
+                                    )
+                                    total_counts["correct"] += counts["correct"]
+                                    total_counts["episodes"] += counts["episodes"]
+                            else:
+                                retrieval_totals[metric] += value
                     predictions = logits.argmax(dim=-1)
                     for local_idx, episode in enumerate(group):
                         start = len(episode.inputs)
@@ -1158,6 +1488,34 @@ class WorkspaceCapabilityDataset(BaseDataset):
                     for key, counts in nth_readout_by_stratum.items()
                 },
             }
+        if bool(getattr(model, "workspace_retrieval_exact_readout", False)):
+            diagnostics["retrieval_workspace"] = {
+                **retrieval_totals,
+                "write_value_accuracy": 100.0
+                * retrieval_totals["write_value_correct"]
+                / max(retrieval_totals["write_value_count"], 1),
+                "queried_value_accuracy": 100.0
+                * retrieval_totals["query_values_correct"]
+                / max(retrieval_totals["query_values_count"], 1),
+                "query_slot_lookup_rate": 100.0
+                * retrieval_totals["query_slots_found"]
+                / max(retrieval_totals["query_slots_total"], 1),
+                "updated_query_value_accuracy": 100.0
+                * retrieval_totals["updated_query_values_correct"]
+                / max(retrieval_totals["updated_query_values_count"], 1),
+                "untouched_query_value_accuracy": 100.0
+                * retrieval_totals["untouched_query_values_correct"]
+                / max(retrieval_totals["untouched_query_values_count"], 1),
+                "initial_write_value_accuracy": 100.0
+                * retrieval_totals.get("initial_value_correct", 0)
+                / max(retrieval_totals.get("initial_value_count", 0), 1),
+                "update_write_value_accuracy": 100.0
+                * retrieval_totals.get("update_value_correct", 0)
+                / max(retrieval_totals.get("update_value_count", 0), 1),
+                "exact_readout_accuracy": 100.0
+                * retrieval_totals["readout_exact"]
+                / max(retrieval_totals["readout_count"], 1),
+            }
         if binding_entity_mentions:
             binding_metrics = {
                 "entity_write_coverage": (
@@ -1219,6 +1577,34 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 print(
                     f"    [workspace-nth-farthest/{stratum}] "
                     f"exact readout={values['accuracy']:.1f}% "
+                    f"({values['correct']}/{values['episodes']})"
+                )
+        retrieval_metrics = diagnostics.get("retrieval_workspace")
+        if retrieval_metrics:
+            print(
+                "  [workspace-retrieval] "
+                f"write value accuracy={retrieval_metrics['write_value_accuracy']:.1f}% "
+                f"({retrieval_metrics['write_value_correct']}/{retrieval_metrics['write_value_count']}) | "
+                f"query slot lookup={retrieval_metrics['query_slot_lookup_rate']:.1f}% "
+                f"({retrieval_metrics['query_slots_found']}/{retrieval_metrics['query_slots_total']}) | "
+                f"queried value accuracy={retrieval_metrics['queried_value_accuracy']:.1f}% "
+                f"({retrieval_metrics['query_values_correct']}/{retrieval_metrics['query_values_count']}) | "
+                f"updated/untouched query value accuracy="
+                f"{retrieval_metrics['updated_query_value_accuracy']:.1f}%/"
+                f"{retrieval_metrics['untouched_query_value_accuracy']:.1f}% | "
+                f"initial/update write accuracy="
+                f"{retrieval_metrics['initial_write_value_accuracy']:.1f}%/"
+                f"{retrieval_metrics['update_write_value_accuracy']:.1f}% | "
+                f"exact readout={retrieval_metrics['exact_readout_accuracy']:.1f}% "
+                f"({retrieval_metrics['readout_exact']}/{retrieval_metrics['readout_count']}) | "
+                f"invalid={retrieval_metrics['invalid_readouts']}"
+            )
+            for query_type, values in sorted(
+                retrieval_metrics["readout_by_query_type"].items()
+            ):
+                print(
+                    f"    [workspace-retrieval/{query_type}] exact readout="
+                    f"{100.0 * values['correct'] / max(values['episodes'], 1):.1f}% "
                     f"({values['correct']}/{values['episodes']})"
                 )
         if binding_entity_mentions:
@@ -1422,7 +1808,12 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 for offset in range(0, len(probes), batch_size):
                     group = probes[offset : offset + batch_size]
                     episodes = [item["probe"] for item in group]
-                    x, _targets, _mask = self._collate(episodes)
+                    x, _targets, _mask = self._collate(
+                        episodes,
+                        token_ids_only=bool(
+                            getattr(model, "workspace_token_id_input", False)
+                        ),
+                    )
                     transactional = bool(
                         getattr(model, "workspace_permutation_transactional", False)
                     )
@@ -1440,6 +1831,20 @@ class WorkspaceCapabilityDataset(BaseDataset):
                                 key: value
                                 for key, value in nth_metadata.items()
                                 if key != "nth_farthest_vector_targets"
+                            }
+                        )
+                    if bool(getattr(model, "workspace_retrieval_exact_readout", False)):
+                        retrieval_metadata = self.workspace_retrieval_metadata(x, episodes)
+                        entity_metadata.update(
+                            {
+                                key: value
+                                for key, value in retrieval_metadata.items()
+                                if key not in (
+                                    "retrieval_value_targets",
+                                    "retrieval_query_targets",
+                                    "retrieval_query_was_updated",
+                                    "retrieval_value_is_update",
+                                )
                             }
                         )
                     forward_metadata = {
@@ -1567,7 +1972,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
                         if state is not None and assigned_slot >= 0:
                             state_row = state[row_index].float()
                             if getattr(workspace, "entity_keyed_writes", False):
-                                state_row = state_row.split(workspace.d_model, dim=-1)[1]
+                                state_row = torch.split(state_row, (workspace._address_dim, workspace.d_model), dim=-1)[1]
                             slot_rms = float(
                                 state_row[assigned_slot].square().mean().sqrt().cpu()
                             )

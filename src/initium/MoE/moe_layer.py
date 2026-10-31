@@ -350,11 +350,6 @@ class SwitchMoE(nn.Module):
             selected_outputs = trace("selected_outputs", selected_outputs)
             output32 = (selected_outputs * accepted_gates.unsqueeze(-1)).sum(dim=1)
             output32 = trace("routed_output", output32)
-            accepted_outputs = (
-                selected_outputs * keep.unsqueeze(-1).to(selected_outputs.dtype)
-                if collect_diagnostics
-                else None
-            )
 
             expert_out_all = None
             if return_details:
@@ -388,9 +383,17 @@ class SwitchMoE(nn.Module):
         output = output32.to(output_dtype)
 
         if collect_diagnostics:
-            assert accepted_outputs is not None
             with torch.no_grad():
-                one_hot_k = F.one_hot(topk_idx, num_classes=self.num_experts).float()
+                accepted_selected = selected_outputs.detach()[keep]
+                total_route_values = max(1, keep.numel() * selected_outputs.shape[-1])
+                accepted_output_sq_mean = (
+                    accepted_selected.square().sum() / total_route_values
+                )
+                accepted_output_absmax = (
+                    accepted_selected.abs().amax()
+                    if accepted_selected.numel()
+                    else selected_outputs.new_zeros((), dtype=torch.float32)
+                )
                 self._last_accepted = keep.detach()
                 self._last_diag = {
                     "cv_importance": (P_i.std() / P_i.mean().clamp(min=1e-8)).detach(),
@@ -405,8 +408,8 @@ class SwitchMoE(nn.Module):
                     "topk_gate_mean": topk_prob.mean().detach(),
                     "input_rms": flat32.square().mean().sqrt().detach(),
                     "input_absmax": flat32.abs().amax().detach(),
-                    "expert_output_rms": accepted_outputs.square().mean().sqrt().detach(),
-                    "expert_output_absmax": accepted_outputs.abs().amax().detach(),
+                    "expert_output_rms": accepted_output_sq_mean.sqrt().detach(),
+                    "expert_output_absmax": accepted_output_absmax.detach(),
                     "routed_output_rms": output32.square().mean().sqrt().detach(),
                     "routed_output_absmax": output32.abs().amax().detach(),
                     "capacity_drop_frac": (1.0 - keep.float().mean()).detach(),
@@ -423,9 +426,10 @@ class SwitchMoE(nn.Module):
                         subset_weight = subset.to(probs.dtype)
                         count = subset_weight.sum()
                         denom = count.clamp_min(1.0)
-                        subset_load = (one_hot_k * subset_weight[:, None, None]).sum(dim=(0, 1)) / (
-                            denom * top_k
-                        )
+                        selected_experts = topk_idx[subset].reshape(-1)
+                        subset_load = torch.bincount(
+                            selected_experts, minlength=self.num_experts
+                        ).to(probs.dtype) / (denom * top_k)
                         subset_importance = (probs * subset_weight[:, None]).sum(dim=0) / denom
                         entropy = (per_token_entropy * subset_weight).sum() / denom
                         max_prob = (per_token_max_prob * subset_weight).sum() / denom

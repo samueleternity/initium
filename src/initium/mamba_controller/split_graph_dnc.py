@@ -252,6 +252,7 @@ class SplitGraphDNC(nn.Module):
         workspace_semantic_entity_addressing: bool = False,
         workspace_permutation_transactional: bool = False,
         workspace_nth_farthest_exact_readout: bool = False,
+        workspace_retrieval_exact_readout: bool = False,
         workspace_key_match_threshold: float = 0.5,
         workspace_no_selection: bool = False,
         workspace_reset_each_step: bool = False,
@@ -266,6 +267,7 @@ class SplitGraphDNC(nn.Module):
         workspace_reconsideration_trigger_mode: str = "innovation",
         workspace_write_to_kv: bool = False,
         workspace_kv_read_scale: float = 0.1,
+        workspace_token_id_input: bool = False,
         sgr_write_salience_enabled: bool = False,
         sgr_workspace_salience_enabled: bool = False,
     ):
@@ -408,6 +410,14 @@ class SplitGraphDNC(nn.Module):
                 "transactional permutation commits require semantic entity-addressed workspace"
             )
         self.workspace_enabled = workspace_enabled
+        self.workspace_token_id_input = bool(workspace_token_id_input)
+        if self.workspace_token_id_input and not (
+            mamba_variant == "mamba1" and input_size == 320
+        ):
+            raise ValueError(
+                "token-ID input is currently supported only for the 320-token "
+                "workspace-capability vocabulary with Mamba-1"
+            )
         self.workspace_num_slots = workspace_num_slots
         self.workspace_entity_keyed_writes = bool(workspace_entity_keyed_writes)
         self.workspace_semantic_entity_addressing = bool(
@@ -418,6 +428,9 @@ class SplitGraphDNC(nn.Module):
         )
         self.workspace_nth_farthest_exact_readout = bool(
             workspace_nth_farthest_exact_readout
+        )
+        self.workspace_retrieval_exact_readout = bool(
+            workspace_retrieval_exact_readout
         )
         self.workspace_key_match_threshold = float(workspace_key_match_threshold)
         self.workspace_no_selection = workspace_no_selection
@@ -747,6 +760,7 @@ class SplitGraphDNC(nn.Module):
                 semantic_entity_addressing=workspace_semantic_entity_addressing,
                 permutation_transactional=workspace_permutation_transactional,
                 nth_farthest_exact_readout=workspace_nth_farthest_exact_readout,
+                retrieval_exact_readout=workspace_retrieval_exact_readout,
                 key_match_threshold=workspace_key_match_threshold,
             )
             if workspace_enabled and workspace_num_slots > 0
@@ -826,6 +840,13 @@ class SplitGraphDNC(nn.Module):
         nth_farthest_query_vectors: torch.Tensor | None = None,
         nth_farthest_query_ranks: torch.Tensor | None = None,
         nth_farthest_query_steps: tuple[int, ...] | None = None,
+        retrieval_value_entity_ids: torch.Tensor | None = None,
+        retrieval_value_mask: torch.Tensor | None = None,
+        retrieval_value_steps: tuple[int, ...] | None = None,
+        retrieval_query_entity_ids: torch.Tensor | None = None,
+        retrieval_query_mask: torch.Tensor | None = None,
+        retrieval_query_operation: torch.Tensor | None = None,
+        retrieval_query_steps: tuple[int, ...] | None = None,
         timespans: torch.Tensor | None = None,
         return_backbone_features: bool = False,
         return_prediction_logits: bool = False,
@@ -833,7 +854,9 @@ class SplitGraphDNC(nn.Module):
         _workspace_kv_base_state: WorkspaceKVState | None = None,
     ):
         """
-        input: (B, T, input_size) -- batch-first, the whole padded episode
+        input: (B, T, input_size) one-hot or (B, T) token IDs when the
+            opt-in workspace token-ID input path is enabled -- batch-first
+            whole padded episode
             at once (this project always calls rnn(input_seq, ...) with the
             full sequence already assembled -- see Alter_PHASE3_mamba.py's
             training loop and evaluate_traversal()).
@@ -861,7 +884,24 @@ class SplitGraphDNC(nn.Module):
         """
         original_hx = hx
         chx, mhx, last_read = hx
-        B, T, _ = input.shape
+        if self.workspace_token_id_input:
+            if input.ndim != 2 or input.dtype not in (torch.int32, torch.int64):
+                raise ValueError(
+                    "workspace token-ID input requires integer input shaped (batch,time)"
+                )
+            B, T = input.shape
+            input_token_ids = input.to(dtype=torch.long)
+            input_valid_mask = input_token_ids.ne(0)
+            recurrent_state_dtype = torch.float32
+        else:
+            if input.ndim != 3 or input.shape[-1] != self.input_size:
+                raise ValueError(
+                    "split-graph input must have shape (batch,time,input_size)"
+                )
+            B, T, _ = input.shape
+            input_token_ids = None
+            input_valid_mask = None
+            recurrent_state_dtype = input.dtype
         if self.workspace_semantic_entity_addressing:
             if entity_ids is None or entity_write_mask is None:
                 raise ValueError(
@@ -893,7 +933,7 @@ class SplitGraphDNC(nn.Module):
                 workspace_kv_state = chx.get("_initium_workspace_kv_state")
             if workspace_kv_state is None or reset_experience:
                 workspace_kv_state = self.workspace_kv_memory.reset_state(
-                    B, device=input.device, dtype=input.dtype
+                    B, device=input.device, dtype=recurrent_state_dtype
                 )
             if _workspace_kv_base_state is not None:
                 workspace_kv_state = _workspace_kv_base_state
@@ -916,7 +956,7 @@ class SplitGraphDNC(nn.Module):
                 raise ValueError("workspace-enabled start_step>0 requires workspace state in hx[0]")
             if workspace_state is None or reset_experience:
                 workspace_state = self.workspace.init_state(
-                    B, device=input.device, dtype=input.dtype
+                    B, device=input.device, dtype=recurrent_state_dtype
                 )
         if start_step:
             if not (0 < start_step < T):
@@ -1043,6 +1083,9 @@ class SplitGraphDNC(nn.Module):
             stage_kwargs = {"token_mask": sequence_valid_mask}
             if timespans is not None and getattr(stage, "supports_timespans", False):
                 stage_kwargs["timespans"] = timespans
+            if input_token_ids is not None and stage_input.ndim == 2:
+                stage_kwargs["input_token_ids"] = input_token_ids
+                stage_kwargs["input_valid_mask"] = input_valid_mask
             return stage(stage_input, **stage_kwargs)
 
         # ---- (a) PARALLEL BACKBONE ------------------------------------
@@ -1062,26 +1105,33 @@ class SplitGraphDNC(nn.Module):
             nonlocal prediction_logits, prediction_error
             if sgr_decoder is None:
                 return
+            input_vectors = (
+                input
+                if input.ndim == 3
+                else torch.nn.functional.one_hot(
+                    input.to(dtype=torch.long), num_classes=self.input_size
+                ).to(dtype=torch.float32)
+            )
             if isinstance(sgr_decoder, CausalInputPredictionHead):
                 prediction_logits = sgr_decoder(features[:, :-1]).float()
                 valid_mask = prediction_valid_mask
                 if valid_mask is None:
-                    valid_mask = input.ne(0).any(dim=-1)
+                    valid_mask = input.ne(0) if input.ndim == 2 else input.ne(0).any(dim=-1)
                 prediction_error = causal_input_prediction_error(
-                    prediction_logits, input, valid_mask
+                    prediction_logits, input_vectors, valid_mask
                 )
                 stream_mask = valid_mask.bool()
             else:
                 prediction_error, prediction_logits = prediction_error_signal(
                     features,
-                    input,
+                    input_vectors,
                     sgr_decoder,
                     signal_mode=self.sgr_error_signal_mode,
                 )
-                token_ids = input.argmax(dim=-1)
-                positions = torch.arange(input.shape[1], device=input.device).unsqueeze(0)
+                token_ids = input if input.ndim == 2 else input.argmax(dim=-1)
+                positions = torch.arange(token_ids.shape[1], device=input.device).unsqueeze(0)
                 stream_lengths = torch.where(
-                    token_ids.eq(20), positions, input.shape[1]
+                    token_ids.eq(20), positions, token_ids.shape[1]
                 ).amin(dim=1)
                 stream_mask = positions < stream_lengths.unsqueeze(1)
             detached_signal = prediction_error.detach()
@@ -1129,6 +1179,9 @@ class SplitGraphDNC(nn.Module):
                     else None
                 ),
             }
+            if input_token_ids is not None and stage_input.ndim == 2:
+                specialist_kwargs["input_token_ids"] = input_token_ids
+                specialist_kwargs["input_valid_mask"] = input_valid_mask
             if timespans is not None and getattr(final_stage, "supports_timespans", False):
                 specialist_kwargs["timespans"] = timespans
             if inter_layer_memory_enabled:
@@ -1256,6 +1309,34 @@ class SplitGraphDNC(nn.Module):
                     tuple(step - start_step for step in (nth_farthest_query_steps or ()) if step >= start_step)
                     if nth_farthest_query_candidate_ids is not None else None
                 ),
+                retrieval_value_steps=(
+                    tuple(step - start_step for step in (retrieval_value_steps or ()) if step >= start_step)
+                    if retrieval_value_entity_ids is not None else None
+                ),
+                retrieval_value_entity_ids=(
+                    retrieval_value_entity_ids[:, start_step:]
+                    if retrieval_value_entity_ids is not None else None
+                ),
+                retrieval_value_mask=(
+                    retrieval_value_mask[:, start_step:]
+                    if retrieval_value_mask is not None else None
+                ),
+                retrieval_query_entity_ids=(
+                    retrieval_query_entity_ids[:, start_step:]
+                    if retrieval_query_entity_ids is not None else None
+                ),
+                retrieval_query_mask=(
+                    retrieval_query_mask[:, start_step:]
+                    if retrieval_query_mask is not None else None
+                ),
+                retrieval_query_operation=(
+                    retrieval_query_operation[:, start_step:]
+                    if retrieval_query_operation is not None else None
+                ),
+                retrieval_query_steps=(
+                    tuple(step - start_step for step in (retrieval_query_steps or ()) if step >= start_step)
+                    if retrieval_query_entity_ids is not None else None
+                ),
                 collect_kv_records=self.workspace_kv_memory is not None,
             )
             if self.workspace_kv_memory is not None:
@@ -1307,6 +1388,8 @@ class SplitGraphDNC(nn.Module):
                     intermediate_observer=(
                         observe_prediction_features if needs_prediction_features else None
                     ),
+                    input_token_ids=input_token_ids,
+                    input_valid_mask=input_valid_mask,
                 )
                 inter_layer_memory_read_done = True
             elif needs_prediction_features and callable(forward_with_intermediate):
@@ -1314,6 +1397,8 @@ class SplitGraphDNC(nn.Module):
                     input,
                     token_mask=sequence_valid_mask,
                     intermediate_observer=observe_prediction_features,
+                    input_token_ids=input_token_ids,
+                    input_valid_mask=input_valid_mask,
                 )
             else:
                 if not needs_prediction_features and not isinstance(self.backbone, nn.Sequential):
@@ -1409,6 +1494,13 @@ class SplitGraphDNC(nn.Module):
                         nth_farthest_query_vectors=nth_farthest_query_vectors,
                         nth_farthest_query_ranks=nth_farthest_query_ranks,
                         nth_farthest_query_steps=nth_farthest_query_steps,
+                        retrieval_value_steps=retrieval_value_steps,
+                        retrieval_value_entity_ids=retrieval_value_entity_ids,
+                        retrieval_value_mask=retrieval_value_mask,
+                        retrieval_query_entity_ids=retrieval_query_entity_ids,
+                        retrieval_query_mask=retrieval_query_mask,
+                        retrieval_query_operation=retrieval_query_operation,
+                        retrieval_query_steps=retrieval_query_steps,
                         timespans=timespans,
                         return_backbone_features=return_backbone_features,
                         return_prediction_logits=return_prediction_logits,

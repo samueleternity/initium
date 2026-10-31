@@ -109,6 +109,7 @@ class WorkspaceBroadcast(nn.Module):
         semantic_entity_addressing: bool = False,
         permutation_transactional: bool = False,
         nth_farthest_exact_readout: bool = False,
+        retrieval_exact_readout: bool = False,
         key_match_threshold: float = 0.5,
     ):
         super().__init__()
@@ -149,12 +150,23 @@ class WorkspaceBroadcast(nn.Module):
         self.compile_recurrence = bool(compile_recurrence)
         self.entity_keyed_writes = bool(entity_keyed_writes)
         self.semantic_entity_addressing = bool(semantic_entity_addressing)
+        # Semantic IDs are exact one-hot keys over the 64-entity vocabulary.
+        # Keeping padded d_model-wide key vectors through every recurrent
+        # state duplicates 448 guaranteed-zero features per slot and token.
+        # Store only that address code; non-semantic learned addresses retain
+        # their full width and their existing behavior.
+        self._address_dim = (
+            self._SEMANTIC_ENTITY_COUNT if self.semantic_entity_addressing else d_model
+        )
         self.permutation_transactional = bool(permutation_transactional)
         self.nth_farthest_exact_readout = bool(nth_farthest_exact_readout)
+        self.retrieval_exact_readout = bool(retrieval_exact_readout)
         if self.nth_farthest_exact_readout and not self.semantic_entity_addressing:
             raise ValueError(
                 "Nth-farthest exact readout requires semantic entity addressing"
             )
+        if self.retrieval_exact_readout and not self.semantic_entity_addressing:
+            raise ValueError("retrieval exact readout requires semantic entity addressing")
         if self.permutation_transactional and not self.semantic_entity_addressing:
             raise ValueError(
                 "permutation transactional mode requires semantic entity addressing"
@@ -180,6 +192,9 @@ class WorkspaceBroadcast(nn.Module):
             if self.nth_farthest_exact_readout
             else None
         )
+        self.semantic_retrieval_value_decoder = (
+            nn.Linear(d_model, 16) if self.retrieval_exact_readout else None
+        )
         self._last_semantic_state_predictions: list[tuple[int, torch.Tensor]] = []
         self._last_semantic_query_predictions: list[
             tuple[int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
@@ -187,6 +202,12 @@ class WorkspaceBroadcast(nn.Module):
         self._last_semantic_pair_commits: list[tuple[int, torch.Tensor]] = []
         self._last_nth_farthest_vector_predictions: list[tuple[int, torch.Tensor]] = []
         self._last_nth_farthest_query_predictions: list[
+            tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = []
+        self._last_retrieval_value_predictions: list[
+            tuple[int, torch.Tensor, torch.Tensor]
+        ] = []
+        self._last_retrieval_query_predictions: list[
             tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]
         ] = []
         self._compiled_recurrence_step = None
@@ -267,12 +288,13 @@ class WorkspaceBroadcast(nn.Module):
     ) -> torch.Tensor:
         if self.semantic_vector_decoder is None:
             raise RuntimeError("Nth-farthest vector decoding is not enabled")
-        address_state, content_state = state.split(self.d_model, dim=-1)
+        address_state, content_state = torch.split(
+            state, (self._address_dim, self.d_model), dim=-1
+        )
         safe_ids = entity_ids.clamp(min=0, max=self._SEMANTIC_ENTITY_COUNT - 1)
         queries = F.one_hot(safe_ids, num_classes=self._SEMANTIC_ENTITY_COUNT).to(
             device=state.device, dtype=torch.float32
         )
-        queries = F.pad(queries, (0, self.d_model - self._SEMANTIC_ENTITY_COUNT))
         address_state = address_state.float()
         occupied = address_state.square().sum(dim=-1) > 1e-12
         scores = torch.einsum("bqd,bsd->bqs", queries, _normalize_address(address_state))
@@ -287,6 +309,45 @@ class WorkspaceBroadcast(nn.Module):
             *read_values.shape[:-1], 6, 16
         )
 
+    def pop_retrieval_value_predictions(
+        self,
+    ) -> list[tuple[int, torch.Tensor, torch.Tensor]]:
+        predictions = self._last_retrieval_value_predictions
+        self._last_retrieval_value_predictions = []
+        return predictions
+
+    def pop_retrieval_query_predictions(
+        self,
+    ) -> list[tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]]:
+        predictions = self._last_retrieval_query_predictions
+        self._last_retrieval_query_predictions = []
+        return predictions
+
+    def _semantic_retrieval_value_logits(
+        self, state: torch.Tensor, entity_ids: torch.Tensor, valid_mask: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Read scalar values from exact semantic entity addresses."""
+        if self.semantic_retrieval_value_decoder is None:
+            raise RuntimeError("retrieval exact readout is not enabled")
+        address_state, content_state = torch.split(
+            state, (self._address_dim, self.d_model), dim=-1
+        )
+        safe_ids = entity_ids.clamp(min=0, max=self._SEMANTIC_ENTITY_COUNT - 1)
+        queries = F.one_hot(safe_ids, num_classes=self._SEMANTIC_ENTITY_COUNT).to(
+            device=state.device, dtype=torch.float32
+        )
+        address_state = address_state.float()
+        occupied = address_state.square().sum(dim=-1) > 1e-12
+        scores = torch.einsum("bqd,bsd->bqs", queries, _normalize_address(address_state))
+        scores = scores.masked_fill(~occupied.unsqueeze(1), -2.0)
+        best_scores, slot_indices = scores.max(dim=-1)
+        found = valid_mask & best_scores.ge(self.key_match_threshold)
+        read_values = content_state.gather(
+            1, slot_indices.unsqueeze(-1).expand(-1, -1, self.d_model)
+        ).float()
+        read_values = read_values * found.unsqueeze(-1).to(read_values.dtype)
+        return self.semantic_retrieval_value_decoder(read_values), found
+
     def _nth_farthest_query_logits(
         self,
         state: torch.Tensor,
@@ -300,14 +361,13 @@ class WorkspaceBroadcast(nn.Module):
         dimensions = query_vector.ne(-1).sum(dim=-1).clamp(min=1, max=6)
         dimension_mask = torch.arange(6, device=state.device).unsqueeze(0) < dimensions.unsqueeze(1)
         expected_candidates = candidate_mask & candidate_ids.ge(0)
-        address_state = state.split(self.d_model, dim=-1)[0].float()
+        address_state = torch.split(
+            state, (self._address_dim, self.d_model), dim=-1
+        )[0].float()
         address_queries = F.one_hot(
             candidate_ids.clamp(min=0, max=self._SEMANTIC_ENTITY_COUNT - 1),
             num_classes=self._SEMANTIC_ENTITY_COUNT,
         ).to(device=state.device, dtype=torch.float32)
-        address_queries = F.pad(
-            address_queries, (0, self.d_model - self._SEMANTIC_ENTITY_COUNT)
-        )
         occupied = address_state.square().sum(dim=-1) > 1e-12
         address_scores = torch.einsum(
             "bqd,bsd->bqs", address_queries, _normalize_address(address_state)
@@ -352,12 +412,13 @@ class WorkspaceBroadcast(nn.Module):
         self, state: torch.Tensor, entity_ids: torch.Tensor, active: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Exchange two addressed payloads from the same pre-commit state."""
-        address_state, content_state = state.split(self.d_model, dim=-1)
+        address_state, content_state = torch.split(
+            state, (self._address_dim, self.d_model), dim=-1
+        )
         safe_ids = entity_ids.clamp(min=0, max=self._SEMANTIC_ENTITY_COUNT - 1)
         keys = F.one_hot(safe_ids, num_classes=self._SEMANTIC_ENTITY_COUNT).to(
             device=state.device, dtype=torch.float32
         )
-        keys = F.pad(keys, (0, self.d_model - self._SEMANTIC_ENTITY_COUNT))
         scores = torch.einsum(
             "bpd,bsd->bps", keys, _normalize_address(address_state.float())
         )
@@ -395,7 +456,9 @@ class WorkspaceBroadcast(nn.Module):
         """Decode object->position and position->object answers from slot values."""
         if self.semantic_state_decoder is None:
             raise RuntimeError("semantic query readout requires semantic entity addressing")
-        address_state, content_state = state.split(self.d_model, dim=-1)
+        address_state, content_state = torch.split(
+            state, (self._address_dim, self.d_model), dim=-1
+        )
         occupied = address_state.detach().float().square().sum(dim=-1) > 1e-12
         entity_to_position = self._semantic_state_logits(
             state, query_ids[:, None], query_kind.eq(1)[:, None]
@@ -425,12 +488,13 @@ class WorkspaceBroadcast(nn.Module):
     ) -> torch.Tensor:
         if self.semantic_state_decoder is None:
             raise RuntimeError("semantic state decoding requires semantic entity addressing")
-        address_state, content_state = state.split(self.d_model, dim=-1)
+        address_state, content_state = torch.split(
+            state, (self._address_dim, self.d_model), dim=-1
+        )
         safe_ids = entity_ids.clamp(min=0, max=self._SEMANTIC_ENTITY_COUNT - 1)
         queries = F.one_hot(safe_ids, num_classes=self._SEMANTIC_ENTITY_COUNT).to(
             device=state.device, dtype=torch.float32
         )
-        queries = F.pad(queries, (0, self.d_model - self._SEMANTIC_ENTITY_COUNT))
         address_state = address_state.float()
         occupied = address_state.square().sum(dim=-1) > 1e-12
         scores = torch.einsum("bqd,bsd->bqs", queries, _normalize_address(address_state))
@@ -443,7 +507,11 @@ class WorkspaceBroadcast(nn.Module):
         return self.semantic_state_decoder(read_values)
 
     def init_state(self, batch: int, *, device, dtype) -> torch.Tensor:
-        state_width = self.d_model * (2 if self.entity_keyed_writes else 1)
+        state_width = (
+            self._address_dim + self.d_model
+            if self.entity_keyed_writes
+            else self.d_model
+        )
         return torch.zeros(batch, self.num_slots, state_width, device=device, dtype=dtype)
 
     def _entity_keyed_write_proposals(
@@ -581,7 +649,9 @@ class WorkspaceBroadcast(nn.Module):
                 write_weights.dtype
             )
         if self.entity_keyed_writes:
-            address_state, content_state = state.split(self.d_model, dim=-1)
+            address_state, content_state = torch.split(
+                state, (self._address_dim, self.d_model), dim=-1
+            )
             proposal, mass, address_proposal, address_diagnostics = (
                 self._entity_keyed_write_proposals(
                     selected_deltas,
@@ -671,15 +741,16 @@ class WorkspaceBroadcast(nn.Module):
                 next_content, self._SEMANTIC_CONTENT_RMS_LIMIT
             )
         if self.entity_keyed_writes:
-            next_address = update.mul(address_proposal).add(
-                (1.0 - update).mul(address_state)
+            address_update = update[..., : self._address_dim]
+            next_address = address_update.mul(address_proposal).add(
+                (1.0 - address_update).mul(address_state)
             )
             next_address = _normalize_address(next_address)
             next_state = torch.cat((next_address, next_content), dim=-1)
             occupied = next_address.detach().float().square().sum(dim=-1) > 1e-12
             read_scores = torch.einsum(
                 "bed,bsd->bes",
-                _normalize_address(read_queries),
+                _normalize_address(read_queries)[..., : self._address_dim],
                 _normalize_address(next_address),
             )
             read_scores = read_scores.masked_fill(~occupied.unsqueeze(1), -1e4)
@@ -903,14 +974,20 @@ class WorkspaceBroadcast(nn.Module):
             raise ValueError("specialist delta shape does not match workspace configuration")
         if selected_specialists_only and no_selection:
             raise ValueError("random workspace selection requires all expert candidates")
-        state_width = self.d_model * (2 if self.entity_keyed_writes else 1)
+        state_width = (
+            self._address_dim + self.d_model
+            if self.entity_keyed_writes
+            else self.d_model
+        )
         if state.shape != (batch, self.num_slots, state_width):
             raise ValueError("workspace state has an incompatible batch/slot/feature shape")
 
         if reset_each_step:
             state = torch.zeros_like(state)
         if self.entity_keyed_writes:
-            address_state, content_state = state.split(self.d_model, dim=-1)
+            address_state, content_state = torch.split(
+                state, (self._address_dim, self.d_model), dim=-1
+            )
         else:
             address_state, content_state = None, state
         selected_deltas = (
@@ -1112,8 +1189,9 @@ class WorkspaceBroadcast(nn.Module):
             )
         if self.entity_keyed_writes:
             assert address_state is not None and address_proposal is not None
-            next_address = update.mul(address_proposal).add(
-                (1.0 - update).mul(address_state)
+            address_update = update[..., : self._address_dim]
+            next_address = address_update.mul(address_proposal).add(
+                (1.0 - address_update).mul(address_state)
             )
             next_address = _normalize_address(next_address)
             next_state = torch.cat((next_address, next_content), dim=-1)
@@ -1201,10 +1279,12 @@ class WorkspaceBroadcast(nn.Module):
             else next_state
         )
         if self.entity_keyed_writes:
-            read_addresses, read_content = read_state.split(self.d_model, dim=-1)
+            read_addresses, read_content = torch.split(
+                read_state, (self._address_dim, self.d_model), dim=-1
+            )
             read_scores = torch.einsum(
                 "bed,bsd->bes",
-                _normalize_address(read_queries),
+                _normalize_address(read_queries)[..., : self._address_dim],
                 _normalize_address(read_addresses),
             )
             occupied = read_addresses.detach().float().square().sum(dim=-1) > 1e-12
@@ -1298,6 +1378,13 @@ class WorkspaceBroadcast(nn.Module):
         nth_farthest_query_vectors: torch.Tensor | None = None,
         nth_farthest_query_ranks: torch.Tensor | None = None,
         nth_farthest_query_steps: tuple[int, ...] | None = None,
+        retrieval_value_entity_ids: torch.Tensor | None = None,
+        retrieval_value_mask: torch.Tensor | None = None,
+        retrieval_value_steps: tuple[int, ...] | None = None,
+        retrieval_query_entity_ids: torch.Tensor | None = None,
+        retrieval_query_mask: torch.Tensor | None = None,
+        retrieval_query_operation: torch.Tensor | None = None,
+        retrieval_query_steps: tuple[int, ...] | None = None,
         collect_kv_records: bool = False,
     ):
         """Process time-major specialists ``(B,T,E,D)`` sequentially."""
@@ -1309,6 +1396,8 @@ class WorkspaceBroadcast(nn.Module):
         self._last_semantic_pair_commits = []
         self._last_nth_farthest_vector_predictions = []
         self._last_nth_farthest_query_predictions = []
+        self._last_retrieval_value_predictions = []
+        self._last_retrieval_query_predictions = []
         step_diags: list[dict[str, torch.Tensor]] | None = [] if self.diagnostics_enabled else None
         state_observer = getattr(self, "_initium_recurrent_state_observer", None)
         smoothed_prediction_error = None
@@ -1450,6 +1539,56 @@ class WorkspaceBroadcast(nn.Module):
             nth_farthest_query_ranks, nth_farthest_query_steps,
         )):
             raise ValueError("Nth-farthest metadata requires nth_farthest_exact_readout mode")
+        if self.retrieval_exact_readout:
+            expected_query_shape = (*specialist_deltas.shape[:2], 8)
+            if (
+                retrieval_value_entity_ids is None
+                or retrieval_value_mask is None
+                or retrieval_query_entity_ids is None
+                or retrieval_query_mask is None
+                or retrieval_query_operation is None
+                or retrieval_query_entity_ids.shape != expected_query_shape
+                or retrieval_query_mask.shape != expected_query_shape
+                or retrieval_query_operation.shape != specialist_deltas.shape[:2]
+                or retrieval_value_entity_ids.shape != specialist_deltas.shape[:2]
+                or retrieval_value_mask.shape != specialist_deltas.shape[:2]
+            ):
+                raise ValueError(
+                    "retrieval exact readout requires query IDs/mask shaped (batch,time,8) "
+                    "and operations shaped (batch,time)"
+                )
+            if retrieval_query_mask.dtype != torch.bool or retrieval_value_mask.dtype != torch.bool:
+                raise TypeError("retrieval masks must use torch.bool")
+            if any(
+                value.dtype not in (torch.int32, torch.int64)
+                for value in (
+                    retrieval_value_entity_ids,
+                    retrieval_query_entity_ids,
+                    retrieval_query_operation,
+                )
+            ):
+                raise TypeError("retrieval query IDs and operations must be integer tensors")
+            retrieval_value_steps = tuple(sorted(set(retrieval_value_steps or ())))
+            retrieval_query_steps = tuple(sorted(set(retrieval_query_steps or ())))
+            max_steps = specialist_deltas.shape[1]
+            if any(
+                step < 0 or step >= max_steps
+                for step in (*retrieval_value_steps, *retrieval_query_steps)
+            ):
+                raise ValueError("retrieval event/query step is outside the current sequence")
+        elif any(
+            value is not None
+            for value in (
+                retrieval_value_steps,
+                retrieval_value_entity_ids,
+                retrieval_value_mask,
+                retrieval_query_entity_ids,
+                retrieval_query_mask,
+                retrieval_query_operation,
+                retrieval_query_steps,
+            )
+        ):
+            raise ValueError("retrieval metadata requires retrieval_exact_readout mode")
         if self.num_slots > 0 and not self.write_gate_closed:
             # These projections depend only on this token's routed expert
             # outputs, so batch them over time before the causal slot loop.
@@ -1495,9 +1634,6 @@ class WorkspaceBroadcast(nn.Module):
                         identity_keys_time_major = F.one_hot(
                             safe_entity_ids, num_classes=self._SEMANTIC_ENTITY_COUNT
                         ).to(dtype=torch.float32)
-                        identity_keys_time_major = F.pad(
-                            identity_keys_time_major, (0, self.d_model - 64)
-                        )
                         # Keep the batch stride of each time slice stable as
                         # the curriculum changes sequence length. The expert
                         # axis remains a zero-copy expansion.
@@ -1518,9 +1654,16 @@ class WorkspaceBroadcast(nn.Module):
                         )
                         if self.semantic_entity_addressing:
                             assert entity_ids is not None
-                            direct_queries = identity_keys_time_major.unsqueeze(
-                                2
-                            ).expand(-1, -1, selected_deltas.shape[2], -1)
+                            # The read projection remains d_model-wide because
+                            # non-entity tokens use learned queries. Keep that
+                            # interface while storing recurrent semantic keys
+                            # compactly at _address_dim.
+                            direct_queries = F.pad(
+                                identity_keys_time_major,
+                                (0, self.d_model - self._address_dim),
+                            ).unsqueeze(2).expand(
+                                -1, -1, selected_deltas.shape[2], -1
+                            )
                             semantic_query_mask = entity_ids.ge(0).transpose(0, 1)[
                                 :, :, None, None
                             ]
@@ -1777,7 +1920,7 @@ class WorkspaceBroadcast(nn.Module):
                     active_write_frac = (step_weights.sum(dim=-1) > 0).float().mean()
                     write_gate_mean = compiled_update.detach().float().mean()
                     diagnostic_state = (
-                        state.split(self.d_model, dim=-1)[1]
+                        torch.split(state, (self._address_dim, self.d_model), dim=-1)[1]
                         if self.entity_keyed_writes
                         else state
                     )
@@ -1827,8 +1970,12 @@ class WorkspaceBroadcast(nn.Module):
                         trigger_count = trigger.sum().float()
                         surprise_mean = (surprise * eligible).sum() / eligible_count
                         if self.entity_keyed_writes:
-                            state_content = state.split(self.d_model, dim=-1)[1]
-                            previous_content = previous_state.split(self.d_model, dim=-1)[1]
+                            state_content = torch.split(
+                                state, (self._address_dim, self.d_model), dim=-1
+                            )[1]
+                            previous_content = torch.split(
+                                previous_state, (self._address_dim, self.d_model), dim=-1
+                            )[1]
                             actual_change = state_content.detach() - previous_content.detach()
                         else:
                             actual_change = state.detach() - previous_state.detach()
@@ -1892,12 +2039,14 @@ class WorkspaceBroadcast(nn.Module):
                     self._last_semantic_pair_commits.append((step, committed))
             if collect_kv_records:
                 old_content = (
-                    state_before_step.split(self.d_model, dim=-1)[1]
+                    torch.split(
+                        state_before_step, (self._address_dim, self.d_model), dim=-1
+                    )[1]
                     if self.entity_keyed_writes
                     else state_before_step
                 )
                 new_content = (
-                    state.split(self.d_model, dim=-1)[1]
+                    torch.split(state, (self._address_dim, self.d_model), dim=-1)[1]
                     if self.entity_keyed_writes
                     else state
                 )
@@ -1906,7 +2055,19 @@ class WorkspaceBroadcast(nn.Module):
                 ).detach()
                 accepted = change > 1e-6
                 weights = change * accepted.to(change.dtype)
-                record_payload = state if self.entity_keyed_writes else new_content
+                if self.entity_keyed_writes and self.semantic_entity_addressing:
+                    record_address, record_content = torch.split(
+                        state, (self._address_dim, self.d_model), dim=-1
+                    )
+                    record_payload = torch.cat(
+                        (
+                            F.pad(record_address, (0, self.d_model - self._address_dim)),
+                            record_content,
+                        ),
+                        dim=-1,
+                    )
+                else:
+                    record_payload = state if self.entity_keyed_writes else new_content
                 record_count = min(2, record_payload.shape[1])
                 top_weights, top_slots = weights.topk(record_count, dim=1)
                 record = record_payload.gather(
@@ -1985,6 +2146,32 @@ class WorkspaceBroadcast(nn.Module):
                 )
                 self._last_nth_farthest_query_predictions.append(
                     (step, query_logits, selected_entities, active_queries)
+                )
+            if retrieval_value_steps and step in retrieval_value_steps:
+                assert retrieval_value_entity_ids is not None and retrieval_value_mask is not None
+                value_logits, found = self._semantic_retrieval_value_logits(
+                    state,
+                    retrieval_value_entity_ids[:, step, None],
+                    retrieval_value_mask[:, step, None],
+                )
+                self._last_retrieval_value_predictions.append(
+                    (step, value_logits.squeeze(1), found.squeeze(1))
+                )
+            if retrieval_query_steps and step in retrieval_query_steps:
+                assert retrieval_query_entity_ids is not None
+                assert retrieval_query_mask is not None
+                query_logits, found = self._semantic_retrieval_value_logits(
+                    state,
+                    retrieval_query_entity_ids[:, step],
+                    retrieval_query_mask[:, step],
+                )
+                self._last_retrieval_query_predictions.append(
+                    (
+                        step,
+                        query_logits.detach(),
+                        found.detach(),
+                        retrieval_query_mask[:, step].detach(),
+                    )
                 )
             outputs.append(out)
             if step_diags is not None:

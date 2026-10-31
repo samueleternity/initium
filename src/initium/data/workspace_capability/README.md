@@ -25,6 +25,26 @@ the project's existing workspace gate, reconsideration, prediction-error
 salience, and slot-count options. Treat workspace variants as separate
 experiments; do not aggregate them into one “workspace” score.
 
+For an input-path performance comparison, add `--workspace-token-id-input` to
+the compact-input arm while keeping every other option and seed fixed. It stores
+each generated stream as integer token IDs instead of a `(batch,time,320)`
+float32 one-hot tensor. The split-graph input Linear uses the same learned
+weights as an embedding lookup, including its bias and zero-row padding
+semantics. Targets and auxiliary prediction objectives keep their existing
+definitions. The default remains one-hot input, and the run ID gets the
+`_tokenidinput` tag.
+
+The compact input representation does not reduce the model's saved
+back-propagation activations. If a longer lesson still exceeds GPU memory, the
+training CLI also provides `--activation-offload-to-cpu`. This stores autograd
+saved tensors in pinned host memory and restores them during backward, retaining
+full BPTT and the same forward equations at the cost of host RAM and transfer
+time. `--activation-offload-cpu-budget-mb` limits copied activation payload per
+step (default 2048 MiB); saves over that cap stay on their original device. Add
+both flags to matched input arms when measuring the offload effect. Console
+telemetry reports per-step copied/resident saved-tensor bytes and, on Linux,
+process RSS, peak RSS, and pinned RAM. Run IDs include the configured budget.
+
 ## Task tracks
 
 Each track has its own generator and symbolic oracle in `tracks/`. Select one
@@ -251,6 +271,26 @@ can be added as controlled variants using the core trainer's CLI help.
 Unit and integration coverage for the package lives in
 `tests/unit/test_workspace_capability.py` and
 `tests/integration/test_workspace_capability_pipeline.py`.
+
+### Retrieval exact readout
+
+`--workspace-retrieval-exact-readout` is an opt-in positive control for the
+`retrieval_aggregation` track. It supervises a scalar decoder from each entity's
+addressed workspace slot after every initial write or update. At query time it
+reads the requested entity slots and applies the requested recall, modulo-16
+sum, even-count, or parity operation to the decoded values. For example, use
+`--workspace-task-track all --workspace-num-slots 64
+--workspace-entity-keyed-writes --workspace-semantic-entity-addressing
+--workspace-retrieval-exact-readout` to test it alongside the other tracks.
+The option requires at least 64 slots and a positive
+`--workspace-retrieval-value-loss-weight` (default `0.1`). It does not require
+KV memory.
+
+Console output and `run_<id>_workspace_task_metrics.csv` report write-value
+accuracy, query-slot lookup rate, queried-value accuracy, exact readout
+accuracy, and invalid reads separately. This isolates payload preservation,
+entity lookup, and the final aggregation operation; it is a task-specific
+algorithmic control rather than a general learned aggregator.
 
 Run the focused checks from the repository root with:
 

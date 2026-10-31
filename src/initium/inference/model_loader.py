@@ -194,6 +194,22 @@ def _build_split_graph(c: _Cfg, input_dim, hidden, nr_cells, cell_size, read_hea
             "dnc_enabled",
             not c.get("split_graph_backbone_only", False),
         ),
+        memory_type=c.get("memory_type", "dnc"),
+        memory_heads=c.get("memory_heads", 4),
+        memory_dk=c.get("memory_dk", 64),
+        memory_dv=c.get("memory_dv", 64),
+        memory_read_lag=c.get("memory_read_lag", 1),
+        memory_inter_layer_read=c.get("memory_inter_layer_read", False),
+        memory_inter_layer_read_every_block=c.get(
+            "memory_inter_layer_read_every_block", False
+        ),
+        # Historical checkpoints injected full-strength inter-layer reads.
+        memory_inter_layer_read_scale=c.get("memory_inter_layer_read_scale", 1.0),
+        memory_topk=c.get("memory_topk"),
+        memory_position=c.get("memory_position", "none"),
+        delta_gate=c.get("delta_gate", True),
+        delta_chunk=c.get("delta_chunk", 64),
+        delta_use_fla=c.get("delta_use_fla", False),
         independent_linears=True,
         moe_enabled=_moe["moe_enabled"],
         moe_placement=c.get("split_graph_moe_placement", "all"),
@@ -210,6 +226,12 @@ def _build_split_graph(c: _Cfg, input_dim, hidden, nr_cells, cell_size, read_hea
         ),
         workspace_enabled=c.get("workspace_enabled", cc.WORKSPACE_ENABLED),
         workspace_num_slots=c.get("workspace_num_slots", cc.WORKSPACE_NUM_SLOTS),
+        workspace_compile_recurrence=c.get("workspace_compile_recurrence", False),
+        workspace_entity_keyed_writes=c.get("workspace_entity_keyed_writes", False),
+        workspace_semantic_entity_addressing=c.get(
+            "workspace_semantic_entity_addressing", False
+        ),
+        workspace_key_match_threshold=c.get("workspace_key_match_threshold", 0.5),
         workspace_no_selection=c.get("workspace_no_selection", cc.WORKSPACE_NO_SELECTION),
         workspace_reset_each_step=c.get("workspace_reset_each_step", cc.WORKSPACE_RESET_EACH_STEP),
         workspace_train_mode=c.get("workspace_train_mode", cc.WORKSPACE_TRAIN_MODE),
@@ -269,9 +291,18 @@ def load_model(ckpt: dict, device: torch.device, deterministic_write: bool = Fal
     output_proj = nn.Linear(w.shape[1], w.shape[0]).to(device)
 
     beta = float(ckpt.get("beta_target", 0.0) or 0.0)
+    stochastic_heads_enabled = raw.get("stochastic_write_heads_enabled")
+    if stochastic_heads_enabled is None:
+        # Backward compatibility: pre-metadata DNC checkpoints installed the
+        # Gaussian head, while pre-KV-beta checkpoints did not. Do not infer
+        # KV stochasticity from beta alone.
+        stochastic_heads_enabled = (
+            raw.get("memory_type", "dnc") == "dnc"
+            and getattr(rnn, "dnc_enabled", True)
+        )
     heads = (
         install_stochastic_write_heads(rnn, device=device, sample=(beta > 0.0))
-        if getattr(rnn, "dnc_enabled", True)
+        if stochastic_heads_enabled
         else []
     )
 

@@ -269,22 +269,56 @@ copies and reassignments and is computed, not present as a scalar literal in
 the input. Later lessons add variables and operations. The generated chain
 records its depth and exact-match results are grouped by chain difficulty.
 
-Each new family is selectable directly through `--workspace-task-track` and
-is included in `all`. Episodes for these six families are kept shorter than
+Each family is selectable directly through `--workspace-task-track` and is
+included in `all`. Episodes for these six families are kept shorter than
 the existing long permutation track, so they do not raise its full-BPTT
 sequence-length peak. The existing lesson-5 activation-memory limit remains;
 compact token-ID inputs reduce batch storage but do not remove that limit.
 
-Use `--workspace-task-track new_all` to train on these six new families together
+Use `--workspace-task-track new_all` to train on these six capability families together
 without mixing in the original five tracks. In `new_all`, semantic entity
 addressing needs at least 48 slots for the maximum set of world-state and
 agent-belief keys; 48 slots are sufficient, while `all` still requires 64 for
 retrieval aggregation.
 
+## GNW functional probes
+
+Seven additional tracks translate the consciousness-paper list into bounded
+symbolic tasks: `ignition`, `psychological_refractory`, `masked_priming`,
+`sustained_maintenance`, `no_report_confidence`, `bistable_perception`, and
+`trace_conditioning`. The existing `attentional_blink` RSVP track is reused as
+the eighth probe. Select any one with `--workspace-task-track <track>` or use
+`--workspace-task-track gnw_all` to train only on this eight-track probe cohort.
+The `all` mix contains all eighteen tracks; `new_all` remains the separate
+six-track capability cohort.
+
+The probes expose condition-stratified results through the existing
+`query_types` metrics. Ignition varies repeated evidence strength; the RSVP
+track varies lag and masking; the refractory task varies stimulus-onset gap;
+masked priming crosses visibility and congruency; maintenance varies distractor
+delay; no-report/confidence pairs an action response with an optional coarse
+confidence response; rivalry uses a two-state hysteresis process; trace
+conditioning varies the gap in a cue/outcome association. Track markers for
+the seven appended tracks use an in-vocabulary extension code, so the model
+input/output projection width stays at the existing 320-token size.
+
+These are symbolic functional analogues, not human psychophysics. In
+particular, the refractory task currently reports accuracy by onset gap rather
+than reaction-time distributions; the no-report confidence label is a coarse
+evidence-margin target and does not yet provide Brier score or type-2 ROC
+analysis. Ignition's psychometric and workspace-state curves need to be read
+from condition-stratified evaluation and workspace telemetry together. Passing
+any or all of them would support functional workspace signatures only; it
+would not establish phenomenal consciousness. The local papers most relevant
+to these mappings include Sergent & Dehaene (2004), Sergent, Baillet & Dehaene
+(2005), Pashler (1994), Dehaene et al. (2001, 2011), Naccache et al. (2002),
+Dehaene, Lau & Kouider (2017), and Butlin et al. (2023).
+
 ## Curriculum, evaluation, and metrics
 
-Each track has six difficulty levels. `all` rotates the eleven tracks evenly
-across batches; `new_all` rotates only the six new tracks. Each multi-track
+Each track has six difficulty levels. `all` rotates the eighteen tracks evenly
+across batches; `new_all` rotates the six capability tracks and `gnw_all`
+rotates the eight GNW probes. Each multi-track
 batch contains every selected track when `batch_size` is at least the selected
 track count. Curriculum evaluation uses a small balanced set per required
 challenge group. Advancement requires at least 80% episode exact match overall,

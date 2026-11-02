@@ -8258,6 +8258,7 @@ if __name__ == "__main__":
         choices=[
             "all",
             "new_all",
+            "gnw_all",
             "permutation",
             "entity_state",
             "relational_join",
@@ -8269,11 +8270,19 @@ if __name__ == "__main__":
             "rule_switching",
             "attentional_blink",
             "variable_binding",
+            "ignition",
+            "psychological_refractory",
+            "masked_priming",
+            "sustained_maintenance",
+            "no_report_confidence",
+            "bistable_perception",
+            "trace_conditioning",
         ],
         default="all",
         help=(
-            "Track for --dataset-type workspace-capability. 'all' balances all eleven "
-            "tracks; 'new_all' balances only the six new tracks. Multi-track batches "
+            "Track for --dataset-type workspace-capability. 'all' balances all eighteen "
+            "tracks; 'new_all' balances the six added capability tracks; 'gnw_all' "
+            "balances the eight GNW functional probes. Multi-track batches "
             "include each selected track when batch size is large enough."
         ),
     )
@@ -8395,7 +8404,7 @@ if __name__ == "__main__":
             parser.error(
                 "workspace-capability is generated on demand; dataset links/prepared data are unsupported"
             )
-    elif args.workspace_task_track not in ("all", "new_all"):
+    elif args.workspace_task_track not in ("all", "new_all", "gnw_all"):
         parser.error("--workspace-task-track requires --dataset-type workspace-capability")
     if args.workspace_token_id_input and args.dataset_type != "workspace-capability":
         parser.error("--workspace-token-id-input requires --dataset-type workspace-capability")
@@ -8908,13 +8917,11 @@ if __name__ == "__main__":
                 "semantic entity addressing"
             )
         if args.dataset_type != "workspace-capability" or args.workspace_task_track not in (
-            "attentional_blink",
-            "new_all",
-            "all",
+            "attentional_blink", "gnw_all", "new_all", "all",
         ):
             parser.error(
                 "--workspace-attentional-item-memory supports workspace-capability "
-                "tracks attentional_blink, new_all, or all"
+                "tracks attentional_blink, gnw_all, new_all, or all"
             )
         if args.workspace_num_slots < 26:
             parser.error(

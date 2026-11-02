@@ -48,24 +48,33 @@ from initium.data.workspace_capability.episode import (
     SOURCE_BASE,
     SOURCE_COUNT,
     SEP,
-    track_index,
+    TRACK_TOKEN_IDS,
+    track_marker_info,
     track_token,
     VOCAB_SIZE,
     TaskEpisode,
     entity_token,
+    source_token,
     validate_episode,
 )
 from initium.data.workspace_capability.tracks import (
     attentional_blink,
     belief_tracking,
+    bistable_perception,
     capacity_bottleneck,
     entity_state,
+    ignition,
+    masked_priming,
     mixed_skill,
+    no_report_confidence,
     nth_farthest,
     permutation,
+    psychological_refractory,
     relational_join,
     retrieval_aggregation,
     rule_switching,
+    sustained_maintenance,
+    trace_conditioning,
     variable_binding,
 )
 
@@ -81,6 +90,13 @@ _GENERATORS = {
     "rule_switching": rule_switching.generate,
     "attentional_blink": attentional_blink.generate,
     "variable_binding": variable_binding.generate,
+    "ignition": ignition.generate,
+    "psychological_refractory": psychological_refractory.generate,
+    "masked_priming": masked_priming.generate,
+    "sustained_maintenance": sustained_maintenance.generate,
+    "no_report_confidence": no_report_confidence.generate,
+    "bistable_perception": bistable_perception.generate,
+    "trace_conditioning": trace_conditioning.generate,
 }
 TRACKS = tuple(_GENERATORS)
 ALL_TRACK = "all"
@@ -93,7 +109,12 @@ NEW_TRACKS = (
     "variable_binding",
 )
 NEW_ALL_TRACK = "new_all"
-MULTI_TRACKS = {ALL_TRACK, NEW_ALL_TRACK}
+GNW_TRACKS = (
+    "ignition", "attentional_blink", "psychological_refractory", "masked_priming",
+    "sustained_maintenance", "no_report_confidence", "bistable_perception", "trace_conditioning",
+)
+GNW_ALL_TRACK = "gnw_all"
+MULTI_TRACKS = {ALL_TRACK, NEW_ALL_TRACK, GNW_ALL_TRACK}
 _EVAL_KV_ATTENTION_BUDGET_BYTES = 512 * 1024 * 1024
 _SDPA_MATH_WORKSPACE_MULTIPLIER = 2
 _WORKSPACE_OPERATION_CODES = {"lookup": 1, "copy": 2, "add": 3, "sort": 4}
@@ -108,6 +129,13 @@ _ENTITY_ADDRESS_EVENT_TOKENS = {
     "relational_join": {EV_FACT},
     "nth_farthest": {EV_VECTOR},
     "retrieval_aggregation": {EV_KV, EV_UPDATE},
+    "ignition": {EV_INIT},
+    "psychological_refractory": {EV_INIT, EV_UPDATE},
+    "masked_priming": {EV_INIT},
+    "sustained_maintenance": {EV_INIT, EV_UPDATE},
+    "no_report_confidence": {EV_INIT, EV_UPDATE},
+    "bistable_perception": {EV_INIT, EV_UPDATE},
+    "trace_conditioning": {EV_INIT, EV_UPDATE},
 }
 
 
@@ -122,10 +150,10 @@ class WorkspaceCapabilityDataset(BaseDataset):
 
     def __init__(self, task_track: str = ALL_TRACK, *, batch_size_hint: int = 16):
         task_track = (task_track or ALL_TRACK).lower().replace("-", "_")
-        if task_track not in (*TRACKS, ALL_TRACK, NEW_ALL_TRACK):
+        if task_track not in (*TRACKS, ALL_TRACK, NEW_ALL_TRACK, GNW_ALL_TRACK):
             raise ValueError(
                 "unknown workspace task track "
-                f"{task_track!r}; choose one of {(*TRACKS, ALL_TRACK, NEW_ALL_TRACK)}"
+                f"{task_track!r}; choose one of {(*TRACKS, ALL_TRACK, NEW_ALL_TRACK, GNW_ALL_TRACK)}"
             )
         self.task_track = task_track
         self.batch_size_hint = max(1, int(batch_size_hint))
@@ -151,6 +179,8 @@ class WorkspaceCapabilityDataset(BaseDataset):
             return TRACKS
         if self.task_track == NEW_ALL_TRACK:
             return NEW_TRACKS
+        if self.task_track == GNW_ALL_TRACK:
+            return GNW_TRACKS
         return (self.task_track,)
 
     @staticmethod
@@ -181,6 +211,13 @@ class WorkspaceCapabilityDataset(BaseDataset):
         if track == "variable_binding":
             chain = "long" if int(difficulty["assignments"]) >= 12 else "short"
             return (f"computed_chain_{chain}",)
+        if track == "ignition":
+            return ("all",)
+        if track in {
+            "psychological_refractory", "masked_priming", "sustained_maintenance",
+            "no_report_confidence", "bistable_perception", "trace_conditioning",
+        }:
+            return ("all",)
         return ("all",)
 
     def _make_curriculum_eval_episodes(
@@ -253,18 +290,30 @@ class WorkspaceCapabilityDataset(BaseDataset):
             # A typed task marker allows one shared model to condition on the
             # operation grammar without relying on accidental token statistics.
             track_id = TRACKS.index(track)
+            marker_prefix = (
+                (
+                    BOS,
+                    track_token(0),
+                    track_token(len(TRACK_TOKEN_IDS) - 1),
+                    source_token(track_id - len(TRACK_TOKEN_IDS)),
+                    SEP,
+                )
+                if track_id >= len(TRACK_TOKEN_IDS)
+                else (BOS, track_token(track_id), SEP)
+            )
+            prefix_shift = len(marker_prefix) - 1
             episode = TaskEpisode(
                 episode.track,
-                (BOS, track_token(track_id), SEP) + episode.inputs[1:],
+                marker_prefix + episode.inputs[1:],
                 episode.answer,
                 {
                     **episode.metadata,
                     "task_id": track_id,
-                    "sequence_length": len(episode.inputs) + 2,
+                    "sequence_length": len(episode.inputs) + prefix_shift,
                     **(
                         {
                             "state_trace": tuple(
-                                {**snapshot, "step": int(snapshot["step"]) + 2}
+                                {**snapshot, "step": int(snapshot["step"]) + prefix_shift}
                                 for snapshot in episode.metadata["state_trace"]
                             )
                         }
@@ -274,7 +323,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
                     **(
                         {
                             "workspace_query_reads": tuple(
-                                (int(step) + 2, int(key), int(value))
+                                (int(step) + prefix_shift, int(key), int(value))
                                 for step, key, value in episode.metadata[
                                     "workspace_query_reads"
                                 ]
@@ -408,8 +457,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
         )
         for row, tokens in enumerate(token_ids):
             if self.task_track in MULTI_TRACKS:
-                track_marker = int(tokens[1]) if len(tokens) > 1 else -1
-                decoded_track_index = track_index(track_marker)
+                decoded_track_index, _prefix_length = track_marker_info(tokens)
                 if decoded_track_index is None or decoded_track_index >= len(TRACKS):
                     continue
                 track = TRACKS[decoded_track_index]
@@ -590,6 +638,8 @@ class WorkspaceCapabilityDataset(BaseDataset):
                         valid_event = has_scalar or has_boolean
                     elif track == "variable_binding":
                         valid_event = has_scalar or len(event_entities) >= 2
+                    elif track == "trace_conditioning":
+                        valid_event = has_scalar or has_boolean
                     else:
                         valid_event = has_scalar
                     if valid_event:
@@ -912,11 +962,11 @@ class WorkspaceCapabilityDataset(BaseDataset):
                     frame_mask[row, position] = True
                     frame_steps.add(position)
             cue = []
-            for token_value in tokens:
+            _track_id, prefix_length = track_marker_info(tokens)
+            cue_tokens = tokens[prefix_length:] if prefix_length else tokens
+            for token_value in cue_tokens:
                 token = int(token_value)
-                # Multi-track episodes prepend BOS / TRACK / SEP before the
-                # original attentional-blink stream. Ignore that prefix
-                # separator while collecting the cue's first two source tokens.
+                # Begin after the explicit multi-track marker, if present.
                 if token == SEP and len(cue) >= 2:
                     break
                 if SOURCE_BASE <= token < SOURCE_BASE + SOURCE_COUNT:

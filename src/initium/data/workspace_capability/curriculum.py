@@ -104,6 +104,20 @@ def difficulty_for(
             "variables": (5, 5, 6, 7, 8, 10)[level],
             "assignments": (7, 9, 11, 13, 17, 21)[level],
         }
+    elif track == "ignition":
+        config = {"maximum_strength": (3, 4, 5, 6, 7, 8)[level]}
+    elif track == "psychological_refractory":
+        config = {"maximum_soa": (2, 3, 4, 5, 6, 7)[level]}
+    elif track == "masked_priming":
+        config = {"masked_probability": (0.35, 0.45, 0.55, 0.65, 0.75, 0.8)[level]}
+    elif track == "sustained_maintenance":
+        config = {"maximum_delay": (3, 5, 7, 9, 11, 12)[level]}
+    elif track == "no_report_confidence":
+        config = {"maximum_evidence": (4, 5, 6, 7, 8, 8)[level]}
+    elif track == "bistable_perception":
+        config = {"maximum_frames": (4, 5, 6, 7, 8, 10)[level]}
+    elif track == "trace_conditioning":
+        config = {"maximum_gap": (1, 2, 3, 4, 5, 6)[level]}
     else:
         raise ValueError(f"unknown workspace capability track {track!r}")
     if ood and track != "permutation":
@@ -147,6 +161,20 @@ def difficulty_for(
             )
         elif track == "variable_binding":
             config["assignments"] = min(int(config["assignments"]) + 2, 24)
+        elif track == "ignition":
+            config["maximum_strength"] = min(int(config["maximum_strength"]) + 1, 8)
+        elif track == "psychological_refractory":
+            config["maximum_soa"] = min(int(config["maximum_soa"]) + 1, 8)
+        elif track == "masked_priming":
+            config["masked_probability"] = min(float(config["masked_probability"]) + 0.1, 0.9)
+        elif track == "sustained_maintenance":
+            config["maximum_delay"] = min(int(config["maximum_delay"]) + 2, 12)
+        elif track == "no_report_confidence":
+            config["maximum_evidence"] = min(int(config["maximum_evidence"]) + 1, 8)
+        elif track == "bistable_perception":
+            config["maximum_frames"] = min(int(config["maximum_frames"]) + 1, 10)
+        elif track == "trace_conditioning":
+            config["maximum_gap"] = min(int(config["maximum_gap"]) + 1, 6)
         else:
             updates = config["updates"]
             distractors = config["distractors"]
@@ -216,7 +244,7 @@ class WorkspaceCapabilityCurriculum:
             ):
                 groups_ready = False
                 break
-        all_tracks_ready = self.dataset.task_track not in {"all", "new_all"} or (
+        all_tracks_ready = self.dataset.task_track not in {"all", "new_all", "gnw_all"} or (
             len(per_track) == len(self.dataset._tracks())
             and all(
                 item["exact_match"] / 100.0 >= self.dataset.advance_threshold

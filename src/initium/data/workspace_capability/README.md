@@ -206,52 +206,68 @@ and simple aggregation as context and interference grow.
 
 Balanced subconditions cover symbolic change detection with set size `k`,
 symbolic identity tracking with `k` marked objects and moving distractors, and
-n-back lag. The change-detection and tracking conditions directly vary the
-number of simultaneously relevant items; n-back varies lag and is reported as
-a separate control. The tracking stream uses explicit symbolic object IDs, so
-it is an event-based tracking analogue rather than a visual MOT replication.
+n-back lag. Change detection now interleaves non-probe updates before revealing
+only the probed item's current value; tracking adds more targets, frames, and
+moving non-targets. N-back streams grow independently of `n`. Each generator
+records its subtask and `k` or lag, so results can be inspected by condition.
+The tracking stream uses explicit symbolic object IDs, so it is an event-based
+tracking analogue rather than a visual MOT replication.
 
 ### `belief_tracking` — agent-specific state and reality controls
 
 The generator presents an initial world state, subsequent object moves, and
 which agents observed each move. It balances false-belief queries (the queried
 agent misses the final move), true-belief queries (the agent observes it), and
-current-world controls. This is a typed
-symbolic false-belief task informed by the ToM-bAbI/ToMi belief-question
-families, not a reproduction of either natural-language benchmark.
+current-world controls. The curriculum adds more agents, objects, and repeated
+moves, with at most ten moves per episode to bound sequence activation use.
+Each agent receives a partial observation history; the final query is
+balanced across false belief, true belief, and reality. This is a typed
+symbolic task informed by ToM-bAbI/ToMi, not a reproduction of either
+natural-language benchmark.
 
 ### `mixed_skill` — composed lookup, arithmetic, copy, and sort
 
-An episode provides a small key/value table followed by a shuffled pipeline of
-skill-marked operations. The answer concatenates the intermediate results in
-pipeline order, including both values emitted by sort. Operation results are
-not included in the input; workspace address metadata marks table keys and
-pipeline stages only.
+An episode provides a key/value table followed by a dependent pipeline. The
+initial lookup feeds arithmetic, copy, and sort stages; later operations reuse
+prior stage results. The answer concatenates all intermediate outputs in order,
+including both values emitted by sort. Results are absent from the input;
+workspace address metadata marks table keys and pipeline stages only. The
+curriculum grows from three to eight operations while keeping one compact
+symbolic event per operation.
 
 ### `rule_switching` — card-feature feedback and task-set revision
 
-Evidence trials show cards, a simulated category choice, and exact correct or
-incorrect feedback. The hidden active feature can change mid-episode. Half of
-the switch episodes include an explicit cue, while the rest require inferring
-the new rule from feedback; the final query asks for the active feature value
-on a novel card. This is a compact symbolic switch task, not a full human WCST
-protocol.
+Evidence trials show cards, a simulated feature choice, and noisy feedback.
+All card features share one value-token family, so token type does not reveal
+the active feature. The number of switches and feedback noise rise by lesson;
+some switches are cued while others must be inferred from evidence. The final
+query asks for the active feature value on a novel card. This is a compact
+symbolic task, not a full human WCST protocol.
 
 ### `attentional_blink` — RSVP lag and symbolic mask conditions
 
-Each stream contains two scalar-coded targets among relation-coded
-distractors. T2 lag varies from immediate succession through the later
-recovery range, and symbolic mask items are varied in the gap. Both targets
-must be reported in order. This controls temporal spacing and report accuracy;
-it is not a visual display or a unique test of global-workspace ignition.
+Each item is an RSVP frame with two cued features and a scalar value. Targets
+match the conjunction of both cue features; hard distractors often match one
+feature, so neither parity nor a single-feature filter identifies them. A mask
+condition adds a post-T2 noise-mask frame; intervening frames remain ordinary
+distractors at every lag.
+The generator does not expose target positions through semantic workspace
+addresses or output-key labels. T2 lag and mask condition are reported
+separately, including T1/T2 accuracy by lag and mask. Difficulty increases
+the number of distractors, partial-match lure rate, and maximum target lag.
+This remains a symbolic RSVP analogue rather than a visual display or a unique
+test of global-workspace ignition. Curriculum advancement requires the
+exact-match threshold at every observed lag/mask condition, not only on an
+aggregate short/long-lag group. Both masked and unmasked conditions are
+balanced at every lag.
 
 ### `variable_binding` — sequential assignment and copy-by-value
 
-Variables receive scalar values, are reassigned, or copy another variable's
-current value. Every episode begins with a copy followed by a source
-reassignment, then queries the copied variable; later curriculum levels add
-more assignment operations. Copies take effect at the assignment point, so
-later reassignment of the source does not change the destination's value.
+Variables receive scalar values, are reassigned, copied by value, or assigned a
+modular sum of two current variables. The queried result follows multiple
+copies and reassignments and is computed, not present as a scalar literal in
+the input. Later lessons add variables and operations. The generated chain
+records its depth and exact-match results are grouped by chain difficulty.
 
 Each new family is selectable directly through `--workspace-task-track` and
 is included in `all`. Episodes for these six families are kept shorter than
@@ -259,12 +275,26 @@ the existing long permutation track, so they do not raise its full-BPTT
 sequence-length peak. The existing lesson-5 activation-memory limit remains;
 compact token-ID inputs reduce batch storage but do not remove that limit.
 
+Use `--workspace-task-track new_all` to train on these six new families together
+without mixing in the original five tracks. In `new_all`, semantic entity
+addressing needs at least 48 slots for the maximum set of world-state and
+agent-belief keys; 48 slots are sufficient, while `all` still requires 64 for
+retrieval aggregation.
+
 ## Curriculum, evaluation, and metrics
 
-Each track has six difficulty levels. `all` rotates tracks evenly across batches;
-every batch contains each of the eleven tracks when `batch_size` is at least 11.
-The curriculum advances only after the overall answer-accuracy threshold and
-every track's threshold are met. The dataset can also be run
+Each track has six difficulty levels. `all` rotates the eleven tracks evenly
+across batches; `new_all` rotates only the six new tracks. Each multi-track
+batch contains every selected track when `batch_size` is at least the selected
+track count. Curriculum evaluation uses a small balanced set per required
+challenge group. Advancement requires at least 80% episode exact match overall,
+per track, and in each required group; token accuracy alone cannot advance a
+lesson. Workspace readback-on, bypassed, and shuffled evaluations reuse the
+same balanced episode objects and are logged by track and difficulty group.
+The blink task additionally logs T1/T2 accuracy for each observed lag/mask
+query type. This adds evaluation compute but keeps evaluation microbatching
+bounded by the configured dataset batch size.
+The dataset can also be run
 with `--workspace-task-track <track>` to study one skill without dilution from
 the others. Evaluation uses locally seeded ID and OOD episode generators so
 the episode set is reproducible for paired model conditions.
@@ -349,6 +379,88 @@ accuracy, query-slot lookup rate, queried-value accuracy, exact readout
 accuracy, and invalid reads separately. This isolates payload preservation,
 entity lookup, and the final aggregation operation; it is a task-specific
 algorithmic control rather than a general learned aggregator.
+
+### General key-value workspace readout
+
+`--workspace-key-value-loss-weight 0.1` enables a vocabulary-sized value
+decoder over semantic entity-addressed slot reads. It trains sparse value
+reconstruction at explicit event commits and keyed reads at answer/query
+positions. When an answer token has a direct `workspace_output_keys` mapping,
+the task logits at that position are replaced with the slot readout, so the
+answer depends on persistent state. The probe also respects the existing
+workspace readback bypass and shuffle counterfactuals.
+
+The first track mappings cover direct state answers for multi-agent belief,
+variable binding, the scalar stages of mixed-skill pipelines, the two RSVP
+targets, and symbolic multiple-object tracking. Capacity change-detection and
+n-back compare two retrieved values through a generic equality operator;
+rule switching selects a retrieved card feature using the retrieved rule.
+These operation outputs are computed from slot-read predictions. Mixed-skill
+two-value sorting is routed through two distinct keyed records when the
+operation executor is enabled. Add
+`--workspace-operation-executor` to execute mixed-skill and variable-binding
+lookup/copy/modular-add/sort programs causally and write intermediate values
+back into workspace slots. It requires a positive key-value loss weight; the
+executor reads only input-derived operands, while sparse target values train
+the committed slot contents. Without this flag, operation events continue to
+use the ordinary task decoder. The key-value readout requires
+`--workspace`, `--workspace-entity-keyed-writes`,
+`--workspace-semantic-entity-addressing`, and
+`--dataset-type workspace-capability`. It adds one small value head and sparse
+metadata shaped `(batch, time, 4)`; it does not allocate another recurrent
+slot bank. Training reports `L_ws_kv` alongside task loss.
+The executor allocates a free semantic slot when an operation destination has
+not yet been written by an input event, which allows the second sort result to
+be committed independently.
+
+Add `--workspace-operation-diagnostics` with the executor to report key-source
+read accuracy, destination commit rate, and decoded committed-value accuracy
+by operation at evaluation. It also reports final answer accuracy and episode
+exact match for mixed-skill and variable-binding tracks. Diagnostic targets
+are evaluation-only and are not passed to the executor. Rows are appended to
+`run_<id>_workspace_task_metrics.csv`; the flag is off by default.
+
+For capacity change detection, the output program compares the initial and
+current location values and emits `BOOL_TRUE` exactly when they differ. The
+optional `--workspace-exact-value-comparison` flag uses each addressed value
+head's highest-scoring location token for that comparison, with a soft
+straight-through surrogate used only for the training gradient. Evaluation
+reports operand-value accuracy and comparison accuracy separately, so a failed
+answer can be attributed to value retrieval or comparison. It requires
+`--workspace-key-value-loss-weight > 0`, workspace entity-keyed writes, and
+semantic entity addressing; supported tracks are `capacity_bottleneck`,
+`new_all`, and `all`.
+
+`--workspace-exact-selection` applies the same hard-forward/soft-gradient
+approach to rule-switching selector programs. It chooses the most likely
+stored rule token and then the most likely value token in that rule's candidate
+slot. Evaluation reports rule/value operand accuracy separately from selected
+output accuracy.
+
+`--workspace-attentional-item-memory` stores every RSVP frame value in a slot
+indexed by its order in the stream, including distractors. The write addresses
+are derived from frame order and do not identify target locations. Sparse
+key-value supervision trains the value reader at each frame boundary; answer
+prediction still has to select the cue-matching targets through workspace
+readback.
+
+Add `--workspace-attentional-cue-readout` to make that retrieval path explicit.
+It supervises separate color and shape decoders for each frame, while the
+existing categorical value decoder learns the frame's scalar value,
+then at the answer cue scores every occupied stream-order slot against the
+visible color/shape conjunction. It selects the two highest-scoring matches in
+temporal order and uses their scalar logits for T1/T2. The forward metadata
+contains cue tokens and the answer step only; it does not contain target frame
+indices, target values, or target labels. This flag implies
+`--workspace-attentional-item-memory` and requires at least 26 slots, semantic
+entity addressing, and positive key-value loss. Evaluation applies the same
+readout to baseline and workspace-readback ablation passes.
+
+`--workspace-sparse-recurrence` batches broadcast reads over spans with a
+fixed workspace state, then executes the usual causal update at semantic write
+and state-side operation steps. It reduces per-token recurrent launches while
+preserving the read result at every token. It is disabled during per-step
+workspace telemetry and falls back for unsupported recurrence modes.
 
 Run the focused checks from the repository root with:
 

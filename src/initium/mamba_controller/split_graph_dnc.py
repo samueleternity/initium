@@ -248,11 +248,19 @@ class SplitGraphDNC(nn.Module):
         workspace_enabled: bool = False,
         workspace_num_slots: int = 5,
         workspace_compile_recurrence: bool = False,
+        workspace_sparse_recurrence: bool = False,
         workspace_entity_keyed_writes: bool = False,
         workspace_semantic_entity_addressing: bool = False,
         workspace_permutation_transactional: bool = False,
         workspace_nth_farthest_exact_readout: bool = False,
         workspace_retrieval_exact_readout: bool = False,
+        workspace_key_value_readout: bool = False,
+        workspace_operation_executor: bool = False,
+        workspace_operation_diagnostics: bool = False,
+        workspace_exact_value_comparison: bool = False,
+        workspace_exact_selection: bool = False,
+        workspace_attentional_item_memory: bool = False,
+        workspace_attentional_cue_readout: bool = False,
         workspace_key_match_threshold: float = 0.5,
         workspace_no_selection: bool = False,
         workspace_reset_each_step: bool = False,
@@ -426,6 +434,28 @@ class SplitGraphDNC(nn.Module):
         self.workspace_permutation_transactional = bool(workspace_permutation_transactional)
         self.workspace_nth_farthest_exact_readout = bool(workspace_nth_farthest_exact_readout)
         self.workspace_retrieval_exact_readout = bool(workspace_retrieval_exact_readout)
+        self.workspace_key_value_readout_enabled = bool(workspace_key_value_readout)
+        self.workspace_operation_executor_enabled = bool(workspace_operation_executor)
+        self.workspace_operation_diagnostics_enabled = bool(workspace_operation_diagnostics)
+        self.workspace_exact_value_comparison_enabled = bool(workspace_exact_value_comparison)
+        self.workspace_exact_selection_enabled = bool(workspace_exact_selection)
+        self.workspace_attentional_item_memory_enabled = bool(
+            workspace_attentional_item_memory or workspace_attentional_cue_readout
+        )
+        self.workspace_attentional_cue_readout_enabled = bool(
+            workspace_attentional_cue_readout
+        )
+        self.workspace_sparse_recurrence_enabled = bool(workspace_sparse_recurrence)
+        if self.workspace_sparse_recurrence_enabled and not (
+            self.workspace_entity_keyed_writes and self.workspace_semantic_entity_addressing
+        ):
+            raise ValueError(
+                "workspace sparse recurrence requires entity-keyed semantic addressing"
+            )
+        if self.workspace_operation_executor_enabled and not self.workspace_key_value_readout_enabled:
+            raise ValueError("workspace operation executor requires key-value readout")
+        if self.workspace_operation_diagnostics_enabled and not self.workspace_operation_executor_enabled:
+            raise ValueError("workspace operation diagnostics require the operation executor")
         self.workspace_key_match_threshold = float(workspace_key_match_threshold)
         self.workspace_no_selection = workspace_no_selection
         self.workspace_reset_each_step = workspace_reset_each_step
@@ -752,6 +782,11 @@ class SplitGraphDNC(nn.Module):
                 permutation_transactional=workspace_permutation_transactional,
                 nth_farthest_exact_readout=workspace_nth_farthest_exact_readout,
                 retrieval_exact_readout=workspace_retrieval_exact_readout,
+                key_value_readout=workspace_key_value_readout,
+                operation_executor=workspace_operation_executor,
+                operation_diagnostics=workspace_operation_diagnostics,
+                sparse_recurrence=workspace_sparse_recurrence,
+                attentional_cue_readout=workspace_attentional_cue_readout,
                 key_match_threshold=workspace_key_match_threshold,
             )
             if workspace_enabled and workspace_num_slots > 0
@@ -823,6 +858,18 @@ class SplitGraphDNC(nn.Module):
         state_supervision_entity_ids: torch.Tensor | None = None,
         state_supervision_mask: torch.Tensor | None = None,
         state_supervision_steps: tuple[int, ...] | None = None,
+        key_value_entity_ids: torch.Tensor | None = None,
+        key_value_mask: torch.Tensor | None = None,
+        key_value_steps: tuple[int, ...] | None = None,
+        attentional_cue_color_ids: torch.Tensor | None = None,
+        attentional_cue_shape_ids: torch.Tensor | None = None,
+        attentional_cue_query_step_ids: torch.Tensor | None = None,
+        attentional_cue_readout_steps: tuple[int, ...] | None = None,
+        attentional_frame_entity_ids: torch.Tensor | None = None,
+        attentional_frame_mask: torch.Tensor | None = None,
+        attentional_frame_steps: tuple[int, ...] | None = None,
+        operation_metadata: torch.Tensor | None = None,
+        operation_steps: tuple[int, ...] | None = None,
         nth_farthest_vector_entity_ids: torch.Tensor | None = None,
         nth_farthest_vector_mask: torch.Tensor | None = None,
         nth_farthest_vector_steps: tuple[int, ...] | None = None,
@@ -1262,6 +1309,72 @@ class SplitGraphDNC(nn.Module):
                         if step >= start_step
                     )
                     if state_supervision_entity_ids is not None
+                    else None
+                ),
+                key_value_entity_ids=(
+                    key_value_entity_ids[:, start_step:]
+                    if key_value_entity_ids is not None
+                    else None
+                ),
+                key_value_mask=(
+                    key_value_mask[:, start_step:] if key_value_mask is not None else None
+                ),
+                key_value_steps=(
+                    tuple(step - start_step for step in (key_value_steps or ()) if step >= start_step)
+                    if key_value_entity_ids is not None
+                    else None
+                ),
+                attentional_cue_color_ids=attentional_cue_color_ids,
+                attentional_cue_shape_ids=attentional_cue_shape_ids,
+                attentional_cue_query_step_ids=(
+                    torch.where(
+                        attentional_cue_query_step_ids >= start_step,
+                        attentional_cue_query_step_ids - start_step,
+                        torch.full_like(attentional_cue_query_step_ids, -1),
+                    )
+                    if attentional_cue_query_step_ids is not None
+                    else None
+                ),
+                attentional_cue_readout_steps=(
+                    tuple(
+                        step - start_step
+                        for step in (attentional_cue_readout_steps or ())
+                        if step >= start_step
+                    )
+                    if attentional_cue_query_step_ids is not None
+                    else None
+                ),
+                attentional_frame_entity_ids=(
+                    attentional_frame_entity_ids[:, start_step:]
+                    if attentional_frame_entity_ids is not None
+                    else None
+                ),
+                attentional_frame_mask=(
+                    attentional_frame_mask[:, start_step:]
+                    if attentional_frame_mask is not None
+                    else None
+                ),
+                attentional_frame_steps=(
+                    tuple(
+                        step - start_step
+                        for step in (attentional_frame_steps or ())
+                        if step >= start_step
+                    )
+                    if attentional_frame_entity_ids is not None
+                    else None
+                ),
+                operation_metadata=(
+                    operation_metadata[:, start_step:]
+                    if operation_metadata is not None
+                    else None
+                ),
+                operation_steps=(
+                    tuple(
+                        step - start_step
+                        for step in (operation_steps or ())
+                        if step >= start_step
+                    )
+                    if operation_metadata is not None
                     else None
                 ),
                 nth_farthest_vector_entity_ids=(

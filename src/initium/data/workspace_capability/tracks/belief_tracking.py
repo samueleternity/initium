@@ -22,7 +22,7 @@ from initium.data.workspace_capability.tracks._shared import common_metadata
 
 
 def generate(difficulty: dict, rng: random.Random, *, ood: bool = False) -> TaskEpisode:
-    agents = min(max(2, int(difficulty["agents"])), 4)
+    agents = min(max(2, int(difficulty["agents"])), 5)
     objects = min(max(1, int(difficulty["objects"])), 8)
     moves = min(max(1, int(difficulty["moves"])), 10)
     object_ids = list(range(objects))
@@ -104,12 +104,15 @@ def generate(difficulty: dict, rng: random.Random, *, ood: bool = False) -> Task
             track="belief_tracking",
             sequence_length=len(stream),
             query_type=f"{query_condition}_agents{agents}_objects{objects}",
+            progression_group=query_condition,
             relevant_updates=relevant_updates,
             distractor_count=moves - relevant_updates,
             source_count=agents,
             candidate_baseline_pct=100.0 / LOCATION_COUNT,
             agent_count=agents,
             object_count=objects,
+            query_agent=query_agent,
+            query_object=query_object,
             world_move_count=moves,
             observation_count=observation_count,
             false_belief=(
@@ -119,5 +122,9 @@ def generate(difficulty: dict, rng: random.Random, *, ood: bool = False) -> Task
                 query_condition == "true_belief" and answer_value == world[query_object]
             ),
             ood=bool(ood),
+            workspace_output_keys=(
+                (query_object if query_condition == "reality" else 8 + query_agent * 8 + query_object),
+                -1,
+            ),
         ),
     )

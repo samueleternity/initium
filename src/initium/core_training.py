@@ -835,6 +835,14 @@ def load_frozen_workspace_warm_start(
         "workspace_num_slots",
         "workspace_entity_keyed_writes",
         "workspace_semantic_entity_addressing",
+        "workspace_key_value_loss_weight",
+        "workspace_operation_executor",
+        "workspace_operation_diagnostics",  # evaluation-only instrumentation
+        "workspace_exact_value_comparison",  # parameter-free answer readout
+        "workspace_exact_selection",  # parameter-free answer readout
+        "workspace_sparse_recurrence",  # execution optimization
+        "workspace_attentional_item_memory",  # workspace-only data addressing
+        "workspace_attentional_cue_readout",  # task-specific typed decoders/readout
         "workspace_permutation_transactional",
         "workspace_key_match_threshold",
         "workspace_no_selection",
@@ -1089,6 +1097,7 @@ def run(
     segment_diagnostics_every_step: bool = False,
     activation_offload_to_cpu: bool = False,
     activation_offload_cpu_budget_mb: int = 2048,
+    fp32: bool = False,
     split_graph_moe_placement: str = "all",
     split_graph_moe_backbone_block_isolation: int | None = None,
     split_graph_moe_backbone_residual_scale: float = 1.0,
@@ -1174,6 +1183,14 @@ def run(
     workspace_nth_farthest_vector_loss_weight: float = 0.1,
     workspace_retrieval_exact_readout: bool = False,
     workspace_retrieval_value_loss_weight: float = 0.1,
+    workspace_key_value_loss_weight: float = 0.0,
+    workspace_operation_executor: bool = False,
+    workspace_operation_diagnostics: bool = False,
+    workspace_exact_value_comparison: bool = False,
+    workspace_exact_selection: bool = False,
+    workspace_sparse_recurrence: bool = False,
+    workspace_attentional_item_memory: bool = False,
+    workspace_attentional_cue_readout: bool = False,
     prepared_dataset=None,
     ogs_weights: tuple[float, float, float] = OGS_WEIGHTS,
     batch_size: int = BATCH_SIZE,
@@ -1198,6 +1215,10 @@ def run(
         raise ValueError("log_every must be positive")
     if memory_type not in {"none", "dnc", "kv", "delta"}:
         raise ValueError("memory_type must be none, dnc, kv, or delta")
+    if workspace_attentional_cue_readout:
+        # Cue readout depends on structured per-frame storage; the single flag
+        # enables that prerequisite while retaining the same validation.
+        workspace_attentional_item_memory = True
     if workspace_token_id_input and dataset_type != "workspace-capability":
         raise ValueError("workspace token-ID input requires --dataset-type workspace-capability")
     if activation_offload_to_cpu and device.type != "cuda":
@@ -1216,6 +1237,78 @@ def run(
         or workspace_retrieval_value_loss_weight < 0
     ):
         raise ValueError("workspace_retrieval_value_loss_weight must be finite and >= 0")
+    if not math.isfinite(workspace_key_value_loss_weight) or workspace_key_value_loss_weight < 0:
+        raise ValueError("workspace_key_value_loss_weight must be finite and >= 0")
+    if workspace_operation_executor and not (
+        workspace_key_value_loss_weight > 0
+        and workspace_enabled
+        and workspace_entity_keyed_writes
+        and workspace_semantic_entity_addressing
+        and dataset_type == "workspace-capability"
+        and str(workspace_task_track).lower().replace("-", "_")
+        in {"mixed_skill", "variable_binding", "new_all", "all"}
+    ):
+        raise ValueError(
+            "workspace operation executor requires workspace key-value readout, "
+            "semantic entity addressing, and a supported workspace-capability track"
+        )
+    if workspace_operation_diagnostics and not workspace_operation_executor:
+        raise ValueError(
+            "workspace operation diagnostics require workspace_operation_executor"
+        )
+    if workspace_exact_value_comparison and not (
+        workspace_key_value_loss_weight > 0
+        and workspace_enabled
+        and workspace_entity_keyed_writes
+        and workspace_semantic_entity_addressing
+        and dataset_type == "workspace-capability"
+        and str(workspace_task_track).lower().replace("-", "_")
+        in {"capacity_bottleneck", "new_all", "all"}
+    ):
+        raise ValueError(
+            "exact workspace value comparison requires key-value readout, semantic "
+            "entity addressing, and a supported workspace-capability track"
+        )
+    if workspace_sparse_recurrence and not (
+        workspace_enabled
+        and workspace_entity_keyed_writes
+        and workspace_semantic_entity_addressing
+    ):
+        raise ValueError(
+            "workspace sparse recurrence requires workspace, entity-keyed writes, "
+            "and semantic entity addressing"
+        )
+    if workspace_exact_selection and not (
+        workspace_key_value_loss_weight > 0
+        and workspace_enabled
+        and workspace_entity_keyed_writes
+        and workspace_semantic_entity_addressing
+        and dataset_type == "workspace-capability"
+        and str(workspace_task_track).lower().replace("-", "_")
+        in {"rule_switching", "new_all", "all"}
+    ):
+        raise ValueError(
+            "exact workspace selection requires key-value readout, semantic entity "
+            "addressing, and a supported workspace-capability track"
+        )
+    if workspace_attentional_item_memory and not (
+        workspace_key_value_loss_weight > 0
+        and workspace_enabled
+        and workspace_entity_keyed_writes
+        and workspace_semantic_entity_addressing
+        and dataset_type == "workspace-capability"
+        and str(workspace_task_track).lower().replace("-", "_")
+        in {"attentional_blink", "new_all", "all"}
+    ):
+        raise ValueError(
+            "attentional item memory requires key-value readout, semantic entity "
+            "addressing, and a supported workspace-capability track"
+        )
+    if workspace_attentional_item_memory and workspace_num_slots < 26:
+        raise ValueError(
+            "attentional item memory requires at least 26 workspace slots for the "
+            "longest generated RSVP stream"
+        )
     if memory_read_lag not in (0, 1):
         raise ValueError("memory_read_lag must be 0 or 1")
     if not math.isfinite(memory_inter_layer_read_scale) or memory_inter_layer_read_scale < 0:
@@ -1337,6 +1430,16 @@ def run(
                 raise ValueError("retrieval exact readout requires at least 64 workspace slots")
             if workspace_retrieval_value_loss_weight <= 0:
                 raise ValueError("retrieval exact readout requires a positive value loss weight")
+        if workspace_key_value_loss_weight > 0 and not (
+            workspace_enabled
+            and workspace_semantic_entity_addressing
+            and workspace_entity_keyed_writes
+            and dataset_type == "workspace-capability"
+        ):
+            raise ValueError(
+                "workspace key-value supervision requires workspace-capability, "
+                "semantic entity addressing, and entity-keyed writes"
+            )
         if (
             workspace_semantic_entity_addressing
             and workspace_task_track in {"all", "retrieval_aggregation"}
@@ -1345,6 +1448,16 @@ def run(
             raise ValueError(
                 "semantic entity addressing on retrieval_aggregation/all requires at least 64 "
                 "workspace slots to cover every entity ID in the generated episodes"
+            )
+        if (
+            workspace_semantic_entity_addressing
+            and workspace_task_track in {"new_all", "belief_tracking"}
+            and workspace_num_slots < 48
+        ):
+            raise ValueError(
+                "semantic entity addressing on belief_tracking/new_all requires at least 48 "
+                "workspace slots "
+                "to cover all agent/object belief keys"
             )
         if workspace_permutation_transactional:
             if not (
@@ -2058,6 +2171,134 @@ def run(
                     values.get("priority_tie_episode_fraction"),
                 ]
             )
+        for track, groups in sorted(diagnostics.get("progression_groups", {}).items()):
+            for group, values in sorted(groups.items()):
+                workspace_task_writer.writerow(
+                    [
+                        step_value,
+                        lesson_value,
+                        eval_type,
+                        f"{track}/difficulty/{group}",
+                        values.get("accuracy"),
+                        values.get("exact_match"),
+                        values.get("episodes"),
+                        values.get("answers"),
+                        *([None] * 8),
+                    ]
+                )
+        for track, query_types in sorted(diagnostics.get("query_types", {}).items()):
+            for query_type, values in sorted(query_types.items()):
+                workspace_task_writer.writerow(
+                    [
+                        step_value,
+                        lesson_value,
+                        eval_type,
+                        f"{track}/query/{query_type}",
+                        values.get("accuracy"),
+                        values.get("exact_match"),
+                        values.get("episodes"),
+                        values.get("answers"),
+                        *([None] * 8),
+                    ]
+                )
+        operation_diagnostics = diagnostics.get("workspace_operation_diagnostics", {})
+        for operation, values in sorted(operation_diagnostics.get("by_operation", {}).items()):
+            for metric, accuracy_key, correct_key, count_key in (
+                (
+                    "source_read",
+                    "source_read_accuracy",
+                    "source_reads_correct",
+                    "source_reads_total",
+                ),
+                (
+                    "destination_commit",
+                    "destination_commit_rate",
+                    "destination_commits",
+                    "destination_attempts",
+                ),
+                (
+                    "committed_value",
+                    "committed_value_accuracy",
+                    "committed_values_correct",
+                    "committed_values_total",
+                ),
+            ):
+                workspace_task_writer.writerow(
+                    [
+                        step_value,
+                        lesson_value,
+                        eval_type,
+                        f"workspace_operation/{operation}/{metric}",
+                        values.get(accuracy_key),
+                        values.get(accuracy_key),
+                        values.get(count_key),
+                        values.get(correct_key),
+                        *([None] * 8),
+                    ]
+                )
+        for track, values in sorted(
+            operation_diagnostics.get("final_query_by_track", {}).items()
+        ):
+            workspace_task_writer.writerow(
+                [
+                    step_value,
+                    lesson_value,
+                    eval_type,
+                    f"workspace_operation/final_query/{track}",
+                    values.get("answer_accuracy"),
+                    values.get("episode_exact_match"),
+                    values.get("episodes"),
+                    values.get("answers"),
+                    *([None] * 8),
+                ]
+            )
+        for operation, values in sorted(
+            diagnostics.get("workspace_value_programs", {}).get("by_operation", {}).items()
+        ):
+            for metric, accuracy_key, correct_key, count_key in (
+                (
+                    "operand_value",
+                    "operand_value_accuracy",
+                    "operand_values_correct",
+                    "operand_values_total",
+                ),
+                (
+                    "program_output",
+                    "output_accuracy",
+                    "outputs_correct",
+                    "outputs_total",
+                ),
+            ):
+                workspace_task_writer.writerow(
+                    [
+                        step_value,
+                        lesson_value,
+                        eval_type,
+                        f"workspace_value_program/{operation}/{metric}",
+                        values.get(accuracy_key),
+                        values.get(accuracy_key),
+                        values.get(count_key),
+                        values.get(correct_key),
+                        *([None] * 8),
+                    ]
+                )
+        for query_type, values in sorted(
+            diagnostics.get("attentional_blink_by_lag_mask", {}).items()
+        ):
+            for target, accuracy_key in (("T1", "t1_accuracy"), ("T2", "t2_accuracy")):
+                workspace_task_writer.writerow(
+                    [
+                        step_value,
+                        lesson_value,
+                        eval_type,
+                        f"attentional_blink/{query_type}/{target}",
+                        values.get(accuracy_key),
+                        values.get("episode_exact_match") if target == "T2" else None,
+                        values.get("episodes"),
+                        values.get("episodes"),
+                        *([None] * 8),
+                    ]
+                )
         for query_type, values in sorted(
             diagnostics.get("permutation_query_directions", {}).items()
         ):
@@ -2296,9 +2537,9 @@ def run(
             shuffled_diagnostics = getattr(dataset, "last_eval_diagnostics", {})
             segment_diagnostics.emit("eval-id-workspace-shuffled")
             rows = [
-                ("all", "full", baseline_accuracy, baseline_exact),
-                ("all", "readback_bypassed", ablated_accuracy, ablated_exact),
-                ("all", "readback_shuffled", shuffled_accuracy, shuffled_exact),
+                ("all", "full", baseline_accuracy, baseline_exact, baseline_accuracy, baseline_exact),
+                ("all", "readback_bypassed", ablated_accuracy, ablated_exact, baseline_accuracy, baseline_exact),
+                ("all", "readback_shuffled", shuffled_accuracy, shuffled_exact, baseline_accuracy, baseline_exact),
             ]
             base_tracks = (baseline_diagnostics or {}).get("tracks", {})
             ablated_tracks = ablated_diagnostics.get("tracks", {})
@@ -2311,22 +2552,100 @@ def run(
                             "full",
                             base_tracks[track]["accuracy"],
                             base_tracks[track]["exact_match"],
+                            base_tracks[track]["accuracy"],
+                            base_tracks[track]["exact_match"],
                         ),
                         (
                             track,
                             "readback_bypassed",
                             ablated_tracks[track]["accuracy"],
                             ablated_tracks[track]["exact_match"],
+                            base_tracks[track]["accuracy"],
+                            base_tracks[track]["exact_match"],
                         ),
                         (
                             track,
                             "readback_shuffled",
                             shuffled_tracks[track]["accuracy"],
                             shuffled_tracks[track]["exact_match"],
+                            base_tracks[track]["accuracy"],
+                            base_tracks[track]["exact_match"],
                         ),
                     ]
                 )
-            for track, condition, accuracy, exact in rows:
+            base_groups = (baseline_diagnostics or {}).get("progression_groups", {})
+            ablated_groups = ablated_diagnostics.get("progression_groups", {})
+            shuffled_groups = shuffled_diagnostics.get("progression_groups", {})
+            for track in sorted(set(base_groups) & set(ablated_groups) & set(shuffled_groups)):
+                common_groups = (
+                    set(base_groups[track])
+                    & set(ablated_groups[track])
+                    & set(shuffled_groups[track])
+                )
+                for group in sorted(common_groups):
+                    for condition, diagnostics in (
+                        ("full", base_groups),
+                        ("readback_bypassed", ablated_groups),
+                        ("readback_shuffled", shuffled_groups),
+                    ):
+                        values = diagnostics[track][group]
+                        rows.append(
+                            (
+                                f"{track}/difficulty/{group}",
+                                condition,
+                                values["accuracy"],
+                                values["exact_match"],
+                                base_groups[track][group]["accuracy"],
+                                base_groups[track][group]["exact_match"],
+                            )
+                        )
+            base_queries = (baseline_diagnostics or {}).get("query_types", {})
+            ablated_queries = ablated_diagnostics.get("query_types", {})
+            shuffled_queries = shuffled_diagnostics.get("query_types", {})
+            for track in sorted(set(base_queries) & set(ablated_queries) & set(shuffled_queries)):
+                common_queries = (
+                    set(base_queries[track])
+                    & set(ablated_queries[track])
+                    & set(shuffled_queries[track])
+                )
+                for query_type in sorted(common_queries):
+                    for condition, diagnostics in (
+                        ("full", base_queries),
+                        ("readback_bypassed", ablated_queries),
+                        ("readback_shuffled", shuffled_queries),
+                    ):
+                        values = diagnostics[track][query_type]
+                        rows.append(
+                            (
+                                f"{track}/query/{query_type}",
+                                condition,
+                                values["accuracy"],
+                                values["exact_match"],
+                                base_queries[track][query_type]["accuracy"],
+                                base_queries[track][query_type]["exact_match"],
+                            )
+                        )
+            base_blink = (baseline_diagnostics or {}).get("attentional_blink_by_lag_mask", {})
+            ablated_blink = ablated_diagnostics.get("attentional_blink_by_lag_mask", {})
+            shuffled_blink = shuffled_diagnostics.get("attentional_blink_by_lag_mask", {})
+            for query_type in sorted(set(base_blink) & set(ablated_blink) & set(shuffled_blink)):
+                for condition, diagnostics in (
+                    ("full", base_blink),
+                    ("readback_bypassed", ablated_blink),
+                    ("readback_shuffled", shuffled_blink),
+                ):
+                    values = diagnostics[query_type]
+                    rows.append(
+                        (
+                            f"attentional_blink/{query_type}",
+                            condition,
+                            values["t2_accuracy"],
+                            values["episode_exact_match"],
+                            base_blink[query_type]["t2_accuracy"],
+                            base_blink[query_type]["episode_exact_match"],
+                        )
+                    )
+            for track, condition, accuracy, exact, reference_accuracy, reference_exact in rows:
                 workspace_check_writer.writerow(
                     [
                         step_value,
@@ -2335,8 +2654,8 @@ def run(
                         condition,
                         accuracy,
                         exact,
-                        baseline_accuracy - accuracy,
-                        baseline_exact - exact,
+                        reference_accuracy - accuracy,
+                        reference_exact - exact,
                     ]
                 )
             workspace_check_file.flush()
@@ -2837,12 +3156,20 @@ def run(
             workspace_enabled=workspace_enabled,
             workspace_num_slots=workspace_num_slots,
             workspace_compile_recurrence=workspace_compile_recurrence,
+            workspace_sparse_recurrence=workspace_sparse_recurrence,
+            workspace_attentional_item_memory=workspace_attentional_item_memory,
+            workspace_attentional_cue_readout=workspace_attentional_cue_readout,
             workspace_token_id_input=workspace_token_id_input,
             workspace_entity_keyed_writes=workspace_entity_keyed_writes,
             workspace_semantic_entity_addressing=workspace_semantic_entity_addressing,
             workspace_permutation_transactional=workspace_permutation_transactional,
             workspace_nth_farthest_exact_readout=workspace_nth_farthest_exact_readout,
             workspace_retrieval_exact_readout=workspace_retrieval_exact_readout,
+            workspace_key_value_readout=workspace_key_value_loss_weight > 0,
+            workspace_operation_executor=workspace_operation_executor,
+            workspace_operation_diagnostics=workspace_operation_diagnostics,
+            workspace_exact_value_comparison=workspace_exact_value_comparison,
+            workspace_exact_selection=workspace_exact_selection,
             workspace_key_match_threshold=workspace_key_match_threshold,
             workspace_no_selection=workspace_no_selection,
             workspace_reset_each_step=workspace_reset_each_step,
@@ -3096,6 +3423,14 @@ def run(
                 f"gate={workspace_gate_variant} | "
                 f"bistable_gradient={workspace_bistable_gradient_mode} | "
                 f"workspace_bptt_horizon={workspace_bptt_horizon or 'full'} | "
+                f"key_value_readout={'on' if workspace_key_value_loss_weight > 0 else 'off'} | "
+                f"operation_executor={'on' if workspace_operation_executor else 'off'} | "
+                f"operation_diagnostics={'on' if workspace_operation_diagnostics else 'off'} | "
+                f"exact_value_comparison={'on' if workspace_exact_value_comparison else 'off'} | "
+                f"exact_selection={'on' if workspace_exact_selection else 'off'} | "
+                f"sparse_recurrence={'on' if workspace_sparse_recurrence else 'off'} | "
+                f"attentional_item_memory={'on' if workspace_attentional_item_memory else 'off'} | "
+                f"attentional_cue_readout={'on' if workspace_attentional_cue_readout else 'off'} | "
                 f"workspace_to_kv={'on(two-pass, lag=1, read_scale=' + format(workspace_kv_read_scale, 'g') + ')' if workspace_write_to_kv else 'off'} | "
                 f"reconsideration={'on' if workspace_reconsideration_enabled else 'off'}"
                 f"(trigger={workspace_reconsideration_trigger_mode}, "
@@ -3219,6 +3554,14 @@ def run(
         extra_model_config["workspace_nth_farthest_exact_readout"] = True
     if workspace_retrieval_exact_readout:
         extra_model_config["workspace_retrieval_exact_readout"] = True
+    if workspace_attentional_cue_readout:
+        extra_model_config["workspace_attentional_cue_readout"] = True
+    if workspace_key_value_loss_weight > 0:
+        extra_model_config["workspace_key_value_loss_weight"] = float(
+            workspace_key_value_loss_weight
+        )
+    if workspace_operation_executor:
+        extra_model_config["workspace_operation_executor"] = True
     if sgr_prediction_enabled:
         extra_model_config["sgr_prediction_decoder_enabled"] = True
         extra_model_config["sgr_prediction_loss_weight"] = float(sgr_prediction_loss_weight)
@@ -3613,11 +3956,25 @@ def run(
     )
     if sgr_prediction_decoder is not None:
         param_count += sum(p.numel() for p in sgr_prediction_decoder.parameters())
-    amp_enabled = USE_AMP and device.type == "cuda"
+    # Mamba and the rest of the backbone must also run outside autocast when
+    # diagnosing FP16 instability. Workspace internals already promote several
+    # operations to FP32, which does not protect the backbone's recurrent path.
+    amp_enabled = USE_AMP and device.type == "cuda" and not fp32
+    workspace_amp_stability = bool(amp_enabled and workspace_enabled)
+    workspace_amp_init_scale = 16.0 if workspace_amp_stability else AMP_INIT_SCALE
+    workspace_amp_growth_interval = 100_000 if workspace_amp_stability else 2_000
     kl_on = bool(stochastic_heads) and stochastic_heads[0].sample
     print(
         f"[{run_id}] params {param_count} | kl_terms={'on' if kl_on else 'off'} | amp={'on' if amp_enabled else 'off'}"
     )
+    if fp32:
+        print(f"[{run_id}] full FP32 mode: CUDA autocast and GradScaler disabled")
+    if workspace_amp_stability:
+        print(
+            f"[{run_id}] workspace AMP stability: FP16 GradScaler starts at "
+            f"{workspace_amp_init_scale:g} with growth_interval="
+            f"{workspace_amp_growth_interval} (dynamic backoff remains active)"
+        )
     if sgr_prediction_decoder is not None:
         if sgr_phase2_arm is not None:
             decoder_phase_label = "Phase 2"
@@ -3656,7 +4013,12 @@ def run(
             f"[{run_id}] SGR Phase 4 consumers={consumer_summary} | "
             f"signal={sgr_phase2_signal} (detached){dnc_weight}"
         )
-    scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled, init_scale=AMP_INIT_SCALE)
+    scaler = torch.amp.GradScaler(
+        "cuda",
+        enabled=amp_enabled,
+        init_scale=workspace_amp_init_scale,
+        growth_interval=workspace_amp_growth_interval,
+    )
 
     # Dynamic-N (macro-scale): None unless dynamic_n_mode -- every call site
     # below guards on `dynamic_n_ctrl is not None` so this is a true no-op
@@ -3875,10 +4237,15 @@ def run(
         if (
             not frozen_workspace_warm_start
             and not workspace_condition_warm_start
+            and amp_enabled
             and "scaler_state_dict" in ckpt
         ):
             scaler.load_state_dict(ckpt["scaler_state_dict"])
-        elif not frozen_workspace_warm_start and not workspace_condition_warm_start:
+        elif (
+            not frozen_workspace_warm_start
+            and not workspace_condition_warm_start
+            and amp_enabled
+        ):
             print(
                 f"[{run_id}] WARNING: checkpoint predates GradScaler-state "
                 f"saving (v3 fix) -- scaler starting fresh at "
@@ -3886,6 +4253,18 @@ def run(
                 # (continued below, unchanged)
                 f"prior leg's scale."
             )
+        if workspace_amp_stability:
+            scaler_state = scaler.state_dict()
+            restored_scale = float(scaler_state.get("scale", workspace_amp_init_scale))
+            if (
+                restored_scale > workspace_amp_init_scale
+                or int(scaler_state.get("growth_interval", workspace_amp_growth_interval))
+                != workspace_amp_growth_interval
+            ):
+                scaler_state["scale"] = min(restored_scale, workspace_amp_init_scale)
+                scaler_state["growth_interval"] = workspace_amp_growth_interval
+                scaler_state["_growth_tracker"] = 0
+                scaler.load_state_dict(scaler_state)
         # NOT loading scheduler_state_dict: LR is now recomputed from the
         # absolute step every iteration via set_lr() (see above), clamped
         # at LR_DECAY_STEPS -- this sidesteps the periodicity bug entirely,
@@ -4015,6 +4394,7 @@ def run(
     avg_kl = 0.0
     running_sgr_prediction_loss: Any = 0.0
     running_workspace_state_loss: Any = 0.0
+    running_workspace_key_value_loss: Any = 0.0
     running_workspace_state_correct: Any = 0.0
     running_workspace_state_count: Any = 0.0
     running_nth_vector_loss: Any = 0.0
@@ -4028,6 +4408,7 @@ def run(
     running_retrieval_query_found: Any = 0.0
     running_retrieval_query_slots: Any = 0.0
     running_log_steps = 0
+    running_eval_seconds = 0.0
     last_train_sgr_signal_diagnostics: dict[str, torch.Tensor] = {}
     workspace_reconsideration_window: dict[str, torch.Tensor] | None = None
     if workspace_telemetry_enabled and workspace_reconsideration_enabled:
@@ -4147,10 +4528,13 @@ def run(
         workspace_forward_kwargs = {}
         nth_metadata = None
         retrieval_metadata = None
+        key_value_metadata = None
         if workspace_semantic_entity_addressing:
             workspace_metadata = dataset.workspace_entity_address_metadata(
                 input_seq,
                 paired_swap_commits=workspace_permutation_transactional,
+                attentional_item_memory=workspace_attentional_item_memory,
+                attentional_cue_readout=workspace_attentional_cue_readout,
             )
             if workspace_nth_farthest_exact_readout:
                 nth_metadata = dataset.workspace_nth_farthest_metadata(input_seq)
@@ -4184,6 +4568,33 @@ def run(
                 else value
                 for key, value in workspace_metadata.items()
             }
+        if workspace_key_value_loss_weight > 0:
+            key_value_metadata = {
+                key: value.to(device, non_blocking=True)
+                if isinstance(value, torch.Tensor)
+                else value
+                for key, value in dataset.workspace_key_value_metadata(
+                    input_seq,
+                    include_operations=workspace_operation_executor,
+                    attentional_item_memory=workspace_attentional_item_memory,
+                ).items()
+            }
+            workspace_forward_kwargs.update(
+                {
+                    "key_value_entity_ids": key_value_metadata["key_value_entity_ids"],
+                    "key_value_mask": key_value_metadata["key_value_mask"],
+                    "key_value_steps": key_value_metadata["key_value_steps"],
+                }
+            )
+            if workspace_operation_executor:
+                workspace_forward_kwargs.update(
+                    {
+                        "operation_metadata": key_value_metadata[
+                            "workspace_operation_metadata"
+                        ],
+                        "operation_steps": key_value_metadata["workspace_operation_steps"],
+                    }
+                )
         state_supervision_positions = None
         state_supervision_mask = None
         if workspace_state_loss_weight > 0:
@@ -4270,6 +4681,7 @@ def run(
         value_logits: torch.Tensor | None = None
         query_logits: torch.Tensor | None = None
         per_state_loss: torch.Tensor | None = None
+        workspace_key_value_loss = None
         per_coordinate_loss: torch.Tensor | None = None
         per_value_loss: torch.Tensor | None = None
         saved_tensor_context = (
@@ -4398,12 +4810,33 @@ def run(
                 rnn.workspace.pop_nth_farthest_query_predictions()
             output = output.transpose(0, 1)  # (B, T, 92); Linear accepts non-contiguous input.
             output = output_proj(output)  # (B, T, 90)
+            key_value_predictions = []
+            if workspace_key_value_loss_weight > 0:
+                workspace_module = getattr(rnn, "workspace", None)
+                if workspace_module is None or key_value_metadata is None:
+                    raise RuntimeError("workspace key-value supervision has no active readout")
+                key_value_predictions = workspace_module.pop_key_value_predictions()
+                output = dataset.apply_workspace_key_value_readout_logits(
+                    output,
+                    key_value_predictions,
+                    key_value_metadata,
+                    answer_mask,
+                    exact_value_comparison=workspace_exact_value_comparison,
+                    exact_selection=workspace_exact_selection,
+                )
             if workspace_permutation_transactional:
                 workspace_module = getattr(rnn, "workspace", None)
                 if workspace_module is None:
                     raise RuntimeError("transactional permutation readout has no workspace module")
                 output = dataset.apply_workspace_permutation_query_logits(
                     output, workspace_module.pop_semantic_query_predictions()
+                )
+            if workspace_attentional_cue_readout:
+                workspace_module = getattr(rnn, "workspace", None)
+                if workspace_module is None:
+                    raise RuntimeError("attentional cue readout has no active workspace module")
+                output = dataset.apply_workspace_attentional_cue_readout_logits(
+                    output, workspace_module.pop_attentional_cue_predictions()
                 )
             if split_graph_forward_trace is not None and split_graph_forward_trace.active:
                 split_graph_forward_trace.observe("task_output.logits", output)
@@ -4427,6 +4860,27 @@ def run(
                     "stopping before backward/optimizer update to protect the checkpoint."
                 )
             task_loss = dataset.loss(output, target_digits, answer_mask)
+            if workspace_key_value_loss_weight > 0:
+                workspace_key_value_loss = dataset.workspace_key_value_loss(
+                    key_value_predictions,
+                    key_value_metadata,
+                    device=device,
+                    dtype=task_loss.dtype,
+                )
+                if workspace_attentional_cue_readout:
+                    workspace_module = getattr(rnn, "workspace", None)
+                    if workspace_module is None or key_value_metadata is None:
+                        raise RuntimeError(
+                            "attentional frame supervision has no active workspace metadata"
+                        )
+                    frame_predictions = workspace_module.pop_attentional_frame_predictions()
+                    frame_field_loss = dataset.workspace_attentional_frame_loss(
+                        frame_predictions,
+                        key_value_metadata,
+                        device=device,
+                        dtype=task_loss.dtype,
+                    )
+                    workspace_key_value_loss = workspace_key_value_loss + frame_field_loss
             workspace_state_loss = None
             if workspace_state_loss_weight > 0:
                 workspace_module = getattr(rnn, "workspace", None)
@@ -4692,6 +5146,11 @@ def run(
             + (
                 workspace_retrieval_value_loss_weight * retrieval_value_loss
                 if retrieval_value_loss is not None
+                else 0.0
+            )
+            + (
+                workspace_key_value_loss_weight * workspace_key_value_loss
+                if workspace_key_value_loss is not None
                 else 0.0
             )
             + beta_eff * kl_loss
@@ -4977,6 +5436,8 @@ def run(
             running_workspace_state_loss += workspace_state_loss.detach()
             running_workspace_state_correct += state_correct.detach()
             running_workspace_state_count += state_count
+        if workspace_key_value_loss is not None:
+            running_workspace_key_value_loss += workspace_key_value_loss.detach()
         if nth_vector_loss is not None:
             running_nth_vector_loss += nth_vector_loss.detach()
             running_nth_vector_correct += nth_vector_correct.detach()
@@ -5086,6 +5547,16 @@ def run(
                 )
                 / window_steps
                 if workspace_state_loss_weight > 0
+                else None
+            )
+            avg_workspace_key_value_loss = (
+                (
+                    running_workspace_key_value_loss.item()
+                    if torch.is_tensor(running_workspace_key_value_loss)
+                    else running_workspace_key_value_loss
+                )
+                / window_steps
+                if workspace_key_value_loss_weight > 0
                 else None
             )
             avg_workspace_state_accuracy = (
@@ -5240,6 +5711,8 @@ def run(
                     f"acc={avg_workspace_state_accuracy:.1%} "
                     f"states/batch={avg_workspace_state_count:.1f}"
                 )
+            if avg_workspace_key_value_loss is not None:
+                parts.append(f"L_ws_kv {avg_workspace_key_value_loss:.4f}")
             if avg_nth_vector_loss is not None:
                 parts.append(
                     f"L_nth_vec {avg_nth_vector_loss:.4f} "
@@ -5285,6 +5758,7 @@ def run(
             parts += [
                 f"diversity {avg_div:.2f}",
                 f"{window_steps / elapsed:.2f} steps/s",
+                f"eval_overhead {running_eval_seconds:.1f}s",
                 f"LR {current_lr:.6f}",
                 f"grad_norm {avg_grad_norm:.4g}",
                 f"postclip_grad_norm {avg_postclip_grad_norm:.4g}",
@@ -5658,6 +6132,7 @@ def run(
             running_task_loss, running_kl_loss, running_div, running_grad_norm = 0.0, 0.0, 0, 0.0
             running_sgr_prediction_loss = 0.0
             running_workspace_state_loss = 0.0
+            running_workspace_key_value_loss = 0.0
             running_workspace_state_correct = 0.0
             running_workspace_state_count = 0.0
             running_nth_vector_loss = 0.0
@@ -5671,6 +6146,7 @@ def run(
             running_retrieval_query_found = 0.0
             running_retrieval_query_slots = 0.0
             running_log_steps = 0
+            running_eval_seconds = 0.0
             running_postclip_grad_norm = 0.0
             running_finite_grad_steps = 0
             running_nonfinite_grad_steps = 0
@@ -5742,6 +6218,7 @@ def run(
         per_value_loss = None
         prediction_logits = backbone_features = None
 
+        evaluation_started_at = time.time() if step % EVAL_EVERY == 0 else None
         if step % EVAL_EVERY == 0:
             pre_advance_lesson = curriculum.lesson  # capture before maybe_advance can bump it
             id_stage_memory = rnn.memories[0]
@@ -6307,6 +6784,15 @@ def run(
                         f"[{modality}]: full {id_triple_acc:.2f}% | ablated ({modality} off) "
                         f"{m_acc:.2f}% | dependency {id_triple_acc - m_acc:.2f}"
                     )
+
+        if evaluation_started_at is not None:
+            evaluation_seconds = time.time() - evaluation_started_at
+            # The throughput window is intended to describe optimizer steps,
+            # not periodic evaluation/ablation work. Keep that overhead
+            # visible separately so longer workspace diagnostics do not make
+            # training throughput appear to regress.
+            t0 += evaluation_seconds
+            running_eval_seconds += evaluation_seconds
 
         if step % checkpoint_every == 0 or step == total_steps:
             ckpt_path = os.path.join(CHECKPOINT_DIR, f"{run_id}_step{step}.pt")
@@ -7048,6 +7534,14 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--fp32",
+        action="store_true",
+        help=(
+            "Disable CUDA autocast and GradScaler; train the full model, including "
+            "Mamba, in FP32. Uses more VRAM and may run slower."
+        ),
+    )
+    parser.add_argument(
         "--moe-placement",
         choices=("all", "backbone", "combiner"),
         default="all",
@@ -7202,6 +7696,87 @@ if __name__ == "__main__":
             "Auxiliary cross-entropy for decoding the current scalar from each "
             "retrieval entity slot after every completed write; must be positive "
             "with --workspace-retrieval-exact-readout."
+        ),
+    )
+    parser.add_argument(
+        "--workspace-key-value-loss-weight",
+        type=float,
+        default=0.0,
+        metavar="WEIGHT",
+        help=(
+            "Train a generic vocabulary decoder from semantic entity-addressed workspace "
+            "reads. Supervises explicit event values and keyed answer queries, and routes "
+            "those answer positions through retrieved slot values. Requires workspace, "
+            "entity-keyed writes, and semantic entity addressing."
+        ),
+    )
+    parser.add_argument(
+        "--workspace-operation-executor",
+        action="store_true",
+        help=(
+            "Execute supported mixed-skill and variable-binding lookup/copy/add/sort "
+            "operations from semantic workspace slots, then commit intermediate results. "
+            "Requires --workspace-key-value-loss-weight > 0 and semantic entity addressing."
+        ),
+    )
+    parser.add_argument(
+        "--workspace-operation-diagnostics",
+        action="store_true",
+        help=(
+            "At evaluations, report per-operation operand read accuracy, destination commit "
+            "rate, committed-value accuracy, and final mixed-skill/variable-binding answer "
+            "accuracy. Requires --workspace-operation-executor."
+        ),
+    )
+    parser.add_argument(
+        "--workspace-exact-value-comparison",
+        action="store_true",
+        help=(
+            "Compare the two retrieved location values by their hard categorical "
+            "predictions for workspace equality/change-detection outputs; use a "
+            "straight-through soft comparison gradient during training. Requires "
+            "workspace key-value readout and semantic entity addressing."
+        ),
+    )
+    parser.add_argument(
+        "--workspace-exact-selection",
+        action="store_true",
+        help=(
+            "Use the highest-scoring stored rule and selected scalar category for "
+            "workspace selector outputs, with a soft straight-through training "
+            "gradient. Intended for rule_switching; requires key-value readout and "
+            "semantic entity addressing."
+        ),
+    )
+    parser.add_argument(
+        "--workspace-sparse-recurrence",
+        action="store_true",
+        help=(
+            "Batch workspace broadcasts across consecutive tokens with no semantic "
+            "write or state-side operation. State-changing events remain causal and "
+            "use the normal recurrent transition. Requires entity-keyed semantic "
+            "addressing; training telemetry and unsupported modes fall back to the "
+            "standard per-token recurrence."
+        ),
+    )
+    parser.add_argument(
+        "--workspace-attentional-item-memory",
+        action="store_true",
+        help=(
+            "Store every RSVP frame in a stream-order workspace slot, including "
+            "distractors, and supervise its scalar value. The target positions are "
+            "not exposed; the model must use cue-conditioned readback to answer. "
+            "Requires workspace key-value readout and semantic entity addressing."
+        ),
+    )
+    parser.add_argument(
+        "--workspace-attentional-cue-readout",
+        action="store_true",
+        help=(
+            "Use the visible color/shape cue to retrieve the first two matching RSVP "
+            "item values from workspace slots and decode T1/T2. Implies "
+            "--workspace-attentional-item-memory; requires semantic entity addressing, "
+            "positive key-value loss, and at least 26 slots."
         ),
     )
     parser.add_argument(
@@ -7682,6 +8257,7 @@ if __name__ == "__main__":
         type=str,
         choices=[
             "all",
+            "new_all",
             "permutation",
             "entity_state",
             "relational_join",
@@ -7696,9 +8272,9 @@ if __name__ == "__main__":
         ],
         default="all",
         help=(
-            "Track for --dataset-type workspace-capability. 'all' balances the eleven "
-            "tracks across batches (all appear in a batch when batch size >= 11); "
-            "individual tracks get independent curricula."
+            "Track for --dataset-type workspace-capability. 'all' balances all eleven "
+            "tracks; 'new_all' balances only the six new tracks. Multi-track batches "
+            "include each selected track when batch size is large enough."
         ),
     )
     parser.add_argument(
@@ -7819,7 +8395,7 @@ if __name__ == "__main__":
             parser.error(
                 "workspace-capability is generated on demand; dataset links/prepared data are unsupported"
             )
-    elif args.workspace_task_track != "all":
+    elif args.workspace_task_track not in ("all", "new_all"):
         parser.error("--workspace-task-track requires --dataset-type workspace-capability")
     if args.workspace_token_id_input and args.dataset_type != "workspace-capability":
         parser.error("--workspace-token-id-input requires --dataset-type workspace-capability")
@@ -8149,7 +8725,7 @@ if __name__ == "__main__":
             parser.error(
                 "--workspace-permutation-transactional requires --workspace-num-slots >= 16"
             )
-        if args.dataset_type != "workspace-capability" or args.workspace_task_track not in (
+        if args.dataset_type != "workspace-capability" or args.workspace_task_track.lower().replace("-", "_") not in (
             "permutation",
             "all",
         ):
@@ -8170,6 +8746,15 @@ if __name__ == "__main__":
         parser.error(
             "--workspace-semantic-entity-addressing with retrieval_aggregation/all "
             "requires --workspace-num-slots >= 64 to cover every entity ID"
+        )
+    if (
+        args.workspace_semantic_entity_addressing
+        and args.workspace_task_track in {"new_all", "belief_tracking"}
+        and args.workspace_num_slots < 48
+    ):
+        parser.error(
+            "--workspace-semantic-entity-addressing with belief_tracking/new_all requires "
+            "--workspace-num-slots >= 48 to cover all agent/object belief keys"
         )
     if args.workspace_semantic_state_diagnostics and not args.workspace_semantic_entity_addressing:
         parser.error(
@@ -8223,6 +8808,119 @@ if __name__ == "__main__":
         or args.workspace_retrieval_value_loss_weight < 0
     ):
         parser.error("--workspace-retrieval-value-loss-weight must be finite and >= 0")
+    if not math.isfinite(args.workspace_key_value_loss_weight) or args.workspace_key_value_loss_weight < 0:
+        parser.error("--workspace-key-value-loss-weight must be finite and >= 0")
+    if args.workspace_key_value_loss_weight > 0 and not (
+        args.workspace
+        and args.workspace_entity_keyed_writes
+        and args.workspace_semantic_entity_addressing
+        and args.dataset_type == "workspace-capability"
+    ):
+        parser.error(
+            "--workspace-key-value-loss-weight requires --workspace, "
+            "--workspace-entity-keyed-writes, --workspace-semantic-entity-addressing, "
+            "and --dataset-type workspace-capability"
+        )
+    if args.workspace_operation_executor:
+        if args.workspace_key_value_loss_weight <= 0:
+            parser.error(
+                "--workspace-operation-executor requires a positive "
+                "--workspace-key-value-loss-weight"
+            )
+        if args.dataset_type != "workspace-capability" or args.workspace_task_track not in (
+            "mixed_skill",
+            "variable_binding",
+            "new_all",
+            "all",
+        ):
+            parser.error(
+                "--workspace-operation-executor supports workspace-capability tracks "
+                "mixed_skill, variable_binding, new_all, or all"
+            )
+    if args.workspace_operation_diagnostics and not args.workspace_operation_executor:
+        parser.error(
+            "--workspace-operation-diagnostics requires --workspace-operation-executor"
+        )
+    if args.workspace_exact_value_comparison:
+        if not (
+            args.workspace
+            and args.workspace_key_value_loss_weight > 0
+            and args.workspace_entity_keyed_writes
+            and args.workspace_semantic_entity_addressing
+        ):
+            parser.error(
+                "--workspace-exact-value-comparison requires --workspace, "
+                "--workspace-key-value-loss-weight > 0, --workspace-entity-keyed-writes, "
+                "and --workspace-semantic-entity-addressing"
+            )
+        if args.dataset_type != "workspace-capability" or args.workspace_task_track not in (
+            "capacity_bottleneck",
+            "new_all",
+            "all",
+        ):
+            parser.error(
+                "--workspace-exact-value-comparison supports workspace-capability "
+                "tracks capacity_bottleneck, new_all, or all"
+            )
+    if args.workspace_exact_selection:
+        if not (
+            args.workspace
+            and args.workspace_key_value_loss_weight > 0
+            and args.workspace_entity_keyed_writes
+            and args.workspace_semantic_entity_addressing
+        ):
+            parser.error(
+                "--workspace-exact-selection requires workspace, "
+                "--workspace-key-value-loss-weight > 0, entity-keyed writes, and "
+                "semantic entity addressing"
+            )
+        if args.dataset_type != "workspace-capability" or args.workspace_task_track not in (
+            "rule_switching",
+            "new_all",
+            "all",
+        ):
+            parser.error(
+                "--workspace-exact-selection supports workspace-capability tracks "
+                "rule_switching, new_all, or all"
+            )
+    if args.workspace_sparse_recurrence and not (
+        args.workspace
+        and args.workspace_entity_keyed_writes
+        and args.workspace_semantic_entity_addressing
+    ):
+        parser.error(
+            "--workspace-sparse-recurrence requires --workspace, "
+            "--workspace-entity-keyed-writes, and "
+            "--workspace-semantic-entity-addressing"
+        )
+    if args.workspace_attentional_cue_readout:
+        args.workspace_attentional_item_memory = True
+    if args.workspace_attentional_item_memory:
+        if not (
+            args.workspace
+            and args.workspace_key_value_loss_weight > 0
+            and args.workspace_entity_keyed_writes
+            and args.workspace_semantic_entity_addressing
+        ):
+            parser.error(
+                "--workspace-attentional-item-memory requires workspace, "
+                "--workspace-key-value-loss-weight > 0, entity-keyed writes, and "
+                "semantic entity addressing"
+            )
+        if args.dataset_type != "workspace-capability" or args.workspace_task_track not in (
+            "attentional_blink",
+            "new_all",
+            "all",
+        ):
+            parser.error(
+                "--workspace-attentional-item-memory supports workspace-capability "
+                "tracks attentional_blink, new_all, or all"
+            )
+        if args.workspace_num_slots < 26:
+            parser.error(
+                "--workspace-attentional-item-memory requires "
+                "--workspace-num-slots >= 26"
+            )
     if args.workspace_retrieval_exact_readout:
         if not args.workspace or not args.workspace_semantic_entity_addressing:
             parser.error(
@@ -8424,6 +9122,8 @@ if __name__ == "__main__":
                     ".", "p"
                 )
                 run_id += f"_retrievalexact_val{retrieval_loss_tag}"
+            if args.workspace_attentional_cue_readout:
+                run_id += "_attncue"
             if args.workspace_compile_recurrence:
                 run_id += "_compiledrecurrence"
             if args.workspace_gate_variant != "continuous" or args.workspace_train_scope == "gate":
@@ -8520,8 +9220,12 @@ if __name__ == "__main__":
         # retains them when long architecture/config names are shortened.
         if args.workspace_token_id_input:
             run_id += "_tokenidinput"
+        if args.workspace_operation_diagnostics:
+            run_id += "_opdiag"
         if args.activation_offload_to_cpu:
             run_id += f"_actoffloadcpu{args.activation_offload_cpu_budget_mb}m"
+        if args.fp32:
+            run_id += "_fp32"
         summary = run(
             beta_target=beta,
             run_id=run_id,
@@ -8548,6 +9252,7 @@ if __name__ == "__main__":
             segment_diagnostics_every_step=args.segment_diagnostics_every_step,
             activation_offload_to_cpu=args.activation_offload_to_cpu,
             activation_offload_cpu_budget_mb=args.activation_offload_cpu_budget_mb,
+            fp32=args.fp32,
             split_graph_moe_placement=args.moe_placement,
             split_graph_moe_backbone_block_isolation=args.moe_backbone_block_isolation,
             split_graph_moe_backbone_residual_scale=args.moe_backbone_residual_scale,
@@ -8634,6 +9339,14 @@ if __name__ == "__main__":
             workspace_nth_farthest_vector_loss_weight=args.workspace_nth_farthest_vector_loss_weight,
             workspace_retrieval_exact_readout=args.workspace_retrieval_exact_readout,
             workspace_retrieval_value_loss_weight=args.workspace_retrieval_value_loss_weight,
+            workspace_key_value_loss_weight=args.workspace_key_value_loss_weight,
+            workspace_operation_executor=args.workspace_operation_executor,
+            workspace_operation_diagnostics=args.workspace_operation_diagnostics,
+            workspace_exact_value_comparison=args.workspace_exact_value_comparison,
+            workspace_exact_selection=args.workspace_exact_selection,
+            workspace_sparse_recurrence=args.workspace_sparse_recurrence,
+            workspace_attentional_item_memory=args.workspace_attentional_item_memory,
+            workspace_attentional_cue_readout=args.workspace_attentional_cue_readout,
             prepared_dataset=prepared_dataset,
             ogs_weights=tuple(args.ogs_weights),
             batch_size=args.batch_size,

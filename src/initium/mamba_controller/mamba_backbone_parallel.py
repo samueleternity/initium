@@ -208,7 +208,11 @@ class _ParallelBlock(nn.Module):
         if prediction_error is not None:
             return self.forward_with_prediction_error(x, prediction_error)
         numeric_observer = getattr(self, "_initium_forward_numeric_observer", None)
-        if self.variant == "mamba3" and _MAMBA3_BF16_OK:
+        if (
+            self.variant == "mamba3"
+            and _MAMBA3_BF16_OK
+            and torch.is_autocast_enabled(device_type=x.device.type)
+        ):
             with torch.autocast(device_type=x.device.type, dtype=torch.bfloat16, enabled=True):
                 normed = self.norm(x.float()).to(torch.bfloat16)
                 if numeric_observer is not None:

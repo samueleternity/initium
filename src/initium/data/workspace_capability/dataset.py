@@ -29,6 +29,7 @@ from initium.data.workspace_capability.episode import (
     EV_INIT,
     EV_KV,
     EV_MOVE,
+    EV_NOISE,
     EV_PARITY_QUERY,
     EV_PUT,
     EV_REMOVE,
@@ -83,12 +84,26 @@ _GENERATORS = {
 }
 TRACKS = tuple(_GENERATORS)
 ALL_TRACK = "all"
+NEW_TRACKS = (
+    "capacity_bottleneck",
+    "belief_tracking",
+    "mixed_skill",
+    "rule_switching",
+    "attentional_blink",
+    "variable_binding",
+)
+NEW_ALL_TRACK = "new_all"
+MULTI_TRACKS = {ALL_TRACK, NEW_ALL_TRACK}
 _EVAL_KV_ATTENTION_BUDGET_BYTES = 512 * 1024 * 1024
 _SDPA_MATH_WORKSPACE_MULTIPLIER = 2
+_WORKSPACE_OPERATION_CODES = {"lookup": 1, "copy": 2, "add": 3, "sort": 4}
+_WORKSPACE_OPERATION_NAMES = {1: "lookup", 2: "copy", 3: "modular_add", 4: "sort"}
+_WORKSPACE_OPERAND_KEY = 1
+_WORKSPACE_OPERAND_LITERAL = 2
 _ENTITY_ADDRESS_EVENT_TOKENS = {
-    "capacity_bottleneck": {EV_INIT, EV_MOVE},
+    "capacity_bottleneck": {EV_INIT, EV_MOVE, EV_UPDATE},
     "rule_switching": {EV_ASSERT, EV_VECTOR},
-    "variable_binding": {EV_INIT, EV_KV, EV_UPDATE},
+    "variable_binding": {EV_INIT, EV_KV, EV_UPDATE, EV_VECTOR},
     "entity_state": {EV_PUT, EV_ASSERT, EV_MOVE, EV_REMOVE, EV_SUPERSEDE},
     "relational_join": {EV_FACT},
     "nth_farthest": {EV_VECTOR},
@@ -102,14 +117,15 @@ class WorkspaceCapabilityDataset(BaseDataset):
     name = "workspace-capability"
     input_dim = VOCAB_SIZE
     output_dim = VOCAB_SIZE
-    advance_threshold = 0.82
+    advance_threshold = 0.80
     old_lesson_mix_rate = 0.0
 
     def __init__(self, task_track: str = ALL_TRACK, *, batch_size_hint: int = 16):
         task_track = (task_track or ALL_TRACK).lower().replace("-", "_")
-        if task_track not in (*TRACKS, ALL_TRACK):
+        if task_track not in (*TRACKS, ALL_TRACK, NEW_ALL_TRACK):
             raise ValueError(
-                f"unknown workspace task track {task_track!r}; choose one of {(*TRACKS, ALL_TRACK)}"
+                "unknown workspace task track "
+                f"{task_track!r}; choose one of {(*TRACKS, ALL_TRACK, NEW_ALL_TRACK)}"
             )
         self.task_track = task_track
         self.batch_size_hint = max(1, int(batch_size_hint))
@@ -117,6 +133,8 @@ class WorkspaceCapabilityDataset(BaseDataset):
         self.token_id_input = False
         self.last_batch_examples: list[TaskEpisode] = []
         self.last_eval_diagnostics: dict[str, Any] = {}
+        self._last_id_eval_lesson: int | None = None
+        self._last_id_eval_episodes: list[TaskEpisode] = []
         print(
             f"[workspace-capability] track={self.task_track} | vocabulary={VOCAB_SIZE} "
             "| six-level curriculum | event-oracle generation on CPU"
@@ -129,7 +147,85 @@ class WorkspaceCapabilityDataset(BaseDataset):
         self._output_proj = proj
 
     def _tracks(self):
-        return TRACKS if self.task_track == ALL_TRACK else (self.task_track,)
+        if self.task_track == ALL_TRACK:
+            return TRACKS
+        if self.task_track == NEW_ALL_TRACK:
+            return NEW_TRACKS
+        return (self.task_track,)
+
+    @staticmethod
+    def _curriculum_groups(track: str, lesson: int) -> tuple[str, ...]:
+        """Return challenge strata that must pass before this track advances."""
+        difficulty = difficulty_for(track, lesson)
+        if track == "capacity_bottleneck":
+            return ("change_detection", "multiple_object_tracking", "n_back")
+        if track == "belief_tracking":
+            return ("false_belief", "true_belief", "reality")
+        if track == "mixed_skill":
+            return (f"dependent_ops_{int(difficulty['operations'])}",)
+        if track == "rule_switching":
+            switches = int(difficulty["switches"])
+            if not switches:
+                return ("stable_rule",)
+            groups = ["cued_switch", "feedback_inferred_switch"]
+            if switches >= 2:
+                groups.append("mixed_cue_switch")
+            return tuple(groups)
+        if track == "attentional_blink":
+            maximum_lag = int(difficulty["maximum_lag"])
+            return tuple(
+                f"lag_{lag}_{mask}"
+                for lag in range(1, maximum_lag + 1)
+                for mask in ("unmasked", "masked")
+            )
+        if track == "variable_binding":
+            chain = "long" if int(difficulty["assignments"]) >= 12 else "short"
+            return (f"computed_chain_{chain}",)
+        return ("all",)
+
+    def _make_curriculum_eval_episodes(
+        self, lesson_idx: int, rng: random.Random, episodes_per_group: int = 16
+    ) -> list[TaskEpisode]:
+        """Build a balanced, bounded evaluation set for promotion and ablations."""
+        episodes: list[TaskEpisode] = []
+        for track in self._tracks():
+            required = self._curriculum_groups(track, lesson_idx)
+            counts = {group: 0 for group in required}
+            attempts = 0
+            max_attempts = max(256, len(required) * episodes_per_group * 64)
+            while any(counts[group] < episodes_per_group for group in required):
+                if attempts >= max_attempts:
+                    missing = {
+                        group: episodes_per_group - count
+                        for group, count in counts.items()
+                        if count < episodes_per_group
+                    }
+                    raise RuntimeError(
+                        f"could not balance {track} curriculum evaluation groups: {missing}"
+                    )
+                episode = self._make_episode(track, lesson_idx, rng)
+                group = str(episode.metadata.get("progression_group", "all"))
+                attempts += 1
+                if group in counts and counts[group] < episodes_per_group:
+                    episodes.append(episode)
+                    counts[group] += 1
+        return episodes
+
+    def evaluate_curriculum_id(self, model, device, lesson_idx, *, field_log=None):
+        rng = random.Random(91_000 + int(lesson_idx))
+        episodes = self._make_curriculum_eval_episodes(int(lesson_idx), rng)
+        self._last_id_eval_lesson = int(lesson_idx)
+        self._last_id_eval_episodes = episodes
+        return self._evaluate_episodes(model, device, episodes, field_log=field_log)
+
+    def _paired_id_episodes(self, lesson_idx: int) -> list[TaskEpisode]:
+        if self._last_id_eval_lesson == int(lesson_idx) and self._last_id_eval_episodes:
+            return self._last_id_eval_episodes
+        rng = random.Random(91_000 + int(lesson_idx))
+        episodes = self._make_curriculum_eval_episodes(int(lesson_idx), rng)
+        self._last_id_eval_lesson = int(lesson_idx)
+        self._last_id_eval_episodes = episodes
+        return episodes
 
     def _make_episode(
         self,
@@ -153,7 +249,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 **({"ood_axes": ood_axes} if track == "permutation" else {}),
             )
         )
-        if self.task_track == ALL_TRACK:
+        if self.task_track in MULTI_TRACKS:
             # A typed task marker allows one shared model to condition on the
             # operation grammar without relying on accidental token statistics.
             track_id = TRACKS.index(track)
@@ -173,6 +269,18 @@ class WorkspaceCapabilityDataset(BaseDataset):
                             )
                         }
                         if track == "permutation"
+                        else {}
+                    ),
+                    **(
+                        {
+                            "workspace_query_reads": tuple(
+                                (int(step) + 2, int(key), int(value))
+                                for step, key, value in episode.metadata[
+                                    "workspace_query_reads"
+                                ]
+                            )
+                        }
+                        if episode.metadata.get("workspace_query_reads")
                         else {}
                     ),
                 },
@@ -267,7 +375,13 @@ class WorkspaceCapabilityDataset(BaseDataset):
             yield group
 
     def workspace_entity_address_metadata(
-        self, input_vectors: torch.Tensor, *, paired_swap_commits: bool = False
+        self,
+        input_vectors: torch.Tensor,
+        *,
+        paired_swap_commits: bool = False,
+        attentional_item_memory: bool = False,
+        attentional_cue_readout: bool = False,
+        episodes: list[TaskEpisode] | None = None,
     ) -> dict[str, Any]:
         """Build causal entity keys and event-boundary writes for each task track.
 
@@ -279,6 +393,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
         Query entity tokens never write.
         """
         token_ids = self._input_token_ids(input_vectors).detach().cpu().tolist()
+        examples = self.last_batch_examples if episodes is None else episodes
         entity_ids = torch.full(
             input_vectors.shape[:2], -1, dtype=torch.long, device=input_vectors.device
         )
@@ -292,7 +407,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
             input_vectors.shape[:2], dtype=torch.bool, device=input_vectors.device
         )
         for row, tokens in enumerate(token_ids):
-            if self.task_track == ALL_TRACK:
+            if self.task_track in MULTI_TRACKS:
                 track_marker = int(tokens[1]) if len(tokens) > 1 else -1
                 decoded_track_index = track_index(track_marker)
                 if decoded_track_index is None or decoded_track_index >= len(TRACKS):
@@ -301,6 +416,30 @@ class WorkspaceCapabilityDataset(BaseDataset):
             else:
                 track = self.task_track
             if track != "permutation":
+                if track == "attentional_blink" and attentional_item_memory:
+                    self._add_attentional_item_address_writes(
+                        row, tokens, entity_ids, write_mask
+                    )
+                    continue
+                if track == "rule_switching":
+                    self._add_rule_switching_address_writes(row, tokens, entity_ids, write_mask)
+                    continue
+                if track == "capacity_bottleneck" and row < len(examples):
+                    query_type = str(examples[row].metadata.get("query_type", ""))
+                    if query_type.startswith("change_detection"):
+                        self._add_capacity_change_address_writes(
+                            row, tokens, entity_ids, write_mask
+                        )
+                        continue
+                    if query_type.startswith("n_back"):
+                        self._add_capacity_n_back_address_writes(
+                            row,
+                            tokens,
+                            int(examples[row].metadata.get("n_back", 1)),
+                            entity_ids,
+                            write_mask,
+                        )
+                        continue
                 self._add_event_boundary_entity_writes(row, tokens, track, entity_ids, write_mask)
                 continue
             phase = "none"
@@ -376,6 +515,11 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 .flatten()
                 .tolist()
             )
+        if attentional_cue_readout:
+            cue_metadata = self.workspace_attentional_cue_metadata(
+                input_vectors, episodes=examples
+            )
+            metadata.update(cue_metadata)
         return metadata
 
     @staticmethod
@@ -489,7 +633,6 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 has_location = False
                 querying = True
                 query_agent = None
-                continue
             if token in (EV_INIT, EV_MOVE, EV_ASSERT):
                 active_event = token
                 event_agent = None
@@ -536,6 +679,80 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 has_location = False
                 querying = False
                 query_agent = None
+
+    @staticmethod
+    def _add_rule_switching_address_writes(row, tokens, entity_ids, write_mask) -> None:
+        """Keep the inferred task-set under one stable semantic address."""
+        active_event = None
+        event_entities: list[int] = []
+        scalar_count = 0
+        for position, token_value in enumerate(tokens):
+            token = int(token_value)
+            if ENTITY_BASE <= token < ENTITY_BASE + ENTITY_COUNT:
+                entity_ids[row, position] = token - ENTITY_BASE
+                if active_event is not None:
+                    event_entities.append(token - ENTITY_BASE)
+            if token in (EV_UPDATE, EV_ASSERT, EV_VECTOR):
+                active_event = token
+                event_entities = []
+                scalar_count = 0
+                continue
+            if SCALAR_BASE <= token < SCALAR_BASE + SCALAR_COUNT:
+                if active_event == EV_VECTOR and scalar_count < 3:
+                    entity_ids[row, position] = scalar_count
+                    write_mask[row, position] = True
+                scalar_count += 1
+            if token == SEP:
+                if active_event in (EV_UPDATE, EV_ASSERT):
+                    entity_ids[row, position] = 63
+                    write_mask[row, position] = True
+                active_event = None
+                event_entities = []
+                scalar_count = 0
+
+    @staticmethod
+    def _add_capacity_change_address_writes(row, tokens, entity_ids, write_mask) -> None:
+        """Preserve initial probe values beside the current entity value."""
+        active_event = None
+        pending_entity = -1
+        has_location = False
+        for position, token_value in enumerate(tokens):
+            token = int(token_value)
+            if token in (EV_INIT, EV_UPDATE):
+                active_event = token
+                pending_entity = -1
+                has_location = False
+            elif ENTITY_BASE <= token < ENTITY_BASE + ENTITY_COUNT:
+                pending_entity = token - ENTITY_BASE
+                entity_ids[row, position] = pending_entity
+            elif LOCATION_BASE <= token < LOCATION_BASE + LOCATION_COUNT:
+                has_location = True
+            elif token == SEP:
+                if active_event in (EV_INIT, EV_UPDATE) and pending_entity >= 0 and has_location:
+                    key = pending_entity + 32 if active_event == EV_INIT else pending_entity
+                    entity_ids[row, position] = key
+                    write_mask[row, position] = True
+                active_event = None
+                pending_entity = -1
+                has_location = False
+
+    @staticmethod
+    def _add_capacity_n_back_address_writes(row, tokens, n_back, entity_ids, write_mask) -> None:
+        """Keep only the two symbols the n-back decision must compare."""
+        query_index = next(
+            (index for index, token in enumerate(tokens) if int(token) == QUERY), len(tokens)
+        )
+        value_positions = [
+            index
+            for index, token in enumerate(tokens[:query_index])
+            if LOCATION_BASE <= int(token) < LOCATION_BASE + LOCATION_COUNT
+        ]
+        if len(value_positions) <= n_back:
+            return
+        positions = (value_positions[-1 - n_back], value_positions[-1])
+        for key, position in zip((60, 61), positions):
+            entity_ids[row, position] = key
+            write_mask[row, position] = True
 
     @staticmethod
     def _add_mixed_skill_address_writes(row, tokens, entity_ids, write_mask) -> None:
@@ -618,6 +835,111 @@ class WorkspaceCapabilityDataset(BaseDataset):
         }
 
     @staticmethod
+    def _attentional_item_frame_records(tokens: list[int]):
+        """Parse cue-independent RSVP frame fields and their ordinal addresses."""
+        cue_tokens: list[int] = []
+        cue_complete = False
+        frame_sources: list[int] = []
+        frame_value = -1
+        ignore_mask_frame = False
+        frame_index = 0
+        records: list[tuple[int, int, int, int, int]] = []
+        for position, token_value in enumerate(tokens):
+            token = int(token_value)
+            if not cue_complete:
+                if SOURCE_BASE <= token < SOURCE_BASE + SOURCE_COUNT:
+                    cue_tokens.append(token)
+                elif token == SEP and len(cue_tokens) >= 2:
+                    cue_complete = True
+                continue
+            if token == QUERY:
+                break
+            if token == EV_NOISE:
+                ignore_mask_frame = True
+                continue
+            if SOURCE_BASE <= token < SOURCE_BASE + SOURCE_COUNT:
+                frame_sources.append(token)
+            elif SCALAR_BASE <= token < SCALAR_BASE + SCALAR_COUNT:
+                frame_value = token
+            elif token == SEP:
+                if not ignore_mask_frame and len(frame_sources) == 2 and frame_value >= 0:
+                    records.append(
+                        (position, frame_index, frame_sources[0], frame_sources[1], frame_value)
+                    )
+                frame_index += 1
+                frame_sources.clear()
+                frame_value = -1
+                ignore_mask_frame = False
+        return records
+
+    @staticmethod
+    def _add_attentional_item_address_writes(row, tokens, entity_ids, write_mask) -> None:
+        """Address every RSVP item by stream order, without target-position labels."""
+        for position, frame_index, _color, _shape, _value in (
+            WorkspaceCapabilityDataset._attentional_item_frame_records(tokens)
+        ):
+            if frame_index >= ENTITY_COUNT:
+                continue
+            entity_ids[row, position] = frame_index
+            write_mask[row, position] = True
+
+    def workspace_attentional_cue_metadata(
+        self,
+        input_vectors: torch.Tensor,
+        *,
+        episodes: list[TaskEpisode] | None = None,
+    ) -> dict[str, Any]:
+        """Build cue reads from visible cue tokens, never from answer labels."""
+        examples = self.last_batch_examples if episodes is None else episodes
+        if len(examples) != input_vectors.shape[0]:
+            raise RuntimeError("attentional cue metadata lost batch/episode alignment")
+        token_rows = self._input_token_ids(input_vectors).detach().cpu().tolist()
+        color_ids = torch.full((len(examples),), -1, dtype=torch.long)
+        shape_ids = torch.full((len(examples),), -1, dtype=torch.long)
+        query_step_ids = torch.full((len(examples),), -1, dtype=torch.long)
+        frame_entity_ids = torch.full(input_vectors.shape[:2], -1, dtype=torch.long)
+        frame_mask = torch.zeros(input_vectors.shape[:2], dtype=torch.bool)
+        query_steps: set[int] = set()
+        frame_steps: set[int] = set()
+        for row, (episode, tokens) in enumerate(zip(examples, token_rows)):
+            if episode.track != "attentional_blink":
+                continue
+            for position, frame_index, _color, _shape, _value in (
+                self._attentional_item_frame_records(tokens)
+            ):
+                if frame_index < ENTITY_COUNT and position < input_vectors.shape[1]:
+                    frame_entity_ids[row, position] = frame_index
+                    frame_mask[row, position] = True
+                    frame_steps.add(position)
+            cue = []
+            for token_value in tokens:
+                token = int(token_value)
+                # Multi-track episodes prepend BOS / TRACK / SEP before the
+                # original attentional-blink stream. Ignore that prefix
+                # separator while collecting the cue's first two source tokens.
+                if token == SEP and len(cue) >= 2:
+                    break
+                if SOURCE_BASE <= token < SOURCE_BASE + SOURCE_COUNT:
+                    cue.append(token)
+                    if len(cue) == 2:
+                        break
+            if len(cue) != 2:
+                raise RuntimeError("attentional-blink input is missing its two-token cue")
+            color_ids[row], shape_ids[row] = cue
+            query_step = len(episode.inputs)
+            query_step_ids[row] = query_step
+            query_steps.add(query_step)
+        return {
+            "attentional_cue_color_ids": color_ids,
+            "attentional_cue_shape_ids": shape_ids,
+            "attentional_cue_query_step_ids": query_step_ids,
+            "attentional_cue_readout_steps": tuple(sorted(query_steps)),
+            "attentional_frame_entity_ids": frame_entity_ids,
+            "attentional_frame_mask": frame_mask,
+            "attentional_frame_steps": tuple(sorted(frame_steps)),
+        }
+
+    @staticmethod
     def apply_workspace_permutation_query_logits(logits, query_predictions):
         """Replace marked answer logits with workspace-decoded permutation logits."""
         if not query_predictions:
@@ -640,6 +962,28 @@ class WorkspaceCapabilityDataset(BaseDataset):
             updated = torch.where(query_kind.eq(1).unsqueeze(-1), position_vocab_logits, original)
             updated = torch.where(query_kind.eq(2).unsqueeze(-1), entity_vocab_logits, updated)
             result[:, int(step)] = updated
+        return result
+
+    @staticmethod
+    def apply_workspace_attentional_cue_readout_logits(logits, predictions):
+        """Decode T1/T2 from cue-matched, workspace-stored RSVP item slots."""
+        if not predictions:
+            return logits
+        result = logits.clone()
+        for step, first_logits, second_logits, active in predictions:
+            active = active.to(device=logits.device, dtype=torch.bool)
+            for offset, value_logits in enumerate((first_logits, second_logits)):
+                output_step = int(step) + offset
+                if not 0 <= output_step < logits.shape[1]:
+                    continue
+                value_logits = value_logits.to(device=logits.device, dtype=logits.dtype)
+                selected_logits = result.new_full(
+                    (result.shape[0], result.shape[-1]), -1e4
+                )
+                selected_logits[:, SCALAR_BASE : SCALAR_BASE + SCALAR_COUNT] = value_logits
+                result[:, output_step] = torch.where(
+                    active.unsqueeze(-1), selected_logits, result[:, output_step]
+                )
         return result
 
     @staticmethod
@@ -782,6 +1126,582 @@ class WorkspaceCapabilityDataset(BaseDataset):
             "state_supervision_mask": valid,
             "state_supervision_steps": tuple(sorted(supervised_steps)),
         }
+
+    @staticmethod
+    def _workspace_operation_events(episode: TaskEpisode, tokens: list[int]):
+        """Parse supported input programs and simulate labels for sparse loss only."""
+        if episode.track not in ("mixed_skill", "variable_binding"):
+            return ()
+        current_values: dict[int, int] = {}
+        records = []
+        index = 0
+        while index < len(episode.inputs):
+            event = int(tokens[index])
+            if event not in (EV_INIT, EV_UPDATE, EV_KV, EV_VECTOR):
+                index += 1
+                continue
+            end = index + 1
+            while end < len(episode.inputs) and int(tokens[end]) != SEP:
+                end += 1
+            if end >= len(episode.inputs):
+                break
+            fields = [int(value) for value in tokens[index + 1 : end]]
+            entity_fields = [
+                value - ENTITY_BASE
+                for value in fields
+                if ENTITY_BASE <= value < ENTITY_BASE + ENTITY_COUNT
+            ]
+            scalar_fields = [
+                value
+                for value in fields
+                if SCALAR_BASE <= value < SCALAR_BASE + SCALAR_COUNT
+            ]
+            step = end
+            if episode.track == "mixed_skill":
+                if event == EV_KV and entity_fields and scalar_fields:
+                    current_values[entity_fields[0]] = scalar_fields[0]
+                elif event == EV_VECTOR and len(entity_fields) >= 2:
+                    if len(fields) < 2 or not SOURCE_BASE <= fields[1] < SOURCE_BASE + SOURCE_COUNT:
+                        raise ValueError("mixed-skill operation is missing its skill code")
+                    skill = fields[1] - SOURCE_BASE
+                    destination = entity_fields[0]
+                    operands = entity_fields[1:]
+                    literal = scalar_fields[0] if scalar_fields else -1
+                    if skill == 0 and operands:
+                        operation = "lookup"
+                        operand0 = (_WORKSPACE_OPERAND_KEY, operands[0])
+                        operand1 = (0, -1)
+                        outputs = (current_values[operands[0]],)
+                        expected_operands = (current_values[operands[0]], -100)
+                    elif skill == 1 and operands and literal >= 0:
+                        operation = "add"
+                        operand0 = (_WORKSPACE_OPERAND_KEY, operands[0])
+                        operand1 = (_WORKSPACE_OPERAND_LITERAL, literal)
+                        outputs = (
+                            SCALAR_BASE
+                            + ((current_values[operands[0]] - SCALAR_BASE + literal - SCALAR_BASE)
+                               % SCALAR_COUNT),
+                        )
+                        expected_operands = (current_values[operands[0]], literal)
+                    elif skill == 2 and operands:
+                        operation = "copy"
+                        operand0 = (_WORKSPACE_OPERAND_KEY, operands[0])
+                        operand1 = (0, -1)
+                        outputs = (current_values[operands[0]],)
+                        expected_operands = (current_values[operands[0]], -100)
+                    elif skill == 3 and operands and literal >= 0:
+                        operation = "sort"
+                        operand0 = (_WORKSPACE_OPERAND_KEY, operands[0])
+                        operand1 = (_WORKSPACE_OPERAND_LITERAL, literal)
+                        outputs = tuple(
+                            sorted((current_values[operands[0]], literal))
+                        )
+                        expected_operands = (current_values[operands[0]], literal)
+                    else:
+                        raise ValueError(f"invalid mixed-skill operation code {skill}")
+                    destination1 = destination + 1 if operation == "sort" else -1
+                    records.append(
+                        (
+                            step,
+                            operation,
+                            destination,
+                            destination1,
+                            operand0,
+                            operand1,
+                            outputs,
+                            expected_operands,
+                        )
+                    )
+                    current_values[destination] = outputs[0]
+                    if destination1 >= 0:
+                        current_values[destination1] = outputs[1]
+            else:
+                if event in (EV_INIT, EV_UPDATE) and entity_fields and scalar_fields:
+                    current_values[entity_fields[0]] = scalar_fields[0]
+                elif event == EV_KV and len(entity_fields) >= 2:
+                    destination, source = entity_fields[:2]
+                    value = current_values[source]
+                    records.append(
+                        (
+                            step,
+                            "copy",
+                            destination,
+                            -1,
+                            (_WORKSPACE_OPERAND_KEY, source),
+                            (0, -1),
+                            (value,),
+                            (value, -100),
+                        )
+                    )
+                    current_values[destination] = value
+                elif event == EV_VECTOR and len(entity_fields) >= 3:
+                    destination, left, right = entity_fields[:3]
+                    if not any(
+                        SOURCE_BASE <= value < SOURCE_BASE + SOURCE_COUNT
+                        and value - SOURCE_BASE == 4
+                        for value in fields
+                    ):
+                        raise ValueError("variable-binding compute operation is not modular add")
+                    left_value = current_values[left] - SCALAR_BASE
+                    right_value = current_values[right] - SCALAR_BASE
+                    result = SCALAR_BASE + ((left_value + right_value) % SCALAR_COUNT)
+                    records.append(
+                        (
+                            step,
+                            "add",
+                            destination,
+                            -1,
+                            (_WORKSPACE_OPERAND_KEY, left),
+                            (_WORKSPACE_OPERAND_KEY, right),
+                            (result,),
+                            (current_values[left], current_values[right]),
+                        )
+                    )
+                    current_values[destination] = result
+            index = end + 1
+        return tuple(records)
+
+    def workspace_key_value_metadata(
+        self,
+        input_vectors: torch.Tensor,
+        episodes: list[TaskEpisode] | None = None,
+        *,
+        include_operations: bool = False,
+        include_operation_diagnostics: bool = False,
+        attentional_item_memory: bool = False,
+    ) -> dict[str, Any]:
+        """Pack sparse semantic value reads for causal updates and answer queries.
+
+        Episodes may provide ``workspace_output_keys`` aligned to their answer
+        tokens. Simple event updates with an explicit categorical payload are
+        also supervised at their commit boundary. Storage is bounded to two
+        reads per timestep, independent of sequence length.
+        """
+        examples = self.last_batch_examples if episodes is None else episodes
+        batch, time = input_vectors.shape[:2]
+        if len(examples) != batch:
+            raise RuntimeError("workspace key-value metadata lost batch/episode alignment")
+        entity_meta = self.workspace_entity_address_metadata(
+            input_vectors,
+            episodes=examples,
+            attentional_item_memory=attentional_item_memory,
+        )
+        token_rows = self._input_token_ids(input_vectors).detach().cpu().tolist()
+        entity_rows = entity_meta["entity_ids"].detach().cpu().tolist()
+        write_rows = entity_meta["entity_write_mask"].detach().cpu().tolist()
+        key_ids = torch.full((batch, time, 4), -1, dtype=torch.long)
+        targets = torch.full((batch, time, 4), -100, dtype=torch.long)
+        masks = torch.zeros((batch, time, 4), dtype=torch.bool)
+        attentional_color_targets = torch.full((batch, time), -100, dtype=torch.long)
+        attentional_shape_targets = torch.full((batch, time), -100, dtype=torch.long)
+        operation_metadata = (
+            torch.full((batch, time, 7), -1, dtype=torch.long)
+            if include_operations
+            else None
+        )
+        operation_diagnostic_targets = (
+            torch.full((batch, time, 4), -100, dtype=torch.long)
+            if include_operation_diagnostics
+            else None
+        )
+        operation_steps: set[int] = set()
+        read_steps: set[int] = set()
+        output_program_specs: list[tuple[int, int, str, int]] = []
+
+        for row, (episode, tokens, event_keys, event_writes) in enumerate(
+            zip(examples, token_rows, entity_rows, write_rows)
+        ):
+            per_step: dict[int, list[tuple[int, int]]] = {}
+            operation_records = (
+                self._workspace_operation_events(episode, tokens) if include_operations else ()
+            )
+            row_operation_steps = set()
+            for (
+                step,
+                operation,
+                destination0,
+                destination1,
+                operand0,
+                operand1,
+                output_values,
+                expected_operands,
+            ) in operation_records:
+                if operation_metadata is None:
+                    raise RuntimeError("operation metadata storage was not initialized")
+                if not 0 <= step < min(time, len(episode.inputs)):
+                    continue
+                operation_metadata[row, step] = torch.tensor(
+                    (
+                        _WORKSPACE_OPERATION_CODES[operation],
+                        destination0,
+                        destination1,
+                        operand0[0],
+                        operand0[1],
+                        operand1[0],
+                        operand1[1],
+                    ),
+                    dtype=torch.long,
+                )
+                if operation_diagnostic_targets is not None:
+                    operation_diagnostic_targets[row, step] = torch.tensor(
+                        (
+                            expected_operands[0],
+                            expected_operands[1],
+                            output_values[0],
+                            output_values[1] if len(output_values) > 1 else -100,
+                        ),
+                        dtype=torch.long,
+                    )
+                row_operation_steps.add(step)
+                operation_steps.add(step)
+                destinations = (destination0, destination1)
+                for column, (destination, target_value) in enumerate(
+                    zip(destinations, output_values)
+                ):
+                    if destination < 0:
+                        continue
+                    key_ids[row, step, column] = destination
+                    targets[row, step, column] = target_value
+                    masks[row, step, column] = True
+                read_steps.add(step)
+            active_event = -1
+            payload = -100
+            source_payload = -1
+            rule_trial = 0
+            if attentional_item_memory and episode.track == "attentional_blink":
+                for frame_step, frame_id, color_token, shape_token, value_token in (
+                    self._attentional_item_frame_records(tokens)
+                ):
+                    if frame_step >= min(time, len(episode.inputs)) or frame_id >= ENTITY_COUNT:
+                        continue
+                    attentional_color_targets[row, frame_step] = color_token - SOURCE_BASE
+                    attentional_shape_targets[row, frame_step] = shape_token - SOURCE_BASE
+                    # The generic vocabulary head is categorical. Train it on
+                    # the frame's scalar value only; color and shape use
+                    # separate typed heads to avoid contradictory labels for
+                    # identical semantic-address reads.
+                    per_step.setdefault(frame_step, []).append((frame_id, value_token))
+            for position, token_value in enumerate(tokens[: len(episode.inputs)]):
+                token = int(token_value)
+                if token in (EV_INIT, EV_MOVE, EV_UPDATE, EV_ASSERT, EV_KV):
+                    active_event, payload, source_payload = token, -100, -1
+                    if episode.track == "rule_switching" and token == EV_ASSERT:
+                        rules = tuple(episode.metadata.get("trial_rules", ()))
+                        if rule_trial < len(rules):
+                            source_payload = SOURCE_BASE + int(rules[rule_trial])
+                        rule_trial += 1
+                elif (
+                    include_operations
+                    and episode.track in ("mixed_skill", "variable_binding")
+                    and token == EV_VECTOR
+                ):
+                    active_event, payload, source_payload = token, -100, -1
+                elif episode.track == "rule_switching" and token == EV_VECTOR:
+                    active_event, payload = token, -100
+                elif (
+                    episode.track == "rule_switching"
+                    and active_event == EV_UPDATE
+                    and SOURCE_BASE <= token < SOURCE_BASE + SOURCE_COUNT
+                ):
+                    source_payload = token
+                elif LOCATION_BASE <= token < LOCATION_BASE + LOCATION_COUNT:
+                    payload = token
+                elif SCALAR_BASE <= token < SCALAR_BASE + SCALAR_COUNT:
+                    payload = token
+                    if (
+                        episode.track == "rule_switching"
+                        and active_event == EV_VECTOR
+                        and event_writes[position]
+                    ):
+                        key = int(event_keys[position])
+                        per_step.setdefault(position, []).append((key, token))
+                elif token in (BOOL_FALSE, BOOL_TRUE):
+                    payload = token
+                if (
+                    token == SEP
+                    and event_writes[position]
+                    and payload >= 0
+                    and position not in row_operation_steps
+                    and not (
+                        attentional_item_memory and episode.track == "attentional_blink"
+                    )
+                    and not (
+                        episode.track == "rule_switching"
+                        and active_event in (EV_UPDATE, EV_ASSERT)
+                    )
+                ):
+                    key = int(event_keys[position])
+                    if key >= 0:
+                        per_step.setdefault(position, []).append((key, payload))
+                if (
+                    episode.track == "rule_switching"
+                    and token == SEP
+                    and event_writes[position]
+                    and source_payload >= 0
+                ):
+                    per_step.setdefault(position, []).append((63, source_payload))
+                if token == SEP:
+                    active_event, payload, source_payload = -1, -100, -1
+
+            # Updates are supervised only where a token stream explicitly
+            # carries the stored value. Copy/compute events receive pressure
+            # from a later query instead of a fabricated scalar target.
+            for step, values in per_step.items():
+                packed = values[:4]
+                key_ids[row, step, : len(packed)] = torch.tensor([v[0] for v in packed])
+                targets[row, step, : len(packed)] = torch.tensor([v[1] for v in packed])
+                masks[row, step, : len(packed)] = True
+                read_steps.add(step)
+
+            output_key_field = (
+                "workspace_operation_output_keys"
+                if include_operations and episode.track == "mixed_skill"
+                else "workspace_output_keys"
+            )
+            output_keys = tuple(episode.metadata.get(output_key_field, ()))
+            if output_keys and len(output_keys) != len(episode.answer):
+                raise ValueError(
+                    f"{episode.track} workspace_output_keys must align with all answer tokens"
+                )
+            for offset, key_value in enumerate(output_keys):
+                key = int(key_value)
+                step = len(episode.inputs) + offset
+                if key < -1 or key >= ENTITY_COUNT:
+                    raise ValueError(f"{episode.track} workspace output key must be -1 or [0, 64)")
+                if key < 0 or step >= time or int(episode.answer[offset]) == EOS:
+                    continue
+                key_ids[row, step, 0] = key
+                targets[row, step, 0] = int(episode.answer[offset])
+                masks[row, step, 0] = True
+                read_steps.add(step)
+            for query in episode.metadata.get("workspace_query_reads", ()):
+                step, key_value, target_value = (int(value) for value in query)
+                key = key_value
+                if key < 0 or key >= ENTITY_COUNT:
+                    raise ValueError(f"{episode.track} workspace query key is outside [0, 64)")
+                if target_value < 0 or target_value >= VOCAB_SIZE:
+                    raise ValueError(f"{episode.track} workspace query target is outside the vocabulary")
+                if not 0 <= step < min(time, len(episode.inputs)):
+                    continue
+                free = torch.nonzero(~masks[row, step], as_tuple=False).flatten()
+                if free.numel() == 0:
+                    continue
+                column = int(free[0])
+                key_ids[row, step, column] = key
+                targets[row, step, column] = target_value
+                masks[row, step, column] = True
+                read_steps.add(step)
+            output_programs = tuple(episode.metadata.get("workspace_output_programs", ()))
+            for program in output_programs:
+                offset, operation, keys, expected = program
+                offset = int(offset)
+                if not 0 <= offset < len(episode.answer):
+                    raise ValueError(f"{episode.track} workspace output offset is out of range")
+                step = len(episode.inputs) + offset
+                answer_keys = tuple(int(key) for key in keys)
+                if step >= time:
+                    raise RuntimeError(f"{episode.track} workspace output exceeds its batch sequence")
+                if not answer_keys:
+                    continue
+                expected_values = tuple(int(value) for value in expected)
+                if len(answer_keys) != len(expected_values) or len(answer_keys) > 4:
+                    raise ValueError(f"{episode.track} has invalid workspace output program operands")
+                if any(key < 0 or key >= ENTITY_COUNT for key in answer_keys):
+                    raise ValueError(f"{episode.track} workspace output key is outside [0, 64)")
+                if any(value < 0 or value >= VOCAB_SIZE for value in expected_values):
+                    raise ValueError(f"{episode.track} workspace output target is outside the vocabulary")
+                if operation in {"equal", "not_equal"} and len(answer_keys) != 2:
+                    raise ValueError("workspace comparison output requires exactly two values")
+                if operation == "select" and len(answer_keys) != 4:
+                    raise ValueError("workspace selector output requires a rule and three values")
+                key_ids[row, step, : len(answer_keys)] = torch.tensor(answer_keys)
+                targets[row, step, : len(expected_values)] = torch.tensor(expected_values)
+                masks[row, step, : len(answer_keys)] = True
+                output_program_specs.append((row, step, str(operation), len(answer_keys)))
+                read_steps.add(step)
+
+        result = {
+            "key_value_entity_ids": key_ids,
+            "key_value_targets": targets,
+            "key_value_mask": masks,
+            "key_value_steps": tuple(sorted(read_steps)),
+            "key_value_output_programs": tuple(output_program_specs),
+            "attentional_frame_color_targets": attentional_color_targets,
+            "attentional_frame_shape_targets": attentional_shape_targets,
+        }
+        if include_operations:
+            if operation_metadata is None:
+                raise RuntimeError("workspace operation metadata was not initialized")
+            result["workspace_operation_metadata"] = operation_metadata
+            result["workspace_operation_steps"] = tuple(sorted(operation_steps))
+        if include_operation_diagnostics:
+            if not include_operations or operation_diagnostic_targets is None:
+                raise ValueError(
+                    "operation diagnostic targets require operation metadata"
+                )
+            result["workspace_operation_diagnostic_targets"] = operation_diagnostic_targets
+        return result
+
+    @staticmethod
+    def apply_workspace_key_value_readout_logits(
+        logits,
+        predictions,
+        metadata,
+        answer_mask,
+        *,
+        exact_value_comparison: bool = False,
+        exact_selection: bool = False,
+    ):
+        """Route answer logits through addressed workspace values when keyed."""
+        if not predictions:
+            return logits
+        result = logits.clone()
+        masks = metadata["key_value_mask"].to(device=logits.device)
+        answer_mask = answer_mask.to(device=logits.device).bool()
+        for step, value_logits in predictions:
+            if not 0 <= int(step) < logits.shape[1]:
+                continue
+            active = masks[:, int(step), 0] & answer_mask[:, int(step)]
+            routed = value_logits[:, 0].to(device=logits.device, dtype=logits.dtype)
+            result[:, int(step)] = torch.where(active.unsqueeze(-1), routed, result[:, int(step)])
+        predictions_by_step = {int(step): value for step, value in predictions}
+        for row, step, operation, operand_count in metadata.get(
+            "key_value_output_programs", ()
+        ):
+            value_logits = predictions_by_step.get(int(step))
+            if value_logits is None:
+                continue
+            # Compose a probability distribution rather than emitting a
+            # +/-1e4 one-hot logit vector. The latter makes a wrong hard
+            # operation contribute ~20,000 to task CE and severs the task-loss
+            # gradient at argmax. Marginalizing the operation over the value
+            # head's categorical predictions gives a calibrated output
+            # distribution and lets the task loss train the addressed values.
+            operands = value_logits[int(row), : int(operand_count)].float()
+            hard_program_probs = None
+            if operation in {"equal", "not_equal"}:
+                if int(operand_count) != 2:
+                    raise ValueError("workspace comparison output requires exactly two values")
+                # Values on these tasks are location tokens. Restricting the
+                # comparator to that typed range prevents probability mass on
+                # unrelated vocabulary items from acting like a false value.
+                value_logits = operands[:, LOCATION_BASE : LOCATION_BASE + LOCATION_COUNT]
+                operand_probs = value_logits.softmax(dim=-1)
+                p_equal = (operand_probs[0] * operand_probs[1]).sum()
+                p_true = p_equal if operation == "equal" else 1.0 - p_equal
+                bool_probs = torch.stack((1.0 - p_true, p_true))
+                if exact_value_comparison:
+                    hard_values = value_logits.argmax(dim=-1)
+                    hard_equal = hard_values[0].eq(hard_values[1])
+                    hard_true = hard_equal if operation == "equal" else ~hard_equal
+                    hard_probs = torch.stack((~hard_true, hard_true)).to(bool_probs.dtype)
+                bool_tokens = torch.tensor(
+                    (BOOL_FALSE, BOOL_TRUE), device=logits.device, dtype=torch.long
+                )
+                operation_probs = torch.zeros(
+                    result.shape[-1], device=logits.device, dtype=torch.float32
+                ).scatter(0, bool_tokens, bool_probs)
+                if exact_value_comparison:
+                    hard_program_probs = torch.zeros_like(operation_probs).scatter(
+                        0, bool_tokens, hard_probs
+                    )
+            elif operation == "select":
+                if int(operand_count) != 4:
+                    raise ValueError("workspace selector output requires four values")
+                selector_probs = operands[0].softmax(dim=-1)
+                # Match the existing selector rule exactly: clamp(value -
+                # SOURCE_BASE, 0, 2), which maps all vocabulary values into
+                # one of the three value operands.
+                selector_weights = torch.stack(
+                    (
+                        selector_probs[: SOURCE_BASE + 1].sum(),
+                        selector_probs[SOURCE_BASE + 1],
+                        selector_probs[SOURCE_BASE + 2 :].sum(),
+                    )
+                )
+                value_probs = operands[1:].softmax(dim=-1)
+                operation_probs = selector_weights @ value_probs
+                if exact_selection:
+                    hard_selector = operands[0, SOURCE_BASE : SOURCE_BASE + 3].argmax()
+                    hard_value_token = value_probs[hard_selector].argmax()
+                    hard_program_probs = F.one_hot(
+                        hard_value_token, num_classes=result.shape[-1]
+                    ).to(operation_probs.dtype)
+            else:
+                raise ValueError(f"unknown workspace key-value output operation {operation!r}")
+
+            # Keep probabilities normalized and cap the penalty for an
+            # impossible/very-low-probability class at a meaningful finite
+            # value. These are log-probabilities, so cross-entropy is a proper
+            # NLL and has scale independent of vocabulary size or logit units.
+            operation_probs = operation_probs.clamp_min(1e-7)
+            operation_log_probs = operation_probs.log()
+            operation_log_probs = operation_log_probs - torch.logsumexp(
+                operation_log_probs, dim=-1
+            )
+            if hard_program_probs is not None:
+                # The forward pass uses an exact discrete comparison. Keep a
+                # finite hard decision for NLL while using the soft categorical
+                # comparison only as a straight-through training gradient.
+                hard_program_probs = hard_program_probs.clamp_min(1e-7)
+                hard_log_probs = hard_program_probs.log()
+                hard_log_probs = hard_log_probs - torch.logsumexp(
+                    hard_log_probs, dim=-1
+                )
+                operation_log_probs = (
+                    hard_log_probs
+                    + operation_log_probs
+                    - operation_log_probs.detach()
+                )
+            is_answer = answer_mask[int(row), int(step)].to(device=logits.device).bool()
+            result[int(row), int(step)] = torch.where(
+                is_answer,
+                operation_log_probs.to(dtype=result.dtype),
+                result[int(row), int(step)],
+            )
+        return result
+
+    @staticmethod
+    def workspace_key_value_loss(predictions, metadata, *, device, dtype):
+        """Sparse CE for event-boundary state and query-time value retrieval."""
+        if not predictions:
+            return torch.zeros((), device=device, dtype=dtype)
+        steps = torch.tensor([step for step, _ in predictions], device=device, dtype=torch.long)
+        logits = torch.stack([value for _, value in predictions], dim=1).float()
+        targets = metadata["key_value_targets"].to(device=device).index_select(1, steps)
+        masks = metadata["key_value_mask"].to(device=device).index_select(1, steps)
+        valid = masks & targets.ge(0)
+        if not bool(valid.any()):
+            return logits.new_zeros(())
+        return F.cross_entropy(logits[valid], targets[valid])
+
+    @staticmethod
+    def workspace_attentional_frame_loss(predictions, metadata, *, device, dtype):
+        """Supervise separate cue features from their addressed RSVP frame slots."""
+        if not predictions:
+            return torch.zeros((), device=device, dtype=dtype)
+        steps = torch.tensor([step for step, *_ in predictions], device=device, dtype=torch.long)
+        color_logits = torch.stack([color for _, color, _, _ in predictions], dim=1).float()
+        shape_logits = torch.stack([shape for _, _, shape, _ in predictions], dim=1).float()
+        found = torch.stack([valid for _, _, _, valid in predictions], dim=1).bool()
+        color_targets = metadata["attentional_frame_color_targets"].to(device=device).index_select(
+            1, steps
+        )
+        shape_targets = metadata["attentional_frame_shape_targets"].to(device=device).index_select(
+            1, steps
+        )
+        color_valid = color_targets.ge(0) & found
+        shape_valid = shape_targets.ge(0) & found
+        losses = []
+        for logits, targets, valid in (
+            (color_logits, color_targets, color_valid),
+            (shape_logits, shape_targets, shape_valid),
+        ):
+            if bool(valid.any()):
+                losses.append(F.cross_entropy(logits[valid], targets[valid]))
+        if not losses:
+            return color_logits.new_zeros(())
+        return torch.stack(losses).mean()
 
     def workspace_nth_farthest_metadata(
         self,
@@ -1074,6 +1994,9 @@ class WorkspaceCapabilityDataset(BaseDataset):
         prior_workspace_bypass = getattr(model, "workspace_eval_bypass", None)
         prior_workspace_shuffle = getattr(model, "workspace_eval_shuffle_readback", None)
         workspace = getattr(model, "workspace", None)
+        operation_diagnostics_enabled = bool(
+            getattr(model, "workspace_operation_diagnostics_enabled", False)
+        )
         prior_assignment_observer = getattr(workspace, "_initium_address_assignment_observer", None)
         collect_entity_bindings = bool(
             workspace is not None and getattr(workspace, "entity_keyed_writes", False)
@@ -1095,6 +2018,13 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 )
             model.workspace_eval_shuffle_readback = True
         totals: dict[str, list[int]] = defaultdict(lambda: [0, 0, 0, 0])
+        progression_totals: dict[tuple[str, str], list[int]] = defaultdict(
+            lambda: [0, 0, 0, 0]
+        )
+        query_type_totals: dict[tuple[str, str], list[int]] = defaultdict(
+            lambda: [0, 0, 0, 0]
+        )
+        blink_t2_totals: dict[str, list[int]] = defaultdict(lambda: [0, 0, 0, 0])
         split_totals: dict[str, list[float]] = defaultdict(lambda: [0.0] * 7)
         metadata_totals: dict[str, list[float]] = defaultdict(lambda: [0.0] * 8)
         permutation_query_totals: dict[str, list[int]] = defaultdict(lambda: [0, 0])
@@ -1120,6 +2050,8 @@ class WorkspaceCapabilityDataset(BaseDataset):
             "invalid_readouts": 0,
             "readout_by_query_type": {},
         }
+        operation_diagnostic_totals: dict[str, list[int]] = defaultdict(lambda: [0] * 6)
+        value_program_totals: dict[str, list[int]] = defaultdict(lambda: [0] * 4)
         permutation_pair_commit_attempts = 0
         permutation_pair_commit_successes = 0
         correct_total = answer_total = exact_total = 0
@@ -1152,12 +2084,21 @@ class WorkspaceCapabilityDataset(BaseDataset):
                     )
                     workspace_forward_kwargs = {}
                     binding_entity_metadata = None
+                    key_value_metadata = None
                     if bool(getattr(model, "workspace_semantic_entity_addressing", False)):
                         transactional = bool(
                             getattr(model, "workspace_permutation_transactional", False)
                         )
                         binding_entity_metadata = self.workspace_entity_address_metadata(
-                            x, paired_swap_commits=transactional
+                            x,
+                            paired_swap_commits=transactional,
+                            attentional_item_memory=bool(
+                                getattr(model, "workspace_attentional_item_memory_enabled", False)
+                            ),
+                            attentional_cue_readout=bool(
+                                getattr(model, "workspace_attentional_cue_readout_enabled", False)
+                            ),
+                            episodes=group,
                         )
                         if transactional:
                             binding_entity_metadata.update(
@@ -1194,6 +2135,51 @@ class WorkspaceCapabilityDataset(BaseDataset):
                                     )
                                 }
                             )
+                        if bool(getattr(model, "workspace_key_value_readout_enabled", False)):
+                            operation_executor = bool(
+                                getattr(model, "workspace_operation_executor_enabled", False)
+                            )
+                            key_value_metadata = {
+                                key: value.to(device, non_blocking=True)
+                                if isinstance(value, torch.Tensor)
+                                and key != "workspace_operation_diagnostic_targets"
+                                else value
+                                for key, value in self.workspace_key_value_metadata(
+                                    x,
+                                    group,
+                                    include_operations=operation_executor,
+                                    include_operation_diagnostics=(
+                                        operation_diagnostics_enabled
+                                    ),
+                                    attentional_item_memory=bool(
+                                        getattr(
+                                            model,
+                                            "workspace_attentional_item_memory_enabled",
+                                            False,
+                                        )
+                                    ),
+                                ).items()
+                            }
+                            binding_entity_metadata.update(
+                                {
+                                    "key_value_entity_ids": key_value_metadata[
+                                        "key_value_entity_ids"
+                                    ],
+                                    "key_value_mask": key_value_metadata["key_value_mask"],
+                                    "key_value_steps": key_value_metadata["key_value_steps"],
+                                }
+                            )
+                            if operation_executor:
+                                binding_entity_metadata.update(
+                                    {
+                                        "operation_metadata": key_value_metadata[
+                                            "workspace_operation_metadata"
+                                        ],
+                                        "operation_steps": key_value_metadata[
+                                            "workspace_operation_steps"
+                                        ],
+                                    }
+                                )
                         workspace_forward_kwargs = {
                             key: value.to(device, non_blocking=True)
                             if isinstance(value, torch.Tensor)
@@ -1322,6 +2308,149 @@ class WorkspaceCapabilityDataset(BaseDataset):
                                         slots[left] == slots[right]
                                     )
                     logits = self._output_proj(output.transpose(0, 1).contiguous())
+                    if key_value_metadata is not None:
+                        key_value_predictions = workspace.pop_key_value_predictions()
+                        exact_comparison = bool(
+                            getattr(model, "workspace_exact_value_comparison_enabled", False)
+                        )
+                        exact_selection = bool(
+                            getattr(model, "workspace_exact_selection_enabled", False)
+                        )
+                        if exact_comparison or exact_selection:
+                            prediction_steps = {
+                                int(step): values for step, values in key_value_predictions
+                            }
+                            for row, step, operation, operand_count in key_value_metadata.get(
+                                "key_value_output_programs", ()
+                            ):
+                                values = prediction_steps.get(int(step))
+                                if values is None:
+                                    continue
+                                operand_count = int(operand_count)
+                                targets = key_value_metadata["key_value_targets"][
+                                    int(row), int(step), :operand_count
+                                ]
+                                predictions_for_row = values[int(row), :operand_count].argmax(
+                                    dim=-1
+                                )
+                                if operation in {"equal", "not_equal"} and exact_comparison:
+                                    if operand_count != 2 or not bool(
+                                        targets.ge(LOCATION_BASE).logical_and(
+                                            targets.lt(LOCATION_BASE + LOCATION_COUNT)
+                                        ).all()
+                                    ):
+                                        continue
+                                    predicted_values = values[
+                                        int(row), :2,
+                                        LOCATION_BASE : LOCATION_BASE + LOCATION_COUNT,
+                                    ].argmax(dim=-1) + LOCATION_BASE
+                                    predictions_for_row = predicted_values
+                                    counts = value_program_totals[str(operation)]
+                                    expected_equal = targets[0].eq(targets[1])
+                                    expected_true = (
+                                        expected_equal
+                                        if operation == "equal"
+                                        else ~expected_equal
+                                    )
+                                    predicted_true = (
+                                        predicted_values[0].eq(predicted_values[1])
+                                        if operation == "equal"
+                                        else predicted_values[0].ne(predicted_values[1])
+                                    )
+                                    program_correct = predicted_true.eq(expected_true)
+                                elif operation == "select" and exact_selection:
+                                    if operand_count != 4:
+                                        continue
+                                    counts = value_program_totals["select"]
+                                    expected_index = int(targets[0]) - SOURCE_BASE
+                                    if not 0 <= expected_index < 3:
+                                        continue
+                                    predicted_index = int(
+                                        values[
+                                            int(row), 0, SOURCE_BASE : SOURCE_BASE + 3
+                                        ].argmax()
+                                    )
+                                    predicted_output = int(
+                                        values[int(row), predicted_index + 1].argmax()
+                                    )
+                                    program_correct = predicted_output == int(
+                                        targets[expected_index + 1]
+                                    )
+                                else:
+                                    continue
+                                counts[0] += int((predictions_for_row == targets).sum())
+                                counts[1] += operand_count
+                                counts[2] += int(program_correct)
+                                counts[3] += 1
+                        logits = self.apply_workspace_key_value_readout_logits(
+                            logits,
+                            key_value_predictions,
+                            key_value_metadata,
+                            _mask,
+                            exact_value_comparison=exact_comparison,
+                            exact_selection=exact_selection,
+                        )
+                    if bool(getattr(model, "workspace_attentional_cue_readout_enabled", False)):
+                        logits = self.apply_workspace_attentional_cue_readout_logits(
+                            logits, workspace.pop_attentional_cue_predictions()
+                        )
+                    if operation_diagnostics_enabled and key_value_metadata is not None:
+                        operation_traces = workspace.pop_operation_diagnostics()
+                        diagnostic_targets = key_value_metadata[
+                            "workspace_operation_diagnostic_targets"
+                        ]
+                        for (
+                            operation_step,
+                            operation_codes,
+                            source0_predictions,
+                            source1_predictions,
+                            destination0_committed,
+                            destination1_committed,
+                            destination0_values,
+                            destination1_values,
+                        ) in operation_traces:
+                            step_codes = operation_codes.detach().cpu().tolist()
+                            source0 = source0_predictions.detach().cpu().tolist()
+                            source1 = source1_predictions.detach().cpu().tolist()
+                            commit0 = destination0_committed.detach().cpu().tolist()
+                            commit1 = destination1_committed.detach().cpu().tolist()
+                            value0 = destination0_values.detach().cpu().tolist()
+                            value1 = destination1_values.detach().cpu().tolist()
+                            expected = diagnostic_targets[:, operation_step].tolist()
+                            operand_kinds = (
+                                key_value_metadata["workspace_operation_metadata"][:, operation_step][
+                                    :, [3, 5]
+                                ]
+                                .detach()
+                                .cpu()
+                                .tolist()
+                            )
+                            for row, operation_code in enumerate(step_codes):
+                                operation_name = _WORKSPACE_OPERATION_NAMES.get(
+                                    int(operation_code)
+                                )
+                                if operation_name is None:
+                                    continue
+                                counts = operation_diagnostic_totals[operation_name]
+                                for prediction, target, operand_kind in zip(
+                                    (source0[row], source1[row]),
+                                    expected[row][:2],
+                                    operand_kinds[row],
+                                ):
+                                    if int(target) >= 0 and int(operand_kind) == 1:
+                                        counts[0] += int(int(prediction) == int(target))
+                                        counts[1] += 1
+                                for committed, prediction, target in zip(
+                                    (commit0[row], commit1[row]),
+                                    (value0[row], value1[row]),
+                                    expected[row][2:],
+                                ):
+                                    if int(target) >= 0:
+                                        counts[2] += int(bool(committed))
+                                        counts[3] += 1
+                                        if bool(committed):
+                                            counts[4] += int(int(prediction) == int(target))
+                                            counts[5] += 1
                     if bool(getattr(model, "workspace_permutation_transactional", False)):
                         query_predictions = workspace.pop_semantic_query_predictions()
                         logits = self.apply_workspace_permutation_query_logits(
@@ -1490,6 +2619,28 @@ class WorkspaceCapabilityDataset(BaseDataset):
                         n_correct = sum(int(a == b) for a, b in zip(pred, expected))
                         n_answers = len(expected)
                         exact = n_correct == n_answers
+                        progression_group = str(
+                            episode.metadata.get("progression_group", "all")
+                        )
+                        progression_counts = progression_totals[
+                            (episode.track, progression_group)
+                        ]
+                        progression_counts[0] += n_correct
+                        progression_counts[1] += n_answers
+                        progression_counts[2] += 1
+                        progression_counts[3] += int(exact)
+                        query_type = str(episode.metadata.get("query_type", "unknown"))
+                        query_counts = query_type_totals[(episode.track, query_type)]
+                        query_counts[0] += n_correct
+                        query_counts[1] += n_answers
+                        query_counts[2] += 1
+                        query_counts[3] += int(exact)
+                        if episode.track == "attentional_blink" and len(pred) >= 2:
+                            blink_counts = blink_t2_totals[query_type]
+                            blink_counts[0] += int(pred[0] == expected[0])
+                            blink_counts[1] += int(pred[1] == expected[1])
+                            blink_counts[2] += 1
+                            blink_counts[3] += int(exact)
                         if episode.track == "permutation":
                             query_counts = permutation_query_totals[
                                 str(episode.metadata.get("query_type", "unknown"))
@@ -1605,6 +2756,41 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 }
                 for track, counts in totals.items()
             },
+            "progression_groups": {
+                track: {
+                    group: {
+                        "accuracy": 100.0 * counts[0] / max(counts[1], 1),
+                        "exact_match": 100.0 * counts[3] / max(counts[2], 1),
+                        "episodes": int(counts[2]),
+                        "answers": int(counts[1]),
+                    }
+                    for (group_track, group), counts in sorted(progression_totals.items())
+                    if group_track == track
+                }
+                for track in sorted({key[0] for key in progression_totals})
+            },
+            "query_types": {
+                track: {
+                    query_type: {
+                        "accuracy": 100.0 * counts[0] / max(counts[1], 1),
+                        "exact_match": 100.0 * counts[3] / max(counts[2], 1),
+                        "episodes": int(counts[2]),
+                        "answers": int(counts[1]),
+                    }
+                    for (query_track, query_type), counts in sorted(query_type_totals.items())
+                    if query_track == track
+                }
+                for track in sorted({key[0] for key in query_type_totals})
+            },
+            "attentional_blink_by_lag_mask": {
+                query_type: {
+                    "t1_accuracy": 100.0 * counts[0] / max(counts[2], 1),
+                    "t2_accuracy": 100.0 * counts[1] / max(counts[2], 1),
+                    "episode_exact_match": 100.0 * counts[3] / max(counts[2], 1),
+                    "episodes": int(counts[2]),
+                }
+                for query_type, counts in sorted(blink_t2_totals.items())
+            },
         }
         if bool(getattr(model, "workspace_nth_farthest_exact_readout", False)):
             diagnostics["nth_farthest_workspace"] = {
@@ -1695,6 +2881,47 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 }
                 for split, counts in split_totals.items()
             }
+        if operation_diagnostics_enabled:
+            diagnostics["workspace_operation_diagnostics"] = {
+                "by_operation": {
+                    operation_name: {
+                        "source_read_accuracy": 100.0 * counts[0] / max(counts[1], 1),
+                        "source_reads_correct": counts[0],
+                        "source_reads_total": counts[1],
+                        "destination_commit_rate": 100.0 * counts[2] / max(counts[3], 1),
+                        "destination_commits": counts[2],
+                        "destination_attempts": counts[3],
+                        "committed_value_accuracy": 100.0 * counts[4] / max(counts[5], 1),
+                        "committed_values_correct": counts[4],
+                        "committed_values_total": counts[5],
+                    }
+                    for operation_name, counts in sorted(operation_diagnostic_totals.items())
+                },
+                "final_query_by_track": {
+                    track: {
+                        "answer_accuracy": diagnostics["tracks"][track]["accuracy"],
+                        "episode_exact_match": diagnostics["tracks"][track]["exact_match"],
+                        "episodes": diagnostics["tracks"][track]["episodes"],
+                        "answers": diagnostics["tracks"][track]["answers"],
+                    }
+                    for track in ("mixed_skill", "variable_binding")
+                    if track in diagnostics["tracks"]
+                },
+            }
+        if value_program_totals:
+            diagnostics["workspace_value_programs"] = {
+                "by_operation": {
+                    operation: {
+                        "operand_value_accuracy": 100.0 * counts[0] / max(counts[1], 1),
+                        "operand_values_correct": counts[0],
+                        "operand_values_total": counts[1],
+                        "output_accuracy": 100.0 * counts[2] / max(counts[3], 1),
+                        "outputs_correct": counts[2],
+                        "outputs_total": counts[3],
+                    }
+                    for operation, counts in sorted(value_program_totals.items())
+                }
+            }
         self.last_eval_diagnostics = diagnostics
         print(
             f"[workspace-capability/{self.task_track}] accuracy {accuracy:.2f}% | "
@@ -1744,6 +2971,26 @@ class WorkspaceCapabilityDataset(BaseDataset):
                     f"{100.0 * values['correct'] / max(values['episodes'], 1):.1f}% "
                     f"({values['correct']}/{values['episodes']})"
                 )
+        operation_metrics = diagnostics.get("workspace_operation_diagnostics")
+        if operation_metrics:
+            for operation_name, metrics in sorted(operation_metrics["by_operation"].items()):
+                print(
+                    f"  [workspace-operation/{operation_name}] "
+                    f"source read={metrics['source_read_accuracy']:.1f}% "
+                    f"({metrics['source_reads_correct']}/{metrics['source_reads_total']}) | "
+                    f"destination commit={metrics['destination_commit_rate']:.1f}% "
+                    f"({metrics['destination_commits']}/{metrics['destination_attempts']}) | "
+                    f"committed value={metrics['committed_value_accuracy']:.1f}% "
+                    f"({metrics['committed_values_correct']}/"
+                    f"{metrics['committed_values_total']})"
+                )
+            for track, metrics in sorted(operation_metrics["final_query_by_track"].items()):
+                print(
+                    f"  [workspace-operation/final-query/{track}] "
+                    f"answer={metrics['answer_accuracy']:.1f}% | "
+                    f"episode exact={metrics['episode_exact_match']:.1f}% "
+                    f"n={metrics['episodes']}"
+                )
         if binding_entity_mentions:
             print(
                 "  [workspace-binding/permutation] "
@@ -1762,11 +3009,35 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 f"(n={binding_metrics['write_mentions_with_routes']}) | "
                 f"episodes={binding_metrics['episodes']}"
             )
+        for operation, metrics in sorted(
+            diagnostics.get("workspace_value_programs", {}).get("by_operation", {}).items()
+        ):
+            print(
+                f"  [workspace-value-program/{operation}] "
+                f"operand accuracy={metrics['operand_value_accuracy']:.1f}% "
+                f"({metrics['operand_values_correct']}/{metrics['operand_values_total']}) | "
+                f"program output={metrics['output_accuracy']:.1f}% "
+                f"({metrics['outputs_correct']}/{metrics['outputs_total']})"
+            )
         for track, metrics in diagnostics["tracks"].items():
             print(
                 f"  [{track}] answer {metrics['accuracy']:.2f}% | "
                 f"exact {metrics['exact_match']:.2f}% | "
                 f"context={metrics['mean_context_tokens']:.1f} tokens | n={metrics['episodes']}"
+            )
+        for track, groups in diagnostics.get("progression_groups", {}).items():
+            for group, metrics in sorted(groups.items()):
+                print(
+                    f"    [{track}/{group}] exact={metrics['exact_match']:.1f}% "
+                    f"answer={metrics['accuracy']:.1f}% n={metrics['episodes']}"
+                )
+        for query_type, metrics in sorted(
+            diagnostics.get("attentional_blink_by_lag_mask", {}).items()
+        ):
+            print(
+                f"    [attentional_blink/{query_type}] T1={metrics['t1_accuracy']:.1f}% "
+                f"T2={metrics['t2_accuracy']:.1f}% exact="
+                f"{metrics['episode_exact_match']:.1f}% n={metrics['episodes']}"
             )
         for split, metrics in diagnostics.get("permutation_generalization", {}).items():
             print(
@@ -1782,6 +3053,10 @@ class WorkspaceCapabilityDataset(BaseDataset):
             self._make_episode(track, lesson_idx, rng)
             for track in (tracks[i % len(tracks)] for i in range(num_episodes))
         ]
+        return self._evaluate_episodes(model, device, episodes, **kwargs)
+
+    def _evaluate_paired_id(self, model, device, lesson_idx: int, **kwargs):
+        episodes = self._paired_id_episodes(lesson_idx)
         return self._evaluate_episodes(model, device, episodes, **kwargs)
 
     def evaluate_ood(self, model, device, num_episodes, rng, verbose_n=0, field_log=None):
@@ -1946,7 +3221,14 @@ class WorkspaceCapabilityDataset(BaseDataset):
                         getattr(model, "workspace_permutation_transactional", False)
                     )
                     entity_metadata = self.workspace_entity_address_metadata(
-                        x, paired_swap_commits=transactional
+                        x,
+                        paired_swap_commits=transactional,
+                        attentional_item_memory=bool(
+                            getattr(model, "workspace_attentional_item_memory_enabled", False)
+                        ),
+                        attentional_cue_readout=bool(
+                            getattr(model, "workspace_attentional_cue_readout_enabled", False)
+                        ),
                     )
                     if transactional:
                         entity_metadata.update(
@@ -2021,6 +3303,10 @@ class WorkspaceCapabilityDataset(BaseDataset):
                         logits = self.apply_workspace_permutation_query_logits(
                             logits, workspace.pop_semantic_query_predictions()
                         )
+                    if bool(getattr(model, "workspace_attentional_cue_readout_enabled", False)):
+                        logits = self.apply_workspace_attentional_cue_readout_logits(
+                            logits, workspace.pop_attentional_cue_predictions()
+                        )
                     predictions = logits.argmax(dim=-1)
                     workspace._initium_address_assignment_observer = None
                     workspace._initium_recurrent_state_observer = None
@@ -2037,6 +3323,10 @@ class WorkspaceCapabilityDataset(BaseDataset):
                     if transactional:
                         bypass_logits = self.apply_workspace_permutation_query_logits(
                             bypass_logits, workspace.pop_semantic_query_predictions()
+                        )
+                    if bool(getattr(model, "workspace_attentional_cue_readout_enabled", False)):
+                        bypass_logits = self.apply_workspace_attentional_cue_readout_logits(
+                            bypass_logits, workspace.pop_attentional_cue_predictions()
                         )
                     bypass_predictions = bypass_logits.argmax(dim=-1)
                     # fmt: off
@@ -2213,30 +3503,15 @@ class WorkspaceCapabilityDataset(BaseDataset):
         return self._evaluate_episodes(model, device, episodes, ablate_memory=True)[:2]
 
     def evaluate_id_ablated(self, model, device, curriculum, lesson_idx):
-        rng = random.Random(91_000 + int(lesson_idx))
-        tracks = self._tracks()
-        episodes = [
-            self._make_episode(track, lesson_idx, rng)
-            for track in (tracks[i % len(tracks)] for i in range(64))
-        ]
+        episodes = self._paired_id_episodes(lesson_idx)
         return self._evaluate_episodes(model, device, episodes, ablate_memory=True)[:2]
 
     def evaluate_workspace_ablated(self, model, device, curriculum, lesson_idx):
-        rng = random.Random(91_000 + int(lesson_idx))
-        tracks = self._tracks()
-        episodes = [
-            self._make_episode(track, lesson_idx, rng)
-            for track in (tracks[i % len(tracks)] for i in range(64))
-        ]
+        episodes = self._paired_id_episodes(lesson_idx)
         return self._evaluate_episodes(model, device, episodes, ablate_workspace=True)[:2]
 
     def evaluate_workspace_shuffled(self, model, device, curriculum, lesson_idx):
-        rng = random.Random(91_000 + int(lesson_idx))
-        tracks = self._tracks()
-        episodes = [
-            self._make_episode(track, lesson_idx, rng)
-            for track in (tracks[i % len(tracks)] for i in range(64))
-        ]
+        episodes = self._paired_id_episodes(lesson_idx)
         return self._evaluate_episodes(model, device, episodes, shuffle_workspace_readback=True)[:2]
 
     def evaluate_id_combiner_stage_ablated(

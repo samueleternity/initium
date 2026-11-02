@@ -1,4 +1,4 @@
-"""Multi-operation episodes whose final answer concatenates skill outputs."""
+"""Dependent lookup/arithmetic/copy/sort pipelines with hidden stage values."""
 
 from __future__ import annotations
 
@@ -20,52 +20,63 @@ from initium.data.workspace_capability.episode import (
 )
 from initium.data.workspace_capability.tracks._shared import common_metadata
 
-_SKILLS = ("lookup", "arithmetic", "copy", "sort")
+_SKILL_IDS = {"lookup": 0, "arithmetic": 1, "copy": 2, "sort": 3}
 
 
 def generate(difficulty: dict, rng: random.Random, *, ood: bool = False) -> TaskEpisode:
-    operation_count = min(max(2, int(difficulty["operations"])), 4)
-    keys = min(max(4, int(difficulty["keys"])), 10 if ood else 8)
+    operation_count = min(max(3, int(difficulty["operations"])), 8)
+    keys = min(max(4, int(difficulty["keys"])), 12 if ood else 10)
     table = {key: rng.randrange(SCALAR_COUNT) for key in range(keys)}
-    skills = list(_SKILLS)
-    rng.shuffle(skills)
-    skills = skills[:operation_count]
-    table_values = list(table.values())
-
     stream = [BOS]
     for key, value in table.items():
         stream.extend((EV_KV, entity_token(key), scalar_token(value), SEP))
 
-    outputs: list[int] = []
-    stage_ids = [ENTITY_COUNT - 4 + index for index in range(operation_count)]
-    for stage_id, skill in zip(stage_ids, skills):
+    outputs: list[tuple[int, ...]] = []
+    # Reserve two semantic addresses per stage so a sort operation can commit
+    # both ordered outputs without aliasing the next stage's result.
+    stage_ids = [ENTITY_COUNT - 16 + 2 * index for index in range(operation_count)]
+    skills = ["lookup"] + [
+        ("arithmetic", "copy", "sort")[(index - 1) % 3]
+        for index in range(1, operation_count)
+    ]
+    for index, (stage_id, skill) in enumerate(zip(stage_ids, skills)):
+        previous = outputs[index - 1][0] if index else None
+        previous_stage = stage_ids[index - 1] if index else None
         if skill == "lookup":
+            # The initial lookup seeds the chain. Later lookup stages are not
+            # used so every downstream stage can depend on a prior result.
             key = rng.randrange(keys)
             result = (table[key],)
             args = (entity_token(key),)
-            skill_id = 0
         elif skill == "arithmetic":
-            left, right = rng.randrange(SCALAR_COUNT), rng.randrange(SCALAR_COUNT)
-            result = ((left + right) % SCALAR_COUNT,)
-            args = (scalar_token(left), scalar_token(right))
-            skill_id = 1
+            right = rng.randrange(SCALAR_COUNT)
+            result = ((int(previous) + right) % SCALAR_COUNT,)
+            args = (entity_token(int(previous_stage)), scalar_token(right))
         elif skill == "copy":
-            value = rng.choice(table_values)
-            result = (value,)
-            args = (scalar_token(value),)
-            skill_id = 2
+            result = (int(previous),)
+            args = (entity_token(int(previous_stage)),)
         else:
-            left, right = rng.sample(range(SCALAR_COUNT), 2)
-            result = tuple(sorted((left, right)))
-            args = (scalar_token(left), scalar_token(right))
-            skill_id = 3
-        # Stage IDs are the semantic workspace addresses. The skill token
-        # selects the operation, and the output itself is absent from input.
-        stream.extend((EV_VECTOR, entity_token(stage_id), source_token(skill_id), *args, SEP))
-        outputs.extend(scalar_token(value) for value in result)
+            right = rng.randrange(SCALAR_COUNT)
+            result = tuple(sorted((int(previous), right)))
+            args = (entity_token(int(previous_stage)), scalar_token(right))
+        stream.extend(
+            (EV_VECTOR, entity_token(stage_id), source_token(_SKILL_IDS[skill]), *args, SEP)
+        )
+        outputs.append(result)
 
     stream.extend((QUERY, *(entity_token(stage_id) for stage_id in stage_ids), SEP))
-    answer = (*outputs, EOS)
+    answer = tuple(scalar_token(value) for output in outputs for value in output) + (EOS,)
+    output_keys: list[int] = []
+    operation_output_keys: list[int] = []
+    for stage_id, skill, stage_output in zip(stage_ids, skills, outputs):
+        if skill == "sort":
+            output_keys.extend((-1, -1))
+            operation_output_keys.extend((stage_id, stage_id + 1))
+        else:
+            output_keys.append(stage_id)
+            operation_output_keys.append(stage_id)
+    output_keys.append(-1)
+    operation_output_keys.append(-1)
     return TaskEpisode(
         "mixed_skill",
         tuple(stream),
@@ -73,14 +84,19 @@ def generate(difficulty: dict, rng: random.Random, *, ood: bool = False) -> Task
         common_metadata(
             track="mixed_skill",
             sequence_length=len(stream),
-            query_type=f"ops{operation_count}_" + ";".join(skills),
+            query_type=f"dependent_ops{operation_count}_" + ";".join(skills),
             relevant_updates=operation_count,
             distractor_count=keys,
-            source_count=len(_SKILLS),
-            candidate_baseline_pct=100.0 / (SCALAR_COUNT ** max(1, len(outputs))),
+            source_count=len(_SKILL_IDS),
+            candidate_baseline_pct=100.0 / (SCALAR_COUNT ** max(1, len(answer) - 1)),
             operation_count=operation_count,
             skill_sequence=tuple(skills),
-            output_count=len(outputs),
+            output_count=len(answer) - 1,
+            dependency_depth=max(0, operation_count - 1),
+            outputs_are_not_in_input=True,
             ood=bool(ood),
+            progression_group=f"dependent_ops_{operation_count}",
+            workspace_output_keys=tuple(output_keys),
+            workspace_operation_output_keys=tuple(operation_output_keys),
         ),
     )

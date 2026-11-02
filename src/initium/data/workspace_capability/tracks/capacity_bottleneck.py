@@ -24,7 +24,7 @@ from initium.data.workspace_capability.tracks._shared import common_metadata
 
 
 def _change_detection(difficulty: dict, rng: random.Random, *, ood: bool) -> TaskEpisode:
-    k = min(max(1, int(difficulty["set_size"])), 9 if ood else 8)
+    k = min(max(2, int(difficulty["set_size"])), 9 if ood else 8)
     items = list(range(k))
     values = [rng.randrange(LOCATION_COUNT) for _ in items]
     probe = rng.randrange(k)
@@ -35,8 +35,18 @@ def _change_detection(difficulty: dict, rng: random.Random, *, ood: bool) -> Tas
     stream = [BOS]
     for item, value in zip(items, values):
         stream.extend((EV_INIT, entity_token(item), location_token(value), SEP))
-    for item, value in zip(items, current):
-        stream.extend((EV_UPDATE, entity_token(item), location_token(value), SEP))
+    delay_events = min(max(0, int(difficulty.get("delay_events", 0))), 12)
+    distractor_items = [item for item in items if item != probe]
+    for _ in range(delay_events):
+        distractor_item = rng.choice(distractor_items)
+        distractor_value = (
+            current[distractor_item] + rng.randrange(1, LOCATION_COUNT)
+        ) % LOCATION_COUNT
+        current[distractor_item] = distractor_value
+        stream.extend(
+            (EV_UPDATE, entity_token(distractor_item), location_token(distractor_value), SEP)
+        )
+    stream.extend((EV_UPDATE, entity_token(probe), location_token(current[probe]), SEP))
     stream.extend((QUERY, entity_token(probe), SEP))
     answer = (BOOL_TRUE if changed else BOOL_FALSE, EOS)
     return TaskEpisode(
@@ -46,12 +56,26 @@ def _change_detection(difficulty: dict, rng: random.Random, *, ood: bool) -> Tas
         common_metadata(
             track="capacity_bottleneck",
             sequence_length=len(stream),
-            query_type=f"change_detection_k{k}",
+            query_type=f"change_detection_k{k}_delay{delay_events}",
             relevant_updates=int(changed),
+            distractor_count=delay_events,
+            progression_group="change_detection",
             candidate_baseline_pct=50.0,
             set_size=k,
             probe_item=probe,
             changed=changed,
+            workspace_query_reads=(
+                (len(stream) - 1, 32 + probe, location_token(values[probe])),
+                (len(stream) - 1, probe, location_token(current[probe])),
+            ),
+            workspace_output_programs=(
+                (
+                    0,
+                    "not_equal",
+                    (32 + probe, probe),
+                    (location_token(values[probe]), location_token(current[probe])),
+                ),
+            ),
             ood=bool(ood),
             symbolic=True,
         ),
@@ -104,13 +128,15 @@ def _tracking(difficulty: dict, rng: random.Random, *, ood: bool) -> TaskEpisode
             probe_item=probe,
             ood=bool(ood),
             symbolic_identity_tokens=True,
+            progression_group="multiple_object_tracking",
+            workspace_output_keys=(probe, -1),
         ),
     )
 
 
 def _n_back(difficulty: dict, rng: random.Random, *, ood: bool) -> TaskEpisode:
     n = min(max(1, int(difficulty["n_back"])), 5 if ood else 4)
-    length = min(16, n + 3)
+    length = min(16, max(n + 3, int(difficulty.get("stream_length", n + 3))))
     symbols = [rng.randrange(LOCATION_COUNT) for _ in range(length)]
     is_match = bool(rng.getrandbits(1))
     if is_match:
@@ -120,6 +146,10 @@ def _n_back(difficulty: dict, rng: random.Random, *, ood: bool) -> TaskEpisode:
     stream = [BOS, EV_INIT, count_token(n), SEP]
     stream.extend(location_token(value) for value in symbols)
     stream.extend((QUERY, SEP))
+    workspace_query_reads = (
+        (len(stream) - 1, 60, location_token(symbols[-1 - n])),
+        (len(stream) - 1, 61, location_token(symbols[-1])),
+    )
     return TaskEpisode(
         "capacity_bottleneck",
         tuple(stream),
@@ -127,11 +157,21 @@ def _n_back(difficulty: dict, rng: random.Random, *, ood: bool) -> TaskEpisode:
         common_metadata(
             track="capacity_bottleneck",
             sequence_length=len(stream),
-            query_type=f"n_back_n{n}",
+            query_type=f"n_back_n{n}_length{length}",
             relevant_updates=int(is_match),
+            progression_group="n_back",
             candidate_baseline_pct=50.0,
             n_back=n,
             stream_length=length,
+            workspace_query_reads=workspace_query_reads,
+            workspace_output_programs=(
+                (
+                    0,
+                    "equal",
+                    (60, 61),
+                    (location_token(symbols[-1 - n]), location_token(symbols[-1])),
+                ),
+            ),
             ood=bool(ood),
         ),
     )

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import random
 from collections import Counter, defaultdict
 from typing import Any
@@ -78,6 +79,13 @@ from initium.data.workspace_capability.tracks import (
     trace_conditioning,
     variable_binding,
 )
+from initium.data.workspace_capability.gnw_metrics import (
+    binary_brier,
+    expected_calibration_error,
+    psychometric_logistic,
+    type2_auc,
+    wilson_interval,
+)
 
 _GENERATORS = {
     "permutation": permutation.generate,
@@ -133,6 +141,12 @@ _FUNCTIONAL_FEATURE_ABLATIONS = (
     ("exact_value_comparison", "workspace_exact_value_comparison_enabled"),
     ("exact_selection", "workspace_exact_selection_enabled"),
 )
+_WORKSPACE_MODULE_FEATURE_ABLATIONS = {
+    "attentional_cue_readout": "attentional_cue_readout_enabled",
+    "nth_farthest_exact_readout": "nth_farthest_exact_readout",
+    "retrieval_exact_readout": "retrieval_exact_readout",
+    "operation_executor": "operation_executor",
+}
 KEY_VALUE_OPERAND_CAPACITY = 16
 _EVAL_KV_ATTENTION_BUDGET_BYTES = 512 * 1024 * 1024
 _SDPA_MATH_WORKSPACE_MULTIPLIER = 2
@@ -403,6 +417,11 @@ class WorkspaceCapabilityDataset(BaseDataset):
             "or one-hot vectors shaped (batch,time,vocabulary)"
         )
 
+    @classmethod
+    def workspace_input_token_rows(cls, input_vectors: torch.Tensor) -> list[list[int]]:
+        """Decode the batch once for CPU-side causal metadata construction."""
+        return cls._input_token_ids(input_vectors).detach().cpu().tolist()
+
     @staticmethod
     def _evaluation_groups(episodes, max_batch_size, *, kv_attention_heads=0):
         """Microbatch long KV evaluation streams within a conservative budget.
@@ -451,6 +470,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
         attentional_cue_readout: bool = False,
         masked_prime_trace: bool = False,
         episodes: list[TaskEpisode] | None = None,
+        token_rows: list[list[int]] | None = None,
     ) -> dict[str, Any]:
         """Build causal entity keys and event-boundary writes for each task track.
 
@@ -461,7 +481,11 @@ class WorkspaceCapabilityDataset(BaseDataset):
         complete input-event boundary, after the event payload is visible.
         Query entity tokens never write.
         """
-        token_ids = self._input_token_ids(input_vectors).detach().cpu().tolist()
+        token_ids = (
+            token_rows
+            if token_rows is not None
+            else self._input_token_ids(input_vectors).detach().cpu().tolist()
+        )
         examples = self.last_batch_examples if episodes is None else episodes
         entity_ids = torch.full(
             input_vectors.shape[:2], -1, dtype=torch.long, device=input_vectors.device
@@ -1355,6 +1379,64 @@ class WorkspaceCapabilityDataset(BaseDataset):
             index = end + 1
         return tuple(records)
 
+    @staticmethod
+    def _rule_feedback_targets(episode: TaskEpisode, tokens: list[int]) -> tuple[int, ...]:
+        """Infer a current rule from visible cues and noisy choice feedback only."""
+        import math
+
+        log_scores = [0.0, 0.0, 0.0]
+        feedback_targets: list[int] = []
+        index = 0
+        while index < len(episode.inputs):
+            event = int(tokens[index])
+            end = index + 1
+            while end < len(episode.inputs) and int(tokens[end]) != SEP:
+                end += 1
+            fields = [int(value) for value in tokens[index + 1 : end]]
+            if event == EV_UPDATE:
+                cue = next(
+                    (
+                        value - SOURCE_BASE
+                        for value in fields
+                        if SOURCE_BASE <= value < SOURCE_BASE + 3
+                    ),
+                    None,
+                )
+                if cue is not None:
+                    # A visible cue is an explicit task-set update. Give it a
+                    # finite prior so subsequent feedback can still correct it.
+                    log_scores = [-3.0, -3.0, -3.0]
+                    log_scores[cue] = 0.0
+            elif event == EV_ASSERT:
+                choice = next(
+                    (
+                        value - SOURCE_BASE
+                        for value in fields
+                        if SOURCE_BASE <= value < SOURCE_BASE + 3
+                    ),
+                    None,
+                )
+                feedback = next(
+                    (value == BOOL_TRUE for value in fields if value in (BOOL_FALSE, BOOL_TRUE)),
+                    None,
+                )
+                if choice is not None and feedback is not None:
+                    # The task's feedback noise is variable and not provided to
+                    # the updater; a conservative fixed likelihood prevents a
+                    # single noisy observation from dominating. Exponential
+                    # decay lets later evidence recover after unannounced shifts.
+                    log_scores = [0.72 * value for value in log_scores]
+                    for hypothesis in range(3):
+                        predicts_success = hypothesis == choice
+                        log_scores[hypothesis] += math.log(
+                            0.8 if feedback == predicts_success else 0.2
+                        )
+                    maximum = max(log_scores)
+                    winners = [i for i, value in enumerate(log_scores) if value == maximum]
+                    feedback_targets.append(winners[0])
+            index = end + 1
+        return tuple(feedback_targets)
+
     def workspace_key_value_metadata(
         self,
         input_vectors: torch.Tensor,
@@ -1362,9 +1444,12 @@ class WorkspaceCapabilityDataset(BaseDataset):
         *,
         include_operations: bool = False,
         include_operation_diagnostics: bool = False,
+        rule_feedback_update: bool = False,
         attentional_item_memory: bool = False,
         no_report_confidence_readout: bool = False,
         masked_prime_trace: bool = False,
+        entity_metadata: dict[str, Any] | None = None,
+        token_rows: list[list[int]] | None = None,
     ) -> dict[str, Any]:
         """Pack sparse semantic value reads for causal updates and answer queries.
 
@@ -1381,13 +1466,18 @@ class WorkspaceCapabilityDataset(BaseDataset):
         operand_capacity = (
             KEY_VALUE_OPERAND_CAPACITY if no_report_confidence_readout else 4
         )
-        entity_meta = self.workspace_entity_address_metadata(
+        entity_meta = entity_metadata or self.workspace_entity_address_metadata(
             input_vectors,
             episodes=examples,
             attentional_item_memory=attentional_item_memory,
             masked_prime_trace=masked_prime_trace,
+            token_rows=token_rows,
         )
-        token_rows = self._input_token_ids(input_vectors).detach().cpu().tolist()
+        token_rows = (
+            token_rows
+            if token_rows is not None
+            else self._input_token_ids(input_vectors).detach().cpu().tolist()
+        )
         entity_rows = entity_meta["entity_ids"].detach().cpu().tolist()
         write_rows = entity_meta["entity_write_mask"].detach().cpu().tolist()
         key_ids = torch.full((batch, time, operand_capacity), -1, dtype=torch.long)
@@ -1469,6 +1559,11 @@ class WorkspaceCapabilityDataset(BaseDataset):
             payload = -100
             source_payload = -1
             rule_trial = 0
+            rule_feedback_targets = (
+                self._rule_feedback_targets(episode, tokens)
+                if rule_feedback_update and episode.track == "rule_switching"
+                else ()
+            )
             if attentional_item_memory and episode.track == "attentional_blink":
                 for frame_step, frame_id, color_token, shape_token, value_token in (
                     self._attentional_item_frame_records(tokens)
@@ -1491,9 +1586,15 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 ):
                     active_event, payload, source_payload = token, -100, -1
                     if episode.track == "rule_switching" and token == EV_ASSERT:
-                        rules = tuple(episode.metadata.get("trial_rules", ()))
-                        if rule_trial < len(rules):
-                            source_payload = SOURCE_BASE + int(rules[rule_trial])
+                        if rule_feedback_update:
+                            if rule_trial < len(rule_feedback_targets):
+                                source_payload = SOURCE_BASE + int(
+                                    rule_feedback_targets[rule_trial]
+                                )
+                        else:
+                            rules = tuple(episode.metadata.get("trial_rules", ()))
+                            if rule_trial < len(rules):
+                                source_payload = SOURCE_BASE + int(rules[rule_trial])
                         rule_trial += 1
                 elif (
                     include_operations
@@ -1623,6 +1724,19 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 if not answer_keys:
                     continue
                 expected_values = tuple(int(value) for value in expected)
+                if (
+                    rule_feedback_update
+                    and episode.track == "rule_switching"
+                    and operation == "select"
+                    and rule_feedback_targets
+                ):
+                    # The selector's rule operand must follow the feedback-only
+                    # tracker too; otherwise the final query would reintroduce
+                    # the hidden trial_rules label as auxiliary supervision.
+                    expected_values = (
+                        SOURCE_BASE + int(rule_feedback_targets[-1]),
+                        *expected_values[1:],
+                    )
                 if (
                     len(answer_keys) != len(expected_values)
                     or len(answer_keys) > operand_capacity
@@ -2179,6 +2293,8 @@ class WorkspaceCapabilityDataset(BaseDataset):
         workspace = getattr(model, "workspace", None)
         feature_ablation_attribute = None
         prior_feature_ablation_value = None
+        module_feature_ablation_attribute = None
+        prior_module_feature_ablation_value = None
         operation_diagnostics_enabled = bool(
             getattr(model, "workspace_operation_diagnostics_enabled", False)
         )
@@ -2218,6 +2334,14 @@ class WorkspaceCapabilityDataset(BaseDataset):
             feature_ablation_attribute = feature_attribute
             prior_feature_ablation_value = getattr(model, feature_attribute)
             setattr(model, feature_attribute, False)
+            module_feature_ablation_attribute = _WORKSPACE_MODULE_FEATURE_ABLATIONS.get(
+                str(ablate_workspace_feature)
+            )
+            if module_feature_ablation_attribute is not None and workspace is not None:
+                prior_module_feature_ablation_value = getattr(
+                    workspace, module_feature_ablation_attribute
+                )
+                setattr(workspace, module_feature_ablation_attribute, False)
         totals: dict[str, list[int]] = defaultdict(lambda: [0, 0, 0, 0])
         progression_totals: dict[tuple[str, str], list[int]] = defaultdict(
             lambda: [0, 0, 0, 0]
@@ -2229,6 +2353,11 @@ class WorkspaceCapabilityDataset(BaseDataset):
             lambda: [0, 0, 0, 0, 0, 0]
         )
         ignition_access_totals: dict[int, list[int]] = defaultdict(lambda: [0, 0, 0, 0])
+        no_report_confidence_scores: list[float] = []
+        no_report_confidence_correct: list[int] = []
+        masked_prime_condition_totals: dict[tuple[str, str], list[int]] = defaultdict(
+            lambda: [0, 0, 0, 0, 0]
+        )
         blink_t2_totals: dict[str, list[int]] = defaultdict(lambda: [0, 0, 0, 0])
         split_totals: dict[str, list[float]] = defaultdict(lambda: [0.0] * 7)
         metadata_totals: dict[str, list[float]] = defaultdict(lambda: [0.0] * 8)
@@ -2256,6 +2385,13 @@ class WorkspaceCapabilityDataset(BaseDataset):
             "readout_by_query_type": {},
         }
         operation_diagnostic_totals: dict[str, list[int]] = defaultdict(lambda: [0] * 6)
+        variable_binding_stage_totals: dict[tuple[str, str], list[int]] = defaultdict(
+            lambda: [0] * 6
+        )
+        variable_binding_query_read_correct = 0
+        variable_binding_query_read_count = 0
+        rule_feedback_tracker_correct = 0
+        rule_feedback_tracker_count = 0
         value_program_totals: dict[str, list[int]] = defaultdict(lambda: [0] * 4)
         masked_prime_trace_reads: dict[str, list[int]] = defaultdict(lambda: [0, 0])
         permutation_pair_commit_attempts = 0
@@ -2288,6 +2424,11 @@ class WorkspaceCapabilityDataset(BaseDataset):
                         group,
                         token_ids_only=bool(getattr(model, "workspace_token_id_input", False)),
                     )
+                    token_rows = (
+                        self.workspace_input_token_rows(x)
+                        if bool(getattr(model, "workspace_semantic_entity_addressing", False))
+                        else None
+                    )
                     workspace_forward_kwargs = {}
                     binding_entity_metadata = None
                     key_value_metadata = None
@@ -2308,6 +2449,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
                                 getattr(model, "workspace_masked_prime_trace_enabled", False)
                             ),
                             episodes=group,
+                            token_rows=token_rows,
                         )
                         if transactional:
                             binding_entity_metadata.update(
@@ -2360,6 +2502,13 @@ class WorkspaceCapabilityDataset(BaseDataset):
                                     include_operation_diagnostics=(
                                         operation_diagnostics_enabled
                                     ),
+                                    rule_feedback_update=bool(
+                                        getattr(
+                                            model,
+                                            "workspace_rule_feedback_update_enabled",
+                                            False,
+                                        )
+                                    ),
                                     attentional_item_memory=bool(
                                         getattr(
                                             model,
@@ -2377,6 +2526,8 @@ class WorkspaceCapabilityDataset(BaseDataset):
                                     masked_prime_trace=bool(
                                         getattr(model, "workspace_masked_prime_trace_enabled", False)
                                     ),
+                                    entity_metadata=binding_entity_metadata,
+                                    token_rows=token_rows,
                                 ).items()
                             }
                             binding_entity_metadata.update(
@@ -2536,6 +2687,18 @@ class WorkspaceCapabilityDataset(BaseDataset):
                             masks_by_step = key_value_metadata["key_value_mask"]
                             for read_step, read_logits in key_value_predictions:
                                 for row, episode in enumerate(group):
+                                    if (
+                                        episode.track == "variable_binding"
+                                        and int(read_step) == len(episode.inputs)
+                                        and bool(key_value_metadata["key_value_mask"][row, read_step, 0])
+                                    ):
+                                        target_value = int(
+                                            key_value_metadata["key_value_targets"][row, read_step, 0]
+                                        )
+                                        variable_binding_query_read_correct += int(
+                                            int(read_logits[row, 0].argmax().item()) == target_value
+                                        )
+                                        variable_binding_query_read_count += 1
                                     if episode.track != "masked_priming":
                                         continue
                                     prime_query_step = len(episode.inputs) - 3
@@ -2712,6 +2875,16 @@ class WorkspaceCapabilityDataset(BaseDataset):
                                 )
                                 if operation_name is None:
                                     continue
+                                episode = group[row]
+                                variable_binding_counts = None
+                                if episode.track == "variable_binding":
+                                    assignment_count = int(
+                                        episode.metadata.get("assignment_count", 0)
+                                    )
+                                    complexity = "long" if assignment_count >= 12 else "short"
+                                    variable_binding_counts = variable_binding_stage_totals[
+                                        (f"assignments_{complexity}", operation_name)
+                                    ]
                                 counts = operation_diagnostic_totals[operation_name]
                                 for prediction, target, operand_kind in zip(
                                     (source0[row], source1[row]),
@@ -2719,8 +2892,12 @@ class WorkspaceCapabilityDataset(BaseDataset):
                                     operand_kinds[row],
                                 ):
                                     if int(target) >= 0 and int(operand_kind) == 1:
-                                        counts[0] += int(int(prediction) == int(target))
+                                        correct_read = int(int(prediction) == int(target))
+                                        counts[0] += correct_read
                                         counts[1] += 1
+                                        if variable_binding_counts is not None:
+                                            variable_binding_counts[0] += correct_read
+                                            variable_binding_counts[1] += 1
                                 for committed, prediction, target in zip(
                                     (commit0[row], commit1[row]),
                                     (value0[row], value1[row]),
@@ -2729,9 +2906,16 @@ class WorkspaceCapabilityDataset(BaseDataset):
                                     if int(target) >= 0:
                                         counts[2] += int(bool(committed))
                                         counts[3] += 1
+                                        if variable_binding_counts is not None:
+                                            variable_binding_counts[2] += int(bool(committed))
+                                            variable_binding_counts[3] += 1
                                         if bool(committed):
-                                            counts[4] += int(int(prediction) == int(target))
+                                            correct_output = int(int(prediction) == int(target))
+                                            counts[4] += correct_output
                                             counts[5] += 1
+                                            if variable_binding_counts is not None:
+                                                variable_binding_counts[4] += correct_output
+                                                variable_binding_counts[5] += 1
                     if bool(getattr(model, "workspace_permutation_transactional", False)):
                         query_predictions = workspace.pop_semantic_query_predictions()
                         logits = self.apply_workspace_permutation_query_logits(
@@ -2903,6 +3087,21 @@ class WorkspaceCapabilityDataset(BaseDataset):
                         progression_group = str(
                             episode.metadata.get("progression_group", "all")
                         )
+                        if (
+                            episode.track == "rule_switching"
+                            and bool(
+                                getattr(model, "workspace_rule_feedback_update_enabled", False)
+                            )
+                        ):
+                            tokens = token_rows[local_idx]
+                            inferred_rules = self._rule_feedback_targets(episode, tokens)
+                            true_rules = tuple(episode.metadata.get("trial_rules", ()))
+                            matched = min(len(inferred_rules), len(true_rules))
+                            rule_feedback_tracker_correct += sum(
+                                int(inferred_rules[index] == int(true_rules[index]))
+                                for index in range(matched)
+                            )
+                            rule_feedback_tracker_count += matched
                         progression_counts = progression_totals[
                             (episode.track, progression_group)
                         ]
@@ -2944,6 +3143,17 @@ class WorkspaceCapabilityDataset(BaseDataset):
                             process[3] += 1
                             reported = bool(episode.metadata["explicit_report"])
                             if reported:
+                                confidence_logits = logits[
+                                    local_idx, start + 1,
+                                    SCALAR_BASE : SCALAR_BASE + 4,
+                                ].float().softmax(dim=-1)
+                                confidence_score = float(
+                                    (confidence_logits * confidence_logits.new_tensor(
+                                        (0.125, 0.375, 0.625, 0.875)
+                                    )).sum().item()
+                                )
+                                no_report_confidence_scores.append(confidence_score)
+                                no_report_confidence_correct.append(latent_correct)
                                 process[4] += int(
                                     len(pred) > 1
                                     and pred[1]
@@ -2980,6 +3190,20 @@ class WorkspaceCapabilityDataset(BaseDataset):
                                 predicted_response == int(episode.metadata["latent_target"])
                             )
                             process[5] += 1
+                            condition = (
+                                "masked" if bool(episode.metadata["mask_condition"]) else "visible",
+                                "congruent" if bool(episode.metadata["prime_congruent"]) else "incongruent",
+                            )
+                            condition_counts = masked_prime_condition_totals[condition]
+                            condition_counts[0] += int(predicted_response == response)
+                            condition_counts[1] += int(
+                                prime != response and predicted_response == prime
+                            )
+                            condition_counts[2] += int(prime != response)
+                            condition_counts[3] += int(
+                                predicted_response == int(episode.metadata["latent_target"])
+                            )
+                            condition_counts[4] += 1
                         if episode.track == "permutation":
                             query_counts = permutation_query_totals[
                                 str(episode.metadata.get("query_type", "unknown"))
@@ -3037,6 +3261,12 @@ class WorkspaceCapabilityDataset(BaseDataset):
                     model,
                     feature_ablation_attribute,
                     prior_feature_ablation_value,
+                )
+            if module_feature_ablation_attribute is not None and workspace is not None:
+                setattr(
+                    workspace,
+                    module_feature_ablation_attribute,
+                    prior_module_feature_ablation_value,
                 )
             model.train(was_training)
 
@@ -3141,23 +3371,95 @@ class WorkspaceCapabilityDataset(BaseDataset):
             signatures = {}
             for (track, condition), counts in sorted(gnw_process_totals.items()):
                 if track == "no_report_confidence":
+                    lower, upper = wilson_interval(counts[0], counts[1])
                     metrics = {
                         "evidence_action_accuracy": 100.0 * counts[0] / max(counts[1], 1),
+                        "evidence_action_accuracy_wilson95_pct": [100.0 * lower, 100.0 * upper],
                         "latent_truth_alignment": 100.0 * counts[2] / max(counts[3], 1),
                         "reported_confidence_bin_accuracy": 100.0 * counts[4] / max(counts[5], 1),
                         "episodes": counts[1],
                         "reported_episodes": counts[5],
+                        "small_sample_warning": counts[1] < 20,
                     }
                 else:
+                    lower, upper = wilson_interval(counts[0], counts[1])
                     metrics = {
                         "percept_response_accuracy": 100.0 * counts[0] / max(counts[1], 1),
+                        "percept_response_accuracy_wilson95_pct": [100.0 * lower, 100.0 * upper],
                         "prime_intrusion_rate_on_conflict": 100.0 * counts[2] / max(counts[3], 1),
                         "latent_target_alignment": 100.0 * counts[4] / max(counts[5], 1),
                         "episodes": counts[1],
                         "conflict_episodes": counts[3],
+                        "small_sample_warning": counts[1] < 20 or counts[3] < 20,
                     }
                 signatures.setdefault(track, {})[condition] = metrics
             diagnostics["gnw_process_signatures"] = signatures
+            if no_report_confidence_scores:
+                diagnostics["gnw_no_report_confidence_calibration"] = {
+                    "n_reported": len(no_report_confidence_scores),
+                    "brier_score": binary_brier(
+                        no_report_confidence_scores, no_report_confidence_correct
+                    ),
+                    "ece_10_bins": expected_calibration_error(
+                        no_report_confidence_scores, no_report_confidence_correct, bins=10
+                    ),
+                    "type2_roc_auc": type2_auc(
+                        no_report_confidence_scores, no_report_confidence_correct
+                    ),
+                    "confidence_score_definition": "expected normalized confidence-bin probability (bin centers)",
+                    "small_sample_warning": len(no_report_confidence_scores) < 20,
+                }
+            if masked_prime_condition_totals:
+                conditions = {}
+                for (visibility, congruency), counts in sorted(masked_prime_condition_totals.items()):
+                    low, high = wilson_interval(counts[0], counts[4])
+                    intrusion_low, intrusion_high = wilson_interval(counts[1], counts[2])
+                    conditions[f"{visibility}_{congruency}"] = {
+                        "target_response_accuracy_pct": 100.0 * counts[0] / max(counts[4], 1),
+                        "target_response_accuracy_wilson95_pct": [100.0 * low, 100.0 * high],
+                        "prime_intrusion_on_conflict_pct": 100.0 * counts[1] / max(counts[2], 1),
+                        "prime_intrusion_wilson95_pct": [
+                            100.0 * intrusion_low, 100.0 * intrusion_high
+                        ],
+                        "conflict_episodes": counts[2],
+                        "latent_target_alignment_pct": 100.0 * counts[3] / max(counts[4], 1),
+                        "episodes": counts[4],
+                        "small_sample_warning": counts[4] < 20 or counts[2] < 20,
+                    }
+                prime_consistency = {
+                    (visibility, congruency): counts[1] / max(counts[2], 1)
+                    for (visibility, congruency), counts in masked_prime_condition_totals.items()
+                }
+                interaction = math.nan
+                interaction_ci = [math.nan, math.nan]
+                required = (
+                    ("visible", "incongruent"), ("visible", "congruent"),
+                    ("masked", "incongruent"), ("masked", "congruent"),
+                )
+                if all(key in prime_consistency for key in required):
+                    interaction = (
+                        prime_consistency[("visible", "incongruent")]
+                        - prime_consistency[("visible", "congruent")]
+                        - prime_consistency[("masked", "incongruent")]
+                        + prime_consistency[("masked", "congruent")]
+                    )
+                    interaction_variance = sum(
+                        rate * (1.0 - rate)
+                        / max(masked_prime_condition_totals[key][2], 1)
+                        for key, rate in prime_consistency.items()
+                        if key in required
+                    )
+                    interaction_se = math.sqrt(max(interaction_variance, 0.0))
+                    interaction_ci = [
+                        interaction - 1.959963984540054 * interaction_se,
+                        interaction + 1.959963984540054 * interaction_se,
+                    ]
+                diagnostics["gnw_masked_priming_conditions"] = {
+                    "conditions": conditions,
+                    "visibility_by_congruency_interaction_prime_intrusion": interaction,
+                    "interaction_wald95": interaction_ci,
+                    "interaction_definition": "(visible incongruent - visible congruent) - (masked incongruent - masked congruent), using prime intrusions among target-conflict trials",
+                }
             diagnostics["gnw_process_context"] = {
                 "workspace_enabled": bool(getattr(model, "workspace_enabled", False)),
                 "workspace_readback_bypassed": bool(ablate_workspace),
@@ -3181,12 +3483,23 @@ class WorkspaceCapabilityDataset(BaseDataset):
             diagnostics["gnw_ignition_access_curve"] = {
                 str(strength): {
                     "predicted_access_rate": 100.0 * counts[0] / max(counts[3], 1),
+                    "predicted_access_wilson95_pct": [
+                        100.0 * wilson_interval(counts[0], counts[3])[0],
+                        100.0 * wilson_interval(counts[0], counts[3])[1],
+                    ],
                     "target_report_rate": 100.0 * counts[1] / max(counts[3], 1),
                     "response_accuracy": 100.0 * counts[2] / max(counts[3], 1),
                     "episodes": counts[3],
+                    "small_sample_warning": counts[3] < 20,
                 }
                 for strength, counts in sorted(ignition_access_totals.items())
             }
+            diagnostics["gnw_ignition_psychometric_fit"] = psychometric_logistic(
+                {
+                    strength: (counts[0], counts[3])
+                    for strength, counts in ignition_access_totals.items()
+                }
+            )
         if bool(getattr(model, "workspace_nth_farthest_exact_readout", False)):
             diagnostics["nth_farthest_workspace"] = {
                 "vector_coordinate_accuracy": 100.0
@@ -3303,6 +3616,37 @@ class WorkspaceCapabilityDataset(BaseDataset):
                     if track in diagnostics["tracks"]
                 },
             }
+            diagnostics["variable_binding_stage_diagnostics"] = {
+                "query_slot_read_accuracy": (
+                    100.0 * variable_binding_query_read_correct
+                    / max(variable_binding_query_read_count, 1)
+                ),
+                "query_slot_reads_correct": variable_binding_query_read_correct,
+                "query_slot_reads_total": variable_binding_query_read_count,
+                "by_assignment_length_and_operation": {
+                    f"{complexity}/{operation}": {
+                        "operand_read_accuracy": 100.0 * counts[0] / max(counts[1], 1),
+                        "operand_values_correct": counts[0],
+                        "operand_values_total": counts[1],
+                        "destination_commit_rate": 100.0 * counts[2] / max(counts[3], 1),
+                        "destination_commits": counts[2],
+                        "destination_attempts": counts[3],
+                        "committed_value_accuracy": 100.0 * counts[4] / max(counts[5], 1),
+                        "committed_values_correct": counts[4],
+                        "committed_values_total": counts[5],
+                    }
+                    for (complexity, operation), counts in sorted(
+                        variable_binding_stage_totals.items()
+                    )
+                },
+            }
+        if bool(getattr(model, "workspace_rule_feedback_update_enabled", False)):
+            diagnostics["workspace_rule_feedback_tracker"] = {
+                "feedback_only_target_accuracy_pct": 100.0 * rule_feedback_tracker_correct
+                / max(rule_feedback_tracker_count, 1),
+                "correct_updates": rule_feedback_tracker_correct,
+                "updates": rule_feedback_tracker_count,
+            }
         if value_program_totals:
             diagnostics["workspace_value_programs"] = {
                 "by_operation": {
@@ -3353,6 +3697,53 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 f"{values['predicted_access_rate']:.1f}% | target report="
                 f"{values['target_report_rate']:.1f}% | response accuracy="
                 f"{values['response_accuracy']:.1f}% (n={values['episodes']})"
+            )
+        rule_tracker = diagnostics.get("workspace_rule_feedback_tracker")
+        if rule_tracker:
+            print(
+                "  [workspace-rule-feedback/tracker] "
+                f"feedback-only target estimate={rule_tracker['feedback_only_target_accuracy_pct']:.1f}% "
+                f"({rule_tracker['correct_updates']}/{rule_tracker['updates']} visible-feedback updates)"
+            )
+        ignition_fit = diagnostics.get("gnw_ignition_psychometric_fit")
+        if ignition_fit:
+            print(
+                "  [GNW-ignition/logistic-fit] "
+                f"50% access threshold={ignition_fit['threshold_50']:.3g} | "
+                f"95% CI=[{ignition_fit['threshold_50_wald95'][0]:.3g},"
+                f"{ignition_fit['threshold_50_wald95'][1]:.3g}] | "
+                f"slope={ignition_fit['slope']:.3g} "
+                f"95% CI=[{ignition_fit['slope_wald95'][0]:.3g},"
+                f"{ignition_fit['slope_wald95'][1]:.3g}] | n={ignition_fit['n']} "
+                f"({ignition_fit['strength_levels']} strengths; "
+                f"small_n={ignition_fit['small_sample_warning']})"
+            )
+        confidence_metrics = diagnostics.get("gnw_no_report_confidence_calibration")
+        if confidence_metrics:
+            print(
+                "  [GNW-no-report/confidence-calibration] "
+                f"Brier={confidence_metrics['brier_score']:.4f} | "
+                f"ECE={confidence_metrics['ece_10_bins']:.4f} | "
+                f"type-2 AUC={confidence_metrics['type2_roc_auc']:.4f} | "
+                f"reported n={confidence_metrics['n_reported']}"
+            )
+        priming_metrics = diagnostics.get("gnw_masked_priming_conditions")
+        if priming_metrics:
+            for condition, metrics in priming_metrics["conditions"].items():
+                print(
+                    f"  [GNW-masked-priming/{condition}] "
+                    f"target accuracy={metrics['target_response_accuracy_pct']:.1f}% "
+                    f"CI95=[{metrics['target_response_accuracy_wilson95_pct'][0]:.1f},"
+                    f"{metrics['target_response_accuracy_wilson95_pct'][1]:.1f}] | "
+                    f"prime intrusion={metrics['prime_intrusion_on_conflict_pct']:.1f}% "
+                    f"({metrics['conflict_episodes']} conflicts) "
+                    f"n={metrics['episodes']}"
+                )
+            print(
+                "  [GNW-masked-priming] visibility×congruency interaction="
+                f"{priming_metrics['visibility_by_congruency_interaction_prime_intrusion']:.4f} "
+                f"95% CI=[{priming_metrics['interaction_wald95'][0]:.4f},"
+                f"{priming_metrics['interaction_wald95'][1]:.4f}]"
             )
         nth_metrics = diagnostics.get("nth_farthest_workspace")
         if nth_metrics:
@@ -3418,6 +3809,28 @@ class WorkspaceCapabilityDataset(BaseDataset):
                     f"episode exact={metrics['episode_exact_match']:.1f}% "
                     f"n={metrics['episodes']}"
                 )
+            variable_metrics = diagnostics.get("variable_binding_stage_diagnostics")
+            if variable_metrics and variable_metrics["query_slot_reads_total"]:
+                print(
+                    "  [workspace-variable-binding/query-read] "
+                    f"accuracy={variable_metrics['query_slot_read_accuracy']:.1f}% "
+                    f"({variable_metrics['query_slot_reads_correct']}/"
+                    f"{variable_metrics['query_slot_reads_total']})"
+                )
+            if variable_metrics:
+                for stage, values in sorted(
+                    variable_metrics["by_assignment_length_and_operation"].items()
+                ):
+                    print(
+                        f"  [workspace-variable-binding/{stage}] "
+                        f"operand reads={values['operand_read_accuracy']:.1f}% "
+                        f"({values['operand_values_correct']}/{values['operand_values_total']}) | "
+                        f"commit={values['destination_commit_rate']:.1f}% "
+                        f"({values['destination_commits']}/{values['destination_attempts']}) | "
+                        f"committed values={values['committed_value_accuracy']:.1f}% "
+                        f"({values['committed_values_correct']}/"
+                        f"{values['committed_values_total']})"
+                    )
         if binding_entity_mentions:
             print(
                 "  [workspace-binding/permutation] "
@@ -3656,6 +4069,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
                         attentional_cue_readout=bool(
                             getattr(model, "workspace_attentional_cue_readout_enabled", False)
                         ),
+                        episodes=episodes,
                     )
                     if transactional:
                         entity_metadata.update(
@@ -3683,6 +4097,43 @@ class WorkspaceCapabilityDataset(BaseDataset):
                                     "retrieval_query_was_updated",
                                     "retrieval_value_is_update",
                                 )
+                            }
+                        )
+                    if bool(getattr(model, "workspace_operation_executor_enabled", False)):
+                        operation_metadata = self.workspace_key_value_metadata(
+                            x,
+                            episodes,
+                            include_operations=True,
+                            rule_feedback_update=bool(
+                                getattr(
+                                    model,
+                                    "workspace_rule_feedback_update_enabled",
+                                    False,
+                                )
+                            ),
+                            attentional_item_memory=bool(
+                                getattr(model, "workspace_attentional_item_memory_enabled", False)
+                            ),
+                            no_report_confidence_readout=bool(
+                                getattr(
+                                    model,
+                                    "workspace_no_report_confidence_readout_enabled",
+                                    False,
+                                )
+                            ),
+                            masked_prime_trace=bool(
+                                getattr(model, "workspace_masked_prime_trace_enabled", False)
+                            ),
+                            entity_metadata=entity_metadata,
+                        )
+                        entity_metadata.update(
+                            {
+                                "operation_metadata": operation_metadata[
+                                    "workspace_operation_metadata"
+                                ],
+                                "operation_steps": operation_metadata[
+                                    "workspace_operation_steps"
+                                ],
                             }
                         )
                     forward_metadata = {

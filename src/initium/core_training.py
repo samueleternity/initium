@@ -843,6 +843,7 @@ def load_frozen_workspace_warm_start(
         "workspace_sparse_recurrence",  # execution optimization
         "workspace_attentional_item_memory",  # workspace-only data addressing
         "workspace_attentional_cue_readout",  # task-specific typed decoders/readout
+        "workspace_rule_feedback_update",  # training-target policy; no model state
         "workspace_permutation_transactional",
         "workspace_key_match_threshold",
         "workspace_no_selection",
@@ -1189,6 +1190,7 @@ def run(
     workspace_operation_diagnostics: bool = False,
     workspace_exact_value_comparison: bool = False,
     workspace_exact_selection: bool = False,
+    workspace_rule_feedback_update: bool = False,
     workspace_sparse_recurrence: bool = False,
     workspace_attentional_item_memory: bool = False,
     workspace_attentional_cue_readout: bool = False,
@@ -1325,6 +1327,19 @@ def run(
         raise ValueError(
             "exact workspace selection requires key-value readout, semantic entity "
             "addressing, and a supported workspace-capability track"
+        )
+    if workspace_rule_feedback_update and not (
+        workspace_key_value_loss_weight > 0
+        and workspace_enabled
+        and workspace_entity_keyed_writes
+        and workspace_semantic_entity_addressing
+        and dataset_type == "workspace-capability"
+        and str(workspace_task_track).lower().replace("-", "_")
+        in {"rule_switching", "gnw_all", "new_all", "all"}
+    ):
+        raise ValueError(
+            "workspace rule feedback update requires key-value readout, semantic "
+            "entity addressing, and a supported workspace-capability track"
         )
     if workspace_attentional_item_memory and not (
         workspace_key_value_loss_weight > 0
@@ -3323,6 +3338,7 @@ def run(
             workspace_sparse_recurrence=workspace_sparse_recurrence,
             workspace_attentional_item_memory=workspace_attentional_item_memory,
             workspace_attentional_cue_readout=workspace_attentional_cue_readout,
+            workspace_rule_feedback_update=workspace_rule_feedback_update,
             workspace_no_report_confidence_readout=workspace_no_report_confidence_readout,
             workspace_masked_prime_trace=workspace_masked_prime_trace,
             workspace_token_id_input=workspace_token_id_input,
@@ -3597,6 +3613,7 @@ def run(
                 f"sparse_recurrence={'on' if workspace_sparse_recurrence else 'off'} | "
                 f"attentional_item_memory={'on' if workspace_attentional_item_memory else 'off'} | "
                 f"attentional_cue_readout={'on' if workspace_attentional_cue_readout else 'off'} | "
+                f"rule_feedback_update={'on' if workspace_rule_feedback_update else 'off'} | "
                 f"no_report_readout={'on' if workspace_no_report_confidence_readout else 'off'} | "
                 f"masked_prime_trace={'on' if workspace_masked_prime_trace else 'off'} | "
                 f"workspace_to_kv={'on(two-pass, lag=1, read_scale=' + format(workspace_kv_read_scale, 'g') + ')' if workspace_write_to_kv else 'off'} | "
@@ -3725,6 +3742,8 @@ def run(
         extra_model_config["workspace_retrieval_exact_readout"] = True
     if workspace_attentional_cue_readout:
         extra_model_config["workspace_attentional_cue_readout"] = True
+    if workspace_rule_feedback_update:
+        extra_model_config["workspace_rule_feedback_update"] = True
     if workspace_no_report_confidence_readout:
         extra_model_config["workspace_no_report_confidence_readout"] = True
     if workspace_masked_prime_trace:
@@ -4702,6 +4721,11 @@ def run(
         nth_metadata = None
         retrieval_metadata = None
         key_value_metadata = None
+        workspace_token_rows = (
+            dataset.workspace_input_token_rows(input_seq)
+            if workspace_semantic_entity_addressing and workspace_key_value_loss_weight > 0
+            else None
+        )
         if workspace_semantic_entity_addressing:
             workspace_metadata = dataset.workspace_entity_address_metadata(
                 input_seq,
@@ -4709,6 +4733,7 @@ def run(
                 attentional_item_memory=workspace_attentional_item_memory,
                 attentional_cue_readout=workspace_attentional_cue_readout,
                 masked_prime_trace=workspace_masked_prime_trace,
+                token_rows=workspace_token_rows,
             )
             if workspace_nth_farthest_exact_readout:
                 nth_metadata = dataset.workspace_nth_farthest_metadata(input_seq)
@@ -4750,9 +4775,12 @@ def run(
                 for key, value in dataset.workspace_key_value_metadata(
                     input_seq,
                     include_operations=workspace_operation_executor,
+                    rule_feedback_update=workspace_rule_feedback_update,
                     attentional_item_memory=workspace_attentional_item_memory,
                     no_report_confidence_readout=workspace_no_report_confidence_readout,
                     masked_prime_trace=workspace_masked_prime_trace,
+                    entity_metadata=(workspace_metadata if workspace_semantic_entity_addressing else None),
+                    token_rows=workspace_token_rows,
                 ).items()
             }
             workspace_forward_kwargs.update(
@@ -7948,12 +7976,23 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--workspace-attentional-cue-readout",
+        "--workspace-attentional-blink-readout",
         action="store_true",
+        dest="workspace_attentional_cue_readout",
         help=(
             "Use the visible color/shape cue to retrieve the first two matching RSVP "
             "item values from workspace slots and decode T1/T2. Implies "
             "--workspace-attentional-item-memory; requires semantic entity addressing, "
             "positive key-value loss, and at least 26 slots."
+        ),
+    )
+    parser.add_argument(
+        "--workspace-rule-feedback-update",
+        action="store_true",
+        help=(
+            "Supervise rule-slot updates from visible choice/feedback using a "
+            "recency-decayed Bayesian evidence tracker; does not use hidden per-trial "
+            "rule labels. Requires key-value readout and semantic entity addressing."
         ),
     )
     parser.add_argument(
@@ -9164,6 +9203,18 @@ if __name__ == "__main__":
                 "--workspace-attentional-item-memory requires "
                 "--workspace-num-slots >= 26"
             )
+    if args.workspace_rule_feedback_update and not (
+        args.workspace
+        and args.workspace_key_value_loss_weight > 0
+        and args.workspace_entity_keyed_writes
+        and args.workspace_semantic_entity_addressing
+        and args.dataset_type == "workspace-capability"
+        and args.workspace_task_track in {"rule_switching", "gnw_all", "new_all", "all"}
+    ):
+        parser.error(
+            "--workspace-rule-feedback-update requires workspace key-value readout, "
+            "semantic entity addressing, and rule_switching, gnw_all, new_all, or all"
+        )
     for enabled, feature_name, supported_track in (
         (
             args.workspace_no_report_confidence_readout,
@@ -9397,6 +9448,8 @@ if __name__ == "__main__":
                 run_id += f"_retrievalexact_val{retrieval_loss_tag}"
             if args.workspace_attentional_cue_readout:
                 run_id += "_attncue"
+            if args.workspace_rule_feedback_update:
+                run_id += "_rulefb"
             if args.workspace_compile_recurrence:
                 run_id += "_compiledrecurrence"
             if args.workspace_gate_variant != "continuous" or args.workspace_train_scope == "gate":
@@ -9620,6 +9673,7 @@ if __name__ == "__main__":
             workspace_operation_diagnostics=args.workspace_operation_diagnostics,
             workspace_exact_value_comparison=args.workspace_exact_value_comparison,
             workspace_exact_selection=args.workspace_exact_selection,
+            workspace_rule_feedback_update=args.workspace_rule_feedback_update,
             workspace_sparse_recurrence=args.workspace_sparse_recurrence,
             workspace_attentional_item_memory=args.workspace_attentional_item_memory,
             workspace_attentional_cue_readout=args.workspace_attentional_cue_readout,

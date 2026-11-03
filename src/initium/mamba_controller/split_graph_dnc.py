@@ -261,6 +261,7 @@ class SplitGraphDNC(nn.Module):
         workspace_exact_selection: bool = False,
         workspace_attentional_item_memory: bool = False,
         workspace_attentional_cue_readout: bool = False,
+        workspace_rule_feedback_update: bool = False,
         workspace_no_report_confidence_readout: bool = False,
         workspace_masked_prime_trace: bool = False,
         workspace_key_match_threshold: float = 0.5,
@@ -448,6 +449,7 @@ class SplitGraphDNC(nn.Module):
         self.workspace_attentional_cue_readout_enabled = bool(
             workspace_attentional_cue_readout
         )
+        self.workspace_rule_feedback_update_enabled = bool(workspace_rule_feedback_update)
         self.workspace_no_report_confidence_readout_enabled = bool(
             workspace_no_report_confidence_readout
         )

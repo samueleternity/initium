@@ -261,6 +261,8 @@ class SplitGraphDNC(nn.Module):
         workspace_exact_selection: bool = False,
         workspace_attentional_item_memory: bool = False,
         workspace_attentional_cue_readout: bool = False,
+        workspace_no_report_confidence_readout: bool = False,
+        workspace_masked_prime_trace: bool = False,
         workspace_key_match_threshold: float = 0.5,
         workspace_no_selection: bool = False,
         workspace_reset_each_step: bool = False,
@@ -276,6 +278,7 @@ class SplitGraphDNC(nn.Module):
         workspace_write_to_kv: bool = False,
         workspace_kv_read_scale: float = 0.1,
         workspace_token_id_input: bool = False,
+        activation_checkpointing: bool = False,
         sgr_write_salience_enabled: bool = False,
         sgr_workspace_salience_enabled: bool = False,
     ):
@@ -445,6 +448,23 @@ class SplitGraphDNC(nn.Module):
         self.workspace_attentional_cue_readout_enabled = bool(
             workspace_attentional_cue_readout
         )
+        self.workspace_no_report_confidence_readout_enabled = bool(
+            workspace_no_report_confidence_readout
+        )
+        self.workspace_masked_prime_trace_enabled = bool(workspace_masked_prime_trace)
+        if (
+            self.workspace_no_report_confidence_readout_enabled
+            or self.workspace_masked_prime_trace_enabled
+        ) and not (
+            workspace_enabled
+            and workspace_entity_keyed_writes
+            and workspace_semantic_entity_addressing
+            and workspace_key_value_readout
+        ):
+            raise ValueError(
+                "GNW-specific workspace readouts require entity-keyed semantic "
+                "workspace addressing and key-value readout"
+            )
         self.workspace_sparse_recurrence_enabled = bool(workspace_sparse_recurrence)
         if self.workspace_sparse_recurrence_enabled and not (
             self.workspace_entity_keyed_writes and self.workspace_semantic_entity_addressing
@@ -506,6 +526,7 @@ class SplitGraphDNC(nn.Module):
             moe_load_balance_alpha=moe_load_balance_alpha,
             moe_residual_scale=moe_backbone_residual_scale,
             moe_block_isolation=moe_backbone_block_isolation,
+            activation_checkpointing=activation_checkpointing,
             device=device,
         )
 

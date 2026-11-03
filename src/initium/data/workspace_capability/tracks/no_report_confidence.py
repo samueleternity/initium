@@ -5,7 +5,7 @@ from __future__ import annotations
 import random
 
 from initium.data.workspace_capability.episode import (
-    BOS, BOOL_FALSE, BOOL_TRUE, EOS, EV_INIT, EV_UPDATE, QUERY, SEP,
+    BOS, BOOL_FALSE, BOOL_TRUE, EOS, EV_ASSERT, EV_INIT, EV_UPDATE, QUERY, SEP,
     TaskEpisode, entity_token, scalar_token,
 )
 from initium.data.workspace_capability.tracks._shared import common_metadata
@@ -24,8 +24,14 @@ def generate(difficulty: dict, rng: random.Random, *, ood: bool = False) -> Task
     stream = [BOS, EV_INIT, entity_token(0), scalar_token(evidence), SEP]
     for index, observation in enumerate(observations):
         stream.extend((EV_UPDATE, entity_token(index + 1), scalar_token(int(observation)), SEP))
+    # Make the reporting instruction observable; otherwise answer length and
+    # confidence reporting would be random from the model's perspective.
+    stream.extend((EV_ASSERT, BOOL_TRUE if report_condition else BOOL_FALSE, SEP))
     stream.extend((QUERY, *(entity_token(index + 1) for index in range(evidence)), SEP))
-    answer = (BOOL_TRUE if truth else BOOL_FALSE,)
+    # The behavioral answer is the action supported by the available evidence.
+    # Keep the latent state only for diagnostic scoring: finite noisy samples
+    # do not reveal it deterministically.
+    answer = (BOOL_TRUE if action else BOOL_FALSE,)
     if report_condition:
         answer += (scalar_token(confidence),)
     answer += (EOS,)
@@ -35,7 +41,9 @@ def generate(difficulty: dict, rng: random.Random, *, ood: bool = False) -> Task
             track="no_report_confidence", sequence_length=len(stream),
             query_type="confidence_probe" if report_condition else "no_report_action",
             relevant_updates=evidence, candidate_baseline_pct=50.0, evidence_strength=evidence,
-            confidence_bin=confidence, action=truth, majority_action=action,
+            confidence_bin=confidence, action=action, majority_action=action,
+            latent_truth=truth,
+            observations=tuple(int(value) for value in observations),
             action_correct=action == truth, cue_error_rate=cue_error_rate,
             vote_margin=margin, explicit_report=report_condition,
             progression_group="all",

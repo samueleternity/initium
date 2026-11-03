@@ -68,6 +68,7 @@ import os as _os
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 from initium.mamba_controller.numerical_stability import limit_mixer_residual_rms
 from initium.MoE.moe_layer import MoEBlock
@@ -338,6 +339,7 @@ class MambaBackboneParallel(nn.Module):
         moe_load_balance_alpha: float = 0.01,
         moe_residual_scale: float = 1.0,
         moe_block_isolation: int | None = None,
+        activation_checkpointing: bool = False,
         sgr_delta_error_gating: bool = False,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
@@ -348,6 +350,7 @@ class MambaBackboneParallel(nn.Module):
         self.input_dim = int(in_dim)
         self.d_model = d_model
         self.moe_enabled = moe_enabled
+        self.activation_checkpointing = bool(activation_checkpointing)
         self.moe_blocks: nn.ModuleList | None = None
         if moe_block_isolation is not None and not 0 <= moe_block_isolation < num_blocks:
             raise ValueError(
@@ -416,6 +419,30 @@ class MambaBackboneParallel(nn.Module):
                 ]
             )
 
+    def _run_block(
+        self,
+        block: nn.Module,
+        *args: torch.Tensor,
+        **kwargs: torch.Tensor,
+    ) -> torch.Tensor:
+        # Numeric observers are intentionally not replayed during backward's
+        # recomputation; keep their instrumented passes eager and single-shot.
+        has_numeric_observer = getattr(block, "_initium_forward_numeric_observer", None) is not None
+        if (
+            self.activation_checkpointing
+            and self.training
+            and torch.is_grad_enabled()
+            and not has_numeric_observer
+        ):
+            function = block if not kwargs else lambda *inputs: block(*inputs, **kwargs)
+            return checkpoint(
+                function,
+                *args,
+                use_reentrant=False,
+                preserve_rng_state=True,
+            )
+        return block(*args, **kwargs)
+
     def _adapt_input(
         self,
         x: torch.Tensor,
@@ -481,7 +508,7 @@ class MambaBackboneParallel(nn.Module):
             numeric_observer("input_adapter.output", h)
         moe_blocks = self.moe_blocks
         for i, block in enumerate(self.blocks):
-            h = block(h)
+            h = self._run_block(block, h)
             if numeric_observer is not None:
                 numeric_observer(f"block.{i}.output", h)
             if moe_blocks is not None and isinstance(moe_blocks[i], MoEBlock):
@@ -505,7 +532,7 @@ class MambaBackboneParallel(nn.Module):
         if numeric_observer is not None:
             numeric_observer("input_adapter.output", h)
         for index, block in enumerate(self.blocks):
-            h = block(h)
+            h = self._run_block(block, h)
             if numeric_observer is not None:
                 numeric_observer(f"block.{index}.output", h)
             if index == 0 and intermediate_observer is not None:
@@ -543,7 +570,7 @@ class MambaBackboneParallel(nn.Module):
             numeric_observer("input_adapter.output", h)
         moe_blocks = self.moe_blocks
         for index, block in enumerate(self.blocks):
-            h = block(h)
+            h = self._run_block(block, h)
             if numeric_observer is not None:
                 numeric_observer(f"block.{index}.output", h)
             if moe_blocks is not None and isinstance(moe_blocks[index], MoEBlock):
@@ -586,7 +613,7 @@ class MambaBackboneParallel(nn.Module):
         # residual back to the autocast input dtype (fp16) can overflow near
         # 65,504 even when the fp32 computation itself remains finite.
         h = self.in_adapter(x).float()
-        first_features = self.blocks[0](h)
+        first_features = self._run_block(self.blocks[0], h)
         batch, sequence, _ = first_features.shape
         token_ids = x.argmax(dim=-1)
         if stream_lengths is None:
@@ -651,9 +678,11 @@ class MambaBackboneParallel(nn.Module):
             # temporal-shuffle controls must not move signal into query,
             # answer, or right-padding positions.
             gate_signal = gate_signal.masked_fill(~stream_mask, 0.0)
-            h = self.blocks[1](first_features, prediction_error=gate_signal)
+            h = self._run_block(
+                self.blocks[1], first_features, prediction_error=gate_signal
+            )
         else:
-            h = self.blocks[1](first_features)
+            h = self._run_block(self.blocks[1], first_features)
         h = self.normalize_output(h)
         diagnostics = {
             "prediction_error": error_signal.detach(),
@@ -716,7 +745,7 @@ class MambaBackboneParallel(nn.Module):
         if inter_layer_read is not None and final_index < 1:
             raise ValueError("inter-layer workspace reads require at least two backbone blocks")
         for i, block in enumerate(self.blocks):
-            h = block(h)
+            h = self._run_block(block, h)
             if i == 0 and intermediate_observer is not None:
                 intermediate_observer(h)
             if numeric_observer is not None:

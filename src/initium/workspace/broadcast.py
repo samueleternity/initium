@@ -1811,17 +1811,19 @@ class WorkspaceBroadcast(nn.Module):
                 "entity metadata is only accepted when semantic entity addressing is enabled"
             )
         if key_value_entity_ids is not None or key_value_mask is not None:
-            expected_value_shape = (*specialist_deltas.shape[:2], 4)
+            expected_value_prefix = specialist_deltas.shape[:2]
             if (
                 not self.key_value_readout
                 or key_value_entity_ids is None
                 or key_value_mask is None
-                or key_value_entity_ids.shape != expected_value_shape
-                or key_value_mask.shape != expected_value_shape
+                or key_value_entity_ids.ndim != 3
+                or key_value_entity_ids.shape[:2] != expected_value_prefix
+                or key_value_entity_ids.shape[-1] < 4
+                or key_value_mask.shape != key_value_entity_ids.shape
             ):
                 raise ValueError(
                     "key-value read metadata requires the enabled readout and shape "
-                    "(batch, time, 4)"
+                    "(batch, time, operands)"
                 )
             if key_value_entity_ids.dtype not in (torch.int32, torch.int64):
                 raise TypeError("key-value entity IDs must be integer tensors")

@@ -165,6 +165,7 @@ def _build_split_graph(c: _Cfg, input_dim, hidden, nr_cells, cell_size, read_hea
         read_heads=read_heads,
         num_backbone_blocks=c.get("split_graph_num_blocks", cc.SPLIT_GRAPH_NUM_BLOCKS),
         mamba_variant=variant,
+        activation_checkpointing=c.get("split_graph_activation_checkpointing", False),
         mamba_d_state=hp["d_state"],
         mamba_d_conv=hp["d_conv"],
         mamba_expand=hp["expand"],
@@ -227,6 +228,11 @@ def _build_split_graph(c: _Cfg, input_dim, hidden, nr_cells, cell_size, read_hea
         workspace_compile_recurrence=c.get("workspace_compile_recurrence", False),
         workspace_entity_keyed_writes=c.get("workspace_entity_keyed_writes", False),
         workspace_semantic_entity_addressing=c.get("workspace_semantic_entity_addressing", False),
+        workspace_key_value_readout=bool(c.get("workspace_key_value_loss_weight", 0.0) > 0),
+        workspace_no_report_confidence_readout=c.get(
+            "workspace_no_report_confidence_readout", False
+        ),
+        workspace_masked_prime_trace=c.get("workspace_masked_prime_trace", False),
         workspace_key_match_threshold=c.get("workspace_key_match_threshold", 0.5),
         workspace_no_selection=c.get("workspace_no_selection", cc.WORKSPACE_NO_SELECTION),
         workspace_reset_each_step=c.get("workspace_reset_each_step", cc.WORKSPACE_RESET_EACH_STEP),

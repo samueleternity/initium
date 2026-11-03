@@ -54,6 +54,7 @@ from initium.data.workspace_capability.episode import (
     VOCAB_SIZE,
     TaskEpisode,
     entity_token,
+    scalar_token,
     source_token,
     validate_episode,
 )
@@ -115,6 +116,24 @@ GNW_TRACKS = (
 )
 GNW_ALL_TRACK = "gnw_all"
 MULTI_TRACKS = {ALL_TRACK, NEW_ALL_TRACK, GNW_ALL_TRACK}
+# Optional task-specific pathways whose causal contribution can be tested at
+# evaluation time. Attribute names are deliberately model-facing so the
+# evaluator only toggles mechanisms that are present and enabled in a run.
+_FUNCTIONAL_FEATURE_ABLATIONS = (
+    (
+        "no_report_confidence_readout",
+        "workspace_no_report_confidence_readout_enabled",
+    ),
+    ("masked_prime_trace", "workspace_masked_prime_trace_enabled"),
+    ("attentional_item_memory", "workspace_attentional_item_memory_enabled"),
+    ("attentional_cue_readout", "workspace_attentional_cue_readout_enabled"),
+    ("nth_farthest_exact_readout", "workspace_nth_farthest_exact_readout"),
+    ("retrieval_exact_readout", "workspace_retrieval_exact_readout"),
+    ("operation_executor", "workspace_operation_executor_enabled"),
+    ("exact_value_comparison", "workspace_exact_value_comparison_enabled"),
+    ("exact_selection", "workspace_exact_selection_enabled"),
+)
+KEY_VALUE_OPERAND_CAPACITY = 16
 _EVAL_KV_ATTENTION_BUDGET_BYTES = 512 * 1024 * 1024
 _SDPA_MATH_WORKSPACE_MULTIPLIER = 2
 _WORKSPACE_OPERATION_CODES = {"lookup": 1, "copy": 2, "add": 3, "sort": 4}
@@ -430,6 +449,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
         paired_swap_commits: bool = False,
         attentional_item_memory: bool = False,
         attentional_cue_readout: bool = False,
+        masked_prime_trace: bool = False,
         episodes: list[TaskEpisode] | None = None,
     ) -> dict[str, Any]:
         """Build causal entity keys and event-boundary writes for each task track.
@@ -489,6 +509,13 @@ class WorkspaceCapabilityDataset(BaseDataset):
                         )
                         continue
                 self._add_event_boundary_entity_writes(row, tokens, track, entity_ids, write_mask)
+                if (
+                    track == "masked_priming"
+                    and masked_prime_trace
+                    and row < len(examples)
+                    and bool(examples[row].metadata.get("mask_condition", False))
+                ):
+                    self._add_masked_prime_trace_write(row, tokens, entity_ids, write_mask)
                 continue
             phase = "none"
             pending_entity = -1
@@ -664,6 +691,23 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 has_relation = True
             elif token in (BOOL_FALSE, BOOL_TRUE):
                 has_boolean = True
+
+    @staticmethod
+    def _add_masked_prime_trace_write(row, tokens, entity_ids, write_mask) -> None:
+        """Store the masked prime in its own slot when the opt-in trace is enabled."""
+        in_prime = False
+        for position, token_value in enumerate(tokens):
+            token = int(token_value)
+            if token == EV_NOISE and not in_prime:
+                in_prime = True
+            elif in_prime and token == SEP:
+                # Entity zero is reserved for the prime; the visible target
+                # occupies entity one in this task.
+                entity_ids[row, position] = 0
+                write_mask[row, position] = True
+                return
+            elif in_prime and token == QUERY:
+                return
 
     @staticmethod
     def _add_belief_address_writes(row, tokens, entity_ids, write_mask) -> None:
@@ -1319,29 +1363,36 @@ class WorkspaceCapabilityDataset(BaseDataset):
         include_operations: bool = False,
         include_operation_diagnostics: bool = False,
         attentional_item_memory: bool = False,
+        no_report_confidence_readout: bool = False,
+        masked_prime_trace: bool = False,
     ) -> dict[str, Any]:
         """Pack sparse semantic value reads for causal updates and answer queries.
 
         Episodes may provide ``workspace_output_keys`` aligned to their answer
         tokens. Simple event updates with an explicit categorical payload are
-        also supervised at their commit boundary. Storage is bounded to two
-        reads per timestep, independent of sequence length.
+        also supervised at their commit boundary. Read width is statically
+        bounded; task aggregators can use a wider answer row without allocating
+        sequence-length-sized intermediates.
         """
         examples = self.last_batch_examples if episodes is None else episodes
         batch, time = input_vectors.shape[:2]
         if len(examples) != batch:
             raise RuntimeError("workspace key-value metadata lost batch/episode alignment")
+        operand_capacity = (
+            KEY_VALUE_OPERAND_CAPACITY if no_report_confidence_readout else 4
+        )
         entity_meta = self.workspace_entity_address_metadata(
             input_vectors,
             episodes=examples,
             attentional_item_memory=attentional_item_memory,
+            masked_prime_trace=masked_prime_trace,
         )
         token_rows = self._input_token_ids(input_vectors).detach().cpu().tolist()
         entity_rows = entity_meta["entity_ids"].detach().cpu().tolist()
         write_rows = entity_meta["entity_write_mask"].detach().cpu().tolist()
-        key_ids = torch.full((batch, time, 4), -1, dtype=torch.long)
-        targets = torch.full((batch, time, 4), -100, dtype=torch.long)
-        masks = torch.zeros((batch, time, 4), dtype=torch.bool)
+        key_ids = torch.full((batch, time, operand_capacity), -1, dtype=torch.long)
+        targets = torch.full((batch, time, operand_capacity), -100, dtype=torch.long)
+        masks = torch.zeros((batch, time, operand_capacity), dtype=torch.bool)
         attentional_color_targets = torch.full((batch, time), -100, dtype=torch.long)
         attentional_shape_targets = torch.full((batch, time), -100, dtype=torch.long)
         operation_metadata = (
@@ -1433,7 +1484,11 @@ class WorkspaceCapabilityDataset(BaseDataset):
                     per_step.setdefault(frame_step, []).append((frame_id, value_token))
             for position, token_value in enumerate(tokens[: len(episode.inputs)]):
                 token = int(token_value)
-                if token in (EV_INIT, EV_MOVE, EV_UPDATE, EV_ASSERT, EV_KV):
+                if token in (EV_INIT, EV_MOVE, EV_UPDATE, EV_ASSERT, EV_KV) or (
+                    masked_prime_trace
+                    and episode.track == "masked_priming"
+                    and token == EV_NOISE
+                ):
                     active_event, payload, source_payload = token, -100, -1
                     if episode.track == "rule_switching" and token == EV_ASSERT:
                         rules = tuple(episode.metadata.get("trial_rules", ()))
@@ -1497,7 +1552,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
             # carries the stored value. Copy/compute events receive pressure
             # from a later query instead of a fabricated scalar target.
             for step, values in per_step.items():
-                packed = values[:4]
+                packed = values[:operand_capacity]
                 key_ids[row, step, : len(packed)] = torch.tensor([v[0] for v in packed])
                 targets[row, step, : len(packed)] = torch.tensor([v[1] for v in packed])
                 masks[row, step, : len(packed)] = True
@@ -1524,7 +1579,13 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 targets[row, step, 0] = int(episode.answer[offset])
                 masks[row, step, 0] = True
                 read_steps.add(step)
-            for query in episode.metadata.get("workspace_query_reads", ()):
+            query_reads = list(episode.metadata.get("workspace_query_reads", ()))
+            if masked_prime_trace and episode.track == "masked_priming":
+                query_step = len(episode.inputs) - 3
+                query_reads.append(
+                    (query_step, 0, scalar_token(int(episode.metadata["prime_value"])))
+                )
+            for query in query_reads:
                 step, key_value, target_value = (int(value) for value in query)
                 key = key_value
                 if key < 0 or key >= ENTITY_COUNT:
@@ -1542,6 +1603,14 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 masks[row, step, column] = True
                 read_steps.add(step)
             output_programs = tuple(episode.metadata.get("workspace_output_programs", ()))
+            if no_report_confidence_readout and episode.track == "no_report_confidence":
+                evidence_keys = tuple(range(1, len(episode.metadata["observations"]) + 1))
+                evidence_targets = tuple(
+                    scalar_token(int(value)) for value in episode.metadata["observations"]
+                )
+                output_programs += ((0, "vote", evidence_keys, evidence_targets),)
+                if bool(episode.metadata["explicit_report"]):
+                    output_programs += ((1, "vote_confidence", evidence_keys, evidence_targets),)
             for program in output_programs:
                 offset, operation, keys, expected = program
                 offset = int(offset)
@@ -1554,7 +1623,10 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 if not answer_keys:
                     continue
                 expected_values = tuple(int(value) for value in expected)
-                if len(answer_keys) != len(expected_values) or len(answer_keys) > 4:
+                if (
+                    len(answer_keys) != len(expected_values)
+                    or len(answer_keys) > operand_capacity
+                ):
                     raise ValueError(f"{episode.track} has invalid workspace output program operands")
                 if any(key < 0 or key >= ENTITY_COUNT for key in answer_keys):
                     raise ValueError(f"{episode.track} workspace output key is outside [0, 64)")
@@ -1601,6 +1673,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
         *,
         exact_value_comparison: bool = False,
         exact_selection: bool = False,
+        exact_no_report_readout: bool = False,
     ):
         """Route answer logits through addressed workspace values when keyed."""
         if not predictions:
@@ -1676,6 +1749,65 @@ class WorkspaceCapabilityDataset(BaseDataset):
                     hard_value_token = value_probs[hard_selector].argmax()
                     hard_program_probs = F.one_hot(
                         hard_value_token, num_classes=result.shape[-1]
+                    ).to(operation_probs.dtype)
+            elif operation in {"vote", "vote_confidence"}:
+                if int(operand_count) < 1:
+                    raise ValueError("workspace vote readout requires at least one evidence value")
+                binary_logits = operands[
+                    :, SCALAR_BASE : SCALAR_BASE + 2
+                ]
+                binary_probs = binary_logits.softmax(dim=-1)[:, 1]
+                count_distribution = binary_probs.new_ones((1,))
+                for positive_probability in binary_probs:
+                    zero = positive_probability.new_zeros((1,))
+                    count_distribution = torch.cat(
+                        (count_distribution * (1.0 - positive_probability), zero)
+                    ) + torch.cat((zero, count_distribution * positive_probability))
+                evidence_count = int(operand_count)
+                positive_counts = torch.arange(
+                    evidence_count + 1, device=logits.device
+                )
+                hard_values = binary_logits.argmax(dim=-1)
+                hard_positive_count = hard_values.sum()
+                hard_margin = (2 * hard_positive_count - evidence_count).abs()
+                if operation == "vote":
+                    threshold = (evidence_count + 1) // 2
+                    positive_probability = count_distribution[threshold:].sum()
+                    operation_probs = torch.zeros(
+                        result.shape[-1], device=logits.device, dtype=torch.float32
+                    ).scatter(
+                        0,
+                        torch.tensor((BOOL_FALSE, BOOL_TRUE), device=logits.device),
+                        torch.stack((1.0 - positive_probability, positive_probability)),
+                    )
+                    hard_token = torch.where(
+                        hard_positive_count * 2 >= evidence_count,
+                        torch.tensor(BOOL_TRUE, device=logits.device),
+                        torch.tensor(BOOL_FALSE, device=logits.device),
+                    )
+                else:
+                    confidence_ids = (
+                        (2 * positive_counts - evidence_count).abs() * 4 // evidence_count
+                    ).clamp(max=3)
+                    confidence_probs = torch.stack(
+                        [
+                            count_distribution[confidence_ids.eq(confidence_bin)].sum()
+                            for confidence_bin in range(4)
+                        ]
+                    )
+                    operation_probs = torch.zeros(
+                        result.shape[-1], device=logits.device, dtype=torch.float32
+                    ).scatter(
+                        0,
+                        torch.arange(SCALAR_BASE, SCALAR_BASE + 4, device=logits.device),
+                        confidence_probs,
+                    )
+                    hard_bin = (hard_margin * 4 // evidence_count).clamp(max=3)
+                    hard_token = SCALAR_BASE + hard_bin
+                if exact_no_report_readout:
+                    hard_program_probs = F.one_hot(
+                        hard_token,
+                        num_classes=result.shape[-1],
                     ).to(operation_probs.dtype)
             else:
                 raise ValueError(f"unknown workspace key-value output operation {operation!r}")
@@ -2034,6 +2166,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
         ablate_memory=False,
         ablate_workspace=False,
         shuffle_workspace_readback=False,
+        ablate_workspace_feature: str | None = None,
         combiner_skip_stages=None,
         field_log=None,
         verbose_n=0,
@@ -2044,6 +2177,8 @@ class WorkspaceCapabilityDataset(BaseDataset):
         prior_workspace_bypass = getattr(model, "workspace_eval_bypass", None)
         prior_workspace_shuffle = getattr(model, "workspace_eval_shuffle_readback", None)
         workspace = getattr(model, "workspace", None)
+        feature_ablation_attribute = None
+        prior_feature_ablation_value = None
         operation_diagnostics_enabled = bool(
             getattr(model, "workspace_operation_diagnostics_enabled", False)
         )
@@ -2067,6 +2202,22 @@ class WorkspaceCapabilityDataset(BaseDataset):
                     "workspace readback shuffle requires a model with active workspace"
                 )
             model.workspace_eval_shuffle_readback = True
+        if ablate_workspace_feature is not None:
+            feature_attribute = dict(_FUNCTIONAL_FEATURE_ABLATIONS).get(
+                str(ablate_workspace_feature)
+            )
+            if feature_attribute is None:
+                raise ValueError(
+                    f"unsupported workspace functional feature {ablate_workspace_feature!r}"
+                )
+            if not bool(getattr(model, feature_attribute, False)):
+                raise ValueError(
+                    f"workspace functional feature {ablate_workspace_feature!r} "
+                    "must be enabled before it can be ablated"
+                )
+            feature_ablation_attribute = feature_attribute
+            prior_feature_ablation_value = getattr(model, feature_attribute)
+            setattr(model, feature_attribute, False)
         totals: dict[str, list[int]] = defaultdict(lambda: [0, 0, 0, 0])
         progression_totals: dict[tuple[str, str], list[int]] = defaultdict(
             lambda: [0, 0, 0, 0]
@@ -2074,6 +2225,10 @@ class WorkspaceCapabilityDataset(BaseDataset):
         query_type_totals: dict[tuple[str, str], list[int]] = defaultdict(
             lambda: [0, 0, 0, 0]
         )
+        gnw_process_totals: dict[tuple[str, str], list[int]] = defaultdict(
+            lambda: [0, 0, 0, 0, 0, 0]
+        )
+        ignition_access_totals: dict[int, list[int]] = defaultdict(lambda: [0, 0, 0, 0])
         blink_t2_totals: dict[str, list[int]] = defaultdict(lambda: [0, 0, 0, 0])
         split_totals: dict[str, list[float]] = defaultdict(lambda: [0.0] * 7)
         metadata_totals: dict[str, list[float]] = defaultdict(lambda: [0.0] * 8)
@@ -2102,6 +2257,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
         }
         operation_diagnostic_totals: dict[str, list[int]] = defaultdict(lambda: [0] * 6)
         value_program_totals: dict[str, list[int]] = defaultdict(lambda: [0] * 4)
+        masked_prime_trace_reads: dict[str, list[int]] = defaultdict(lambda: [0, 0])
         permutation_pair_commit_attempts = 0
         permutation_pair_commit_successes = 0
         correct_total = answer_total = exact_total = 0
@@ -2147,6 +2303,9 @@ class WorkspaceCapabilityDataset(BaseDataset):
                             ),
                             attentional_cue_readout=bool(
                                 getattr(model, "workspace_attentional_cue_readout_enabled", False)
+                            ),
+                            masked_prime_trace=bool(
+                                getattr(model, "workspace_masked_prime_trace_enabled", False)
                             ),
                             episodes=group,
                         )
@@ -2207,6 +2366,16 @@ class WorkspaceCapabilityDataset(BaseDataset):
                                             "workspace_attentional_item_memory_enabled",
                                             False,
                                         )
+                                    ),
+                                    no_report_confidence_readout=bool(
+                                        getattr(
+                                            model,
+                                            "workspace_no_report_confidence_readout_enabled",
+                                            False,
+                                        )
+                                    ),
+                                    masked_prime_trace=bool(
+                                        getattr(model, "workspace_masked_prime_trace_enabled", False)
                                     ),
                                 ).items()
                             }
@@ -2360,13 +2529,46 @@ class WorkspaceCapabilityDataset(BaseDataset):
                     logits = self._output_proj(output.transpose(0, 1).contiguous())
                     if key_value_metadata is not None:
                         key_value_predictions = workspace.pop_key_value_predictions()
+                        if bool(
+                            getattr(model, "workspace_masked_prime_trace_enabled", False)
+                        ):
+                            targets_by_step = key_value_metadata["key_value_targets"]
+                            masks_by_step = key_value_metadata["key_value_mask"]
+                            for read_step, read_logits in key_value_predictions:
+                                for row, episode in enumerate(group):
+                                    if episode.track != "masked_priming":
+                                        continue
+                                    prime_query_step = len(episode.inputs) - 3
+                                    if int(read_step) != prime_query_step:
+                                        continue
+                                    read_mask = masks_by_step[row, read_step]
+                                    if not bool(read_mask.any()):
+                                        continue
+                                    target_values = targets_by_step[row, read_step][read_mask]
+                                    predicted_values = (
+                                        read_logits[row, read_mask].argmax(dim=-1)
+                                    )
+                                    trace_counts = masked_prime_trace_reads[
+                                        str(episode.metadata["query_type"])
+                                    ]
+                                    trace_counts[0] += int(
+                                        predicted_values.eq(target_values).sum().item()
+                                    )
+                                    trace_counts[1] += int(target_values.numel())
                         exact_comparison = bool(
                             getattr(model, "workspace_exact_value_comparison_enabled", False)
                         )
                         exact_selection = bool(
                             getattr(model, "workspace_exact_selection_enabled", False)
                         )
-                        if exact_comparison or exact_selection:
+                        exact_no_report = bool(
+                            getattr(
+                                model,
+                                "workspace_no_report_confidence_readout_enabled",
+                                False,
+                            )
+                        )
+                        if exact_comparison or exact_selection or exact_no_report:
                             prediction_steps = {
                                 int(step): values for step, values in key_value_predictions
                             }
@@ -2426,6 +2628,28 @@ class WorkspaceCapabilityDataset(BaseDataset):
                                     program_correct = predicted_output == int(
                                         targets[expected_index + 1]
                                     )
+                                elif operation in {"vote", "vote_confidence"} and exact_no_report:
+                                    counts = value_program_totals[operation]
+                                    predicted_values = values[
+                                        int(row), :operand_count,
+                                        SCALAR_BASE : SCALAR_BASE + 2,
+                                    ].argmax(dim=-1)
+                                    predicted_positive = int(predicted_values.sum().item())
+                                    margin = abs(2 * predicted_positive - operand_count)
+                                    output_offset = int(step) - len(group[int(row)].inputs)
+                                    if operation == "vote":
+                                        predicted_output = (
+                                            BOOL_TRUE
+                                            if predicted_positive * 2 >= operand_count
+                                            else BOOL_FALSE
+                                        )
+                                    else:
+                                        predicted_output = SCALAR_BASE + min(
+                                            3, margin * 4 // operand_count
+                                        )
+                                    target_output = int(group[int(row)].answer[output_offset])
+                                    predictions_for_row = predicted_values + SCALAR_BASE
+                                    program_correct = predicted_output == target_output
                                 else:
                                     continue
                                 counts[0] += int((predictions_for_row == targets).sum())
@@ -2439,6 +2663,13 @@ class WorkspaceCapabilityDataset(BaseDataset):
                             _mask,
                             exact_value_comparison=exact_comparison,
                             exact_selection=exact_selection,
+                            exact_no_report_readout=bool(
+                                getattr(
+                                    model,
+                                    "workspace_no_report_confidence_readout_enabled",
+                                    False,
+                                )
+                            ),
                         )
                     if bool(getattr(model, "workspace_attentional_cue_readout_enabled", False)):
                         logits = self.apply_workspace_attentional_cue_readout_logits(
@@ -2691,6 +2922,64 @@ class WorkspaceCapabilityDataset(BaseDataset):
                             blink_counts[1] += int(pred[1] == expected[1])
                             blink_counts[2] += 1
                             blink_counts[3] += int(exact)
+                        if episode.track == "no_report_confidence":
+                            process = gnw_process_totals[
+                                (episode.track, str(episode.metadata["query_type"]))
+                            ]
+                            action_correct = int(
+                                pred[0]
+                                == (
+                                    BOOL_TRUE
+                                    if bool(episode.metadata["majority_action"])
+                                    else BOOL_FALSE
+                                )
+                            )
+                            latent_correct = int(
+                                (pred[0] == BOOL_TRUE)
+                                == bool(episode.metadata["latent_truth"])
+                            )
+                            process[0] += action_correct
+                            process[1] += 1
+                            process[2] += latent_correct
+                            process[3] += 1
+                            reported = bool(episode.metadata["explicit_report"])
+                            if reported:
+                                process[4] += int(
+                                    len(pred) > 1
+                                    and pred[1]
+                                    == scalar_token(int(episode.metadata["confidence_bin"]))
+                                )
+                                process[5] += 1
+                        elif episode.track == "ignition":
+                            strength = int(episode.metadata["stimulus_strength"])
+                            access = int(pred[0] == BOOL_TRUE)
+                            expected_access = int(bool(episode.metadata["report"]))
+                            curve_counts = ignition_access_totals[strength]
+                            curve_counts[0] += access
+                            curve_counts[1] += expected_access
+                            curve_counts[2] += int(access == expected_access)
+                            curve_counts[3] += 1
+                        elif episode.track == "masked_priming":
+                            process = gnw_process_totals[
+                                (episode.track, query_type)
+                            ]
+                            predicted_response = (
+                                int(pred[0]) - SCALAR_BASE
+                                if SCALAR_BASE <= int(pred[0]) < SCALAR_BASE + 2
+                                else -1
+                            )
+                            prime = int(episode.metadata["prime_value"])
+                            response = int(episode.metadata["target_value"])
+                            process[0] += int(predicted_response == response)
+                            process[1] += 1
+                            process[2] += int(
+                                prime != response and predicted_response == prime
+                            )
+                            process[3] += int(prime != response)
+                            process[4] += int(
+                                predicted_response == int(episode.metadata["latent_target"])
+                            )
+                            process[5] += 1
                         if episode.track == "permutation":
                             query_counts = permutation_query_totals[
                                 str(episode.metadata.get("query_type", "unknown"))
@@ -2743,6 +3032,12 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 model.workspace_eval_bypass = prior_workspace_bypass
             if shuffle_workspace_readback:
                 model.workspace_eval_shuffle_readback = prior_workspace_shuffle
+            if feature_ablation_attribute is not None:
+                setattr(
+                    model,
+                    feature_ablation_attribute,
+                    prior_feature_ablation_value,
+                )
             model.train(was_training)
 
         accuracy = 100.0 * correct_total / max(answer_total, 1)
@@ -2842,6 +3137,56 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 for query_type, counts in sorted(blink_t2_totals.items())
             },
         }
+        if gnw_process_totals:
+            signatures = {}
+            for (track, condition), counts in sorted(gnw_process_totals.items()):
+                if track == "no_report_confidence":
+                    metrics = {
+                        "evidence_action_accuracy": 100.0 * counts[0] / max(counts[1], 1),
+                        "latent_truth_alignment": 100.0 * counts[2] / max(counts[3], 1),
+                        "reported_confidence_bin_accuracy": 100.0 * counts[4] / max(counts[5], 1),
+                        "episodes": counts[1],
+                        "reported_episodes": counts[5],
+                    }
+                else:
+                    metrics = {
+                        "percept_response_accuracy": 100.0 * counts[0] / max(counts[1], 1),
+                        "prime_intrusion_rate_on_conflict": 100.0 * counts[2] / max(counts[3], 1),
+                        "latent_target_alignment": 100.0 * counts[4] / max(counts[5], 1),
+                        "episodes": counts[1],
+                        "conflict_episodes": counts[3],
+                    }
+                signatures.setdefault(track, {})[condition] = metrics
+            diagnostics["gnw_process_signatures"] = signatures
+            diagnostics["gnw_process_context"] = {
+                "workspace_enabled": bool(getattr(model, "workspace_enabled", False)),
+                "workspace_readback_bypassed": bool(ablate_workspace),
+                "workspace_readback_shuffled": bool(shuffle_workspace_readback),
+                "no_report_exact_aggregation": bool(
+                    getattr(model, "workspace_no_report_confidence_readout_enabled", False)
+                ),
+                "masked_prime_trace_enabled": bool(
+                    getattr(model, "workspace_masked_prime_trace_enabled", False)
+                ),
+                "masked_prime_trace_read_accuracy_by_condition": {
+                    condition: 100.0 * counts[0] / max(counts[1], 1)
+                    for condition, counts in sorted(masked_prime_trace_reads.items())
+                },
+                "masked_prime_trace_reads_by_condition": {
+                    condition: counts[1]
+                    for condition, counts in sorted(masked_prime_trace_reads.items())
+                },
+            }
+        if ignition_access_totals:
+            diagnostics["gnw_ignition_access_curve"] = {
+                str(strength): {
+                    "predicted_access_rate": 100.0 * counts[0] / max(counts[3], 1),
+                    "target_report_rate": 100.0 * counts[1] / max(counts[3], 1),
+                    "response_accuracy": 100.0 * counts[2] / max(counts[3], 1),
+                    "episodes": counts[3],
+                }
+                for strength, counts in sorted(ignition_access_totals.items())
+            }
         if bool(getattr(model, "workspace_nth_farthest_exact_readout", False)):
             diagnostics["nth_farthest_workspace"] = {
                 "vector_coordinate_accuracy": 100.0
@@ -2977,6 +3322,38 @@ class WorkspaceCapabilityDataset(BaseDataset):
             f"[workspace-capability/{self.task_track}] accuracy {accuracy:.2f}% | "
             f"episode exact {perfect:.2f}% | episodes {len(episodes)}"
         )
+        for track, conditions in diagnostics.get("gnw_process_signatures", {}).items():
+            for condition, metrics in conditions.items():
+                if track == "no_report_confidence":
+                    print(
+                        f"  [GNW-process/{track}/{condition}] evidence-action="
+                        f"{metrics['evidence_action_accuracy']:.1f}% | latent-truth alignment="
+                        f"{metrics['latent_truth_alignment']:.1f}% | confidence-bin="
+                        f"{metrics['reported_confidence_bin_accuracy']:.1f}% "
+                        f"({metrics['episodes']} episodes; {metrics['reported_episodes']} reports)"
+                    )
+                else:
+                    print(
+                        f"  [GNW-process/{track}/{condition}] percept-response="
+                        f"{metrics['percept_response_accuracy']:.1f}% | prime intrusion on "
+                        f"conflict={metrics['prime_intrusion_rate_on_conflict']:.1f}% | "
+                        f"latent-target alignment={metrics['latent_target_alignment']:.1f}% "
+                        f"({metrics['episodes']} episodes)"
+                    )
+        for condition, accuracy_value in diagnostics.get("gnw_process_context", {}).get(
+            "masked_prime_trace_read_accuracy_by_condition", {}
+        ).items():
+            print(
+                f"  [GNW-process/masked-prime-trace/{condition}] workspace prime "
+                f"read accuracy={accuracy_value:.1f}%"
+            )
+        for strength, values in diagnostics.get("gnw_ignition_access_curve", {}).items():
+            print(
+                f"  [GNW-ignition/strength_{strength}] predicted access="
+                f"{values['predicted_access_rate']:.1f}% | target report="
+                f"{values['target_report_rate']:.1f}% | response accuracy="
+                f"{values['response_accuracy']:.1f}% (n={values['episodes']})"
+            )
         nth_metrics = diagnostics.get("nth_farthest_workspace")
         if nth_metrics:
             print(
@@ -3563,6 +3940,27 @@ class WorkspaceCapabilityDataset(BaseDataset):
     def evaluate_workspace_shuffled(self, model, device, curriculum, lesson_idx):
         episodes = self._paired_id_episodes(lesson_idx)
         return self._evaluate_episodes(model, device, episodes, shuffle_workspace_readback=True)[:2]
+
+    def evaluate_workspace_feature_ablated(
+        self, model, device, curriculum, lesson_idx, feature_name: str
+    ):
+        """Run a paired evaluation with one enabled task-specific pathway disabled."""
+        episodes = self._paired_id_episodes(lesson_idx)
+        return self._evaluate_episodes(
+            model,
+            device,
+            episodes,
+            ablate_workspace_feature=feature_name,
+        )[:2]
+
+    @staticmethod
+    def enabled_workspace_functional_features(model) -> tuple[str, ...]:
+        """List active task-specific workspace mechanisms eligible for ablation."""
+        return tuple(
+            name
+            for name, attribute in _FUNCTIONAL_FEATURE_ABLATIONS
+            if bool(getattr(model, attribute, False))
+        )
 
     def evaluate_id_combiner_stage_ablated(
         self, model, device, curriculum, lesson_idx, skip_stages

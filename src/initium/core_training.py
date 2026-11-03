@@ -1111,6 +1111,7 @@ def run(
     split_graph_backbone_only: bool = False,
     split_graph_variant: str = SPLIT_GRAPH_MAMBA_VARIANT,
     split_graph_num_blocks: int = SPLIT_GRAPH_NUM_BLOCKS,
+    split_graph_activation_checkpointing: bool = False,
     split_graph_headdim: int = SPLIT_GRAPH_MAMBA_HEADDIM,
     split_graph_combine_reads: bool = SPLIT_GRAPH_COMBINE_READS,
     split_graph_combiner_mode: str = SPLIT_GRAPH_COMBINER_MODE,
@@ -1191,6 +1192,9 @@ def run(
     workspace_sparse_recurrence: bool = False,
     workspace_attentional_item_memory: bool = False,
     workspace_attentional_cue_readout: bool = False,
+    workspace_no_report_confidence_readout: bool = False,
+    workspace_masked_prime_trace: bool = False,
+    workspace_functional_signature_diagnostics: bool = False,
     prepared_dataset=None,
     ogs_weights: tuple[float, float, float] = OGS_WEIGHTS,
     batch_size: int = BATCH_SIZE,
@@ -1219,10 +1223,34 @@ def run(
         # Cue readout depends on structured per-frame storage; the single flag
         # enables that prerequisite while retaining the same validation.
         workspace_attentional_item_memory = True
+    workspace_task_name = str(workspace_task_track).lower().replace("-", "_")
+    workspace_feature_requirements = (
+        (workspace_no_report_confidence_readout, "no_report_confidence"),
+        (workspace_masked_prime_trace, "masked_priming"),
+    )
+    for enabled, feature_track in workspace_feature_requirements:
+        if enabled and not (
+            workspace_enabled
+            and workspace_key_value_loss_weight > 0
+            and workspace_entity_keyed_writes
+            and workspace_semantic_entity_addressing
+            and dataset_type == "workspace-capability"
+            and workspace_task_name in {feature_track, "gnw_all", "all"}
+        ):
+            raise ValueError(
+                f"workspace {feature_track} feature requires key-value readout, "
+                "semantic entity addressing, workspace-capability data, and a "
+                f"compatible track ({feature_track}, gnw_all, or all)"
+            )
     if workspace_token_id_input and dataset_type != "workspace-capability":
         raise ValueError("workspace token-ID input requires --dataset-type workspace-capability")
     if activation_offload_to_cpu and device.type != "cuda":
         raise ValueError("activation offload to CPU requires CUDA training")
+    if activation_offload_to_cpu and split_graph_activation_checkpointing:
+        raise ValueError(
+            "choose either CPU activation offload or split-graph activation checkpointing; "
+            "the latter keeps activations on GPU and recomputes Mamba blocks"
+        )
     if activation_offload_cpu_budget_mb <= 0:
         raise ValueError("activation offload CPU budget must be positive")
     if not math.isfinite(workspace_state_loss_weight) or workspace_state_loss_weight < 0:
@@ -1255,6 +1283,13 @@ def run(
     if workspace_operation_diagnostics and not workspace_operation_executor:
         raise ValueError(
             "workspace operation diagnostics require workspace_operation_executor"
+        )
+    if workspace_functional_signature_diagnostics and not (
+        workspace_enabled and dataset_type == "workspace-capability"
+    ):
+        raise ValueError(
+            "workspace functional signature diagnostics require --workspace and "
+            "--dataset-type workspace-capability"
         )
     if workspace_exact_value_comparison and not (
         workspace_key_value_loss_weight > 0
@@ -1298,7 +1333,7 @@ def run(
         and workspace_semantic_entity_addressing
         and dataset_type == "workspace-capability"
         and str(workspace_task_track).lower().replace("-", "_")
-        in {"attentional_blink", "new_all", "all"}
+        in {"attentional_blink", "gnw_all", "new_all", "all"}
     ):
         raise ValueError(
             "attentional item memory requires key-value readout, semantic entity "
@@ -1329,6 +1364,17 @@ def run(
         raise ValueError("memory_position must be none or rope")
     if memory_position != "none" and memory_type != "kv":
         raise ValueError("memory_position is only supported by KV memory")
+    if split_graph_activation_checkpointing and not (
+        split_graph_enabled
+        and any(
+            kind.strip().lower().startswith("mamba")
+            for kind in str(split_graph_variant).split("+")
+        )
+    ):
+        raise ValueError(
+            "split-graph activation checkpointing requires a split-graph backbone "
+            "containing Mamba blocks"
+        )
     if workspace_compile_recurrence and (
         not workspace_enabled
         or workspace_num_slots < 1
@@ -2201,6 +2247,65 @@ def run(
                         *([None] * 8),
                     ]
                 )
+        for track, conditions in sorted(
+            diagnostics.get("gnw_process_signatures", {}).items()
+        ):
+            for condition, metrics in sorted(conditions.items()):
+                for metric, value in sorted(metrics.items()):
+                    if metric.endswith("episodes") or metric.endswith("reports"):
+                        continue
+                    workspace_task_writer.writerow(
+                        [
+                            step_value,
+                            lesson_value,
+                            eval_type,
+                            f"GNW-process/{track}/{condition}/{metric}",
+                            value,
+                            None,
+                            metrics.get("episodes"),
+                            None,
+                            *([None] * 8),
+                        ]
+                    )
+        for strength, metrics in sorted(
+            diagnostics.get("gnw_ignition_access_curve", {}).items(),
+            key=lambda item: int(item[0]),
+        ):
+            for metric in (
+                "predicted_access_rate",
+                "target_report_rate",
+                "response_accuracy",
+            ):
+                workspace_task_writer.writerow(
+                    [
+                        step_value,
+                        lesson_value,
+                        eval_type,
+                        f"GNW-ignition/strength_{strength}/{metric}",
+                        metrics.get(metric),
+                        None,
+                        metrics.get("episodes"),
+                        None,
+                        *([None] * 8),
+                    ]
+                )
+        for metric, value in sorted(diagnostics.get("gnw_process_context", {}).items()):
+            values = value.items() if isinstance(value, dict) else ((None, value),)
+            for condition, metric_value in values:
+                suffix = f"/{condition}" if condition is not None else ""
+                workspace_task_writer.writerow(
+                    [
+                        step_value,
+                        lesson_value,
+                        eval_type,
+                        f"GNW-process/context/{metric}{suffix}",
+                        metric_value,
+                        None,
+                        diagnostics.get("n_episodes"),
+                        None,
+                        *([None] * 8),
+                    ]
+                )
         operation_diagnostics = diagnostics.get("workspace_operation_diagnostics", {})
         for operation, values in sorted(operation_diagnostics.get("by_operation", {}).items()):
             for metric, accuracy_key, correct_key, count_key in (
@@ -2528,6 +2633,9 @@ def run(
                 rnn, device, curriculum, lesson_value - 1
             )
             ablated_diagnostics = getattr(dataset, "last_eval_diagnostics", {})
+            write_workspace_task_metrics(
+                step_value, lesson_value, "id-workspace-bypassed", ablated_diagnostics
+            )
             segment_diagnostics.emit("eval-id-workspace-bypass")
             segment_diagnostics.set_channel("eval-id-workspace-shuffled")
             _restore_rng_state(id_eval_rng_state)
@@ -2535,6 +2643,9 @@ def run(
                 rnn, device, curriculum, lesson_value - 1
             )
             shuffled_diagnostics = getattr(dataset, "last_eval_diagnostics", {})
+            write_workspace_task_metrics(
+                step_value, lesson_value, "id-workspace-shuffled", shuffled_diagnostics
+            )
             segment_diagnostics.emit("eval-id-workspace-shuffled")
             rows = [
                 ("all", "full", baseline_accuracy, baseline_exact, baseline_accuracy, baseline_exact),
@@ -2645,6 +2756,53 @@ def run(
                             base_blink[query_type]["episode_exact_match"],
                         )
                     )
+            feature_ablation_due = (
+                int(step_value) == int(total_steps)
+                or int(step_value) % max(int(EVAL_EVERY) * 10, 1) == 0
+            )
+            if workspace_functional_signature_diagnostics and feature_ablation_due:
+                eval_feature = getattr(dataset, "evaluate_workspace_feature_ablated", None)
+                enabled_features = getattr(
+                    dataset, "enabled_workspace_functional_features", None
+                )
+                if callable(eval_feature) and callable(enabled_features):
+                    for feature_name in enabled_features(rnn):
+                        channel = f"eval-id-workspace-feature-{feature_name}"
+                        segment_diagnostics.set_channel(channel)
+                        _restore_rng_state(id_eval_rng_state)
+                        feature_accuracy, feature_exact = eval_feature(
+                            rnn, device, curriculum, lesson_value - 1, feature_name
+                        )
+                        segment_diagnostics.emit(channel)
+                        feature_diagnostics = getattr(dataset, "last_eval_diagnostics", {})
+                        write_workspace_task_metrics(
+                            step_value,
+                            lesson_value,
+                            f"id-feature-off-{feature_name}",
+                            feature_diagnostics,
+                        )
+                        rows.append(
+                            (
+                                "all",
+                                f"feature_off/{feature_name}",
+                                feature_accuracy,
+                                feature_exact,
+                                baseline_accuracy,
+                                baseline_exact,
+                            )
+                        )
+                        feature_tracks = feature_diagnostics.get("tracks", {})
+                        for track in sorted(set(base_tracks) & set(feature_tracks)):
+                            rows.append(
+                                (
+                                    track,
+                                    f"feature_off/{feature_name}",
+                                    feature_tracks[track]["accuracy"],
+                                    feature_tracks[track]["exact_match"],
+                                    base_tracks[track]["accuracy"],
+                                    base_tracks[track]["exact_match"],
+                                )
+                            )
             for track, condition, accuracy, exact, reference_accuracy, reference_exact in rows:
                 workspace_check_writer.writerow(
                     [
@@ -2903,6 +3061,11 @@ def run(
             else ""
         )
     )
+    if split_graph_activation_checkpointing:
+        print(
+            f"[{run_id}] split-graph Mamba activation checkpointing=on | "
+            "full-sequence blocks are recomputed in backward to reduce VRAM"
+        )
     if activation_offload_to_cpu:
         print(
             f"[{run_id}] autograd saved-tensor offload=CPU pinned memory | "
@@ -3101,6 +3264,7 @@ def run(
             read_heads=read_heads,
             num_backbone_blocks=split_graph_num_blocks,
             mamba_variant=split_graph_variant,
+            activation_checkpointing=split_graph_activation_checkpointing,
             mamba_d_state=_sg_d_state,
             mamba_d_conv=_sg_d_conv,
             mamba_expand=_sg_expand,
@@ -3159,6 +3323,8 @@ def run(
             workspace_sparse_recurrence=workspace_sparse_recurrence,
             workspace_attentional_item_memory=workspace_attentional_item_memory,
             workspace_attentional_cue_readout=workspace_attentional_cue_readout,
+            workspace_no_report_confidence_readout=workspace_no_report_confidence_readout,
+            workspace_masked_prime_trace=workspace_masked_prime_trace,
             workspace_token_id_input=workspace_token_id_input,
             workspace_entity_keyed_writes=workspace_entity_keyed_writes,
             workspace_semantic_entity_addressing=workspace_semantic_entity_addressing,
@@ -3431,6 +3597,8 @@ def run(
                 f"sparse_recurrence={'on' if workspace_sparse_recurrence else 'off'} | "
                 f"attentional_item_memory={'on' if workspace_attentional_item_memory else 'off'} | "
                 f"attentional_cue_readout={'on' if workspace_attentional_cue_readout else 'off'} | "
+                f"no_report_readout={'on' if workspace_no_report_confidence_readout else 'off'} | "
+                f"masked_prime_trace={'on' if workspace_masked_prime_trace else 'off'} | "
                 f"workspace_to_kv={'on(two-pass, lag=1, read_scale=' + format(workspace_kv_read_scale, 'g') + ')' if workspace_write_to_kv else 'off'} | "
                 f"reconsideration={'on' if workspace_reconsideration_enabled else 'off'}"
                 f"(trigger={workspace_reconsideration_trigger_mode}, "
@@ -3457,6 +3625,7 @@ def run(
         "output_dim": TRIPLE_DIM,
         "num_hidden_layers": getattr(rnn, "num_hidden_layers", None),
         "split_graph_num_blocks": split_graph_num_blocks,
+        "split_graph_activation_checkpointing": split_graph_activation_checkpointing,
         "split_graph_headdim": split_graph_headdim,
         "split_graph_combine_reads": split_graph_combine_reads,
         "split_graph_combiner_mode": split_graph_combiner_mode,
@@ -3556,6 +3725,10 @@ def run(
         extra_model_config["workspace_retrieval_exact_readout"] = True
     if workspace_attentional_cue_readout:
         extra_model_config["workspace_attentional_cue_readout"] = True
+    if workspace_no_report_confidence_readout:
+        extra_model_config["workspace_no_report_confidence_readout"] = True
+    if workspace_masked_prime_trace:
+        extra_model_config["workspace_masked_prime_trace"] = True
     if workspace_key_value_loss_weight > 0:
         extra_model_config["workspace_key_value_loss_weight"] = float(
             workspace_key_value_loss_weight
@@ -4535,6 +4708,7 @@ def run(
                 paired_swap_commits=workspace_permutation_transactional,
                 attentional_item_memory=workspace_attentional_item_memory,
                 attentional_cue_readout=workspace_attentional_cue_readout,
+                masked_prime_trace=workspace_masked_prime_trace,
             )
             if workspace_nth_farthest_exact_readout:
                 nth_metadata = dataset.workspace_nth_farthest_metadata(input_seq)
@@ -4577,6 +4751,8 @@ def run(
                     input_seq,
                     include_operations=workspace_operation_executor,
                     attentional_item_memory=workspace_attentional_item_memory,
+                    no_report_confidence_readout=workspace_no_report_confidence_readout,
+                    masked_prime_trace=workspace_masked_prime_trace,
                 ).items()
             }
             workspace_forward_kwargs.update(
@@ -4823,6 +4999,7 @@ def run(
                     answer_mask,
                     exact_value_comparison=workspace_exact_value_comparison,
                     exact_selection=workspace_exact_selection,
+                    exact_no_report_readout=workspace_no_report_confidence_readout,
                 )
             if workspace_permutation_transactional:
                 workspace_module = getattr(rnn, "workspace", None)
@@ -7780,6 +7957,34 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--workspace-no-report-confidence-readout",
+        action="store_true",
+        help=(
+            "Read the no-report evidence items from semantic workspace slots and "
+            "apply an exact majority plus evidence-margin confidence readout. "
+            "Requires key-value supervision and semantic entity addressing."
+        ),
+    )
+    parser.add_argument(
+        "--workspace-masked-prime-trace",
+        action="store_true",
+        help=(
+            "Store the masked-prime EV_NOISE item in its dedicated semantic workspace "
+            "slot and supervise its readback. This is an explicit ablation of the "
+            "default non-broadcast masked condition."
+        ),
+    )
+    parser.add_argument(
+        "--workspace-functional-signature-diagnostics",
+        action="store_true",
+        help=(
+            "At every tenth periodic and final evaluation, measure per-track workspace readback "
+            "dependence and paired ablations of enabled task-specific workspace "
+            "features. Writes feature_off/* rows to the workspace dependency CSV; "
+            "requires --workspace on workspace-capability."
+        ),
+    )
+    parser.add_argument(
         "--workspace-key-match-threshold",
         type=float,
         default=0.5,
@@ -8000,6 +8205,15 @@ if __name__ == "__main__":
         type=int,
         default=SPLIT_GRAPH_NUM_BLOCKS,
         help="Number of stacked backbone blocks for --split-graph.",
+    )
+    parser.add_argument(
+        "--split-graph-activation-checkpointing",
+        action="store_true",
+        help=(
+            "Recompute Mamba backbone block activations during backward instead of "
+            "retaining their full-sequence intermediates. Preserves full BPTT and "
+            "task difficulty while trading extra compute for lower GPU memory."
+        ),
     )
     parser.add_argument(
         "--split-graph-headdim",
@@ -8408,6 +8622,21 @@ if __name__ == "__main__":
         parser.error("--workspace-task-track requires --dataset-type workspace-capability")
     if args.workspace_token_id_input and args.dataset_type != "workspace-capability":
         parser.error("--workspace-token-id-input requires --dataset-type workspace-capability")
+    if args.split_graph_activation_checkpointing and not (
+        args.split_graph
+        and any(
+            kind.strip().lower().startswith("mamba")
+            for kind in args.split_graph_variant.split("+")
+        )
+    ):
+        parser.error(
+            "--split-graph-activation-checkpointing requires --split-graph with a Mamba backbone"
+        )
+    if args.activation_offload_to_cpu and args.split_graph_activation_checkpointing:
+        parser.error(
+            "choose either --activation-offload-to-cpu or "
+            "--split-graph-activation-checkpointing"
+        )
     if args.dnc_write_observation_variance <= 0:
         parser.error("--dnc-write-observation-variance must be positive")
     if args._dnc_optimized_bundle and args.split_graph:
@@ -8769,6 +8998,13 @@ if __name__ == "__main__":
         parser.error(
             "--workspace-semantic-state-diagnostics requires --workspace-semantic-entity-addressing"
         )
+    if args.workspace_functional_signature_diagnostics and not (
+        args.workspace and args.dataset_type == "workspace-capability"
+    ):
+        parser.error(
+            "--workspace-functional-signature-diagnostics requires --workspace "
+            "and --dataset-type workspace-capability"
+        )
     if args.workspace_state_diagnostic_max_events < 0:
         parser.error("--workspace-state-diagnostic-max-events must be >= 0")
     if not math.isfinite(args.workspace_state_loss_weight) or args.workspace_state_loss_weight < 0:
@@ -8927,6 +9163,36 @@ if __name__ == "__main__":
             parser.error(
                 "--workspace-attentional-item-memory requires "
                 "--workspace-num-slots >= 26"
+            )
+    for enabled, feature_name, supported_track in (
+        (
+            args.workspace_no_report_confidence_readout,
+            "--workspace-no-report-confidence-readout",
+            "no_report_confidence",
+        ),
+        (
+            args.workspace_masked_prime_trace,
+            "--workspace-masked-prime-trace",
+            "masked_priming",
+        ),
+    ):
+        if enabled and not (
+            args.workspace
+            and args.workspace_key_value_loss_weight > 0
+            and args.workspace_entity_keyed_writes
+            and args.workspace_semantic_entity_addressing
+        ):
+            parser.error(
+                f"{feature_name} requires --workspace, positive key-value loss, "
+                "entity-keyed writes, and semantic entity addressing"
+            )
+        if enabled and (
+            args.dataset_type != "workspace-capability"
+            or args.workspace_task_track not in (supported_track, "gnw_all", "all")
+        ):
+            parser.error(
+                f"{feature_name} supports workspace-capability tracks "
+                f"{supported_track}, gnw_all, or all"
             )
     if args.workspace_retrieval_exact_readout:
         if not args.workspace or not args.workspace_semantic_entity_addressing:
@@ -9227,6 +9493,8 @@ if __name__ == "__main__":
         # retains them when long architecture/config names are shortened.
         if args.workspace_token_id_input:
             run_id += "_tokenidinput"
+        if args.split_graph_activation_checkpointing:
+            run_id += "_actckpt"
         if args.workspace_operation_diagnostics:
             run_id += "_opdiag"
         if args.activation_offload_to_cpu:
@@ -9272,6 +9540,7 @@ if __name__ == "__main__":
             split_graph_backbone_only=args.split_graph_backbone_only,
             split_graph_variant=args.split_graph_variant,
             split_graph_num_blocks=args.split_graph_num_blocks,
+            split_graph_activation_checkpointing=args.split_graph_activation_checkpointing,
             split_graph_headdim=args.split_graph_headdim,
             split_graph_combine_reads=not args.split_graph_no_combine,
             split_graph_combiner_mode=args.split_graph_combiner_mode,
@@ -9354,6 +9623,11 @@ if __name__ == "__main__":
             workspace_sparse_recurrence=args.workspace_sparse_recurrence,
             workspace_attentional_item_memory=args.workspace_attentional_item_memory,
             workspace_attentional_cue_readout=args.workspace_attentional_cue_readout,
+            workspace_no_report_confidence_readout=args.workspace_no_report_confidence_readout,
+            workspace_masked_prime_trace=args.workspace_masked_prime_trace,
+            workspace_functional_signature_diagnostics=(
+                args.workspace_functional_signature_diagnostics
+            ),
             prepared_dataset=prepared_dataset,
             ogs_weights=tuple(args.ogs_weights),
             batch_size=args.batch_size,

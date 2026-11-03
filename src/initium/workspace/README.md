@@ -57,6 +57,7 @@ RMS relative to its routed writer to reduce state-scale instability.
 | `--workspace-bptt-horizon STEPS` | Detaches recurrent slot gradients every `STEPS` tokens while preserving the same forward state trajectory. `0` means full-sequence backpropagation. | Reduce activation/gradient memory for long sequences or measure the value of long-range gradient flow. |
 | `--workspace-compile-recurrence` | Compiles the sequential slot-update step with CUDA `torch.compile`; token-only projections are prepared over time, while the state recurrence remains sequential. | Keep this enabled for normal workspace training: it has repeatedly improved training throughput. It supports semantic/keyed addressing, reconsideration, write salience, and transactional pair commits. It does not support random writes (`--workspace-no-selection`) or bistable gates. Omit it only for those unsupported modes or an explicit eager-versus-compiled control. |
 | `--workspace-token-id-input` | For the workspace-capability suite, batches integer token IDs and computes the existing split-graph input projection as an embedding lookup. Padding retains the same zero-vector-plus-bias result as the one-hot path. | Opt-in performance A/B against the default one-hot path. The model math and trainable projection weights are unchanged; the run ID records `_tokenidinput`. |
+| `--split-graph-activation-checkpointing` | Recomputes each Mamba backbone block during backward instead of retaining its full-sequence internal activations. The forward sequence and full BPTT gradient path are unchanged; extra compute trades for lower GPU memory. | Use for long lessons when full-sequence backbone activations push GPU memory over capacity. Requires `--split-graph` with a Mamba backbone. This option cannot be combined with CPU activation offload. |
 | `--activation-offload-to-cpu` | Stores tensors saved by autograd in pinned host memory and restores their original strides when transferring them back for backward. `--activation-offload-cpu-budget-mb MIB` caps copied activation payload per training step (default 2048 MiB); extra saves remain on their original device. | Use when long lessons exceed GPU memory and host memory is available. It keeps full BPTT and forward equations but can increase host RAM and transfer time. Console logs show copied/resident save volume and Linux process RSS/pinned RAM when available. CUDA only. |
 
 Frozen mode and gate scope change which parameters are trainable, so give those
@@ -159,6 +160,10 @@ fraction, gate mean, slot/readback scale, and address match/allocation/overflow
 rates where applicable. Reconsideration and prediction-error write salience
 also create `run_<id>_workspace_telemetry.csv`. Workspace-capability evaluation
 strata are written to `run_<id>_workspace_task_metrics.csv`.
+For workspace-capability runs, `--workspace-functional-signature-diagnostics`
+adds paired per-track ablations of enabled task-specific helpers to
+`run_<id>_workspace_dependency.csv` as `feature_off/<name>` rows. Ignition
+response rates by stimulus strength are included in the task-metrics log.
 
 For long training sequences, segment diagnostics sample one training step per
 `--log-every` interval by default. Use `--segment-diagnostics-every-step` for

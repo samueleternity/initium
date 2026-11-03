@@ -314,6 +314,67 @@ to these mappings include Sergent & Dehaene (2004), Sergent, Baillet & Dehaene
 (2005), Pashler (1994), Dehaene et al. (2001, 2011), Naccache et al. (2002),
 Dehaene, Lau & Kouider (2017), and Butlin et al. (2023).
 
+The no-report task's action is now the majority choice supported by the noisy
+evidence. The latent state is retained only for diagnostic alignment; a noisy
+sample does not define a deterministic label for that hidden state. The
+optional confidence target is the evidence-margin bin, not a calibrated
+probability; the input now includes an explicit cue for whether confidence is
+requested. The masked-priming answer is the response supported by the
+presented target observation; the latent target remains available only for
+perceptual-error metrics. Every evaluation reports GNW process signatures:
+evidence-action and confidence-bin accuracy plus latent-truth alignment for
+no-report, and response accuracy plus prime-intrusion rates by mask/congruency
+condition for masked priming. Workspace runs record those same signatures for
+normal, bypassed, and shuffled readback evaluations where available.
+
+Two opt-in workspace interventions isolate task-specific mechanisms. Add
+`--workspace-no-report-confidence-readout` to use an exact vote and
+evidence-margin readout over the evidence values retrieved from semantic
+workspace slots. Add `--workspace-masked-prime-trace` to store the masked prime
+in its own workspace slot and supervise its query-time retrieval. The latter
+intentionally lifts a masked item into the global workspace; compare it with
+the default no-write condition as an architectural intervention. Both flags
+require positive workspace key-value loss, entity-keyed writes, and semantic
+entity addressing, and work with the individual track, `gnw_all`, or `all`.
+
+### Functional signature diagnostics
+
+Add `--workspace-functional-signature-diagnostics` to measure causal
+contributions from enabled task-specific workspace pathways. It replays the
+same balanced ID episodes with one enabled pathway disabled at a time and
+writes per-track score changes as `feature_off/<name>` conditions in
+`run_<id>_workspace_dependency.csv`. Existing `full`, `readback_bypassed`, and
+`readback_shuffled` conditions remain, so a task score can be compared against
+both a broken broadcast path and each explicit task helper. Only enabled
+helpers are ablated. This adds one evaluation pass per active helper at every
+tenth periodic evaluation and at the final evaluation; leave the flag off for
+ordinary training.
+
+Ignition also writes a response curve by evidence strength with predicted
+access rate, target-report rate, response accuracy, and sample count to
+`run_<id>_workspace_task_metrics.csv`. Interpret this as a task response
+curve, not a direct measurement of conscious access. Condition-level GNW
+process metrics remain in that file as well.
+
+### Combined all-task run
+
+`all` selects all eighteen workspace-capability tracks and does not include
+graph traversal, which belongs to a separate dataset. The following run uses
+the known 4-block Mamba-1/MoE/workspace settings and enables the available
+task-specific helpers; periodic feature ablations report which tasks depend
+on each helper. The helper flags are explicit scaffolds, so this run tests
+their interaction with a shared workspace, not whether the model invented
+those algorithms itself.
+
+```bash
+python -m src.initium.core_training 0.0 --dataset-type workspace-capability --workspace-task-track all --split-graph --split-graph-variant mamba1 --split-graph-num-blocks 4 --moe --moe-placement all --moe-num-experts 8 --moe-top-k 1 --moe-capacity-factor 1.5 --moe-backbone-residual-scale 0.1 --workspace --workspace-num-slots 64 --workspace-entity-keyed-writes --workspace-semantic-entity-addressing --workspace-key-value-loss-weight 0.1 --workspace-operation-executor --workspace-operation-diagnostics --workspace-nth-farthest-exact-readout --workspace-retrieval-exact-readout --workspace-exact-value-comparison --workspace-exact-selection --workspace-attentional-cue-readout --workspace-no-report-confidence-readout --workspace-masked-prime-trace --workspace-functional-signature-diagnostics --workspace-compile-recurrence --workspace-token-id-input --workspace-sparse-recurrence --seed 0 --total-steps 50000 --batch-size 16 --run-id-suffix wcap-all-functional-signatures-s0 --no-moe-diagnostics --no-segment-diagnostics --checkpoint-every 5000 --memory-type none --fp32
+```
+
+For a stricter learned-use comparison, repeat with the task-specific helper
+flags removed while retaining generic semantic key-value supervision,
+workspace readback, and `--workspace-functional-signature-diagnostics`. Keep
+the seed and evaluation episodes matched; compare the two runs separately.
+
 ## Curriculum, evaluation, and metrics
 
 Each track has six difficulty levels. `all` rotates the eighteen tracks evenly

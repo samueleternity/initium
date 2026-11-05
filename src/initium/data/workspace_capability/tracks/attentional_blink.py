@@ -39,8 +39,15 @@ def _distractor(
     return color, shape
 
 
-def _append_item(stream: list[int], color: int, shape: int, value: int) -> None:
+def _append_item(
+    stream: list[int], color: int, shape: int, value: int, *, masked: bool = False
+) -> None:
     """Append one uniformly encoded RSVP item frame."""
+    if masked:
+        # The mask is attached to T2 so the frame-level workspace encoder can
+        # distinguish an item that was locally processed from one eligible for
+        # stable item storage. A trailing noise frame after T2 did not mask T2.
+        stream.append(EV_NOISE)
     stream.extend((source_token(color), source_token(shape), scalar_token(value), SEP))
 
 
@@ -88,18 +95,7 @@ def generate(difficulty: dict, rng: random.Random, *, ood: bool = False) -> Task
         value = rng.randrange(SCALAR_COUNT)
         _append_item(stream, color, shape, value)
 
-    _append_item(stream, target_color, target_shape, target_two)
-    if mask_applied:
-        # A post-T2 pattern mask competes with consolidation of the second
-        # target while preserving a fixed-width stream frame.
-        stream.extend(
-            (
-                EV_NOISE,
-                source_token(rng.randrange(8)),
-                scalar_token(rng.randrange(SCALAR_COUNT)),
-                SEP,
-            )
-        )
+    _append_item(stream, target_color, target_shape, target_two, masked=mask_applied)
 
     for _ in range(after_count):
         color, shape = _distractor(
@@ -137,6 +133,6 @@ def generate(difficulty: dict, rng: random.Random, *, ood: bool = False) -> Task
             progression_group=f"lag_{lag}_{'masked' if mask_applied else 'unmasked'}",
             target_and_distractors_share_token_type=True,
             cue_requires_feature_conjunction=True,
-            mask_is_post_t2_noise_frame=mask_applied,
+            mask_marks_t2_frame_before_workspace_encoding=mask_applied,
         ),
     )

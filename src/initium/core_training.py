@@ -844,6 +844,7 @@ def load_frozen_workspace_warm_start(
         "workspace_attentional_item_memory",  # workspace-only data addressing
         "workspace_attentional_cue_readout",  # task-specific typed decoders/readout
         "workspace_rule_feedback_update",  # training-target policy; no model state
+        "workspace_gnw_task_design_version",  # generated task semantics, not model state
         "workspace_permutation_transactional",
         "workspace_key_match_threshold",
         "workspace_no_selection",
@@ -1197,6 +1198,7 @@ def run(
     workspace_no_report_confidence_readout: bool = False,
     workspace_masked_prime_trace: bool = False,
     workspace_functional_signature_diagnostics: bool = False,
+    workspace_gnw_balanced_eval_episodes_per_cell: int = 0,
     prepared_dataset=None,
     ogs_weights: tuple[float, float, float] = OGS_WEIGHTS,
     batch_size: int = BATCH_SIZE,
@@ -1219,6 +1221,8 @@ def run(
         )
     if log_every <= 0:
         raise ValueError("log_every must be positive")
+    if int(workspace_gnw_balanced_eval_episodes_per_cell) < 0:
+        raise ValueError("workspace_gnw_balanced_eval_episodes_per_cell must be >= 0")
     if memory_type not in {"none", "dnc", "kv", "delta"}:
         raise ValueError("memory_type must be none, dnc, kv, or delta")
     if workspace_attentional_cue_readout:
@@ -1755,6 +1759,26 @@ def run(
             f"checkpoint={checkpoint_config.get('workspace_task_track')!r}, "
             f"requested={dataset.task_track!r}"
         )
+    revised_gnw_tracks = {
+        "all",
+        "gnw_all",
+        "new_all",
+        "ignition",
+        "attentional_blink",
+        "masked_priming",
+    }
+    if (
+        resume_requested
+        and getattr(dataset, "name", None) == "workspace-capability"
+        and dataset.task_track in revised_gnw_tracks
+        and int(checkpoint_config.get("workspace_gnw_task_design_version", 1))
+        != int(getattr(dataset, "gnw_task_design_version", 2))
+    ):
+        raise ValueError(
+            "cannot resume a checkpoint across GNW task-design versions; the "
+            "ignition, attentional-blink, and masked-priming input/label semantics "
+            "changed, so start a fresh run or use the matching source revision"
+        )
     checkpoint_has_workspace = any(
         key.startswith("workspace.") or ".workspace." in key for key in checkpoint_state
     )
@@ -2287,8 +2311,9 @@ def run(
             key=lambda item: int(item[0]),
         ):
             for metric in (
-                "predicted_access_rate",
-                "target_report_rate",
+                "hit_rate",
+                "false_alarm_rate",
+                "balanced_accuracy",
                 "response_accuracy",
             ):
                 workspace_task_writer.writerow(
@@ -2300,6 +2325,140 @@ def run(
                         metrics.get(metric),
                         None,
                         metrics.get("episodes"),
+                        None,
+                        *([None] * 8),
+                    ]
+                )
+        ignition_fit = diagnostics.get("gnw_ignition_psychometric_fit", {})
+        for metric in (
+            "threshold_probability",
+            "threshold_criterion",
+            "threshold_criterion_in_observed_range",
+            "slope",
+            "n",
+            "strength_levels",
+        ):
+            value = ignition_fit.get(metric)
+            if isinstance(value, (int, float)):
+                workspace_task_writer.writerow(
+                    [
+                        step_value,
+                        lesson_value,
+                        eval_type,
+                        f"GNW-ignition/psychometric/{metric}",
+                        value,
+                        None,
+                        ignition_fit.get("n"),
+                        None,
+                        *([None] * 8),
+                    ]
+                )
+        for bound, value in zip(
+            ("low", "high"), ignition_fit.get("threshold_criterion_wald95", ())
+        ):
+            workspace_task_writer.writerow(
+                [
+                    step_value,
+                    lesson_value,
+                    eval_type,
+                    f"GNW-ignition/psychometric/threshold_criterion_ci_{bound}",
+                    value,
+                    None,
+                    ignition_fit.get("n"),
+                    None,
+                    *([None] * 8),
+                ]
+            )
+        priming_metrics = diagnostics.get("gnw_masked_priming_conditions", {})
+        for metric in (
+            "masked_minus_visible_prime_intrusion_on_conflict",
+            "visible_conflict_episodes",
+            "masked_conflict_episodes",
+        ):
+            value = priming_metrics.get(metric)
+            if isinstance(value, (int, float)):
+                workspace_task_writer.writerow(
+                    [
+                        step_value,
+                        lesson_value,
+                        eval_type,
+                        f"GNW-masked-priming/{metric}",
+                        value,
+                        None,
+                        min(
+                            priming_metrics.get("visible_conflict_episodes", 0),
+                            priming_metrics.get("masked_conflict_episodes", 0),
+                        ),
+                        None,
+                        *([None] * 8),
+                    ]
+                )
+        balanced_dependency = diagnostics.get("gnw_balanced_workspace_dependency", {})
+        for metric, value in sorted(balanced_dependency.items()):
+            if isinstance(value, (int, float)):
+                workspace_task_writer.writerow(
+                    [
+                        step_value,
+                        lesson_value,
+                        eval_type,
+                        f"GNW-balanced/workspace/{metric}",
+                        value,
+                        None,
+                        balanced_dependency.get("episodes"),
+                        None,
+                        *([None] * 8),
+                    ]
+                )
+        for track, metrics in sorted(
+            diagnostics.get("gnw_balanced_workspace_dependency_by_track", {}).items()
+        ):
+            for metric, value in sorted(metrics.items()):
+                if isinstance(value, (int, float)):
+                    workspace_task_writer.writerow(
+                        [
+                            step_value,
+                            lesson_value,
+                            eval_type,
+                            f"GNW-balanced/workspace/{track}/{metric}",
+                            value,
+                            None,
+                            metrics.get("episodes"),
+                            None,
+                            *([None] * 8),
+                        ]
+                    )
+        for feature, metrics in sorted(
+            diagnostics.get("gnw_balanced_feature_ablations", {}).items()
+        ):
+            for metric, value in sorted(metrics.items()):
+                workspace_task_writer.writerow(
+                    [
+                        step_value,
+                        lesson_value,
+                        eval_type,
+                        f"GNW-balanced/feature-off/{feature}/{metric}",
+                        value,
+                        None,
+                        metrics.get("episodes"),
+                        None,
+                        *([None] * 8),
+                    ]
+                )
+        for metric, value in sorted(
+            diagnostics.get("gnw_natural_report_confidence_calibration", {}).items()
+        ):
+            if isinstance(value, (int, float)):
+                workspace_task_writer.writerow(
+                    [
+                        step_value,
+                        lesson_value,
+                        eval_type,
+                        f"GNW-balanced/natural-report-calibration/{metric}",
+                        value,
+                        None,
+                        diagnostics["gnw_natural_report_confidence_calibration"].get(
+                            "episodes"
+                        ),
                         None,
                         *([None] * 8),
                     ]
@@ -3637,6 +3796,9 @@ def run(
         "dataset_type": dataset_type,
         "dataset_name": dataset.name,
         "workspace_task_track": getattr(dataset, "task_track", None),
+        "workspace_gnw_task_design_version": getattr(
+            dataset, "gnw_task_design_version", None
+        ),
         "supported_dataset_types": [dataset_type],  # use ["*"] for a future multi-modal model
         "input_dim": INPUT_DIM,
         "output_dim": TRIPLE_DIM,
@@ -7414,6 +7576,25 @@ def run(
         kl_diag,
     )
 
+    gnw_balanced_probe_result = None
+    if workspace_gnw_balanced_eval_episodes_per_cell:
+        balanced_probe_seed = int(seed) * 1_000_003 + int(step) + 0x474E57
+        segment_diagnostics.set_channel("eval-final-gnw-balanced-probe")
+        gnw_balanced_probe_result = dataset.evaluate_gnw_balanced_probe(
+            rnn,
+            device,
+            episodes_per_cell=workspace_gnw_balanced_eval_episodes_per_cell,
+            seed=balanced_probe_seed,
+            feature_ablations=workspace_functional_signature_diagnostics,
+        )
+        write_workspace_task_metrics(
+            step,
+            curriculum.lesson + 1,
+            "final-gnw-balanced-probe",
+            getattr(dataset, "last_eval_diagnostics", None),
+        )
+        segment_diagnostics.emit("eval-final-gnw-balanced-probe")
+
     for hops, (acc, pf, n) in sorted(ood_hop_breakdown.items()):
         hop_log_writer.writerow([step, curriculum.lesson + 1, "ood", hops, acc, pf, n])
     hop_log_file.flush()
@@ -7429,6 +7610,9 @@ def run(
         "ood_offset_perfect": ood_offset_perfect,
         "total_elapsed_sec": time.time() - t_run_start,
     }
+    if gnw_balanced_probe_result is not None:
+        summary["gnw_balanced_probe_accuracy"] = gnw_balanced_probe_result[0]
+        summary["gnw_balanced_probe_episode_exact"] = gnw_balanced_probe_result[1]
     if final_sgr_phase1_eval is not None:
         summary["sgr_prediction_loss_weight"] = float(sgr_prediction_loss_weight)
         for kind, values in final_sgr_phase1_eval["per_type"].items():
@@ -7955,13 +8139,16 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--workspace-sparse-recurrence",
+        "--workspace-parallel-readonly-spans",
         action="store_true",
+        dest="workspace_sparse_recurrence",
         help=(
-            "Batch workspace broadcasts across consecutive tokens with no semantic "
+            "Vectorize workspace reads across consecutive tokens with no semantic "
             "write or state-side operation. State-changing events remain causal and "
             "use the normal recurrent transition. Requires entity-keyed semantic "
             "addressing; training telemetry and unsupported modes fall back to the "
-            "standard per-token recurrence."
+            "standard per-token recurrence. The existing --workspace-sparse-recurrence "
+            "name is an equivalent alias."
         ),
     )
     parser.add_argument(
@@ -8021,6 +8208,18 @@ if __name__ == "__main__":
             "dependence and paired ablations of enabled task-specific workspace "
             "features. Writes feature_off/* rows to the workspace dependency CSV; "
             "requires --workspace on workspace-capability."
+        ),
+    )
+    parser.add_argument(
+        "--workspace-gnw-balanced-eval-per-cell",
+        type=int,
+        default=0,
+        metavar="N",
+        help=(
+            "At final evaluation, run a deterministic balanced GNW probe with N episodes "
+            "per cell: ignition strength×presence, blink lag×mask, masked-prime "
+            "visibility×congruency, and confidence report×action-correctness. Requires "
+            "workspace-capability track all or gnw_all; 0 disables the extra evaluation."
         ),
     )
     parser.add_argument(
@@ -9044,6 +9243,16 @@ if __name__ == "__main__":
             "--workspace-functional-signature-diagnostics requires --workspace "
             "and --dataset-type workspace-capability"
         )
+    if args.workspace_gnw_balanced_eval_per_cell < 0:
+        parser.error("--workspace-gnw-balanced-eval-per-cell must be >= 0")
+    if args.workspace_gnw_balanced_eval_per_cell and (
+        args.dataset_type != "workspace-capability"
+        or args.workspace_task_track not in {"gnw_all", "all"}
+    ):
+        parser.error(
+            "--workspace-gnw-balanced-eval-per-cell requires workspace-capability "
+            "with --workspace-task-track gnw_all or all"
+        )
     if args.workspace_state_diagnostic_max_events < 0:
         parser.error("--workspace-state-diagnostic-max-events must be >= 0")
     if not math.isfinite(args.workspace_state_loss_weight) or args.workspace_state_loss_weight < 0:
@@ -9681,6 +9890,9 @@ if __name__ == "__main__":
             workspace_masked_prime_trace=args.workspace_masked_prime_trace,
             workspace_functional_signature_diagnostics=(
                 args.workspace_functional_signature_diagnostics
+            ),
+            workspace_gnw_balanced_eval_episodes_per_cell=(
+                args.workspace_gnw_balanced_eval_per_cell
             ),
             prepared_dataset=prepared_dataset,
             ogs_weights=tuple(args.ogs_weights),

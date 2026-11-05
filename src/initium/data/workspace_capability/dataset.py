@@ -123,6 +123,7 @@ GNW_TRACKS = (
     "sustained_maintenance", "no_report_confidence", "bistable_perception", "trace_conditioning",
 )
 GNW_ALL_TRACK = "gnw_all"
+GNW_TASK_DESIGN_VERSION = 2
 MULTI_TRACKS = {ALL_TRACK, NEW_ALL_TRACK, GNW_ALL_TRACK}
 # Optional task-specific pathways whose causal contribution can be tested at
 # evaluation time. Attribute names are deliberately model-facing so the
@@ -133,6 +134,7 @@ _FUNCTIONAL_FEATURE_ABLATIONS = (
         "workspace_no_report_confidence_readout_enabled",
     ),
     ("masked_prime_trace", "workspace_masked_prime_trace_enabled"),
+    ("rule_feedback_update", "workspace_rule_feedback_update_enabled"),
     ("attentional_item_memory", "workspace_attentional_item_memory_enabled"),
     ("attentional_cue_readout", "workspace_attentional_cue_readout_enabled"),
     ("nth_farthest_exact_readout", "workspace_nth_farthest_exact_readout"),
@@ -141,6 +143,12 @@ _FUNCTIONAL_FEATURE_ABLATIONS = (
     ("exact_value_comparison", "workspace_exact_value_comparison_enabled"),
     ("exact_selection", "workspace_exact_selection_enabled"),
 )
+_FUNCTIONAL_FEATURE_TRACKS = {
+    "no_report_confidence_readout": {"no_report_confidence"},
+    "masked_prime_trace": {"masked_priming"},
+    "attentional_item_memory": {"attentional_blink"},
+    "attentional_cue_readout": {"attentional_blink"},
+}
 _WORKSPACE_MODULE_FEATURE_ABLATIONS = {
     "attentional_cue_readout": "attentional_cue_readout_enabled",
     "nth_farthest_exact_readout": "nth_farthest_exact_readout",
@@ -162,9 +170,9 @@ _ENTITY_ADDRESS_EVENT_TOKENS = {
     "relational_join": {EV_FACT},
     "nth_farthest": {EV_VECTOR},
     "retrieval_aggregation": {EV_KV, EV_UPDATE},
-    "ignition": {EV_INIT},
+    "ignition": {EV_INIT, EV_UPDATE},
     "psychological_refractory": {EV_INIT, EV_UPDATE},
-    "masked_priming": {EV_INIT},
+    "masked_priming": {EV_INIT, EV_UPDATE},
     "sustained_maintenance": {EV_INIT, EV_UPDATE},
     "no_report_confidence": {EV_INIT, EV_UPDATE},
     "bistable_perception": {EV_INIT, EV_UPDATE},
@@ -189,6 +197,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 f"{task_track!r}; choose one of {(*TRACKS, ALL_TRACK, NEW_ALL_TRACK, GNW_ALL_TRACK)}"
             )
         self.task_track = task_track
+        self.gnw_task_design_version = GNW_TASK_DESIGN_VERSION
         self.batch_size_hint = max(1, int(batch_size_hint))
         self._output_proj = None
         self.token_id_input = False
@@ -1591,10 +1600,6 @@ class WorkspaceCapabilityDataset(BaseDataset):
                                 source_payload = SOURCE_BASE + int(
                                     rule_feedback_targets[rule_trial]
                                 )
-                        else:
-                            rules = tuple(episode.metadata.get("trial_rules", ()))
-                            if rule_trial < len(rules):
-                                source_payload = SOURCE_BASE + int(rules[rule_trial])
                         rule_trial += 1
                 elif (
                     include_operations
@@ -1681,8 +1686,17 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 masks[row, step, 0] = True
                 read_steps.add(step)
             query_reads = list(episode.metadata.get("workspace_query_reads", ()))
+            if episode.track == "rule_switching":
+                if rule_feedback_update and rule_feedback_targets:
+                    feedback_rule = SOURCE_BASE + int(rule_feedback_targets[-1])
+                    query_reads = [
+                        (int(step), int(key), feedback_rule if int(key) == 63 else int(value))
+                        for step, key, value in query_reads
+                    ]
+                else:
+                    query_reads = [query for query in query_reads if int(query[1]) != 63]
             if masked_prime_trace and episode.track == "masked_priming":
-                query_step = len(episode.inputs) - 3
+                query_step = int(episode.inputs.index(QUERY))
                 query_reads.append(
                     (query_step, 0, scalar_token(int(episode.metadata["prime_value"])))
                 )
@@ -1704,6 +1718,11 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 masks[row, step, column] = True
                 read_steps.add(step)
             output_programs = tuple(episode.metadata.get("workspace_output_programs", ()))
+            if episode.track == "rule_switching" and not rule_feedback_update:
+                # Without the feedback-tracker feature, do not train the
+                # workspace against the generator's hidden rule labels or
+                # provide an exact selector program.
+                output_programs = ()
             if no_report_confidence_readout and episode.track == "no_report_confidence":
                 evidence_keys = tuple(range(1, len(episode.metadata["observations"]) + 1))
                 evidence_targets = tuple(
@@ -2295,9 +2314,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
         prior_feature_ablation_value = None
         module_feature_ablation_attribute = None
         prior_module_feature_ablation_value = None
-        operation_diagnostics_enabled = bool(
-            getattr(model, "workspace_operation_diagnostics_enabled", False)
-        )
+        operation_diagnostics_enabled = False
         prior_assignment_observer = getattr(workspace, "_initium_address_assignment_observer", None)
         collect_entity_bindings = bool(
             workspace is not None and getattr(workspace, "entity_keyed_writes", False)
@@ -2342,6 +2359,16 @@ class WorkspaceCapabilityDataset(BaseDataset):
                     workspace, module_feature_ablation_attribute
                 )
                 setattr(workspace, module_feature_ablation_attribute, False)
+        # Feature ablations mutate model-facing switches for the duration of
+        # this evaluation. Operation diagnostics require the operation
+        # executor to remain active because their targets are packed alongside
+        # operation metadata. Recompute after applying the ablation so the
+        # operation_executor-off pass skips those diagnostics instead of
+        # requesting metadata for a disabled pathway.
+        operation_diagnostics_enabled = bool(
+            getattr(model, "workspace_operation_diagnostics_enabled", False)
+            and getattr(model, "workspace_operation_executor_enabled", False)
+        )
         totals: dict[str, list[int]] = defaultdict(lambda: [0, 0, 0, 0])
         progression_totals: dict[tuple[str, str], list[int]] = defaultdict(
             lambda: [0, 0, 0, 0]
@@ -2352,7 +2379,8 @@ class WorkspaceCapabilityDataset(BaseDataset):
         gnw_process_totals: dict[tuple[str, str], list[int]] = defaultdict(
             lambda: [0, 0, 0, 0, 0, 0]
         )
-        ignition_access_totals: dict[int, list[int]] = defaultdict(lambda: [0, 0, 0, 0])
+        # hit, present, false alarm, absent, correct, total
+        ignition_access_totals: dict[int, list[int]] = defaultdict(lambda: [0, 0, 0, 0, 0, 0])
         no_report_confidence_scores: list[float] = []
         no_report_confidence_correct: list[int] = []
         masked_prime_condition_totals: dict[tuple[str, str], list[int]] = defaultdict(
@@ -2701,7 +2729,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
                                         variable_binding_query_read_count += 1
                                     if episode.track != "masked_priming":
                                         continue
-                                    prime_query_step = len(episode.inputs) - 3
+                                    prime_query_step = int(episode.inputs.index(QUERY))
                                     if int(read_step) != prime_query_step:
                                         continue
                                     read_mask = masks_by_step[row, read_step]
@@ -3162,13 +3190,15 @@ class WorkspaceCapabilityDataset(BaseDataset):
                                 process[5] += 1
                         elif episode.track == "ignition":
                             strength = int(episode.metadata["stimulus_strength"])
-                            access = int(pred[0] == BOOL_TRUE)
-                            expected_access = int(bool(episode.metadata["report"]))
+                            response_present = int(pred[0] == BOOL_TRUE)
+                            target_present = bool(episode.metadata["target_present"])
                             curve_counts = ignition_access_totals[strength]
-                            curve_counts[0] += access
-                            curve_counts[1] += expected_access
-                            curve_counts[2] += int(access == expected_access)
-                            curve_counts[3] += 1
+                            curve_counts[0] += int(response_present and target_present)
+                            curve_counts[1] += int(target_present)
+                            curve_counts[2] += int(response_present and not target_present)
+                            curve_counts[3] += int(not target_present)
+                            curve_counts[4] += int(response_present == int(target_present))
+                            curve_counts[5] += 1
                         elif episode.track == "masked_priming":
                             process = gnw_process_totals[
                                 (episode.track, query_type)
@@ -3376,7 +3406,9 @@ class WorkspaceCapabilityDataset(BaseDataset):
                         "evidence_action_accuracy": 100.0 * counts[0] / max(counts[1], 1),
                         "evidence_action_accuracy_wilson95_pct": [100.0 * lower, 100.0 * upper],
                         "latent_truth_alignment": 100.0 * counts[2] / max(counts[3], 1),
-                        "reported_confidence_bin_accuracy": 100.0 * counts[4] / max(counts[5], 1),
+                        "reported_confidence_bin_accuracy": (
+                            100.0 * counts[4] / counts[5] if counts[5] else math.nan
+                        ),
                         "episodes": counts[1],
                         "reported_episodes": counts[5],
                         "small_sample_warning": counts[1] < 20,
@@ -3426,39 +3458,43 @@ class WorkspaceCapabilityDataset(BaseDataset):
                         "episodes": counts[4],
                         "small_sample_warning": counts[4] < 20 or counts[2] < 20,
                     }
-                prime_consistency = {
-                    (visibility, congruency): counts[1] / max(counts[2], 1)
-                    for (visibility, congruency), counts in masked_prime_condition_totals.items()
-                }
-                interaction = math.nan
-                interaction_ci = [math.nan, math.nan]
-                required = (
-                    ("visible", "incongruent"), ("visible", "congruent"),
-                    ("masked", "incongruent"), ("masked", "congruent"),
+                conflict_contrast = math.nan
+                conflict_contrast_ci = [math.nan, math.nan]
+                visible_conflict = masked_prime_condition_totals.get(
+                    ("visible", "incongruent"), [0, 0, 0, 0, 0]
                 )
-                if all(key in prime_consistency for key in required):
-                    interaction = (
-                        prime_consistency[("visible", "incongruent")]
-                        - prime_consistency[("visible", "congruent")]
-                        - prime_consistency[("masked", "incongruent")]
-                        + prime_consistency[("masked", "congruent")]
+                masked_conflict = masked_prime_condition_totals.get(
+                    ("masked", "incongruent"), [0, 0, 0, 0, 0]
+                )
+                if visible_conflict[2] > 0 and masked_conflict[2] > 0:
+                    visible_rate = visible_conflict[1] / visible_conflict[2]
+                    masked_rate = masked_conflict[1] / masked_conflict[2]
+                    conflict_contrast = masked_rate - visible_rate
+                    # Bonferroni-adjusted Wilson intervals for the two
+                    # independent conflict conditions. Congruent cells have
+                    # no conflicts by construction and cannot define this
+                    # contrast or a visibility×congruency interaction.
+                    simultaneous_z = 2.241
+                    visible_interval = wilson_interval(
+                        visible_conflict[1], visible_conflict[2], z=simultaneous_z
                     )
-                    interaction_variance = sum(
-                        rate * (1.0 - rate)
-                        / max(masked_prime_condition_totals[key][2], 1)
-                        for key, rate in prime_consistency.items()
-                        if key in required
+                    masked_interval = wilson_interval(
+                        masked_conflict[1], masked_conflict[2], z=simultaneous_z
                     )
-                    interaction_se = math.sqrt(max(interaction_variance, 0.0))
-                    interaction_ci = [
-                        interaction - 1.959963984540054 * interaction_se,
-                        interaction + 1.959963984540054 * interaction_se,
+                    conflict_contrast_ci = [
+                        masked_interval[0] - visible_interval[1],
+                        masked_interval[1] - visible_interval[0],
                     ]
                 diagnostics["gnw_masked_priming_conditions"] = {
                     "conditions": conditions,
-                    "visibility_by_congruency_interaction_prime_intrusion": interaction,
-                    "interaction_wald95": interaction_ci,
-                    "interaction_definition": "(visible incongruent - visible congruent) - (masked incongruent - masked congruent), using prime intrusions among target-conflict trials",
+                    "masked_minus_visible_prime_intrusion_on_conflict": conflict_contrast,
+                    "conflict_intrusion_difference_simultaneous_wilson95": conflict_contrast_ci,
+                    "conflict_intrusion_difference_definition": (
+                        "masked minus visible prime-intrusion rate on incongruent trials; "
+                        "congruent trials have no conflict by construction"
+                    ),
+                    "visible_conflict_episodes": visible_conflict[2],
+                    "masked_conflict_episodes": masked_conflict[2],
                 }
             diagnostics["gnw_process_context"] = {
                 "workspace_enabled": bool(getattr(model, "workspace_enabled", False)),
@@ -3482,23 +3518,52 @@ class WorkspaceCapabilityDataset(BaseDataset):
         if ignition_access_totals:
             diagnostics["gnw_ignition_access_curve"] = {
                 str(strength): {
-                    "predicted_access_rate": 100.0 * counts[0] / max(counts[3], 1),
+                    "hit_rate": 100.0 * counts[0] / max(counts[1], 1),
                     "predicted_access_wilson95_pct": [
-                        100.0 * wilson_interval(counts[0], counts[3])[0],
-                        100.0 * wilson_interval(counts[0], counts[3])[1],
+                        100.0 * wilson_interval(counts[0], counts[1])[0],
+                        100.0 * wilson_interval(counts[0], counts[1])[1],
                     ],
-                    "target_report_rate": 100.0 * counts[1] / max(counts[3], 1),
-                    "response_accuracy": 100.0 * counts[2] / max(counts[3], 1),
-                    "episodes": counts[3],
-                    "small_sample_warning": counts[3] < 20,
+                    "false_alarm_rate": 100.0 * counts[2] / max(counts[3], 1),
+                    "balanced_accuracy": 100.0
+                    * (counts[0] + counts[3] - counts[2])
+                    / max(counts[1] + counts[3], 1),
+                    "balanced_accuracy_wilson95_pct": [
+                        100.0
+                        * wilson_interval(
+                            counts[0] + counts[3] - counts[2], counts[1] + counts[3]
+                        )[0],
+                        100.0
+                        * wilson_interval(
+                            counts[0] + counts[3] - counts[2], counts[1] + counts[3]
+                        )[1],
+                    ],
+                    "response_accuracy": 100.0 * counts[4] / max(counts[5], 1),
+                    "present_trials": counts[1],
+                    "absent_trials": counts[3],
+                    "episodes": counts[5],
+                    "small_sample_warning": min(counts[1], counts[3]) < 20,
                 }
                 for strength, counts in sorted(ignition_access_totals.items())
             }
+            balanced_accuracy_counts = {}
+            for strength, counts in ignition_access_totals.items():
+                positive_n, negative_n = counts[1], counts[3]
+                if positive_n <= 0 or negative_n <= 0:
+                    continue
+                balanced_accuracy = 0.5 * (
+                    counts[0] / positive_n + (negative_n - counts[2]) / negative_n
+                )
+                # Effective sample size for the equally weighted mean of
+                # independent hit and correct-rejection rates. It equals
+                # 2*n when both classes have n examples.
+                effective_n = 4.0 / (1.0 / positive_n + 1.0 / negative_n)
+                balanced_accuracy_counts[strength] = (
+                    balanced_accuracy * effective_n,
+                    effective_n,
+                )
             diagnostics["gnw_ignition_psychometric_fit"] = psychometric_logistic(
-                {
-                    strength: (counts[0], counts[3])
-                    for strength, counts in ignition_access_totals.items()
-                }
+                balanced_accuracy_counts,
+                threshold_probability=0.75,
             )
         if bool(getattr(model, "workspace_nth_farthest_exact_readout", False)):
             diagnostics["nth_farthest_workspace"] = {
@@ -3669,11 +3734,17 @@ class WorkspaceCapabilityDataset(BaseDataset):
         for track, conditions in diagnostics.get("gnw_process_signatures", {}).items():
             for condition, metrics in conditions.items():
                 if track == "no_report_confidence":
+                    confidence_bin_accuracy = metrics["reported_confidence_bin_accuracy"]
+                    confidence_bin_text = (
+                        f"{confidence_bin_accuracy:.1f}%"
+                        if math.isfinite(confidence_bin_accuracy)
+                        else "n/a"
+                    )
                     print(
                         f"  [GNW-process/{track}/{condition}] evidence-action="
                         f"{metrics['evidence_action_accuracy']:.1f}% | latent-truth alignment="
                         f"{metrics['latent_truth_alignment']:.1f}% | confidence-bin="
-                        f"{metrics['reported_confidence_bin_accuracy']:.1f}% "
+                        f"{confidence_bin_text} "
                         f"({metrics['episodes']} episodes; {metrics['reported_episodes']} reports)"
                     )
                 else:
@@ -3693,10 +3764,12 @@ class WorkspaceCapabilityDataset(BaseDataset):
             )
         for strength, values in diagnostics.get("gnw_ignition_access_curve", {}).items():
             print(
-                f"  [GNW-ignition/strength_{strength}] predicted access="
-                f"{values['predicted_access_rate']:.1f}% | target report="
-                f"{values['target_report_rate']:.1f}% | response accuracy="
-                f"{values['response_accuracy']:.1f}% (n={values['episodes']})"
+                f"  [GNW-ignition/strength_{strength}] hit rate="
+                f"{values['hit_rate']:.1f}% | false alarm="
+                f"{values['false_alarm_rate']:.1f}% | balanced accuracy="
+                f"{values['balanced_accuracy']:.1f}% | response accuracy="
+                f"{values['response_accuracy']:.1f}% (n={values['episodes']}; "
+                f"present/absent={values['present_trials']}/{values['absent_trials']})"
             )
         rule_tracker = diagnostics.get("workspace_rule_feedback_tracker")
         if rule_tracker:
@@ -3709,9 +3782,11 @@ class WorkspaceCapabilityDataset(BaseDataset):
         if ignition_fit:
             print(
                 "  [GNW-ignition/logistic-fit] "
-                f"50% access threshold={ignition_fit['threshold_50']:.3g} | "
-                f"95% CI=[{ignition_fit['threshold_50_wald95'][0]:.3g},"
-                f"{ignition_fit['threshold_50_wald95'][1]:.3g}] | "
+                f"75% balanced-accuracy threshold="
+                f"{ignition_fit['threshold_criterion']:.3g} | "
+                f"95% CI=[{ignition_fit['threshold_criterion_wald95'][0]:.3g},"
+                f"{ignition_fit['threshold_criterion_wald95'][1]:.3g}] | "
+                f"in tested range={ignition_fit['threshold_criterion_in_observed_range']} | "
                 f"slope={ignition_fit['slope']:.3g} "
                 f"95% CI=[{ignition_fit['slope_wald95'][0]:.3g},"
                 f"{ignition_fit['slope_wald95'][1]:.3g}] | n={ignition_fit['n']} "
@@ -3740,10 +3815,13 @@ class WorkspaceCapabilityDataset(BaseDataset):
                     f"n={metrics['episodes']}"
                 )
             print(
-                "  [GNW-masked-priming] visibility×congruency interaction="
-                f"{priming_metrics['visibility_by_congruency_interaction_prime_intrusion']:.4f} "
-                f"95% CI=[{priming_metrics['interaction_wald95'][0]:.4f},"
-                f"{priming_metrics['interaction_wald95'][1]:.4f}]"
+                "  [GNW-masked-priming] masked-visible conflict intrusion difference="
+                f"{priming_metrics['masked_minus_visible_prime_intrusion_on_conflict']:.4f} "
+                f"95% simultaneous CI=["
+                f"{priming_metrics['conflict_intrusion_difference_simultaneous_wilson95'][0]:.4f},"
+                f"{priming_metrics['conflict_intrusion_difference_simultaneous_wilson95'][1]:.4f}] "
+                f"(masked/visible n={priming_metrics['masked_conflict_episodes']}/"
+                f"{priming_metrics['visible_conflict_episodes']})"
             )
         nth_metrics = diagnostics.get("nth_farthest_workspace")
         if nth_metrics:
@@ -3894,6 +3972,268 @@ class WorkspaceCapabilityDataset(BaseDataset):
             for track in (tracks[i % len(tracks)] for i in range(num_episodes))
         ]
         return self._evaluate_episodes(model, device, episodes, **kwargs)
+
+    def evaluate_gnw_balanced_probe(
+        self,
+        model,
+        device,
+        episodes_per_cell: int = 64,
+        *,
+        seed: int = 91_404,
+        field_log=None,
+        feature_ablations: bool = False,
+    ):
+        """Evaluate GNW probes on a deterministic, condition-balanced set.
+
+        The selected strata prevent random sampling from omitting conflict,
+        confidence, lag, or strength cells. Ignition is balanced by presence
+        at each intensity; masked priming by visibility and prime congruency;
+        and confidence by report condition and whether the evidence-supported
+        action matches latent truth. This is a behavioral signature probe,
+        not a consciousness test.
+        """
+        if not set(GNW_TRACKS).issubset(set(self._tracks())):
+            raise ValueError(
+                "balanced GNW evaluation requires --workspace-task-track gnw_all or all"
+            )
+        episodes_per_cell = int(episodes_per_cell)
+        if episodes_per_cell < 1:
+            raise ValueError("episodes_per_cell must be >= 1")
+
+        rng = random.Random(int(seed))
+        episodes: list[TaskEpisode] = []
+
+        def collect(track: str, cells, key_fn):
+            selected = {cell: [] for cell in cells}
+            attempts = 0
+            max_attempts = max(10_000, len(cells) * episodes_per_cell * 200)
+            while any(len(values) < episodes_per_cell for values in selected.values()):
+                if attempts >= max_attempts:
+                    short = {
+                        str(cell): episodes_per_cell - len(values)
+                        for cell, values in selected.items()
+                        if len(values) < episodes_per_cell
+                    }
+                    raise RuntimeError(
+                        f"could not balance GNW probe {track} cells: {short}"
+                    )
+                episode = self._make_episode(track, 5, rng)
+                cell = key_fn(episode)
+                attempts += 1
+                if cell in selected and len(selected[cell]) < episodes_per_cell:
+                    selected[cell].append(episode)
+            for values in selected.values():
+                episodes.extend(values)
+
+        collect(
+            "ignition",
+            tuple((strength, present) for strength in range(9) for present in (False, True)),
+            lambda episode: (
+                int(episode.metadata["stimulus_strength"]),
+                bool(episode.metadata["target_present"]),
+            ),
+        )
+        collect(
+            "attentional_blink",
+            tuple((lag, masked) for lag in range(1, 9) for masked in (False, True)),
+            lambda episode: (
+                int(episode.metadata["target_lag"]),
+                bool(episode.metadata["mask_condition"]),
+            ),
+        )
+        collect(
+            "masked_priming",
+            tuple((masked, congruent) for masked in (False, True) for congruent in (False, True)),
+            lambda episode: (
+                bool(episode.metadata["mask_condition"]),
+                bool(episode.metadata["prime_congruent"]),
+            ),
+        )
+        collect(
+            "no_report_confidence",
+            tuple((report, correct) for report in (False, True) for correct in (False, True)),
+            lambda episode: (
+                bool(episode.metadata["explicit_report"]),
+                bool(episode.metadata["action_correct"]),
+            ),
+        )
+
+        print(
+            f"[workspace-capability/GNW-balanced-probe] seed={seed} "
+            f"episodes_per_cell={episodes_per_cell} total_episodes={len(episodes)} "
+            "(ignition strength×presence; blink lag×mask; priming visibility×congruency; "
+            "confidence report×action-correctness)"
+        )
+        result = self._evaluate_episodes(model, device, episodes, field_log=field_log)
+        full_diagnostics = self.last_eval_diagnostics
+        workspace_available = bool(
+            getattr(model, "workspace", None) is not None
+            and getattr(model, "workspace_enabled", False)
+        )
+        if workspace_available:
+            bypass_result = self._evaluate_episodes(
+                model, device, episodes, ablate_workspace=True
+            )
+            bypass_diagnostics = self.last_eval_diagnostics
+            shuffled_result = self._evaluate_episodes(
+                model, device, episodes, shuffle_workspace_readback=True
+            )
+            shuffled_diagnostics = self.last_eval_diagnostics
+        else:
+            bypass_result = shuffled_result = None
+            bypass_diagnostics = shuffled_diagnostics = {}
+        feature_results = {}
+        if feature_ablations:
+            for feature_name, model_attribute in _FUNCTIONAL_FEATURE_ABLATIONS:
+                if not bool(getattr(model, model_attribute, False)):
+                    continue
+                relevant_tracks = _FUNCTIONAL_FEATURE_TRACKS.get(feature_name, set())
+                feature_episodes = [
+                    episode for episode in episodes if episode.track in relevant_tracks
+                ]
+                if not feature_episodes:
+                    continue
+                feature_baseline = self._evaluate_episodes(
+                    model, device, feature_episodes
+                )
+                feature_result = self._evaluate_episodes(
+                    model,
+                    device,
+                    feature_episodes,
+                    ablate_workspace_feature=feature_name,
+                )
+                feature_results[feature_name] = {
+                    "track": next(iter(relevant_tracks)),
+                    "baseline_accuracy_pct": float(feature_baseline[0]),
+                    "accuracy_pct": float(feature_result[0]),
+                    "episode_exact_pct": float(feature_result[1]),
+                    "full_minus_feature_off_pp": float(
+                        feature_baseline[0] - feature_result[0]
+                    ),
+                    "episodes": len(feature_episodes),
+                }
+                print(
+                    f"  [GNW-balanced/feature-off/{feature_name}] accuracy="
+                    f"{feature_result[0]:.2f}% (baseline {feature_baseline[0]:.2f}%) | drop="
+                    f"{feature_baseline[0] - feature_result[0]:+.2f} pp | "
+                    f"n={len(feature_episodes)}"
+                )
+        natural_report_n = max(256, episodes_per_cell * 4)
+        natural_report_episodes: list[TaskEpisode] = []
+        attempts = 0
+        while len(natural_report_episodes) < natural_report_n:
+            if attempts >= natural_report_n * 20:
+                raise RuntimeError(
+                    "could not build natural-prevalence reported-confidence sample"
+                )
+            episode = self._make_episode("no_report_confidence", 5, rng)
+            attempts += 1
+            if bool(episode.metadata["explicit_report"]):
+                natural_report_episodes.append(episode)
+        self._evaluate_episodes(model, device, natural_report_episodes)
+        natural_confidence_metrics = self.last_eval_diagnostics.get(
+            "gnw_no_report_confidence_calibration", {}
+        )
+        full_diagnostics["gnw_balanced_probe"] = {
+            "seed": int(seed),
+            "episodes_per_cell": episodes_per_cell,
+            "episode_count": len(episodes),
+            "confidence_outcome_prevalence": (
+                "balanced 50/50 correct/incorrect; calibration scores here are "
+                "balanced-prevalence diagnostics"
+            ),
+            "natural_report_calibration_episodes": natural_report_n,
+            "balanced_cells": {
+                "ignition": 18,
+                "attentional_blink": 16,
+                "masked_priming": 4,
+                "no_report_confidence": 4,
+            },
+            "interpretation": "behavioral functional signatures; not a consciousness measure",
+        }
+        full_diagnostics["gnw_balanced_workspace_dependency"] = {
+            "full_accuracy_pct": float(result[0]),
+            "workspace_bypassed_accuracy_pct": (
+                float(bypass_result[0]) if bypass_result is not None else math.nan
+            ),
+            "readback_shuffled_accuracy_pct": (
+                float(shuffled_result[0]) if shuffled_result is not None else math.nan
+            ),
+            "full_minus_bypassed_pp": (
+                float(result[0] - bypass_result[0]) if bypass_result is not None else math.nan
+            ),
+            "full_minus_shuffled_pp": (
+                float(result[0] - shuffled_result[0]) if shuffled_result is not None else math.nan
+            ),
+            "episodes": len(episodes),
+        }
+        full_diagnostics["gnw_balanced_workspace_dependency_by_track"] = {
+            track: {
+                "full_exact_match_pct": float(metrics["exact_match"]),
+                "workspace_bypassed_exact_match_pct": float(
+                    bypass_diagnostics.get("tracks", {}).get(track, {}).get(
+                        "exact_match", math.nan
+                    )
+                ),
+                "readback_shuffled_exact_match_pct": float(
+                    shuffled_diagnostics.get("tracks", {}).get(track, {}).get(
+                        "exact_match", math.nan
+                    )
+                ),
+                "full_minus_bypassed_pp": float(
+                    metrics["exact_match"]
+                    - bypass_diagnostics.get("tracks", {}).get(track, {}).get(
+                        "exact_match", math.nan
+                    )
+                ),
+                "full_minus_shuffled_pp": float(
+                    metrics["exact_match"]
+                    - shuffled_diagnostics.get("tracks", {}).get(track, {}).get(
+                        "exact_match", math.nan
+                    )
+                ),
+                "episodes": int(metrics["episodes"]),
+            }
+            for track, metrics in full_diagnostics.get("tracks", {}).items()
+            if track in {"ignition", "attentional_blink", "masked_priming", "no_report_confidence"}
+        }
+        if feature_ablations:
+            full_diagnostics["gnw_balanced_feature_ablations"] = feature_results
+        full_diagnostics["gnw_natural_report_confidence_calibration"] = {
+            **natural_confidence_metrics,
+            "episodes": len(natural_report_episodes),
+        }
+        self.last_eval_diagnostics = full_diagnostics
+        dependency = full_diagnostics["gnw_balanced_workspace_dependency"]
+        if workspace_available:
+            print(
+                "  [GNW-balanced/workspace-dependence] full/bypass/shuffled="
+                f"{dependency['full_accuracy_pct']:.2f}%/"
+                f"{dependency['workspace_bypassed_accuracy_pct']:.2f}%/"
+                f"{dependency['readback_shuffled_accuracy_pct']:.2f}% | "
+                f"drops={dependency['full_minus_bypassed_pp']:+.2f}/"
+                f"{dependency['full_minus_shuffled_pp']:+.2f} pp"
+            )
+            for track, metrics in sorted(
+                full_diagnostics["gnw_balanced_workspace_dependency_by_track"].items()
+            ):
+                print(
+                    f"    [GNW-balanced/workspace-dependence/{track}] exact full/bypass/shuffled="
+                    f"{metrics['full_exact_match_pct']:.2f}%/"
+                    f"{metrics['workspace_bypassed_exact_match_pct']:.2f}%/"
+                    f"{metrics['readback_shuffled_exact_match_pct']:.2f}% | "
+                    f"drops={metrics['full_minus_bypassed_pp']:+.2f}/"
+                    f"{metrics['full_minus_shuffled_pp']:+.2f} pp "
+                    f"n={metrics['episodes']}"
+                )
+        print(
+            "  [GNW-balanced/natural-report-calibration] "
+            f"Brier={natural_confidence_metrics.get('brier_score', math.nan):.4f} | "
+            f"ECE={natural_confidence_metrics.get('ece_10_bins', math.nan):.4f} | "
+            f"type-2 AUC={natural_confidence_metrics.get('type2_roc_auc', math.nan):.4f} | "
+            f"reported n={natural_confidence_metrics.get('n_reported', 0)}"
+        )
+        return result
 
     def _evaluate_paired_id(self, model, device, lesson_idx: int, **kwargs):
         episodes = self._paired_id_episodes(lesson_idx)

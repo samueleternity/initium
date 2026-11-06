@@ -138,6 +138,8 @@ from initium.mamba_controller.mamba3_controller import Mamba3ControllerWrapper
 from initium.mamba_controller.mamba_controller import MambaControllerWrapper
 from initium.memory_manipulation.dnc_mechanisms import build_memory
 from initium.memory_manipulation.sequence_memories import CausalKVMemory, GatedDeltaMemory
+from initium.workspace.adaptive import AdaptiveWorkspaceSkills
+from initium.workspace.adaptive_v2 import AdaptiveWorkspaceSkillsV2
 from initium.workspace.broadcast import WorkspaceBroadcast
 from initium.workspace.kv_bridge import WorkspaceKVBridge, WorkspaceKVState
 
@@ -247,6 +249,22 @@ class SplitGraphDNC(nn.Module):
         dnc_implementation: str = "base",
         workspace_enabled: bool = False,
         workspace_num_slots: int = 5,
+        workspace_adaptive_enabled: bool = False,
+        workspace_adaptive_v2_enabled: bool = False,
+        workspace_adaptive_v2_num_skills: int = 8,
+        workspace_adaptive_v2_mi_weight: float = 0.01,
+        workspace_adaptive_v3_enabled: bool = False,
+        workspace_adaptive_v3_rank: int = 32,
+        workspace_adaptive_v3_usage_floor_weight: float = 0.0,
+        workspace_adaptive_v3_readback_consistency_weight: float = 0.0,
+        workspace_adaptive_v3_attention_temperature: float = 12.0,
+        workspace_adaptive_v3_temperature_enabled: bool = False,
+        workspace_adaptive_v3_straight_through_binding: bool = False,
+        workspace_adaptive_v3_entity_destinations: bool = False,
+        workspace_adaptive_v3_split_context_norm: bool = False,
+        workspace_adaptive_v3_use_backbone_context: bool = False,
+        workspace_adaptive_v3_teacher_forced_operator_outputs: bool = False,
+        workspace_adaptive_v3_class_balanced_operator_loss: bool = False,
         workspace_compile_recurrence: bool = False,
         workspace_sparse_recurrence: bool = False,
         workspace_entity_keyed_writes: bool = False,
@@ -440,6 +458,7 @@ class SplitGraphDNC(nn.Module):
         self.workspace_retrieval_exact_readout = bool(workspace_retrieval_exact_readout)
         self.workspace_key_value_readout_enabled = bool(workspace_key_value_readout)
         self.workspace_operation_executor_enabled = bool(workspace_operation_executor)
+        self.workspace_adaptive_v3_enabled = bool(workspace_adaptive_v3_enabled)
         self.workspace_operation_diagnostics_enabled = bool(workspace_operation_diagnostics)
         self.workspace_exact_value_comparison_enabled = bool(workspace_exact_value_comparison)
         self.workspace_exact_selection_enabled = bool(workspace_exact_selection)
@@ -766,6 +785,12 @@ class SplitGraphDNC(nn.Module):
             self.output = None
         if workspace_num_slots < 0:
             raise ValueError("workspace_num_slots must be >= 0")
+        if workspace_adaptive_enabled and workspace_adaptive_v2_enabled:
+            raise ValueError("choose either workspace adaptive v1 or v2, not both")
+        if workspace_adaptive_enabled and not (workspace_enabled and workspace_num_slots > 0):
+            raise ValueError("adaptive workspace skills require an active workspace with at least one slot")
+        if workspace_adaptive_v2_enabled and not (workspace_enabled and workspace_num_slots > 0):
+            raise ValueError("adaptive workspace v2 requires an active workspace with at least one slot")
         if workspace_compile_recurrence and (not workspace_enabled or workspace_num_slots < 1):
             raise ValueError(
                 "compiled workspace recurrence requires workspace_enabled=True "
@@ -808,6 +833,24 @@ class SplitGraphDNC(nn.Module):
                 key_value_readout=workspace_key_value_readout,
                 operation_executor=workspace_operation_executor,
                 operation_diagnostics=workspace_operation_diagnostics,
+                adaptive_v3_enabled=workspace_adaptive_v3_enabled,
+                adaptive_v3_rank=workspace_adaptive_v3_rank,
+                adaptive_v3_usage_floor_weight=workspace_adaptive_v3_usage_floor_weight,
+                adaptive_v3_readback_consistency_weight=(
+                    workspace_adaptive_v3_readback_consistency_weight
+                ),
+                adaptive_v3_attention_temperature=workspace_adaptive_v3_attention_temperature,
+                adaptive_v3_temperature_enabled=workspace_adaptive_v3_temperature_enabled,
+                adaptive_v3_straight_through_binding=workspace_adaptive_v3_straight_through_binding,
+                adaptive_v3_entity_destinations=workspace_adaptive_v3_entity_destinations,
+                adaptive_v3_split_context_norm=workspace_adaptive_v3_split_context_norm,
+                adaptive_v3_use_backbone_context=workspace_adaptive_v3_use_backbone_context,
+                adaptive_v3_teacher_forced_operator_outputs=(
+                    workspace_adaptive_v3_teacher_forced_operator_outputs
+                ),
+                adaptive_v3_class_balanced_operator_loss=(
+                    workspace_adaptive_v3_class_balanced_operator_loss
+                ),
                 sparse_recurrence=workspace_sparse_recurrence,
                 attentional_cue_readout=workspace_attentional_cue_readout,
                 key_match_threshold=workspace_key_match_threshold,
@@ -817,6 +860,21 @@ class SplitGraphDNC(nn.Module):
         )
         if workspace_rng_state is not None:
             torch.random.set_rng_state(workspace_rng_state)
+        self.workspace_adaptive = None
+        if workspace_adaptive_enabled or workspace_adaptive_v2_enabled:
+            adaptive_rng_state = torch.random.get_rng_state()
+            if workspace_adaptive_v2_enabled:
+                self.workspace_adaptive = AdaptiveWorkspaceSkillsV2(
+                    hidden_size,
+                    moe_num_experts,
+                    num_skills=workspace_adaptive_v2_num_skills,
+                    mutual_information_loss_weight=workspace_adaptive_v2_mi_weight,
+                )
+            else:
+                self.workspace_adaptive = AdaptiveWorkspaceSkills(hidden_size, moe_num_experts)
+            torch.random.set_rng_state(adaptive_rng_state)
+        self.workspace_adaptive_eval_bypass = False
+        self.workspace_adaptive_v3_eval_bypass = False
         if self.workspace_write_to_kv:
             # Keep this optional sidecar from changing the random stream used
             # by existing modules or matched-seed controls.
@@ -893,6 +951,11 @@ class SplitGraphDNC(nn.Module):
         attentional_frame_steps: tuple[int, ...] | None = None,
         operation_metadata: torch.Tensor | None = None,
         operation_steps: tuple[int, ...] | None = None,
+        adaptive_operator_teacher_targets: torch.Tensor | None = None,
+        adaptive_operator_candidate_mask: torch.Tensor | None = None,
+        adaptive_operator_execution_mask: torch.Tensor | None = None,
+        adaptive_operator_steps: tuple[int, ...] | None = None,
+        adaptive_operator_teacher_weight: float = 0.0,
         nth_farthest_vector_entity_ids: torch.Tensor | None = None,
         nth_farthest_vector_mask: torch.Tensor | None = None,
         nth_farthest_vector_steps: tuple[int, ...] | None = None,
@@ -1259,6 +1322,9 @@ class SplitGraphDNC(nn.Module):
             # state exposed to unscaled expert outputs and defeats this
             # stability control on the write path.
             specialists = specialists[:, start_step:] * self.moe_backbone_residual_scale
+            self.workspace.adaptive_v3_eval_bypass = bool(
+                self.workspace_adaptive_v3_eval_bypass
+            )
             workspace_result = self.workspace(
                 specialists,
                 route_indices[:, start_step:],
@@ -1276,6 +1342,7 @@ class SplitGraphDNC(nn.Module):
                     if prediction_error is not None and workspace_error_consumer
                     else None
                 ),
+                backbone_context=(base[:, start_step:] if self.workspace_adaptive_v3_enabled else None),
                 selected_specialists_only=selected_specialists_only,
                 entity_ids=(entity_ids[:, start_step:] if entity_ids is not None else None),
                 entity_write_mask=(
@@ -1400,6 +1467,31 @@ class SplitGraphDNC(nn.Module):
                     if operation_metadata is not None
                     else None
                 ),
+                adaptive_operator_teacher_targets=(
+                    adaptive_operator_teacher_targets[:, start_step:]
+                    if adaptive_operator_teacher_targets is not None
+                    else None
+                ),
+                adaptive_operator_candidate_mask=(
+                    adaptive_operator_candidate_mask[:, start_step:]
+                    if adaptive_operator_candidate_mask is not None
+                    else None
+                ),
+                adaptive_operator_execution_mask=(
+                    adaptive_operator_execution_mask[:, start_step:]
+                    if adaptive_operator_execution_mask is not None
+                    else None
+                ),
+                adaptive_operator_steps=(
+                    tuple(
+                        step - start_step
+                        for step in (adaptive_operator_steps or ())
+                        if step >= start_step
+                    )
+                    if adaptive_operator_candidate_mask is not None
+                    else None
+                ),
+                adaptive_operator_teacher_weight=adaptive_operator_teacher_weight,
                 nth_farthest_vector_entity_ids=(
                     nth_farthest_vector_entity_ids[:, start_step:]
                     if nth_farthest_vector_entity_ids is not None
@@ -1510,7 +1602,24 @@ class SplitGraphDNC(nn.Module):
             # The workspace returns a selected, broadcast-enriched MoE delta
             # whose candidate inputs have already been residual-scaled, just
             # like the ordinary final MoE block's routed delta.
-            H[:, start_step:] = base[:, start_step:] + broadcast_delta
+            if self.workspace_adaptive is not None:
+                self.workspace_adaptive.eval_bypass = self.workspace_adaptive_eval_bypass
+                adaptive_delta = self.workspace_adaptive(
+                    base[:, start_step:],
+                    specialists,
+                    route_indices[:, start_step:],
+                    route_weights[:, start_step:],
+                    broadcast_delta,
+                    valid_mask=(
+                        sequence_valid_mask[:, start_step:]
+                        if sequence_valid_mask is not None
+                        else None
+                    ),
+                    selected_specialists_only=selected_specialists_only,
+                )
+                H[:, start_step:] = base[:, start_step:] + broadcast_delta + adaptive_delta
+            else:
+                H[:, start_step:] = base[:, start_step:] + broadcast_delta
             normalize_backbone_output = getattr(final_stage, "normalize_output", None)
             if callable(normalize_backbone_output):
                 # forward_with_specialists exposes the pre-normalized final

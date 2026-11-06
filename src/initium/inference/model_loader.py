@@ -225,6 +225,42 @@ def _build_split_graph(c: _Cfg, input_dim, hidden, nr_cells, cell_size, read_hea
         ),
         workspace_enabled=c.get("workspace_enabled", cc.WORKSPACE_ENABLED),
         workspace_num_slots=c.get("workspace_num_slots", cc.WORKSPACE_NUM_SLOTS),
+        workspace_adaptive_enabled=c.get("workspace_adaptive_enabled", False),
+        workspace_adaptive_v2_enabled=c.get("workspace_adaptive_v2_enabled", False),
+        workspace_adaptive_v2_num_skills=c.get("workspace_adaptive_v2_num_skills", 8),
+        workspace_adaptive_v2_mi_weight=c.get("workspace_adaptive_v2_mi_weight", 0.01),
+        workspace_adaptive_v3_enabled=c.get("workspace_adaptive_v3_enabled", False),
+        workspace_adaptive_v3_rank=c.get("workspace_adaptive_v3_rank", 32),
+        workspace_adaptive_v3_usage_floor_weight=c.get(
+            "workspace_adaptive_v3_usage_floor_weight", 0.0
+        ),
+        workspace_adaptive_v3_readback_consistency_weight=c.get(
+            "workspace_adaptive_v3_readback_consistency_weight", 0.0
+        ),
+        workspace_adaptive_v3_attention_temperature=c.get(
+            "workspace_adaptive_v3_attention_temperature", 12.0
+        ),
+        workspace_adaptive_v3_temperature_enabled=c.get(
+            "workspace_adaptive_v3_temperature_enabled", False
+        ),
+        workspace_adaptive_v3_straight_through_binding=c.get(
+            "workspace_adaptive_v3_straight_through_binding", False
+        ),
+        workspace_adaptive_v3_entity_destinations=c.get(
+            "workspace_adaptive_v3_entity_destinations", False
+        ),
+        workspace_adaptive_v3_split_context_norm=c.get(
+            "workspace_adaptive_v3_split_context_norm", False
+        ),
+        workspace_adaptive_v3_use_backbone_context=c.get(
+            "workspace_adaptive_v3_use_backbone_context", False
+        ),
+        workspace_adaptive_v3_teacher_forced_operator_outputs=c.get(
+            "workspace_adaptive_v3_teacher_forced_operator_outputs", False
+        ),
+        workspace_adaptive_v3_class_balanced_operator_loss=c.get(
+            "workspace_adaptive_v3_class_balanced_operator_loss", False
+        ),
         workspace_compile_recurrence=c.get("workspace_compile_recurrence", False),
         workspace_entity_keyed_writes=c.get("workspace_entity_keyed_writes", False),
         workspace_semantic_entity_addressing=c.get("workspace_semantic_entity_addressing", False),

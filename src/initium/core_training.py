@@ -833,6 +833,36 @@ def load_frozen_workspace_warm_start(
         "dnc_backward_trace",  # diagnostic instrumentation, not architecture
         "workspace_enabled",
         "workspace_num_slots",
+        "workspace_adaptive_enabled",
+        "workspace_adaptive_v2_enabled",
+        "workspace_adaptive_v2_num_skills",
+        "workspace_adaptive_v2_mi_weight",
+        "workspace_adaptive_v3_enabled",
+        "workspace_adaptive_v3_rank",
+        "workspace_adaptive_v3_usage_floor_weight",
+        "workspace_adaptive_v3_readback_consistency_weight",
+        "workspace_adaptive_v3_attention_temperature",
+        "workspace_adaptive_v3_temperature_enabled",
+        "workspace_adaptive_v3_straight_through_binding",
+        "workspace_adaptive_v3_entity_destinations",
+        "workspace_adaptive_v3_split_context_norm",
+        "workspace_adaptive_v3_use_backbone_context",
+        "workspace_adaptive_v3_teacher_forced_operator_outputs",
+        "workspace_adaptive_v3_class_balanced_operator_loss",
+        "workspace_adaptive_v3_distillation",
+        "workspace_adaptive_v3_teacher_weight",
+        "workspace_adaptive_v3_teacher_anneal_steps",
+        "workspace_adaptive_v3_teacher_min_weight",
+        "workspace_adaptive_v3_teacher_accuracy_threshold",
+        "workspace_adaptive_v3_feature_off_probability",
+        "workspace_adaptive_v3_feature_off_tracks",
+        "workspace_adaptive_v3_always_feature_off_tracks",
+        "workspace_adaptive_v3_holdout_tracks",
+        "workspace_adaptive_v3_eval_episodes_per_track",
+        "workspace_adaptive_v3_learning_rate_scale",
+        "workspace_adaptive_v3_logit_diagnostics",
+        "finite_check_interval",
+        "split_graph_activation_checkpointing_min_seq_len",
         "workspace_entity_keyed_writes",
         "workspace_semantic_entity_addressing",
         "workspace_key_value_loss_weight",
@@ -915,7 +945,12 @@ def load_frozen_workspace_warm_start(
     unexpected_keys = set(checkpoint_state) - set(target_state)
 
     def is_workspace_key(key: str) -> bool:
-        return key == "workspace" or key.startswith("workspace.") or ".workspace." in key
+        return (
+            key == "workspace"
+            or key.startswith("workspace.")
+            or key.startswith("workspace_adaptive.")
+            or ".workspace." in key
+        )
 
     missing_workspace_keys = sorted(key for key in missing_keys if is_workspace_key(key))
     missing_non_workspace = sorted(missing_keys - set(missing_workspace_keys))
@@ -1085,6 +1120,7 @@ def run(
     total_steps: int = TOTAL_STEPS,  # see --total-steps.
     checkpoint_every: int = CHECKPOINT_EVERY,  # see --checkpoint-every.
     log_every: int = LOG_EVERY,  # see --log-every.
+    finite_check_interval: int = 100,
     link_matrix_mode: str = LINK_MATRIX_MODE,  # Static Option 1
     link_matrix_topk: int | None = LINK_MATRIX_TOPK,  # Static Option 1
     isolate_link_ablation: bool = ISOLATE_LINK_ABLATION,  # Static Option 1
@@ -1114,6 +1150,7 @@ def run(
     split_graph_variant: str = SPLIT_GRAPH_MAMBA_VARIANT,
     split_graph_num_blocks: int = SPLIT_GRAPH_NUM_BLOCKS,
     split_graph_activation_checkpointing: bool = False,
+    split_graph_activation_checkpointing_min_seq_len: int = 256,
     split_graph_headdim: int = SPLIT_GRAPH_MAMBA_HEADDIM,
     split_graph_combine_reads: bool = SPLIT_GRAPH_COMBINE_READS,
     split_graph_combiner_mode: str = SPLIT_GRAPH_COMBINER_MODE,
@@ -1121,6 +1158,34 @@ def run(
     split_graph_combiner_num_blocks: int = SPLIT_GRAPH_COMBINER_NUM_BLOCKS,
     workspace_enabled: bool = WORKSPACE_ENABLED,
     workspace_num_slots: int = WORKSPACE_NUM_SLOTS,
+    workspace_adaptive_enabled: bool = False,
+    workspace_adaptive_v2_enabled: bool = False,
+    workspace_adaptive_v2_num_skills: int = 8,
+    workspace_adaptive_v2_mi_weight: float = 0.01,
+    workspace_adaptive_v3_enabled: bool = False,
+    workspace_adaptive_v3_rank: int = 32,
+    workspace_adaptive_v3_distillation: bool = True,
+    workspace_adaptive_v3_teacher_weight: float = 1.0,
+    workspace_adaptive_v3_teacher_anneal_steps: int = 20_000,
+    workspace_adaptive_v3_teacher_min_weight: float = 0.1,
+    workspace_adaptive_v3_teacher_accuracy_threshold: float = 0.9,
+    workspace_adaptive_v3_feature_off_probability: float = 0.75,
+    workspace_adaptive_v3_feature_off_tracks: tuple[str, ...] = ("mixed_skill", "variable_binding"),
+    workspace_adaptive_v3_always_feature_off_tracks: tuple[str, ...] = ("variable_binding",),
+    workspace_adaptive_v3_holdout_tracks: tuple[str, ...] = (),
+    workspace_adaptive_v3_eval_episodes_per_track: int = 128,
+    workspace_adaptive_v3_usage_floor_weight: float = 0.0,
+    workspace_adaptive_v3_readback_consistency_weight: float = 0.0,
+    workspace_adaptive_v3_attention_temperature: float = 12.0,
+    workspace_adaptive_v3_temperature_enabled: bool = False,
+    workspace_adaptive_v3_straight_through_binding: bool = False,
+    workspace_adaptive_v3_entity_destinations: bool = False,
+    workspace_adaptive_v3_split_context_norm: bool = False,
+    workspace_adaptive_v3_use_backbone_context: bool = False,
+    workspace_adaptive_v3_teacher_forced_operator_outputs: bool = False,
+    workspace_adaptive_v3_class_balanced_operator_loss: bool = False,
+    workspace_adaptive_v3_learning_rate_scale: float = 2.0,
+    workspace_adaptive_v3_logit_diagnostics: bool = False,
     workspace_compile_recurrence: bool = False,
     workspace_token_id_input: bool = False,
     workspace_entity_keyed_writes: bool = False,
@@ -1148,6 +1213,7 @@ def run(
     workspace_stability_max_activation: float = 100_000.0,
     eval_only: bool = False,
     eval_workspace_mode: str = "checkpoint",
+    eval_workspace_adaptive_bypass: bool = False,
     eval_seed: int | None = None,
     dnc_read_variant: str = DNC_READ_VARIANT,
     dnc_read_residual_scale: float = DNC_READ_RESIDUAL_SCALE,
@@ -1221,6 +1287,10 @@ def run(
         )
     if log_every <= 0:
         raise ValueError("log_every must be positive")
+    if finite_check_interval < 1:
+        raise ValueError("finite_check_interval must be positive")
+    if split_graph_activation_checkpointing_min_seq_len < 0:
+        raise ValueError("activation-checkpoint minimum sequence length must be non-negative")
     if int(workspace_gnw_balanced_eval_episodes_per_cell) < 0:
         raise ValueError("workspace_gnw_balanced_eval_episodes_per_cell must be >= 0")
     if memory_type not in {"none", "dnc", "kv", "delta"}:
@@ -1725,6 +1795,69 @@ def run(
         raise ValueError("eval_only requires --resume with a checkpoint")
     if eval_workspace_mode not in ("checkpoint", "reset-each-step", "bypass"):
         raise ValueError("eval_workspace_mode must be 'checkpoint', 'reset-each-step', or 'bypass'")
+    workspace_adaptive_active = workspace_adaptive_enabled or workspace_adaptive_v2_enabled
+    if workspace_adaptive_v3_enabled and workspace_adaptive_active:
+        raise ValueError("workspace adaptive V3 is a separate architecture; disable V1/V2 flags")
+    if workspace_adaptive_v3_enabled and not (
+        workspace_enabled
+        and workspace_num_slots >= 64
+        and split_graph_enabled
+        and workspace_semantic_entity_addressing
+        and workspace_key_value_loss_weight > 0
+    ):
+        raise ValueError(
+            "workspace adaptive V3 requires workspace slots, semantic entity addressing, "
+            "a positive key-value readout loss weight, and split-graph; it needs at least 64 slots"
+        )
+    if workspace_adaptive_v3_rank < 1:
+        raise ValueError("workspace adaptive V3 rank must be positive")
+    if not math.isfinite(workspace_adaptive_v3_attention_temperature) or not (
+        1.0 <= workspace_adaptive_v3_attention_temperature <= 32.0
+    ):
+        raise ValueError("adaptive V3 attention temperature must be finite and in [1, 32]")
+    for name, value in (
+        ("teacher weight", workspace_adaptive_v3_teacher_weight),
+        ("teacher minimum weight", workspace_adaptive_v3_teacher_min_weight),
+        ("teacher accuracy threshold", workspace_adaptive_v3_teacher_accuracy_threshold),
+        ("feature-off probability", workspace_adaptive_v3_feature_off_probability),
+        ("usage-floor weight", workspace_adaptive_v3_usage_floor_weight),
+        ("readback-consistency weight", workspace_adaptive_v3_readback_consistency_weight),
+        ("learning-rate scale", workspace_adaptive_v3_learning_rate_scale),
+    ):
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f"adaptive V3 {name} must be finite and non-negative")
+    if workspace_adaptive_v3_feature_off_probability > 1:
+        raise ValueError("adaptive V3 feature-off probability must be <= 1")
+    if workspace_adaptive_v3_teacher_anneal_steps < 0:
+        raise ValueError("adaptive V3 teacher anneal steps must be non-negative")
+    if workspace_adaptive_v3_teacher_min_weight > workspace_adaptive_v3_teacher_weight:
+        raise ValueError("adaptive V3 teacher minimum weight cannot exceed its initial weight")
+    if workspace_adaptive_v3_teacher_accuracy_threshold > 1:
+        raise ValueError("adaptive V3 teacher accuracy threshold must be <= 1")
+    if workspace_adaptive_v3_eval_episodes_per_track < 1:
+        raise ValueError("adaptive V3 eval episodes per track must be positive")
+    if workspace_adaptive_enabled and workspace_adaptive_v2_enabled:
+        raise ValueError("choose either --workspace-autoadaptive or --workspace-autoadaptive-v2")
+    if workspace_adaptive_active and not (workspace_enabled and workspace_num_slots > 0):
+        raise ValueError("adaptive workspace skills require --workspace and at least one slot")
+    if workspace_adaptive_v3_enabled and workspace_train_mode == "frozen" and workspace_train_scope == "gate":
+        raise ValueError("adaptive workspace V3 cannot train with frozen gate-only scope")
+    if (
+        workspace_adaptive_active
+        and workspace_train_mode == "frozen"
+        and workspace_train_scope == "gate"
+    ):
+        raise ValueError("adaptive workspace skills cannot train with frozen gate-only scope")
+    if workspace_adaptive_v2_num_skills < 2:
+        raise ValueError("workspace adaptive v2 requires at least two skills")
+    if not math.isfinite(workspace_adaptive_v2_mi_weight) or workspace_adaptive_v2_mi_weight < 0:
+        raise ValueError("workspace adaptive v2 MI weight must be finite and non-negative")
+    if eval_workspace_adaptive_bypass and not (
+        eval_only and (workspace_adaptive_active or workspace_adaptive_v3_enabled)
+    ):
+        raise ValueError(
+            "adaptive workspace bypass is evaluation-only and requires an adaptive-workspace checkpoint"
+        )
     if not math.isfinite(workspace_reconsideration_surprise_threshold) or not (
         0.0 <= workspace_reconsideration_surprise_threshold <= 1.0
     ):
@@ -1749,6 +1882,26 @@ def run(
     checkpoint_state = (
         (resume_checkpoint.get("rnn_state_dict") or {}) if resume_checkpoint is not None else {}
     )
+    requested_adaptive_variant = (
+        "v3" if workspace_adaptive_v3_enabled else
+        "v2" if workspace_adaptive_v2_enabled else "v1" if workspace_adaptive_enabled else None
+    )
+    checkpoint_adaptive_variant = (
+        "v3"
+        if bool(checkpoint_config.get("workspace_adaptive_v3_enabled", False))
+        else "v2"
+        if bool(checkpoint_config.get("workspace_adaptive_v2_enabled", False))
+        else "v1"
+        if bool(checkpoint_config.get("workspace_adaptive_enabled", False))
+        or any(key.startswith("workspace_adaptive.") for key in checkpoint_state)
+        else None
+    )
+    if eval_only and (workspace_adaptive_active or workspace_adaptive_v3_enabled) and checkpoint_adaptive_variant != requested_adaptive_variant:
+        raise ValueError(
+            "adaptive workspace evaluation variant does not match the checkpoint: "
+            f"checkpoint={checkpoint_adaptive_variant!r}, "
+            f"requested={requested_adaptive_variant!r}"
+        )
     if (
         resume_requested
         and getattr(dataset, "name", None) == "workspace-capability"
@@ -1780,7 +1933,10 @@ def run(
             "changed, so start a fresh run or use the matching source revision"
         )
     checkpoint_has_workspace = any(
-        key.startswith("workspace.") or ".workspace." in key for key in checkpoint_state
+        key.startswith("workspace.")
+        or key.startswith("workspace_adaptive.")
+        or ".workspace." in key
+        for key in checkpoint_state
     )
     checkpoint_workspace_enabled = bool(
         checkpoint_config.get("workspace_enabled", False) or checkpoint_has_workspace
@@ -1831,6 +1987,14 @@ def run(
         )
         and not eval_only
     )
+    adaptive_workspace_warm_start = bool(
+        resume_requested
+        and workspace_enabled
+        and workspace_adaptive_active
+        and checkpoint_workspace_enabled
+        and checkpoint_adaptive_variant != requested_adaptive_variant
+        and not eval_only
+    )
     gate_variant_warm_start = bool(
         resume_requested
         and workspace_enabled
@@ -1844,6 +2008,7 @@ def run(
         or workspace_mode_warm_start
         or workspace_bptt_warm_start
         or workspace_reconsideration_warm_start
+        or adaptive_workspace_warm_start
         or gate_variant_warm_start
     )
     frozen_workspace_warm_start = bool(
@@ -2128,6 +2293,8 @@ def run(
 
     workspace_task_file: TextIO | None = None
     workspace_task_writer: Any | None = None
+    adaptive_route_file: TextIO | None = None
+    adaptive_route_writer: Any | None = None
     if getattr(dataset, "name", None) == "workspace-capability":
         workspace_task_path = os.path.join(LOG_DIR, f"run_{run_id}_workspace_task_metrics.csv")
         workspace_task_file = open(workspace_task_path, "a" if resuming else "w", newline="")
@@ -2153,6 +2320,16 @@ def run(
                     "priority_tie_episode_fraction",
                 ]
             )
+        if workspace_adaptive_active:
+            adaptive_route_path = os.path.join(
+                LOG_DIR, f"run_{run_id}_workspace_adaptive_routes.csv"
+            )
+            adaptive_route_file = open(adaptive_route_path, "a" if resuming else "w", newline="")
+            adaptive_route_writer = csv.writer(adaptive_route_file)
+            if not resuming or os.path.getsize(adaptive_route_path) == 0:
+                adaptive_route_writer.writerow(
+                    ["step", "lesson", "eval_type", "track", "skill_id", "token_count", "route_fraction"]
+                )
 
     memory_usage_file: TextIO | None = None
     memory_usage_writer: Any | None = None
@@ -2256,6 +2433,68 @@ def run(
                     values.get("priority_tie_episode_fraction"),
                 ]
             )
+        for track, route_metrics in sorted(
+            diagnostics.get("adaptive_workspace_routes_by_track", {}).items()
+        ):
+            fractions = route_metrics.get("route_token_fractions", ())
+            route_summary = ",".join(
+                f"s{skill_id}={float(fraction):.2f}"
+                for skill_id, fraction in enumerate(fractions)
+            )
+            print(
+                f"[{run_id}] Step {step_value} adaptive routes/{track}: "
+                f"{route_summary} | tokens={int(route_metrics.get('token_count', 0))}"
+            )
+        adaptive_dependency = diagnostics.get("gnw_balanced_adaptive_dependency")
+        if adaptive_dependency is not None:
+            workspace_task_writer.writerow(
+                [
+                    step_value,
+                    lesson_value,
+                    f"{eval_type}/adaptive-pathway-bypassed",
+                    "all/adaptive_pathway_bypassed",
+                    adaptive_dependency.get("adaptive_pathway_bypassed_accuracy_pct"),
+                    adaptive_dependency.get(
+                        "adaptive_pathway_bypassed_episode_exact_match_pct"
+                    ),
+                    adaptive_dependency.get("episodes"),
+                    None,
+                    *([None] * 8),
+                ]
+            )
+            for track, values in sorted(adaptive_dependency.get("by_track", {}).items()):
+                workspace_task_writer.writerow(
+                    [
+                        step_value,
+                        lesson_value,
+                        f"{eval_type}/adaptive-pathway-bypassed",
+                        f"{track}/adaptive_pathway_bypassed",
+                        values.get("adaptive_pathway_bypassed_accuracy_pct"),
+                        values.get("adaptive_pathway_bypassed_exact_match_pct"),
+                        values.get("episodes"),
+                        None,
+                        *([None] * 8),
+                    ]
+                )
+        if adaptive_route_writer is not None and adaptive_route_file is not None:
+            for track, route_metrics in sorted(
+                diagnostics.get("adaptive_workspace_routes_by_track", {}).items()
+            ):
+                for skill_id, route_fraction in enumerate(
+                    route_metrics.get("route_token_fractions", ())
+                ):
+                    adaptive_route_writer.writerow(
+                        [
+                            step_value,
+                            lesson_value,
+                            eval_type,
+                            track,
+                            skill_id,
+                            route_metrics.get("token_count"),
+                            route_fraction,
+                        ]
+                    )
+            adaptive_route_file.flush()
         for track, groups in sorted(diagnostics.get("progression_groups", {}).items()):
             for group, values in sorted(groups.items()):
                 workspace_task_writer.writerow(
@@ -2998,6 +3237,67 @@ def run(
                 f"accuracy drops {baseline_accuracy - ablated_accuracy:.2f}/"
                 f"{baseline_accuracy - shuffled_accuracy:.2f} pp"
             )
+            adaptive_ablated_evaluator = getattr(
+                dataset, "evaluate_workspace_adaptive_ablated", None
+            )
+            if (workspace_adaptive_active or workspace_adaptive_v3_enabled) and callable(adaptive_ablated_evaluator):
+                adaptive_channel = "eval-id-adaptive-pathway-bypass"
+                segment_diagnostics.set_channel(adaptive_channel)
+                _restore_rng_state(id_eval_rng_state)
+                adaptive_accuracy, adaptive_exact = adaptive_ablated_evaluator(
+                    rnn, device, curriculum, lesson_value - 1
+                )
+                adaptive_diagnostics = getattr(dataset, "last_eval_diagnostics", {})
+                write_workspace_task_metrics(
+                    step_value,
+                    lesson_value,
+                    "id-adaptive-pathway-bypassed",
+                    adaptive_diagnostics,
+                )
+                segment_diagnostics.emit(adaptive_channel)
+                adaptive_tracks = adaptive_diagnostics.get("tracks", {})
+                if workspace_adaptive_v3_enabled:
+                    print(
+                        f"[{run_id}] Step {step_value} V3 paired causal evaluation "
+                        f"complete for {','.join(sorted(adaptive_tracks))}; "
+                        "see [adaptive-v3/paired/*] for matched-set deltas and intervals"
+                    )
+                else:
+                    print(
+                        f"[{run_id}] Step {step_value} adaptive pathway dependency: "
+                        f"on {baseline_accuracy:.2f}% exact {baseline_exact:.2f}% | "
+                        f"bypassed {adaptive_accuracy:.2f}% exact {adaptive_exact:.2f}% | "
+                        f"drops {baseline_accuracy - adaptive_accuracy:+.2f}/"
+                        f"{baseline_exact - adaptive_exact:+.2f} pp"
+                    )
+                    for track, full_metrics in sorted(base_tracks.items()):
+                        bypass_metrics = adaptive_tracks.get(track)
+                        if bypass_metrics is None:
+                            continue
+                        accuracy_drop = full_metrics["accuracy"] - bypass_metrics["accuracy"]
+                        exact_drop = full_metrics["exact_match"] - bypass_metrics["exact_match"]
+                        episodes = int(full_metrics.get("episodes", 0))
+                        print(
+                            f"[{run_id}] Step {step_value} adaptive pathway/{track}: "
+                            f"accuracy {full_metrics['accuracy']:.2f}%/"
+                            f"{bypass_metrics['accuracy']:.2f}% | "
+                            f"exact {full_metrics['exact_match']:.2f}%/"
+                            f"{bypass_metrics['exact_match']:.2f}% | "
+                            f"drops {accuracy_drop:+.2f}/{exact_drop:+.2f} pp n={episodes}"
+                        )
+                        workspace_check_writer.writerow(
+                            [
+                                step_value,
+                                lesson_value,
+                                track,
+                                "adaptive_pathway_bypassed",
+                                bypass_metrics["accuracy"],
+                                bypass_metrics["exact_match"],
+                                accuracy_drop,
+                                exact_drop,
+                            ]
+                        )
+                workspace_check_file.flush()
         finally:
             _restore_rng_state(rng_state_after)
 
@@ -3237,8 +3537,9 @@ def run(
     )
     if split_graph_activation_checkpointing:
         print(
-            f"[{run_id}] split-graph Mamba activation checkpointing=on | "
-            "full-sequence blocks are recomputed in backward to reduce VRAM"
+            f"[{run_id}] split-graph Mamba activation checkpointing=adaptive | "
+            f"on for sequence length >= {split_graph_activation_checkpointing_min_seq_len} "
+            "(0=always); short batches retain activations to avoid recomputation"
         )
     if activation_offload_to_cpu:
         print(
@@ -3493,6 +3794,34 @@ def run(
             sgr_workspace_salience_enabled=sgr_workspace_write_salience,
             workspace_enabled=workspace_enabled,
             workspace_num_slots=workspace_num_slots,
+            workspace_adaptive_enabled=workspace_adaptive_enabled,
+            workspace_adaptive_v2_enabled=workspace_adaptive_v2_enabled,
+            workspace_adaptive_v2_num_skills=workspace_adaptive_v2_num_skills,
+            workspace_adaptive_v2_mi_weight=workspace_adaptive_v2_mi_weight,
+            workspace_adaptive_v3_enabled=workspace_adaptive_v3_enabled,
+            workspace_adaptive_v3_rank=workspace_adaptive_v3_rank,
+            workspace_adaptive_v3_usage_floor_weight=workspace_adaptive_v3_usage_floor_weight,
+            workspace_adaptive_v3_readback_consistency_weight=(
+                workspace_adaptive_v3_readback_consistency_weight
+            ),
+            workspace_adaptive_v3_attention_temperature=(
+                workspace_adaptive_v3_attention_temperature
+            ),
+            workspace_adaptive_v3_temperature_enabled=(
+                workspace_adaptive_v3_temperature_enabled
+            ),
+            workspace_adaptive_v3_straight_through_binding=(
+                workspace_adaptive_v3_straight_through_binding
+            ),
+            workspace_adaptive_v3_entity_destinations=workspace_adaptive_v3_entity_destinations,
+            workspace_adaptive_v3_split_context_norm=workspace_adaptive_v3_split_context_norm,
+            workspace_adaptive_v3_use_backbone_context=workspace_adaptive_v3_use_backbone_context,
+            workspace_adaptive_v3_teacher_forced_operator_outputs=(
+                workspace_adaptive_v3_teacher_forced_operator_outputs
+            ),
+            workspace_adaptive_v3_class_balanced_operator_loss=(
+                workspace_adaptive_v3_class_balanced_operator_loss
+            ),
             workspace_compile_recurrence=workspace_compile_recurrence,
             workspace_sparse_recurrence=workspace_sparse_recurrence,
             workspace_attentional_item_memory=workspace_attentional_item_memory,
@@ -3579,6 +3908,20 @@ def run(
             dnc_implementation=dnc_implementation,
             **mamba_kwargs,
         ).to(device)
+
+    if isinstance(rnn, SplitGraphDNC):
+        rnn.workspace_adaptive_v3_logit_diagnostics_enabled = bool(
+            workspace_adaptive_v3_logit_diagnostics
+        )
+        rnn.workspace_adaptive_v3_eval_episodes_per_track = int(
+            workspace_adaptive_v3_eval_episodes_per_track
+        )
+        rnn.workspace_adaptive_v3_feature_off_tracks = tuple(
+            workspace_adaptive_v3_feature_off_tracks
+        )
+        rnn.workspace_adaptive_v3_holdout_tracks = tuple(
+            workspace_adaptive_v3_holdout_tracks
+        )
 
     if dnc_compile_memory and not isinstance(rnn, SurpriseRecallBackboneOnly):
         for memory in rnn.memories:
@@ -3756,6 +4099,7 @@ def run(
             print(
                 f"[{run_id}] WORKSPACE {'active' if workspace_active else 'bypassed'} | "
                 f"slots={workspace_num_slots} | write_selection={write_mode} | "
+                f"adaptive_skills={requested_adaptive_variant or 'off'} | "
                 f"write_addressing={('semantic-entity-token' if workspace_semantic_entity_addressing else 'learned-address') if workspace_entity_keyed_writes else 'shared'} | "
                 f"permutation_commit={'atomic-pair' if workspace_permutation_transactional else 'standard'} | "
                 f"{semantic_state_bounds}"
@@ -3782,6 +4126,27 @@ def run(
                 f"compute_precision={'fp32' if workspace_active else 'bypass'} | "
                 "scope=final-backbone-MoE-bank; each specialist reads shared slots"
             )
+            if workspace_adaptive_v3_enabled:
+                print(
+                    f"[{run_id}] adaptive V3 | rank={workspace_adaptive_v3_rank} | "
+                    f"teacher={'on' if workspace_adaptive_v3_distillation else 'off'} "
+                    f"weight={workspace_adaptive_v3_teacher_weight:g} "
+                    f"anneal_steps={workspace_adaptive_v3_teacher_anneal_steps} | "
+                    f"manual_feature_off={workspace_adaptive_v3_feature_off_probability:.0%} "
+                    f"tracks={','.join(workspace_adaptive_v3_feature_off_tracks)} | "
+                    f"always_off={','.join(workspace_adaptive_v3_always_feature_off_tracks) or 'none'} | "
+                    f"eval_n={workspace_adaptive_v3_eval_episodes_per_track}/track | "
+                    f"heldout={','.join(workspace_adaptive_v3_holdout_tracks) or 'none'} | "
+                    f"operator_lr_scale={workspace_adaptive_v3_learning_rate_scale:g} | "
+                    f"temperature={'learned' if workspace_adaptive_v3_temperature_enabled else 'off'}"
+                    f"(init={workspace_adaptive_v3_attention_temperature:g}) | "
+                    f"hard_binding={workspace_adaptive_v3_straight_through_binding} | "
+                    f"entity_destinations={workspace_adaptive_v3_entity_destinations} | "
+                    f"split_context_norm={workspace_adaptive_v3_split_context_norm} | "
+                    f"backbone_context={workspace_adaptive_v3_use_backbone_context} | "
+                    f"teacher_forced_outputs={workspace_adaptive_v3_teacher_forced_operator_outputs} | "
+                    f"balanced_op_loss={workspace_adaptive_v3_class_balanced_operator_loss}"
+                )
         else:
             print(
                 f"[{run_id}] WORKSPACE disabled | Selection-only split-graph run; "
@@ -3865,6 +4230,30 @@ def run(
         "activation_offload_cpu_budget_mb": activation_offload_cpu_budget_mb,
         "workspace_enabled": workspace_enabled,
         "workspace_num_slots": workspace_num_slots,
+        "workspace_adaptive_v3_enabled": workspace_adaptive_v3_enabled,
+        "workspace_adaptive_v3_rank": workspace_adaptive_v3_rank,
+        "workspace_adaptive_v3_usage_floor_weight": workspace_adaptive_v3_usage_floor_weight,
+        "workspace_adaptive_v3_readback_consistency_weight": workspace_adaptive_v3_readback_consistency_weight,
+        "workspace_adaptive_v3_attention_temperature": workspace_adaptive_v3_attention_temperature,
+        "workspace_adaptive_v3_temperature_enabled": workspace_adaptive_v3_temperature_enabled,
+        "workspace_adaptive_v3_straight_through_binding": workspace_adaptive_v3_straight_through_binding,
+        "workspace_adaptive_v3_entity_destinations": workspace_adaptive_v3_entity_destinations,
+        "workspace_adaptive_v3_split_context_norm": workspace_adaptive_v3_split_context_norm,
+        "workspace_adaptive_v3_use_backbone_context": workspace_adaptive_v3_use_backbone_context,
+        "workspace_adaptive_v3_teacher_forced_operator_outputs": workspace_adaptive_v3_teacher_forced_operator_outputs,
+        "workspace_adaptive_v3_class_balanced_operator_loss": workspace_adaptive_v3_class_balanced_operator_loss,
+        "workspace_adaptive_v3_distillation": workspace_adaptive_v3_distillation,
+        "workspace_adaptive_v3_teacher_weight": workspace_adaptive_v3_teacher_weight,
+        "workspace_adaptive_v3_teacher_anneal_steps": workspace_adaptive_v3_teacher_anneal_steps,
+        "workspace_adaptive_v3_teacher_min_weight": workspace_adaptive_v3_teacher_min_weight,
+        "workspace_adaptive_v3_teacher_accuracy_threshold": workspace_adaptive_v3_teacher_accuracy_threshold,
+        "workspace_adaptive_v3_feature_off_probability": workspace_adaptive_v3_feature_off_probability,
+        "workspace_adaptive_v3_feature_off_tracks": tuple(workspace_adaptive_v3_feature_off_tracks),
+        "workspace_adaptive_v3_always_feature_off_tracks": tuple(workspace_adaptive_v3_always_feature_off_tracks),
+        "workspace_adaptive_v3_holdout_tracks": tuple(workspace_adaptive_v3_holdout_tracks),
+        "workspace_adaptive_v3_eval_episodes_per_track": workspace_adaptive_v3_eval_episodes_per_track,
+        "workspace_adaptive_v3_learning_rate_scale": workspace_adaptive_v3_learning_rate_scale,
+        "workspace_adaptive_v3_logit_diagnostics": workspace_adaptive_v3_logit_diagnostics,
         "workspace_compile_recurrence": workspace_compile_recurrence,
         "workspace_token_id_input": workspace_token_id_input,
         "workspace_entity_keyed_writes": workspace_entity_keyed_writes,
@@ -3894,6 +4283,16 @@ def run(
         "workspace_bistable_deterministic": workspace_bistable_deterministic,
         "workspace_stability_max_activation": workspace_stability_max_activation,
     }
+    if workspace_adaptive_enabled:
+        extra_model_config["workspace_adaptive_enabled"] = True
+    if workspace_adaptive_v2_enabled:
+        extra_model_config["workspace_adaptive_v2_enabled"] = True
+        extra_model_config["workspace_adaptive_v2_num_skills"] = (
+            workspace_adaptive_v2_num_skills
+        )
+        extra_model_config["workspace_adaptive_v2_mi_weight"] = (
+            workspace_adaptive_v2_mi_weight
+        )
     if workspace_semantic_entity_addressing:
         extra_model_config["workspace_semantic_entity_addressing"] = True
     if workspace_permutation_transactional:
@@ -4257,6 +4656,9 @@ def run(
         else:
             for parameter in rnn.workspace.parameters():
                 parameter.requires_grad_(True)
+            if rnn.workspace_adaptive is not None:
+                for parameter in rnn.workspace_adaptive.parameters():
+                    parameter.requires_grad_(True)
             if rnn.workspace_kv_memory is not None:
                 for parameter in rnn.workspace_kv_memory.parameters():
                     parameter.requires_grad_(True)
@@ -4299,7 +4701,47 @@ def run(
                 "Frozen gate-only training has parameters outside the selected write gate: "
                 + ", ".join(unexpected_trainable)
             )
-    optimizer = torch.optim.Adam(trainable_parameters, lr=LR)
+    fused_optimizer_enabled = device.type == "cuda"
+    optimizer_kwargs = {"lr": LR, "fused": True} if fused_optimizer_enabled else {"lr": LR}
+    if workspace_adaptive_v3_enabled:
+        v3_parameters = [
+            parameter
+            for name, parameter in trainable_named_parameters
+            if name.startswith("rnn.workspace.adaptive_v3.")
+        ]
+        v3_ids = {id(parameter) for parameter in v3_parameters}
+        base_parameters = [
+            parameter for parameter in trainable_parameters if id(parameter) not in v3_ids
+        ]
+        parameter_groups = []
+        if base_parameters:
+            parameter_groups.append({"params": base_parameters, "lr_multiplier": 1.0})
+        if v3_parameters:
+            parameter_groups.append(
+                {
+                    "params": v3_parameters,
+                    "lr_multiplier": workspace_adaptive_v3_learning_rate_scale,
+                }
+            )
+        try:
+            optimizer = torch.optim.Adam(parameter_groups, **optimizer_kwargs)
+        except (TypeError, RuntimeError) as exc:
+            if not fused_optimizer_enabled:
+                raise
+            print(f"[{run_id}] fused Adam unavailable ({exc}); using standard Adam")
+            optimizer_kwargs = {"lr": LR}
+            fused_optimizer_enabled = False
+            optimizer = torch.optim.Adam(parameter_groups, **optimizer_kwargs)
+    else:
+        try:
+            optimizer = torch.optim.Adam(trainable_parameters, **optimizer_kwargs)
+        except (TypeError, RuntimeError) as exc:
+            if not fused_optimizer_enabled:
+                raise
+            print(f"[{run_id}] fused Adam unavailable ({exc}); using standard Adam")
+            optimizer_kwargs = {"lr": LR}
+            fused_optimizer_enabled = False
+            optimizer = torch.optim.Adam(trainable_parameters, **optimizer_kwargs)
     # Option 3 (Concept 24/LB-17): multi-axis efficiency accounting.
     # param_count is fixed for the life of this run -- static Option 2's
     # nr_cells resize never changes it (every Memory sublayer is sized by
@@ -4319,10 +4761,17 @@ def run(
     workspace_amp_growth_interval = 100_000 if workspace_amp_stability else 2_000
     kl_on = bool(stochastic_heads) and stochastic_heads[0].sample
     print(
-        f"[{run_id}] params {param_count} | kl_terms={'on' if kl_on else 'off'} | amp={'on' if amp_enabled else 'off'}"
+        f"[{run_id}] params {param_count} | kl_terms={'on' if kl_on else 'off'} | "
+        f"amp={'on' if amp_enabled else 'off'} | "
+        f"optimizer=Adam{'-fused' if fused_optimizer_enabled else ''}"
     )
     if fp32:
         print(f"[{run_id}] full FP32 mode: CUDA autocast and GradScaler disabled")
+    if finite_check_interval > 1:
+        print(
+            f"[{run_id}] NaN/Inf tensor scans every {finite_check_interval} steps; "
+            "gradient norm is still validated every optimizer step"
+        )
     if workspace_amp_stability:
         print(
             f"[{run_id}] workspace AMP stability: FP16 GradScaler starts at "
@@ -4443,7 +4892,7 @@ def run(
     def set_lr(step_now):
         lr_now = lr_at_step(step_now)
         for g in optimizer.param_groups:
-            g["lr"] = lr_now
+            g["lr"] = lr_now * float(g.get("lr_multiplier", 1.0))
         return lr_now
 
     step = 0
@@ -4546,7 +4995,7 @@ def run(
                 f"{len(missing_workspace_keys)} workspace tensors freshly initialized, "
                 f"reset optimizer, scaler, RNG, and curriculum to step 0 / lesson 1."
             )
-        elif gate_variant_warm_start:
+        elif gate_variant_warm_start and not adaptive_workspace_warm_start:
             incompatible = rnn.load_state_dict(ckpt["rnn_state_dict"], strict=False)
             expected_missing = {
                 key for key in rnn.state_dict() if key.startswith("workspace.bistable_gate.")
@@ -4564,6 +5013,38 @@ def run(
                 f"checkpoint {resume_from} at step {step}; all shared model and "
                 "workspace tensors loaded, gate parameters initialized fresh, "
                 "optimizer reset."
+            )
+        elif adaptive_workspace_warm_start:
+            checkpoint_rnn_state = ckpt["rnn_state_dict"]
+            if checkpoint_adaptive_variant != requested_adaptive_variant:
+                checkpoint_rnn_state = {
+                    key: value
+                    for key, value in checkpoint_rnn_state.items()
+                    if not key.startswith("workspace_adaptive.")
+                }
+            incompatible = rnn.load_state_dict(checkpoint_rnn_state, strict=False)
+            expected_missing = {
+                key
+                for key in rnn.state_dict()
+                if key.startswith("workspace_adaptive.")
+                or (
+                    gate_variant_warm_start
+                    and key.startswith("workspace.bistable_gate.")
+                )
+            }
+            if set(incompatible.missing_keys) != expected_missing or incompatible.unexpected_keys:
+                raise ValueError(
+                    "Adaptive workspace variant warm start only permits newly initialized "
+                    "workspace_adaptive parameters; checkpoint state differs "
+                    f"(missing={incompatible.missing_keys[:8]}, "
+                    f"unexpected={incompatible.unexpected_keys[:8]})."
+                )
+            output_proj.load_state_dict(ckpt["output_proj_state_dict"])
+            print(
+                f"[{run_id}] Initialized adaptive workspace variant "
+                f"{requested_adaptive_variant} from {resume_from} "
+                f"at checkpoint step {ckpt['step']}; restored existing model and "
+                "workspace weights, initialized the skill bank, and reset the optimizer."
             )
         elif workspace_condition_warm_start:
             rnn.load_state_dict(ckpt["rnn_state_dict"])
@@ -4713,9 +5194,22 @@ def run(
                     rnn.workspace_reset_each_step = True
                 elif eval_workspace_mode == "bypass":
                     rnn.workspace_eval_bypass = True
+            if eval_workspace_adaptive_bypass:
+                if not isinstance(rnn, SplitGraphDNC) or not (
+                    rnn.workspace_adaptive is not None
+                    or rnn.workspace_adaptive_v3_enabled
+                ):
+                    raise ValueError(
+                        "adaptive workspace bypass requires an adaptive-workspace checkpoint"
+                    )
+                if rnn.workspace_adaptive is not None:
+                    rnn.workspace_adaptive_eval_bypass = True
+                if rnn.workspace_adaptive_v3_enabled:
+                    rnn.workspace_adaptive_v3_eval_bypass = True
             print(
                 f"[{run_id}] Evaluation-only checkpoint load | step={step} | "
                 f"workspace_mode={eval_workspace_mode} | "
+                f"adaptive_workspace_bypass={'on' if eval_workspace_adaptive_bypass else 'off'} | "
                 f"eval_seed={eval_seed if eval_seed is not None else 'checkpoint RNG'} | "
                 "optimizer state not loaded"
             )
@@ -4817,7 +5311,9 @@ def run(
     # legs already have their own timestamped log rows if that's needed).
     t_run_start = time.time()
 
+    adaptive_v3_teacher_weight_current = float(workspace_adaptive_v3_teacher_weight)
     while step < total_steps and not eval_only:
+        adaptive_v3_teacher_weight_for_step = adaptive_v3_teacher_weight_current
         moe_diagnostics_due = bool(moe_diagnostics_enabled and running_log_steps + 1 >= log_every)
         for module in moe_diagnostic_modules:
             if module.diagnostics_enabled != moe_diagnostics_due:
@@ -4937,6 +5433,14 @@ def run(
                 for key, value in dataset.workspace_key_value_metadata(
                     input_seq,
                     include_operations=workspace_operation_executor,
+                    include_adaptive_v3=workspace_adaptive_v3_enabled,
+                    adaptive_v3_distillation=workspace_adaptive_v3_distillation,
+                    adaptive_v3_feature_off_probability=workspace_adaptive_v3_feature_off_probability,
+                    adaptive_v3_feature_off_tracks=workspace_adaptive_v3_feature_off_tracks,
+                    adaptive_v3_always_feature_off_tracks=workspace_adaptive_v3_always_feature_off_tracks,
+                    adaptive_v3_holdout_tracks=workspace_adaptive_v3_holdout_tracks,
+                    adaptive_v3_step=step,
+                    adaptive_v3_seed=seed,
                     rule_feedback_update=workspace_rule_feedback_update,
                     attentional_item_memory=workspace_attentional_item_memory,
                     no_report_confidence_readout=workspace_no_report_confidence_readout,
@@ -4961,6 +5465,29 @@ def run(
                         "operation_steps": key_value_metadata["workspace_operation_steps"],
                     }
                 )
+            if workspace_adaptive_v3_enabled:
+                workspace_forward_kwargs.update(
+                    {
+                        "adaptive_operator_candidate_mask": key_value_metadata[
+                            "adaptive_operator_candidate_mask"
+                        ],
+                        "adaptive_operator_execution_mask": key_value_metadata[
+                            "adaptive_operator_execution_mask"
+                        ],
+                        "adaptive_operator_steps": key_value_metadata[
+                            "adaptive_operator_steps"
+                        ],
+                        "adaptive_operator_teacher_weight": (
+                            adaptive_v3_teacher_weight_for_step
+                            if workspace_adaptive_v3_distillation
+                            else 0.0
+                        ),
+                    }
+                )
+                if "adaptive_operator_teacher_targets" in key_value_metadata:
+                    workspace_forward_kwargs["adaptive_operator_teacher_targets"] = (
+                        key_value_metadata["adaptive_operator_teacher_targets"]
+                    )
         state_supervision_positions = None
         state_supervision_mask = None
         if workspace_state_loss_weight > 0:
@@ -5009,6 +5536,16 @@ def run(
         answer_mask = answer_mask.to(device, non_blocking=True)
         if timespans is not None:
             timespans = timespans.to(device, non_blocking=True)
+        activation_checkpointing_this_step = False
+        if split_graph_activation_checkpointing and isinstance(rnn, SplitGraphDNC):
+            backbone = getattr(rnn, "backbone", None)
+            if backbone is not None and hasattr(backbone, "activation_checkpointing"):
+                seq_len = int(input_seq.shape[1])
+                activation_checkpointing_this_step = (
+                    split_graph_activation_checkpointing_min_seq_len == 0
+                    or seq_len >= split_graph_activation_checkpointing_min_seq_len
+                )
+                backbone.activation_checkpointing = activation_checkpointing_this_step
         # The auxiliary head predicts only observed input vectors; task labels
         # are never part of its target. Nonzero input rows are the generic
         # padding contract, independent of dataset-specific answer masks.
@@ -5027,7 +5564,9 @@ def run(
         # Keep it defined for all architectures so failure tracing cannot
         # mask the original non-finite activation with UnboundLocalError.
         sequence_valid_mask = None
-        check_finite_this_step = True
+        check_finite_this_step = (
+            step % finite_check_interval == 0
+        )
         if check_finite_this_step:
             if not _first_nonfinite_report(input_seq, "input_seq", step):
                 emit_failure_diagnostics("train")
@@ -5486,6 +6025,13 @@ def run(
         )  # v8 (Option 4): Switch-style load-balancing loss, already scaled
         # by moe_load_balance_alpha inside SwitchMoE.pop_aux_loss() -- no
         # extra weighting applied here, unlike beta_eff*kl_loss below.
+        adaptive_skill_loss = None
+        if workspace_adaptive_active and isinstance(rnn, SplitGraphDNC):
+            assert rnn.workspace_adaptive is not None
+            adaptive_skill_loss = rnn.workspace_adaptive.pop_aux_loss()
+        adaptive_v3_loss = None
+        if workspace_adaptive_v3_enabled and isinstance(rnn, SplitGraphDNC):
+            adaptive_v3_loss = rnn.workspace.pop_adaptive_v3_aux_loss()
         if check_finite_this_step and not _first_nonfinite_report(
             moe_aux_loss, "moe_aux_loss", step
         ):
@@ -5493,6 +6039,20 @@ def run(
             raise FloatingPointError(
                 f"[{run_id}] non-finite MoE auxiliary loss at step {step}; "
                 "stopping before backward."
+            )
+        if adaptive_skill_loss is not None and check_finite_this_step and not _first_nonfinite_report(
+            adaptive_skill_loss, "adaptive_skill_loss", step
+        ):
+            emit_failure_diagnostics("train")
+            raise FloatingPointError(
+                f"[{run_id}] non-finite adaptive workspace loss at step {step}; stopping."
+            )
+        if adaptive_v3_loss is not None and check_finite_this_step and not _first_nonfinite_report(
+            adaptive_v3_loss, "adaptive_v3_loss", step
+        ):
+            emit_failure_diagnostics("train")
+            raise FloatingPointError(
+                f"[{run_id}] non-finite adaptive workspace V3 loss at step {step}; stopping."
             )
         global_ramp = min(1.0, (step - anneal_start_step) / max(1, KL_ANNEAL_STEPS))
         lesson_dip_ramp = min(1.0, (step - lesson_dip_start_step) / max(1, LESSON_KL_DIP_STEPS))
@@ -5522,6 +6082,8 @@ def run(
             )
             + beta_eff * kl_loss
             + moe_aux_loss
+            + (adaptive_skill_loss if adaptive_skill_loss is not None else 0.0)
+            + (adaptive_v3_loss if adaptive_v3_loss is not None else 0.0)
         )
         if split_graph_forward_trace is not None and split_graph_forward_trace.active:
             split_graph_forward_trace.observe("training.total_loss", loss)
@@ -5834,6 +6396,40 @@ def run(
                 if value is not None:
                     total.add_(value.detach())
         step += 1
+        if (
+            workspace_adaptive_v3_enabled
+            and workspace_adaptive_v3_teacher_anneal_steps > 0
+            and step % 100 == 0
+            and isinstance(rnn, SplitGraphDNC)
+        ):
+            teacher_diagnostics = rnn.workspace.adaptive_v3_training_diagnostics()
+            measured = []
+            for name, value in teacher_diagnostics.items():
+                if (
+                    not name.startswith("teacher_feature_off_")
+                    or not name.endswith("_accuracy")
+                ):
+                    continue
+                count_value = teacher_diagnostics.get(f"{name}_count")
+                if count_value is None or float(count_value.item()) <= 0:
+                    continue
+                measured.append(float(value.item()))
+            if measured:
+                delta = (
+                    workspace_adaptive_v3_teacher_weight
+                    - workspace_adaptive_v3_teacher_min_weight
+                ) * 100.0 / workspace_adaptive_v3_teacher_anneal_steps
+                if min(measured) >= workspace_adaptive_v3_teacher_accuracy_threshold:
+                    adaptive_v3_teacher_weight_current = max(
+                        workspace_adaptive_v3_teacher_min_weight,
+                        adaptive_v3_teacher_weight_current - delta,
+                    )
+                else:
+                    adaptive_v3_teacher_weight_current = min(
+                        workspace_adaptive_v3_teacher_weight,
+                        adaptive_v3_teacher_weight_current + delta,
+                    )
+
         running_log_steps += 1
         current_lr = set_lr(step)  # Phase 1 FIX: clamped manual LR, replaces scheduler.step()
 
@@ -6132,6 +6728,11 @@ def run(
                 f"nonfinite_grad_steps {running_nonfinite_grad_steps}",
                 f"clipped_grad_steps {running_clipped_grad_steps}/{running_finite_grad_steps}",
             ]
+            if split_graph_activation_checkpointing:
+                parts.append(
+                    f"act_ckpt={'on' if activation_checkpointing_this_step else 'off'}"
+                    f"(seq={int(input_seq.shape[1])})"
+                )
             if amp_enabled:
                 parts.append(f"amp_scale {amp_scale:.1f}")
             parts.append(f"gpu_mem_peak_mb {gpu_mem_peak_mb:.1f}")
@@ -6161,6 +6762,102 @@ def run(
                     f"moe_capacity_drop {moe_diag.get('moe_capacity_drop_frac', 0.0):.1%}",
                 ]
                 parts.extend(_format_moe_layer_reports(moe_diag))
+            if adaptive_skill_loss is not None:
+                parts.append(f"adaptive_skill_aux {adaptive_skill_loss.detach().item():.5f}")
+            if adaptive_v3_loss is not None:
+                parts.append(f"adaptive_v3_aux {adaptive_v3_loss.detach().item():.5f}")
+            if workspace_adaptive_v3_enabled:
+                v3_diagnostics = rnn.workspace.adaptive_v3_training_diagnostics()
+                context_diagnostics = [
+                    f"{label}:{float(v3_diagnostics[key]):.3f}"
+                    for label, key in (
+                        ("routed_rms", "controller_routed_context_rms"),
+                        ("slot_rms", "controller_slot_context_rms"),
+                        ("backbone_rms", "controller_backbone_context_rms"),
+                        ("inv_temp", "binding_inverse_temperature"),
+                    )
+                    if key in v3_diagnostics
+                ]
+                if context_diagnostics:
+                    parts.append(f"adaptive_v3_context[{','.join(context_diagnostics)}]")
+                operation_probability = v3_diagnostics.get("operation_probability")
+                if operation_probability is not None:
+                    route_names = ("noop", "copy", "add_mod", "compare", "select", "rank", "sort")
+                    route_summary = ",".join(
+                        f"{name}:{float(value):.2f}"
+                        for name, value in zip(route_names, operation_probability)
+                    )
+                    parts.append(f"adaptive_v3_route[{route_summary}]")
+                teacher_loss_parts = [
+                    f"{label}:{float(v3_diagnostics[key]):.3f}"
+                    for label, key in (
+                        ("op", "teacher_operation_loss"),
+                        ("operand0", "teacher_operand0_loss"),
+                        ("operand1", "teacher_operand1_loss"),
+                        ("output", "teacher_output_loss"),
+                        ("output1", "teacher_output1_loss"),
+                        ("bind0", "teacher_operand0_binding_loss"),
+                        ("bind1", "teacher_operand1_binding_loss"),
+                        ("write0", "teacher_destination0_binding_loss"),
+                        ("write1", "teacher_destination1_binding_loss"),
+                    )
+                    if key in v3_diagnostics
+                ]
+                teacher_accuracy_parts = [
+                    f"{label}:{float(v3_diagnostics[key]):.2f}"
+                    for label, key in (
+                        ("op", "teacher_operation_accuracy"),
+                        ("active_op", "teacher_active_operation_accuracy"),
+                        ("operand0", "teacher_operand0_accuracy"),
+                        ("operand1", "teacher_operand1_accuracy"),
+                        ("output", "teacher_output_accuracy"),
+                        ("output1", "teacher_output1_accuracy"),
+                        ("bind0", "teacher_operand0_binding_accuracy"),
+                        ("bind1", "teacher_operand1_binding_accuracy"),
+                        ("write0", "teacher_destination0_binding_accuracy"),
+                        ("write1", "teacher_destination1_binding_accuracy"),
+                        ("off_op", "teacher_feature_off_active_operation_accuracy"),
+                        ("off_read0", "teacher_feature_off_operand0_accuracy"),
+                        ("off_read1", "teacher_feature_off_operand1_accuracy"),
+                        ("off_value", "teacher_feature_off_output_accuracy"),
+                        ("off_commit", "teacher_feature_off_destination0_binding_accuracy"),
+                    )
+                    if key in v3_diagnostics
+                ]
+                teacher_operator_loss_parts = [
+                    f"{name}:{float(v3_diagnostics[f'teacher_op_loss_{name}']):.3f}/"
+                    f"{int(v3_diagnostics[f'teacher_op_loss_{name}_count'].item())}"
+                    for name in ("noop", "copy", "add_mod", "compare", "select", "rank", "sort")
+                    if f"teacher_op_loss_{name}" in v3_diagnostics
+                ]
+                teacher_operator_output_parts = [
+                    f"{name}:{float(v3_diagnostics[f'teacher_operator_output_loss_{name}']):.3f}/"
+                    f"{int(v3_diagnostics[f'teacher_operator_output_loss_{name}_count'].item())}"
+                    for name in ("copy", "add_mod", "compare", "select", "rank", "sort")
+                    if f"teacher_operator_output_loss_{name}" in v3_diagnostics
+                ]
+                if teacher_loss_parts or teacher_accuracy_parts:
+                    parts.append(
+                        f"adaptive_v3_teacher[w={adaptive_v3_teacher_weight_for_step:.3f};"
+                        f"loss {','.join(teacher_loss_parts)};"
+                        f"acc {','.join(teacher_accuracy_parts)};"
+                        f"op_loss/count {','.join(teacher_operator_loss_parts)};"
+                        f"forced_output_loss/count {','.join(teacher_operator_output_parts)}]"
+                    )
+                batch_stats = getattr(dataset, "last_adaptive_v3_batch_stats", {})
+                if batch_stats:
+                    reported_tracks = set(workspace_adaptive_v3_feature_off_tracks) | set(
+                        workspace_adaptive_v3_always_feature_off_tracks
+                    )
+                    parts.append(
+                        "adaptive_v3_feature_off["
+                        + ",".join(
+                            f"{track}:{stats['manual_off']}/{stats['episodes']}"
+                            for track, stats in sorted(batch_stats.items())
+                            if track in reported_tracks
+                        )
+                        + "]"
+                    )
             workspace_diag: dict[str, Any] = {}
             if workspace_enabled and isinstance(rnn, SplitGraphDNC):
                 if rnn.workspace is None:
@@ -6245,6 +6942,28 @@ def run(
                             f"records {workspace_kv_diag['workspace_kv_committed_records'].item():.0f} "
                             f"history {workspace_kv_diag['workspace_kv_history_records'].item():.1f} "
                             f"read_rms {workspace_kv_diag['workspace_kv_read_rms'].item():.3f}]"
+                        )
+                if rnn.workspace_adaptive is not None:
+                    adaptive_diag = rnn.workspace_adaptive.last_diagnostics()
+                    if adaptive_diag:
+                        route_frequency = ",".join(
+                            f"{value:.2f}"
+                            for value in adaptive_diag["route_frequency"].cpu().tolist()
+                        )
+                        output_scales = adaptive_diag["output_scale"].detach().cpu().reshape(-1)
+                        scale_text = ",".join(f"{value:.3f}" for value in output_scales.tolist())
+                        routing_info = (
+                            f" mi={adaptive_diag['routing_mutual_information'].item():.3f}"
+                            if "routing_mutual_information" in adaptive_diag
+                            else ""
+                        )
+                        parts.append(
+                            "workspace_adaptive["
+                            f"route={route_frequency} "
+                            f"entropy={adaptive_diag['route_entropy'].item():.3f} "
+                            f"delta_rms={adaptive_diag['adaptive_delta_rms'].item():.4g} "
+                            f"scale={scale_text}{routing_info} "
+                            f"balance={adaptive_diag['balance_loss'].item():.4g}]"
                         )
             if dyn_n_str:
                 parts.append(dyn_n_str.strip(" |"))
@@ -7654,6 +8373,8 @@ def run(
         workspace_check_file.close()
     if workspace_task_file is not None:
         workspace_task_file.close()
+    if adaptive_route_file is not None:
+        adaptive_route_file.close()
     if memory_usage_file is not None:
         memory_usage_file.close()
     if memory_path_file is not None:
@@ -7803,6 +8524,13 @@ if __name__ == "__main__":
         default=LOG_EVERY,
         metavar="N",
         help=f"print the training summary and emit grouped training diagnostics every N steps (default: {LOG_EVERY}).",
+    )
+    parser.add_argument(
+        "--finite-check-interval",
+        type=int,
+        default=100,
+        metavar="N",
+        help="Synchronously scan model outputs/losses for NaN/Inf every N steps (1 checks every step). Gradient-norm finiteness is still checked each step.",
     )
     parser.add_argument(
         "--link-matrix-mode",
@@ -7969,6 +8697,149 @@ if __name__ == "__main__":
         type=int,
         default=WORKSPACE_NUM_SLOTS,
         help="Persistent workspace slot count (0 is the plumbing/bypass control).",
+    )
+    parser.add_argument(
+        "--workspace-autoadaptive",
+        action="store_true",
+        help=(
+            "Add a learned sparse bank of low-rank workspace skill pathways. "
+            "The task loss trains the pathways and context router without task IDs "
+            "or task-specific decoders. Requires --workspace."
+        ),
+    )
+    parser.add_argument(
+        "--workspace-autoadaptive-v2",
+        action="store_true",
+        help=(
+            "Use adaptive workspace v2: per-skill low-rank output projections "
+            "and a mutual-information routing objective. Mutually exclusive "
+            "with --workspace-autoadaptive; requires --workspace."
+        ),
+    )
+    parser.add_argument(
+        "--workspace-autoadaptive-v2-num-skills",
+        type=int,
+        default=8,
+        help="Number of independently projected adaptive workspace v2 pathways (default: 8).",
+    )
+    parser.add_argument(
+        "--workspace-autoadaptive-v2-mi-weight",
+        type=float,
+        default=0.01,
+        help=(
+            "Weight for the v2 routing mutual-information objective, which "
+            "encourages confident assignments and broad pathway use (default: 0.01)."
+        ),
+    )
+    parser.add_argument(
+        "--workspace-autoadaptive-v3",
+        action="store_true",
+        help=(
+            "Enable the learned address-aware operator bank inside the workspace. "
+            "Requires semantic entity addressing and key-value readout; mutually exclusive with V1/V2."
+        ),
+    )
+    parser.add_argument("--workspace-autoadaptive-v3-rank", type=int, default=32)
+    parser.add_argument(
+        "--workspace-autoadaptive-v3-distillation",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Distill V3 operation, operand-binding, destination, and output behavior from supported programs.",
+    )
+    parser.add_argument("--workspace-autoadaptive-v3-teacher-weight", type=float, default=1.0)
+    parser.add_argument("--workspace-autoadaptive-v3-teacher-anneal-steps", type=int, default=20000,
+                        help="Training steps used to lower teacher weight while the accuracy criterion holds; 0 keeps it fixed.")
+    parser.add_argument("--workspace-autoadaptive-v3-teacher-min-weight", type=float, default=0.1)
+    parser.add_argument("--workspace-autoadaptive-v3-teacher-accuracy-threshold", type=float, default=0.9)
+    parser.add_argument("--workspace-autoadaptive-v3-feature-off-probability", type=float, default=0.75)
+    parser.add_argument(
+        "--workspace-autoadaptive-v3-feature-off-tracks",
+        nargs="+",
+        default=("mixed_skill", "variable_binding"),
+        help="Tracks where each episode independently has this probability of disabling the manual executor.",
+    )
+    parser.add_argument(
+        "--workspace-autoadaptive-v3-always-feature-off-tracks",
+        nargs="*",
+        default=("variable_binding",),
+        help="Tracks trained permanently without the manual executor while retaining teacher supervision.",
+    )
+    parser.add_argument(
+        "--workspace-autoadaptive-v3-holdout-tracks",
+        nargs="*",
+        default=(),
+        help="Tracks withheld from V3 teacher labels and always run without manual operations.",
+    )
+    parser.add_argument("--workspace-autoadaptive-v3-usage-floor-weight", type=float, default=0.0)
+    parser.add_argument("--workspace-autoadaptive-v3-readback-consistency-weight", type=float, default=0.0)
+    parser.add_argument(
+        "--workspace-autoadaptive-v3-attention-temperature",
+        type=float,
+        default=12.0,
+        help="Initial learned inverse temperature for V3 address binding (1-32; default 12).",
+    )
+    parser.add_argument(
+        "--workspace-autoadaptive-v3-temperature-binding",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable the learned inverse temperature for slot binding (default remains the original unscaled cosine scores).",
+    )
+    parser.add_argument(
+        "--workspace-autoadaptive-v3-straight-through-binding",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use hard top-1 operand/destination routing in the forward pass with soft straight-through gradients.",
+    )
+    parser.add_argument(
+        "--workspace-autoadaptive-v3-entity-destinations",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Predict semantic entity IDs for writes, then resolve existing or first-free slots using the workspace allocator.",
+    )
+    parser.add_argument(
+        "--workspace-autoadaptive-v3-split-context-norm",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Normalize routed expert context and mean slot content separately before the V3 controller.",
+    )
+    parser.add_argument(
+        "--workspace-autoadaptive-v3-use-backbone-context",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Append the final backbone residual stream to V3's input-derived controller context.",
+    )
+    parser.add_argument(
+        "--workspace-autoadaptive-v3-teacher-forced-operator-outputs",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Train each operator's output head on its own teacher-labeled examples, independently of router probability.",
+    )
+    parser.add_argument(
+        "--workspace-autoadaptive-v3-class-balanced-operator-loss",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Average operation-selection teacher loss per represented operation class.",
+    )
+    parser.add_argument("--workspace-autoadaptive-v3-learning-rate-scale", type=float, default=2.0)
+    parser.add_argument(
+        "--workspace-autoadaptive-v3-logit-diagnostics",
+        action="store_true",
+        help="On paired evaluation episodes, report answer-logit KL and prediction flips with V3 active vs bypassed (manual executor disabled for both sides).",
+    )
+    parser.add_argument(
+        "--workspace-autoadaptive-v3-eval-episodes-per-track",
+        type=int,
+        default=128,
+        help="Paired V3-on/off evaluation episodes per feature-off track.",
+    )
+    parser.add_argument(
+        "--eval-workspace-adaptive-bypass",
+        action="store_true",
+        help=(
+            "Evaluation-only causal ablation: keep learned workspace memory active "
+            "but disable the adaptive workspace pathway. Requires --eval-only and "
+            "an adaptive workspace checkpoint (V1, V2, or V3)."
+        ),
     )
     parser.add_argument(
         "--workspace-write-to-kv",
@@ -8452,6 +9323,13 @@ if __name__ == "__main__":
             "retaining their full-sequence intermediates. Preserves full BPTT and "
             "task difficulty while trading extra compute for lower GPU memory."
         ),
+    )
+    parser.add_argument(
+        "--split-graph-activation-checkpointing-min-seq-len",
+        type=int,
+        default=256,
+        metavar="N",
+        help="With activation checkpointing enabled, recompute blocks only for batches with sequence length >= N; set 0 to checkpoint every batch.",
     )
     parser.add_argument(
         "--split-graph-headdim",
@@ -8946,6 +9824,10 @@ if __name__ == "__main__":
         parser.error("--activation-offload-cpu-budget-mb must be positive")
     if args.log_every <= 0:
         parser.error("--log-every must be positive")
+    if args.finite_check_interval <= 0:
+        parser.error("--finite-check-interval must be positive")
+    if args.split_graph_activation_checkpointing_min_seq_len < 0:
+        parser.error("--split-graph-activation-checkpointing-min-seq-len must be non-negative")
     if args.dnc_link_sharpness != 1.0 and not args.split_graph:
         parser.error("--dnc-link-sharpness requires --split-graph")
     if args.dnc_backward_trace and not args.split_graph:
@@ -9125,6 +10007,45 @@ if __name__ == "__main__":
             parser.error("prediction-error reconsideration requires --workspace-num-slots >= 1")
     if args.eval_only and args.eval_workspace_mode != "checkpoint" and not args.workspace:
         parser.error("non-default --eval-workspace-mode requires --workspace")
+    if sum((args.workspace_autoadaptive, args.workspace_autoadaptive_v2, args.workspace_autoadaptive_v3)) > 1:
+        parser.error("choose only one adaptive workspace architecture (V1, V2, or V3)")
+    if (args.workspace_autoadaptive or args.workspace_autoadaptive_v2 or args.workspace_autoadaptive_v3) and not args.workspace:
+        parser.error("adaptive workspace variants require --workspace")
+    if args.workspace_autoadaptive_v3 and not (
+        args.split_graph
+        and args.workspace_num_slots >= 64
+        and args.workspace_semantic_entity_addressing
+        and args.workspace_key_value_loss_weight > 0
+    ):
+        parser.error("--workspace-autoadaptive-v3 requires split-graph, at least 64 slots, semantic entity addressing, and positive key-value loss")
+    if args.workspace_autoadaptive_v3_rank < 1:
+        parser.error("--workspace-autoadaptive-v3-rank must be positive")
+    if args.workspace_autoadaptive_v3_teacher_anneal_steps < 0:
+        parser.error("--workspace-autoadaptive-v3-teacher-anneal-steps must be non-negative")
+    if args.workspace_autoadaptive_v3_teacher_min_weight < 0:
+        parser.error("--workspace-autoadaptive-v3-teacher-min-weight must be non-negative")
+    if args.workspace_autoadaptive_v3_teacher_min_weight > args.workspace_autoadaptive_v3_teacher_weight:
+        parser.error("--workspace-autoadaptive-v3-teacher-min-weight cannot exceed teacher weight")
+    if not 0 <= args.workspace_autoadaptive_v3_teacher_accuracy_threshold <= 1:
+        parser.error("--workspace-autoadaptive-v3-teacher-accuracy-threshold must be in [0, 1]")
+    if args.workspace_autoadaptive_v3_eval_episodes_per_track < 1:
+        parser.error("--workspace-autoadaptive-v3-eval-episodes-per-track must be positive")
+    if not 0 <= args.workspace_autoadaptive_v3_feature_off_probability <= 1:
+        parser.error("--workspace-autoadaptive-v3-feature-off-probability must be in [0, 1]")
+    if args.workspace_autoadaptive_v2_num_skills < 2:
+        parser.error("--workspace-autoadaptive-v2-num-skills must be >= 2")
+    if (
+        not math.isfinite(args.workspace_autoadaptive_v2_mi_weight)
+        or args.workspace_autoadaptive_v2_mi_weight < 0
+    ):
+        parser.error("--workspace-autoadaptive-v2-mi-weight must be finite and >= 0")
+    if args.eval_workspace_adaptive_bypass and not (
+        args.eval_only and (args.workspace_autoadaptive or args.workspace_autoadaptive_v2 or args.workspace_autoadaptive_v3)
+    ):
+        parser.error(
+            "--eval-workspace-adaptive-bypass requires --eval-only and "
+            "an adaptive workspace variant"
+        )
     if args.eval_only and args.run_id_suffix is None:
         args.run_id_suffix = f"eval-{args.eval_workspace_mode}"
         if args.eval_seed is not None:
@@ -9636,6 +10557,22 @@ if __name__ == "__main__":
                 run_id += f"_backbonerscale{args.moe_backbone_residual_scale:g}"
         if args.workspace:
             run_id += f"_workspace{args.workspace_num_slots}s_{args.workspace_train_mode}"
+            if args.workspace_autoadaptive:
+                run_id += "_autoadaptive"
+            elif args.workspace_autoadaptive_v2:
+                mi_tag = f"{args.workspace_autoadaptive_v2_mi_weight:g}".replace(".", "p")
+                run_id += (
+                    f"_autoadaptivev2_{args.workspace_autoadaptive_v2_num_skills}s"
+                    f"_mi{mi_tag}"
+                )
+            elif args.workspace_autoadaptive_v3:
+                teacher_tag = f"{args.workspace_autoadaptive_v3_teacher_weight:g}".replace(".", "p")
+                feature_off_tag = f"{args.workspace_autoadaptive_v3_feature_off_probability:g}".replace(".", "p")
+                always_off_tag = "-".join(args.workspace_autoadaptive_v3_always_feature_off_tracks) or "none"
+                run_id += (
+                    f"_autoadaptivev3_r{args.workspace_autoadaptive_v3_rank}"
+                    f"_teacher{teacher_tag}_off{feature_off_tag}_always{always_off_tag}"
+                )
             if args.workspace_entity_keyed_writes:
                 key_threshold_tag = f"{args.workspace_key_match_threshold:g}".replace(
                     ".", "p"
@@ -9715,6 +10652,8 @@ if __name__ == "__main__":
             run_id = f"{run_id}_ds{args.dataset_type}"
         if args.dataset_type == "workspace-capability":
             run_id += f"_track{args.workspace_task_track}"
+            if args.workspace_task_track in ("all", "gnw_all", "new_all", "mixed_skill"):
+                run_id += "_mixedops6"
         if args.sgr_pred_loss_weight > 0:
             pred_weight_tag = f"{args.sgr_pred_loss_weight:g}".replace(".", "p")
             run_id += (
@@ -9759,6 +10698,8 @@ if __name__ == "__main__":
             run_id += "_actckpt"
         if args.workspace_operation_diagnostics:
             run_id += "_opdiag"
+        if args.eval_workspace_adaptive_bypass:
+            run_id += "_adaptive-bypass"
         if args.activation_offload_to_cpu:
             run_id += f"_actoffloadcpu{args.activation_offload_cpu_budget_mb}m"
         if args.fp32:
@@ -9775,6 +10716,7 @@ if __name__ == "__main__":
                 args.checkpoint_every if args.checkpoint_every is not None else CHECKPOINT_EVERY
             ),
             log_every=args.log_every,
+            finite_check_interval=args.finite_check_interval,
             link_matrix_mode=args.link_matrix_mode,
             link_matrix_topk=args.link_matrix_topk,
             isolate_link_ablation=args.isolate_link_ablation,
@@ -9803,6 +10745,9 @@ if __name__ == "__main__":
             split_graph_variant=args.split_graph_variant,
             split_graph_num_blocks=args.split_graph_num_blocks,
             split_graph_activation_checkpointing=args.split_graph_activation_checkpointing,
+            split_graph_activation_checkpointing_min_seq_len=(
+                args.split_graph_activation_checkpointing_min_seq_len
+            ),
             split_graph_headdim=args.split_graph_headdim,
             split_graph_combine_reads=not args.split_graph_no_combine,
             split_graph_combiner_mode=args.split_graph_combiner_mode,
@@ -9810,6 +10755,50 @@ if __name__ == "__main__":
             split_graph_combiner_num_blocks=args.split_graph_combiner_num_blocks,
             workspace_enabled=args.workspace,
             workspace_num_slots=args.workspace_num_slots,
+            workspace_adaptive_enabled=args.workspace_autoadaptive,
+            workspace_adaptive_v2_enabled=args.workspace_autoadaptive_v2,
+            workspace_adaptive_v2_num_skills=args.workspace_autoadaptive_v2_num_skills,
+            workspace_adaptive_v2_mi_weight=args.workspace_autoadaptive_v2_mi_weight,
+            workspace_adaptive_v3_enabled=args.workspace_autoadaptive_v3,
+            workspace_adaptive_v3_rank=args.workspace_autoadaptive_v3_rank,
+            workspace_adaptive_v3_distillation=args.workspace_autoadaptive_v3_distillation,
+            workspace_adaptive_v3_teacher_weight=args.workspace_autoadaptive_v3_teacher_weight,
+            workspace_adaptive_v3_teacher_anneal_steps=args.workspace_autoadaptive_v3_teacher_anneal_steps,
+            workspace_adaptive_v3_teacher_min_weight=args.workspace_autoadaptive_v3_teacher_min_weight,
+            workspace_adaptive_v3_teacher_accuracy_threshold=args.workspace_autoadaptive_v3_teacher_accuracy_threshold,
+            workspace_adaptive_v3_feature_off_probability=args.workspace_autoadaptive_v3_feature_off_probability,
+            workspace_adaptive_v3_feature_off_tracks=tuple(args.workspace_autoadaptive_v3_feature_off_tracks),
+            workspace_adaptive_v3_always_feature_off_tracks=tuple(args.workspace_autoadaptive_v3_always_feature_off_tracks),
+            workspace_adaptive_v3_holdout_tracks=tuple(args.workspace_autoadaptive_v3_holdout_tracks),
+            workspace_adaptive_v3_eval_episodes_per_track=args.workspace_autoadaptive_v3_eval_episodes_per_track,
+            workspace_adaptive_v3_usage_floor_weight=args.workspace_autoadaptive_v3_usage_floor_weight,
+            workspace_adaptive_v3_readback_consistency_weight=args.workspace_autoadaptive_v3_readback_consistency_weight,
+            workspace_adaptive_v3_attention_temperature=(
+                args.workspace_autoadaptive_v3_attention_temperature
+            ),
+            workspace_adaptive_v3_temperature_enabled=(
+                args.workspace_autoadaptive_v3_temperature_binding
+            ),
+            workspace_adaptive_v3_straight_through_binding=(
+                args.workspace_autoadaptive_v3_straight_through_binding
+            ),
+            workspace_adaptive_v3_entity_destinations=(
+                args.workspace_autoadaptive_v3_entity_destinations
+            ),
+            workspace_adaptive_v3_split_context_norm=(
+                args.workspace_autoadaptive_v3_split_context_norm
+            ),
+            workspace_adaptive_v3_use_backbone_context=(
+                args.workspace_autoadaptive_v3_use_backbone_context
+            ),
+            workspace_adaptive_v3_teacher_forced_operator_outputs=(
+                args.workspace_autoadaptive_v3_teacher_forced_operator_outputs
+            ),
+            workspace_adaptive_v3_class_balanced_operator_loss=(
+                args.workspace_autoadaptive_v3_class_balanced_operator_loss
+            ),
+            workspace_adaptive_v3_learning_rate_scale=args.workspace_autoadaptive_v3_learning_rate_scale,
+            workspace_adaptive_v3_logit_diagnostics=args.workspace_autoadaptive_v3_logit_diagnostics,
             workspace_compile_recurrence=args.workspace_compile_recurrence,
             workspace_token_id_input=args.workspace_token_id_input,
             workspace_entity_keyed_writes=args.workspace_entity_keyed_writes,
@@ -9839,6 +10828,7 @@ if __name__ == "__main__":
             workspace_stability_max_activation=args.workspace_stability_max_activation,
             eval_only=args.eval_only,
             eval_workspace_mode=args.eval_workspace_mode,
+            eval_workspace_adaptive_bypass=args.eval_workspace_adaptive_bypass,
             eval_seed=args.eval_seed,
             dnc_read_variant=args.dnc_read_variant,
             dnc_read_residual_scale=args.dnc_read_residual_scale,

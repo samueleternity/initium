@@ -15,6 +15,7 @@ import torch.nn.functional as F
 
 from initium.workspace.bistability import BistableWriteGate
 from initium.workspace.nth_farthest import select_nth_farthest
+from initium.workspace.adaptive_v3 import AdaptiveWorkspaceOperatorBank
 
 _WORKSPACE_CAPABILITY_VOCAB_SIZE = 320
 _WORKSPACE_CAPABILITY_SCALAR_BASE = 136
@@ -116,6 +117,18 @@ class WorkspaceBroadcast(nn.Module):
         key_value_readout: bool = False,
         operation_executor: bool = False,
         operation_diagnostics: bool = False,
+        adaptive_v3_enabled: bool = False,
+        adaptive_v3_rank: int = 32,
+        adaptive_v3_usage_floor_weight: float = 0.0,
+        adaptive_v3_readback_consistency_weight: float = 0.0,
+        adaptive_v3_attention_temperature: float = 12.0,
+        adaptive_v3_temperature_enabled: bool = False,
+        adaptive_v3_straight_through_binding: bool = False,
+        adaptive_v3_entity_destinations: bool = False,
+        adaptive_v3_split_context_norm: bool = False,
+        adaptive_v3_use_backbone_context: bool = False,
+        adaptive_v3_teacher_forced_operator_outputs: bool = False,
+        adaptive_v3_class_balanced_operator_loss: bool = False,
         sparse_recurrence: bool = False,
         attentional_cue_readout: bool = False,
         key_match_threshold: float = 0.5,
@@ -173,6 +186,7 @@ class WorkspaceBroadcast(nn.Module):
         self.key_value_readout = bool(key_value_readout)
         self.operation_executor = bool(operation_executor)
         self.operation_diagnostics_enabled = bool(operation_diagnostics)
+        self.adaptive_v3_enabled = bool(adaptive_v3_enabled)
         self.sparse_recurrence_enabled = bool(sparse_recurrence)
         self.attentional_cue_readout_enabled = bool(attentional_cue_readout)
         if self.nth_farthest_exact_readout and not self.semantic_entity_addressing:
@@ -187,6 +201,12 @@ class WorkspaceBroadcast(nn.Module):
             raise ValueError("operation executor requires key-value readout")
         if self.operation_diagnostics_enabled and not self.operation_executor:
             raise ValueError("operation diagnostics require the operation executor")
+        if self.adaptive_v3_enabled and not (
+            self.semantic_entity_addressing and self.key_value_readout
+        ):
+            raise ValueError(
+                "adaptive workspace V3 requires semantic entity addressing and key-value readout"
+            )
         if self.permutation_transactional and not self.semantic_entity_addressing:
             raise ValueError("permutation transactional mode requires semantic entity addressing")
         if self.semantic_entity_addressing and not self.entity_keyed_writes:
@@ -210,6 +230,26 @@ class WorkspaceBroadcast(nn.Module):
         self.semantic_value_decoder = (
             nn.Linear(d_model, 320) if self.key_value_readout else None
         )
+        self.adaptive_v3 = (
+            AdaptiveWorkspaceOperatorBank(
+                d_model,
+                self._address_dim,
+                rank=adaptive_v3_rank,
+                usage_floor_weight=adaptive_v3_usage_floor_weight,
+                readback_consistency_weight=adaptive_v3_readback_consistency_weight,
+                attention_temperature=adaptive_v3_attention_temperature,
+                temperature_enabled=adaptive_v3_temperature_enabled,
+                straight_through_binding=adaptive_v3_straight_through_binding,
+                entity_destinations=adaptive_v3_entity_destinations,
+                split_context_norm=adaptive_v3_split_context_norm,
+                use_backbone_context=adaptive_v3_use_backbone_context,
+                teacher_forced_operator_outputs=adaptive_v3_teacher_forced_operator_outputs,
+                class_balanced_operator_loss=adaptive_v3_class_balanced_operator_loss,
+            )
+            if self.adaptive_v3_enabled
+            else None
+        )
+        self.adaptive_v3_eval_bypass = False
         self.semantic_attentional_color_decoder = (
             nn.Linear(d_model, _WORKSPACE_CAPABILITY_SOURCE_COUNT)
             if self.attentional_cue_readout_enabled
@@ -237,6 +277,16 @@ class WorkspaceBroadcast(nn.Module):
             self.register_buffer(
                 "_operation_high_indices",
                 torch.maximum(scalar_left, scalar_right).reshape(-1),
+                persistent=False,
+            )
+            self.register_buffer(
+                "_operation_compare_indices",
+                (scalar_left > scalar_right).long().reshape(-1),
+                persistent=False,
+            )
+            self.register_buffer(
+                "_operation_rank_indices",
+                (scalar_left < scalar_right).long().reshape(-1),
                 persistent=False,
             )
         self._last_semantic_state_predictions: list[tuple[int, torch.Tensor]] = []
@@ -518,6 +568,21 @@ class WorkspaceBroadcast(nn.Module):
         self._last_operation_diagnostics = []
         return diagnostics
 
+    def pop_adaptive_v3_aux_loss(self) -> torch.Tensor | None:
+        if self.adaptive_v3 is None:
+            return None
+        return self.adaptive_v3.pop_aux_loss()
+
+    def adaptive_v3_route_steps(self) -> tuple[tuple[int, torch.Tensor], ...]:
+        if self.adaptive_v3 is None:
+            return ()
+        return self.adaptive_v3.last_route_steps()
+
+    def adaptive_v3_training_diagnostics(self) -> dict[str, torch.Tensor]:
+        if self.adaptive_v3 is None:
+            return {}
+        return self.adaptive_v3.last_diagnostics()
+
     def _semantic_retrieval_value_logits(
         self, state: torch.Tensor, entity_ids: torch.Tensor, valid_mask: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -746,7 +811,8 @@ class WorkspaceBroadcast(nn.Module):
 
         Metadata layout is [opcode, dest0, dest1, kind0, value0, kind1, value1].
         Operand kind 1 is a semantic slot key; kind 2 is a token literal. Opcodes
-        are 1=lookup, 2=copy, 3=modular add, 4=two-output sort.
+        are 1=lookup, 2=copy, 3=modular add, 4=two-output sort,
+        5=greater-than comparison, 6=maximum selection, and 7=two-item rank.
         """
         if self.semantic_value_decoder is None:
             raise RuntimeError("workspace operation execution requires value decoding")
@@ -789,6 +855,14 @@ class WorkspaceBroadcast(nn.Module):
         high_probs = torch.zeros_like(first_scalar).scatter_add(
             1, self._operation_high_indices.unsqueeze(0).expand(batch, -1), flat_joint
         )
+        rank_probs = torch.zeros_like(first_scalar).scatter_add(
+            1, self._operation_rank_indices.unsqueeze(0).expand(batch, -1), flat_joint
+        )
+        compare_probs = torch.zeros_like(first_scalar).scatter_add(
+            1,
+            self._operation_compare_indices.unsqueeze(0).expand(batch, -1),
+            flat_joint,
+        )
 
         scalar_padding = (
             _WORKSPACE_CAPABILITY_SCALAR_BASE,
@@ -799,13 +873,22 @@ class WorkspaceBroadcast(nn.Module):
         add_vocab = F.pad(add_probs, scalar_padding)
         low_vocab = F.pad(low_probs, scalar_padding)
         high_vocab = F.pad(high_probs, scalar_padding)
+        rank_vocab = F.pad(rank_probs, scalar_padding)
+        compare_vocab = F.pad(compare_probs, scalar_padding)
         is_lookup_or_copy = opcode.eq(1) | opcode.eq(2)
         is_add = opcode.eq(3)
         is_sort = opcode.eq(4)
+        is_compare = opcode.eq(5)
+        is_select = opcode.eq(6)
+        is_rank = opcode.eq(7)
         output0 = torch.where(
             is_lookup_or_copy.unsqueeze(-1), first,
             torch.where(is_add.unsqueeze(-1), add_vocab,
-                        torch.where(is_sort.unsqueeze(-1), low_vocab, torch.zeros_like(first))),
+                        torch.where(is_sort.unsqueeze(-1), low_vocab,
+                                    torch.where(is_compare.unsqueeze(-1), compare_vocab,
+                                                torch.where(is_select.unsqueeze(-1), high_vocab,
+                                                            torch.where(is_rank.unsqueeze(-1), rank_vocab,
+                                                                        torch.zeros_like(first)))))),
         )
         output1 = torch.where(is_sort.unsqueeze(-1), high_vocab, torch.zeros_like(first))
 
@@ -1725,6 +1808,7 @@ class WorkspaceBroadcast(nn.Module):
         bistable_selection_scale: float | None = None,
         deterministic_gate: bool = False,
         prediction_error: torch.Tensor | None = None,
+        backbone_context: torch.Tensor | None = None,
         selected_specialists_only: bool = False,
         entity_ids: torch.Tensor | None = None,
         entity_write_mask: torch.Tensor | None = None,
@@ -1764,6 +1848,11 @@ class WorkspaceBroadcast(nn.Module):
         attentional_frame_steps: tuple[int, ...] | None = None,
         operation_metadata: torch.Tensor | None = None,
         operation_steps: tuple[int, ...] | None = None,
+        adaptive_operator_teacher_targets: torch.Tensor | None = None,
+        adaptive_operator_candidate_mask: torch.Tensor | None = None,
+        adaptive_operator_execution_mask: torch.Tensor | None = None,
+        adaptive_operator_steps: tuple[int, ...] | None = None,
+        adaptive_operator_teacher_weight: float = 0.0,
         collect_kv_records: bool = False,
     ):
         """Process time-major specialists ``(B,T,E,D)`` sequentially."""
@@ -1781,6 +1870,10 @@ class WorkspaceBroadcast(nn.Module):
         self._last_attentional_cue_predictions = []
         self._last_attentional_frame_predictions = []
         self._last_operation_diagnostics = []
+        self._last_adaptive_v3_route_steps: list[tuple[int, torch.Tensor]] = []
+        if self.adaptive_v3 is not None:
+            self.adaptive_v3.begin_sequence()
+            self.adaptive_v3.eval_bypass = bool(self.adaptive_v3_eval_bypass)
         step_diags: list[dict[str, torch.Tensor]] | None = [] if self.diagnostics_enabled else None
         state_observer = getattr(self, "_initium_recurrent_state_observer", None)
         smoothed_prediction_error = None
@@ -1810,6 +1903,16 @@ class WorkspaceBroadcast(nn.Module):
             raise ValueError(
                 "entity metadata is only accepted when semantic entity addressing is enabled"
             )
+        if self.adaptive_v3 is not None and self.adaptive_v3.use_backbone_context:
+            if backbone_context is None or backbone_context.shape != (
+                specialist_deltas.shape[0], specialist_deltas.shape[1], self.d_model
+            ):
+                raise ValueError(
+                    "adaptive V3 backbone context must have shape (batch, time, d_model)"
+                )
+            time_major_backbone_context = backbone_context.transpose(0, 1).contiguous()
+        else:
+            time_major_backbone_context = None
         if key_value_entity_ids is not None or key_value_mask is not None:
             expected_value_prefix = specialist_deltas.shape[:2]
             if (
@@ -1895,6 +1998,33 @@ class WorkspaceBroadcast(nn.Module):
         elif self.operation_executor:
             raise ValueError("enabled workspace operation executor requires operation metadata")
         operation_steps = tuple(operation_steps or ())
+        if self.adaptive_v3 is not None:
+            expected_adaptive_shape = specialist_deltas.shape[:2]
+            if (
+                adaptive_operator_candidate_mask is None
+                or adaptive_operator_execution_mask is None
+                or adaptive_operator_candidate_mask.shape != expected_adaptive_shape
+                or adaptive_operator_execution_mask.shape != expected_adaptive_shape
+                or adaptive_operator_candidate_mask.dtype != torch.bool
+                or adaptive_operator_execution_mask.dtype != torch.bool
+                or (adaptive_operator_teacher_targets is not None
+                    and adaptive_operator_teacher_targets.shape != (*expected_adaptive_shape, 12))
+            ):
+                raise ValueError(
+                    "adaptive V3 requires candidate/execution masks and optional (B,T,11) teacher targets"
+                )
+            adaptive_operator_steps = tuple(sorted(set(adaptive_operator_steps or ())))
+            if any(step < 0 or step >= specialist_deltas.shape[1] for step in adaptive_operator_steps):
+                raise ValueError("adaptive V3 candidate step is outside the recurrent sequence")
+        elif any(
+            value is not None
+            for value in (
+                adaptive_operator_teacher_targets,
+                adaptive_operator_candidate_mask,
+                adaptive_operator_execution_mask,
+            )
+        ) or adaptive_operator_steps:
+            raise ValueError("adaptive V3 metadata requires the V3 operator bank")
         if self.permutation_transactional:
             expected_pair_shape = (*specialist_deltas.shape[:2], 2)
             expected_metadata_shape = specialist_deltas.shape[:2]
@@ -2260,6 +2390,7 @@ class WorkspaceBroadcast(nn.Module):
                 retrieval_query_steps,
                 attentional_frame_steps,
                 attentional_cue_readout_steps,
+                adaptive_operator_steps if self.adaptive_v3 is not None else (),
             ):
                 sparse_active_steps.update(int(index) for index in (steps or ()))
             sequence_length = specialist_deltas.shape[1]
@@ -2268,14 +2399,13 @@ class WorkspaceBroadcast(nn.Module):
             ):
                 sparse_recurrence = False
                 sparse_active_steps.clear()
-                next_active_step = []
-            else:
-                next_active_step = [sequence_length] * sequence_length
-                following = sequence_length
-                for index in range(sequence_length - 1, -1, -1):
-                    next_active_step[index] = following
-                    if index in sparse_active_steps:
-                        following = index
+        if sparse_recurrence:
+            next_active_step = [sequence_length] * sequence_length
+            following = sequence_length
+            for index in range(sequence_length - 1, -1, -1):
+                next_active_step[index] = following
+                if index in sparse_active_steps:
+                    following = index
         else:
             next_active_step = []
         sparse_skip_until = 0
@@ -2588,6 +2718,48 @@ class WorkspaceBroadcast(nn.Module):
                         )
                 else:
                     self._last_step_diag = {}
+            if (
+                self.adaptive_v3 is not None
+                and step in (adaptive_operator_steps or ())
+                and not bypass_broadcast
+            ):
+                assert adaptive_operator_candidate_mask is not None
+                assert adaptive_operator_execution_mask is not None
+                assert time_major_selected_deltas is not None
+                assert time_major_route_weights is not None
+                assert self.semantic_value_decoder is not None
+                routed_context = (
+                    time_major_selected_deltas[step].float()
+                    * time_major_route_weights[step].float().unsqueeze(-1)
+                ).sum(dim=1)
+                state_content = (
+                    torch.split(state.float(), [self._address_dim, self.d_model], dim=-1)[1]
+                    if self.entity_keyed_writes
+                    else state.float()
+                )
+                adaptive_context = torch.cat(
+                    (routed_context, state_content.mean(dim=1)), dim=-1
+                )
+                adaptive_backbone_context = (
+                    time_major_backbone_context[step].float()
+                    if time_major_backbone_context is not None
+                    else None
+                )
+                state = self.adaptive_v3.step(
+                    state=state.float(),
+                    context=adaptive_context,
+                    backbone_context=adaptive_backbone_context,
+                    semantic_value_decoder=self.semantic_value_decoder,
+                    active_mask=adaptive_operator_candidate_mask[:, step],
+                    execution_mask=adaptive_operator_execution_mask[:, step],
+                    teacher_targets=(
+                        adaptive_operator_teacher_targets[:, step]
+                        if adaptive_operator_teacher_targets is not None
+                        else None
+                    ),
+                    teacher_weight=adaptive_operator_teacher_weight,
+                    step_index=step,
+                )
             if operation_steps and step in operation_steps:
                 assert operation_metadata is not None
                 operand_state = state

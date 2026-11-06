@@ -158,8 +158,24 @@ _WORKSPACE_MODULE_FEATURE_ABLATIONS = {
 KEY_VALUE_OPERAND_CAPACITY = 16
 _EVAL_KV_ATTENTION_BUDGET_BYTES = 512 * 1024 * 1024
 _SDPA_MATH_WORKSPACE_MULTIPLIER = 2
-_WORKSPACE_OPERATION_CODES = {"lookup": 1, "copy": 2, "add": 3, "sort": 4}
-_WORKSPACE_OPERATION_NAMES = {1: "lookup", 2: "copy", 3: "modular_add", 4: "sort"}
+_WORKSPACE_OPERATION_CODES = {
+    "lookup": 1,
+    "copy": 2,
+    "add": 3,
+    "sort": 4,
+    "compare": 5,
+    "select": 6,
+    "rank": 7,
+}
+_WORKSPACE_OPERATION_NAMES = {
+    1: "lookup",
+    2: "copy",
+    3: "modular_add",
+    4: "sort",
+    5: "compare",
+    6: "select",
+    7: "rank",
+}
 _WORKSPACE_OPERAND_KEY = 1
 _WORKSPACE_OPERAND_LITERAL = 2
 _ENTITY_ADDRESS_EVENT_TOKENS = {
@@ -1324,6 +1340,30 @@ class WorkspaceCapabilityDataset(BaseDataset):
                             sorted((current_values[operands[0]], literal))
                         )
                         expected_operands = (current_values[operands[0]], literal)
+                    elif skill == 4 and operands and literal >= 0:
+                        operation = "compare"
+                        operand0 = (_WORKSPACE_OPERAND_KEY, operands[0])
+                        operand1 = (_WORKSPACE_OPERAND_LITERAL, literal)
+                        outputs = (
+                            SCALAR_BASE
+                            + int(current_values[operands[0]] > literal),
+                        )
+                        expected_operands = (current_values[operands[0]], literal)
+                    elif skill == 5 and operands and literal >= 0:
+                        operation = "select"
+                        operand0 = (_WORKSPACE_OPERAND_KEY, operands[0])
+                        operand1 = (_WORKSPACE_OPERAND_LITERAL, literal)
+                        outputs = (max(current_values[operands[0]], literal),)
+                        expected_operands = (current_values[operands[0]], literal)
+                    elif skill == 6 and operands and literal >= 0:
+                        operation = "rank"
+                        operand0 = (_WORKSPACE_OPERAND_KEY, operands[0])
+                        operand1 = (_WORKSPACE_OPERAND_LITERAL, literal)
+                        outputs = (
+                            SCALAR_BASE
+                            + int(current_values[operands[0]] < literal),
+                        )
+                        expected_operands = (current_values[operands[0]], literal)
                     else:
                         raise ValueError(f"invalid mixed-skill operation code {skill}")
                     destination1 = destination + 1 if operation == "sort" else -1
@@ -1452,6 +1492,14 @@ class WorkspaceCapabilityDataset(BaseDataset):
         episodes: list[TaskEpisode] | None = None,
         *,
         include_operations: bool = False,
+        include_adaptive_v3: bool = False,
+        adaptive_v3_distillation: bool = True,
+        adaptive_v3_feature_off_probability: float = 0.0,
+        adaptive_v3_feature_off_tracks: tuple[str, ...] = ("mixed_skill", "variable_binding"),
+        adaptive_v3_always_feature_off_tracks: tuple[str, ...] = (),
+        adaptive_v3_holdout_tracks: tuple[str, ...] = (),
+        adaptive_v3_step: int = 0,
+        adaptive_v3_seed: int = 0,
         include_operation_diagnostics: bool = False,
         rule_feedback_update: bool = False,
         attentional_item_memory: bool = False,
@@ -1496,8 +1544,33 @@ class WorkspaceCapabilityDataset(BaseDataset):
         attentional_shape_targets = torch.full((batch, time), -100, dtype=torch.long)
         operation_metadata = (
             torch.full((batch, time, 7), -1, dtype=torch.long)
-            if include_operations
+            if include_operations or include_adaptive_v3
             else None
+        )
+        adaptive_teacher_targets = (
+            torch.full((batch, time, 12), -100, dtype=torch.long)
+            if include_adaptive_v3 and adaptive_v3_distillation
+            else None
+        )
+        adaptive_candidate_mask = (
+            torch.zeros((batch, time), dtype=torch.bool) if include_adaptive_v3 else None
+        )
+        adaptive_execution_mask = (
+            torch.ones((batch, time), dtype=torch.bool) if include_adaptive_v3 else None
+        )
+        adaptive_steps: set[int] = set()
+        adaptive_v3_batch_stats: dict[str, dict[str, int]] = defaultdict(
+            lambda: {
+                "episodes": 0,
+                "manual_off": 0,
+                "lookup": 0,
+                "copy": 0,
+                "add": 0,
+                "sort": 0,
+                "compare": 0,
+                "select": 0,
+                "rank": 0,
+            }
         )
         operation_diagnostic_targets = (
             torch.full((batch, time, 4), -100, dtype=torch.long)
@@ -1513,8 +1586,50 @@ class WorkspaceCapabilityDataset(BaseDataset):
         ):
             per_step: dict[int, list[tuple[int, int]]] = {}
             operation_records = (
-                self._workspace_operation_events(episode, tokens) if include_operations else ()
+                self._workspace_operation_events(episode, tokens)
+                if include_operations
+                or (include_adaptive_v3 and adaptive_v3_distillation)
+                else ()
             )
+            feature_off = bool(
+                include_adaptive_v3 and episode.track in adaptive_v3_holdout_tracks
+            )
+            if include_adaptive_v3 and (
+                adaptive_v3_feature_off_probability > 0
+                or adaptive_v3_always_feature_off_tracks
+            ):
+                is_holdout = episode.track in adaptive_v3_holdout_tracks
+                always_off = episode.track in adaptive_v3_always_feature_off_tracks
+                rng = random.Random(int(adaptive_v3_seed) + int(adaptive_v3_step) * 1_000_003 + row * 97)
+                sampled_off = (
+                    episode.track in adaptive_v3_feature_off_tracks
+                    and rng.random() < adaptive_v3_feature_off_probability
+                )
+                feature_off = is_holdout or always_off or sampled_off
+            if adaptive_candidate_mask is not None:
+                stats = adaptive_v3_batch_stats[episode.track]
+                stats["episodes"] += 1
+                stats["manual_off"] += int(feature_off)
+                pending_operator_event = False
+                for candidate_step, token_value in enumerate(tokens[: min(time, len(episode.inputs))]):
+                    token = int(token_value)
+                    if token in (EV_INIT, EV_MOVE, EV_UPDATE, EV_ASSERT, EV_KV, EV_VECTOR):
+                        pending_operator_event = True
+                    elif token == SEP and pending_operator_event:
+                        adaptive_candidate_mask[row, candidate_step] = True
+                        adaptive_steps.add(candidate_step)
+                        pending_operator_event = False
+                if (
+                    adaptive_teacher_targets is not None
+                    and episode.track in ("mixed_skill", "variable_binding")
+                    and episode.track not in adaptive_v3_holdout_tracks
+                ):
+                    adaptive_teacher_targets[row, adaptive_candidate_mask[row], 0] = 0
+                    adaptive_teacher_targets[row, adaptive_candidate_mask[row], 11] = int(
+                        feature_off
+                    )
+                if feature_off and adaptive_execution_mask is not None:
+                    adaptive_execution_mask[row] = True
             row_operation_steps = set()
             for (
                 step,
@@ -1526,6 +1641,8 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 output_values,
                 expected_operands,
             ) in operation_records:
+                if episode.track in adaptive_v3_batch_stats:
+                    adaptive_v3_batch_stats[episode.track][operation] += 1
                 if operation_metadata is None:
                     raise RuntimeError("operation metadata storage was not initialized")
                 if not 0 <= step < min(time, len(episode.inputs)):
@@ -1542,6 +1659,33 @@ class WorkspaceCapabilityDataset(BaseDataset):
                     ),
                     dtype=torch.long,
                 )
+                if feature_off:
+                    operation_metadata[row, step, 0] = 0
+                elif include_operations and adaptive_execution_mask is not None:
+                    adaptive_execution_mask[row, step] = False
+                if (
+                    adaptive_teacher_targets is not None
+                    and episode.track in ("mixed_skill", "variable_binding")
+                    and episode.track not in adaptive_v3_holdout_tracks
+                ):
+                    op_code = _WORKSPACE_OPERATION_CODES[operation]
+                    adaptive_teacher_targets[row, step] = torch.tensor(
+                        (
+                            op_code,
+                            destination0,
+                            destination1,
+                            operand0[0],
+                            operand0[1],
+                            operand1[0],
+                            operand1[1],
+                            expected_operands[0],
+                            expected_operands[1],
+                            output_values[0],
+                            output_values[1] if len(output_values) > 1 else -100,
+                            int(feature_off),
+                        ),
+                        dtype=torch.long,
+                    )
                 if operation_diagnostic_targets is not None:
                     operation_diagnostic_targets[row, step] = torch.tensor(
                         (
@@ -1789,6 +1933,17 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 raise RuntimeError("workspace operation metadata was not initialized")
             result["workspace_operation_metadata"] = operation_metadata
             result["workspace_operation_steps"] = tuple(sorted(operation_steps))
+        if include_adaptive_v3:
+            if adaptive_candidate_mask is None or adaptive_execution_mask is None:
+                raise RuntimeError("adaptive V3 metadata was not initialized")
+            result["adaptive_operator_candidate_mask"] = adaptive_candidate_mask
+            result["adaptive_operator_execution_mask"] = adaptive_execution_mask
+            result["adaptive_operator_steps"] = tuple(sorted(adaptive_steps))
+            self.last_adaptive_v3_batch_stats = {
+                track: dict(stats) for track, stats in adaptive_v3_batch_stats.items()
+            }
+            if adaptive_teacher_targets is not None:
+                result["adaptive_operator_teacher_targets"] = adaptive_teacher_targets
         if include_operation_diagnostics:
             if not include_operations or operation_diagnostic_targets is None:
                 raise ValueError(
@@ -2298,6 +2453,8 @@ class WorkspaceCapabilityDataset(BaseDataset):
         *,
         ablate_memory=False,
         ablate_workspace=False,
+        ablate_workspace_adaptive=False,
+        ablate_workspace_operation_executor=False,
         shuffle_workspace_readback=False,
         ablate_workspace_feature: str | None = None,
         combiner_skip_stages=None,
@@ -2309,7 +2466,16 @@ class WorkspaceCapabilityDataset(BaseDataset):
         was_training = model.training
         prior_workspace_bypass = getattr(model, "workspace_eval_bypass", None)
         prior_workspace_shuffle = getattr(model, "workspace_eval_shuffle_readback", None)
+        prior_adaptive_bypass = getattr(model, "workspace_adaptive_eval_bypass", None)
+        prior_adaptive_v3_bypass = getattr(model, "workspace_adaptive_v3_eval_bypass", None)
+        adaptive_eval_bypass = bool(prior_adaptive_bypass)
+        adaptive_module = getattr(model, "workspace_adaptive", None)
+        adaptive_v3_enabled = bool(getattr(model, "workspace_adaptive_v3_enabled", False))
         workspace = getattr(model, "workspace", None)
+        prior_operation_executor = getattr(model, "workspace_operation_executor_enabled", None)
+        prior_module_operation_executor = getattr(workspace, "operation_executor", None)
+        v3_answer_logits: dict[str, list[torch.Tensor]] = defaultdict(list)
+        episode_results_by_track: dict[str, list[tuple[float, bool]]] = defaultdict(list)
         feature_ablation_attribute = None
         prior_feature_ablation_value = None
         module_feature_ablation_attribute = None
@@ -2335,6 +2501,18 @@ class WorkspaceCapabilityDataset(BaseDataset):
                     "workspace readback shuffle requires a model with active workspace"
                 )
             model.workspace_eval_shuffle_readback = True
+        if ablate_workspace_adaptive:
+            if (adaptive_module is None and not adaptive_v3_enabled) or prior_adaptive_bypass is None:
+                raise ValueError("adaptive workspace ablation requires an adaptive workspace")
+            if adaptive_module is not None:
+                model.workspace_adaptive_eval_bypass = True
+            if adaptive_v3_enabled:
+                model.workspace_adaptive_v3_eval_bypass = True
+        if ablate_workspace_operation_executor:
+            if prior_operation_executor is None or workspace is None:
+                raise ValueError("manual operation ablation requires an active workspace")
+            model.workspace_operation_executor_enabled = False
+            workspace.operation_executor = False
         if ablate_workspace_feature is not None:
             feature_attribute = dict(_FUNCTIONAL_FEATURE_ABLATIONS).get(
                 str(ablate_workspace_feature)
@@ -2413,6 +2591,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
             "readout_by_query_type": {},
         }
         operation_diagnostic_totals: dict[str, list[int]] = defaultdict(lambda: [0] * 6)
+        adaptive_v3_route_totals: dict[str, list[int]] = defaultdict(lambda: [0] * 7)
         variable_binding_stage_totals: dict[tuple[str, str], list[int]] = defaultdict(
             lambda: [0] * 6
         )
@@ -2422,6 +2601,9 @@ class WorkspaceCapabilityDataset(BaseDataset):
         rule_feedback_tracker_count = 0
         value_program_totals: dict[str, list[int]] = defaultdict(lambda: [0] * 4)
         masked_prime_trace_reads: dict[str, list[int]] = defaultdict(lambda: [0, 0])
+        adaptive_route_totals: dict[str, list[int]] = defaultdict(
+            lambda: [0] * int(getattr(adaptive_module, "num_skills", 0))
+        )
         permutation_pair_commit_attempts = 0
         permutation_pair_commit_successes = 0
         correct_total = answer_total = exact_total = 0
@@ -2452,12 +2634,22 @@ class WorkspaceCapabilityDataset(BaseDataset):
                         group,
                         token_ids_only=bool(getattr(model, "workspace_token_id_input", False)),
                     )
+                    sequence_valid_mask = None
+                    if adaptive_module is not None:
+                        sequence_valid_mask = torch.zeros(
+                            (len(group), x.shape[1]), dtype=torch.bool
+                        )
+                        for row, episode in enumerate(group):
+                            sequence_valid_mask[row, : len(episode.sequence)] = True
+                        sequence_valid_mask = sequence_valid_mask.to(device, non_blocking=True)
                     token_rows = (
                         self.workspace_input_token_rows(x)
                         if bool(getattr(model, "workspace_semantic_entity_addressing", False))
                         else None
                     )
                     workspace_forward_kwargs = {}
+                    if sequence_valid_mask is not None:
+                        workspace_forward_kwargs["sequence_valid_mask"] = sequence_valid_mask
                     binding_entity_metadata = None
                     key_value_metadata = None
                     if bool(getattr(model, "workspace_semantic_entity_addressing", False)):
@@ -2527,6 +2719,13 @@ class WorkspaceCapabilityDataset(BaseDataset):
                                     x,
                                     group,
                                     include_operations=operation_executor,
+                                    include_adaptive_v3=bool(
+                                        getattr(model, "workspace_adaptive_v3_enabled", False)
+                                    ),
+                                    adaptive_v3_distillation=False,
+                                    adaptive_v3_holdout_tracks=tuple(
+                                        getattr(model, "workspace_adaptive_v3_holdout_tracks", ())
+                                    ),
                                     include_operation_diagnostics=(
                                         operation_diagnostics_enabled
                                     ),
@@ -2578,6 +2777,20 @@ class WorkspaceCapabilityDataset(BaseDataset):
                                         ],
                                     }
                                 )
+                            if bool(getattr(model, "workspace_adaptive_v3_enabled", False)):
+                                binding_entity_metadata.update(
+                                    {
+                                        "adaptive_operator_candidate_mask": key_value_metadata[
+                                            "adaptive_operator_candidate_mask"
+                                        ],
+                                        "adaptive_operator_execution_mask": key_value_metadata[
+                                            "adaptive_operator_execution_mask"
+                                        ],
+                                        "adaptive_operator_steps": key_value_metadata[
+                                            "adaptive_operator_steps"
+                                        ],
+                                    }
+                                )
                         workspace_forward_kwargs = {
                             key: value.to(device, non_blocking=True)
                             if isinstance(value, torch.Tensor)
@@ -2624,6 +2837,32 @@ class WorkspaceCapabilityDataset(BaseDataset):
                             combiner_skip_stages=combiner_skip_stages,
                             **workspace_forward_kwargs,
                         )
+                        if (
+                            adaptive_module is not None
+                            and not ablate_workspace_adaptive
+                            and not adaptive_eval_bypass
+                        ):
+                            assignments = adaptive_module.last_route_assignments()
+                            if assignments is not None:
+                                assignments_cpu = assignments.cpu()
+                                for row, episode in enumerate(group):
+                                    token_count = min(
+                                        len(episode.sequence), assignments_cpu.shape[1]
+                                    )
+                                    route_counts = torch.bincount(
+                                        assignments_cpu[row, :token_count].long(),
+                                        minlength=adaptive_module.num_skills,
+                                    ).tolist()
+                                    track_counts = adaptive_route_totals[episode.track]
+                                    for route_index, count in enumerate(route_counts):
+                                        track_counts[route_index] += int(count)
+                        if adaptive_v3_enabled and not bool(
+                            getattr(model, "workspace_adaptive_v3_eval_bypass", False)
+                        ):
+                            for _route_step, routes in workspace.adaptive_v3_route_steps():
+                                route_ids = routes.detach().cpu().tolist()
+                                for episode, route_id in zip(group, route_ids):
+                                    adaptive_v3_route_totals[episode.track][int(route_id)] += 1
                     finally:
                         if observe_group:
                             workspace._initium_address_assignment_observer = (
@@ -2866,6 +3105,20 @@ class WorkspaceCapabilityDataset(BaseDataset):
                         logits = self.apply_workspace_attentional_cue_readout_logits(
                             logits, workspace.pop_attentional_cue_predictions()
                         )
+                    if adaptive_v3_enabled and bool(
+                        getattr(model, "workspace_adaptive_v3_logit_diagnostics_enabled", False)
+                    ):
+                        for row, episode in enumerate(group):
+                            answer_start = len(episode.inputs)
+                            answer_end = min(
+                                answer_start + len(episode.answer), logits.shape[1]
+                            )
+                            if answer_end > answer_start:
+                                v3_answer_logits[episode.track].append(
+                                    logits[row, answer_start:answer_end]
+                                    .detach()
+                                    .to(device="cpu", dtype=torch.float32)
+                                )
                     if operation_diagnostics_enabled and key_value_metadata is not None:
                         operation_traces = workspace.pop_operation_diagnostics()
                         diagnostic_targets = key_value_metadata[
@@ -3112,6 +3365,9 @@ class WorkspaceCapabilityDataset(BaseDataset):
                         n_correct = sum(int(a == b) for a, b in zip(pred, expected))
                         n_answers = len(expected)
                         exact = n_correct == n_answers
+                        episode_results_by_track[episode.track].append(
+                            (n_correct / max(n_answers, 1), bool(exact))
+                        )
                         progression_group = str(
                             episode.metadata.get("progression_group", "all")
                         )
@@ -3286,6 +3542,13 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 model.workspace_eval_bypass = prior_workspace_bypass
             if shuffle_workspace_readback:
                 model.workspace_eval_shuffle_readback = prior_workspace_shuffle
+            if ablate_workspace_adaptive:
+                model.workspace_adaptive_eval_bypass = prior_adaptive_bypass
+                if adaptive_v3_enabled:
+                    model.workspace_adaptive_v3_eval_bypass = prior_adaptive_v3_bypass
+            if ablate_workspace_operation_executor:
+                model.workspace_operation_executor_enabled = prior_operation_executor
+                workspace.operation_executor = prior_module_operation_executor
             if feature_ablation_attribute is not None:
                 setattr(
                     model,
@@ -3301,6 +3564,10 @@ class WorkspaceCapabilityDataset(BaseDataset):
             model.train(was_training)
 
         accuracy = 100.0 * correct_total / max(answer_total, 1)
+        self._last_eval_episode_results = dict(episode_results_by_track)
+        self._last_eval_v3_answer_logits = {
+            track: torch.cat(rows, dim=0) for track, rows in v3_answer_logits.items() if rows
+        }
         perfect = 100.0 * exact_total / max(len(episodes), 1)
         total_meta = [
             sum(values[index] for values in metadata_totals.values()) for index in range(8)
@@ -3360,6 +3627,27 @@ class WorkspaceCapabilityDataset(BaseDataset):
                     "priority_tie_episode_fraction": metadata_totals[track][7] / max(counts[2], 1),
                 }
                 for track, counts in totals.items()
+            },
+            "adaptive_workspace_routes_by_track": {
+                track: {
+                    "token_count": int(sum(counts)),
+                    "route_token_counts": [int(count) for count in counts],
+                    "route_token_fractions": [
+                        float(count / max(sum(counts), 1)) for count in counts
+                    ],
+                }
+                for track, counts in sorted(adaptive_route_totals.items())
+            },
+            "adaptive_v3_operator_routes_by_track": {
+                track: {
+                    "candidate_count": int(sum(counts)),
+                    "operator_names": ["noop", "copy", "add_mod", "compare", "select", "rank", "sort"],
+                    "operator_counts": [int(count) for count in counts],
+                    "operator_fractions": [
+                        float(count / max(sum(counts), 1)) for count in counts
+                    ],
+                }
+                for track, counts in sorted(adaptive_v3_route_totals.items())
             },
             "progression_groups": {
                 track: {
@@ -3727,6 +4015,21 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 }
             }
         self.last_eval_diagnostics = diagnostics
+        self._last_eval_v3_answer_logits = {
+            track: torch.cat(rows, dim=0) for track, rows in v3_answer_logits.items() if rows
+        }
+        for track, counts in sorted(adaptive_v3_route_totals.items()):
+            total = max(sum(counts), 1)
+            route_text = ",".join(
+                f"{name}:{count / total:.1%}"
+                for name, count in zip(
+                    ("noop", "copy", "add_mod", "compare", "select", "rank", "sort"), counts
+                )
+            )
+            print(
+                f"  [adaptive-v3/routes/{track}] candidates={sum(counts)} "
+                f"{route_text}"
+            )
         print(
             f"[workspace-capability/{self.task_track}] accuracy {accuracy:.2f}% | "
             f"episode exact {perfect:.2f}% | episodes {len(episodes)}"
@@ -4082,6 +4385,16 @@ class WorkspaceCapabilityDataset(BaseDataset):
         else:
             bypass_result = shuffled_result = None
             bypass_diagnostics = shuffled_diagnostics = {}
+        adaptive_module = getattr(model, "workspace_adaptive", None)
+        adaptive_eval_bypass = bool(getattr(model, "workspace_adaptive_eval_bypass", False))
+        if adaptive_module is not None and not adaptive_eval_bypass:
+            adaptive_bypass_result = self._evaluate_episodes(
+                model, device, episodes, ablate_workspace_adaptive=True
+            )
+            adaptive_bypass_diagnostics = self.last_eval_diagnostics
+        else:
+            adaptive_bypass_result = None
+            adaptive_bypass_diagnostics = {}
         feature_results = {}
         if feature_ablations:
             for feature_name, model_attribute in _FUNCTIONAL_FEATURE_ABLATIONS:
@@ -4197,6 +4510,57 @@ class WorkspaceCapabilityDataset(BaseDataset):
             for track, metrics in full_diagnostics.get("tracks", {}).items()
             if track in {"ignition", "attentional_blink", "masked_priming", "no_report_confidence"}
         }
+        full_diagnostics["gnw_balanced_adaptive_dependency"] = {
+            "full_accuracy_pct": float(result[0]),
+            "full_episode_exact_match_pct": float(result[1]),
+            "adaptive_pathway_bypassed_accuracy_pct": (
+                float(adaptive_bypass_result[0])
+                if adaptive_bypass_result is not None
+                else math.nan
+            ),
+            "adaptive_pathway_bypassed_episode_exact_match_pct": (
+                float(adaptive_bypass_result[1])
+                if adaptive_bypass_result is not None
+                else math.nan
+            ),
+            "full_minus_adaptive_bypassed_pp": (
+                float(result[0] - adaptive_bypass_result[0])
+                if adaptive_bypass_result is not None
+                else math.nan
+            ),
+            "episodes": len(episodes),
+            "evaluation_forced_bypass": adaptive_eval_bypass,
+            "by_track": {
+                track: {
+                    "full_accuracy_pct": float(metrics["accuracy"]),
+                    "adaptive_pathway_bypassed_accuracy_pct": float(
+                        adaptive_bypass_diagnostics.get("tracks", {}).get(track, {}).get(
+                            "accuracy", math.nan
+                        )
+                    ),
+                    "full_exact_match_pct": float(metrics["exact_match"]),
+                    "adaptive_pathway_bypassed_exact_match_pct": float(
+                        adaptive_bypass_diagnostics.get("tracks", {}).get(track, {}).get(
+                            "exact_match", math.nan
+                        )
+                    ),
+                    "full_minus_adaptive_bypassed_pp": float(
+                        metrics["exact_match"]
+                        - adaptive_bypass_diagnostics.get("tracks", {}).get(track, {}).get(
+                            "exact_match", math.nan
+                        )
+                    ),
+                    "episodes": int(metrics["episodes"]),
+                }
+                for track, metrics in full_diagnostics.get("tracks", {}).items()
+                if track in {
+                    "ignition",
+                    "attentional_blink",
+                    "masked_priming",
+                    "no_report_confidence",
+                }
+            },
+        }
         if feature_ablations:
             full_diagnostics["gnw_balanced_feature_ablations"] = feature_results
         full_diagnostics["gnw_natural_report_confidence_calibration"] = {
@@ -4214,6 +4578,31 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 f"drops={dependency['full_minus_bypassed_pp']:+.2f}/"
                 f"{dependency['full_minus_shuffled_pp']:+.2f} pp"
             )
+        if adaptive_bypass_result is not None:
+            adaptive_dependency = full_diagnostics["gnw_balanced_adaptive_dependency"]
+            print(
+                "  [GNW-balanced/adaptive-workspace-dependence] full/bypassed="
+                f"{result[0]:.2f}%/{adaptive_bypass_result[0]:.2f}% | "
+                f"drop={adaptive_dependency['full_minus_adaptive_bypassed_pp']:+.2f} pp"
+            )
+            for track, route_metrics in full_diagnostics.get(
+                "adaptive_workspace_routes_by_track", {}
+            ).items():
+                fractions = ",".join(
+                    f"{value:.2f}" for value in route_metrics["route_token_fractions"]
+                )
+                print(
+                    f"  [workspace-adaptive/routes/{track}] "
+                    f"fraction={fractions} tokens={route_metrics['token_count']}"
+                )
+            for track, metrics in sorted(adaptive_dependency["by_track"].items()):
+                print(
+                    f"    [GNW-balanced/adaptive-workspace-dependence/{track}] "
+                    f"accuracy full/bypassed={metrics['full_accuracy_pct']:.2f}%/"
+                    f"{metrics['adaptive_pathway_bypassed_accuracy_pct']:.2f}% | "
+                    f"exact drop={metrics['full_minus_adaptive_bypassed_pp']:+.2f} pp "
+                    f"n={metrics['episodes']}"
+                )
             for track, metrics in sorted(
                 full_diagnostics["gnw_balanced_workspace_dependency_by_track"].items()
             ):
@@ -4439,11 +4828,22 @@ class WorkspaceCapabilityDataset(BaseDataset):
                                 )
                             }
                         )
-                    if bool(getattr(model, "workspace_operation_executor_enabled", False)):
+                    operation_executor_enabled = bool(
+                        getattr(model, "workspace_operation_executor_enabled", False)
+                    )
+                    adaptive_v3_enabled = bool(
+                        getattr(model, "workspace_adaptive_v3_enabled", False)
+                    )
+                    if operation_executor_enabled or adaptive_v3_enabled:
                         operation_metadata = self.workspace_key_value_metadata(
                             x,
                             episodes,
-                            include_operations=True,
+                            include_operations=operation_executor_enabled,
+                            include_adaptive_v3=adaptive_v3_enabled,
+                            adaptive_v3_distillation=False,
+                            adaptive_v3_holdout_tracks=tuple(
+                                getattr(model, "workspace_adaptive_v3_holdout_tracks", ())
+                            ),
                             rule_feedback_update=bool(
                                 getattr(
                                     model,
@@ -4466,16 +4866,31 @@ class WorkspaceCapabilityDataset(BaseDataset):
                             ),
                             entity_metadata=entity_metadata,
                         )
-                        entity_metadata.update(
-                            {
-                                "operation_metadata": operation_metadata[
-                                    "workspace_operation_metadata"
-                                ],
-                                "operation_steps": operation_metadata[
-                                    "workspace_operation_steps"
-                                ],
-                            }
-                        )
+                        if operation_executor_enabled:
+                            entity_metadata.update(
+                                {
+                                    "operation_metadata": operation_metadata[
+                                        "workspace_operation_metadata"
+                                    ],
+                                    "operation_steps": operation_metadata[
+                                        "workspace_operation_steps"
+                                    ],
+                                }
+                            )
+                        if adaptive_v3_enabled:
+                            entity_metadata.update(
+                                {
+                                    "adaptive_operator_candidate_mask": operation_metadata[
+                                        "adaptive_operator_candidate_mask"
+                                    ],
+                                    "adaptive_operator_execution_mask": operation_metadata[
+                                        "adaptive_operator_execution_mask"
+                                    ],
+                                    "adaptive_operator_steps": operation_metadata[
+                                        "adaptive_operator_steps"
+                                    ],
+                                }
+                            )
                     forward_metadata = {
                         key: value.to(device, non_blocking=True)
                         if isinstance(value, torch.Tensor)
@@ -4727,6 +5142,138 @@ class WorkspaceCapabilityDataset(BaseDataset):
     def evaluate_workspace_ablated(self, model, device, curriculum, lesson_idx):
         episodes = self._paired_id_episodes(lesson_idx)
         return self._evaluate_episodes(model, device, episodes, ablate_workspace=True)[:2]
+
+    def evaluate_workspace_adaptive_ablated(self, model, device, curriculum, lesson_idx):
+        """Evaluate paired ID episodes with adaptive workspace mechanisms bypassed."""
+        if bool(getattr(model, "workspace_adaptive_v3_enabled", False)):
+            count = int(getattr(model, "workspace_adaptive_v3_eval_episodes_per_track", 128))
+            tracks = tuple(
+                getattr(model, "workspace_adaptive_v3_feature_off_tracks", ())
+            ) or ("mixed_skill", "variable_binding")
+            rng = random.Random(1_910_003 + int(lesson_idx))
+            episodes = [
+                self._make_episode(track, int(lesson_idx), rng)
+                for track in tracks
+                for _ in range(count)
+            ]
+            full = self._evaluate_episodes(
+                model,
+                device,
+                episodes,
+                ablate_workspace_operation_executor=True,
+            )
+            full_logits = getattr(self, "_last_eval_v3_answer_logits", {})
+            full_episode_results = getattr(self, "_last_eval_episode_results", {})
+            bypass = self._evaluate_episodes(
+                model,
+                device,
+                episodes,
+                ablate_workspace_adaptive=True,
+                ablate_workspace_operation_executor=True,
+            )
+            bypass_logits = getattr(self, "_last_eval_v3_answer_logits", {})
+            bypass_episode_results = getattr(self, "_last_eval_episode_results", {})
+            paired_metrics = {}
+            for track in tracks:
+                enabled_rows = full_episode_results.get(track, ())
+                bypass_rows = bypass_episode_results.get(track, ())
+                paired_count = min(len(enabled_rows), len(bypass_rows))
+                if paired_count:
+                    enabled_acc = torch.tensor(
+                        [row[0] for row in enabled_rows[:paired_count]], dtype=torch.float64
+                    )
+                    bypass_acc = torch.tensor(
+                        [row[0] for row in bypass_rows[:paired_count]], dtype=torch.float64
+                    )
+                    enabled_exact = torch.tensor(
+                        [row[1] for row in enabled_rows[:paired_count]], dtype=torch.float64
+                    )
+                    bypass_exact = torch.tensor(
+                        [row[1] for row in bypass_rows[:paired_count]], dtype=torch.float64
+                    )
+                    accuracy_delta = enabled_acc - bypass_acc
+                    exact_delta = enabled_exact - bypass_exact
+                    generator = torch.Generator().manual_seed(1_910_003 + paired_count)
+                    indices = torch.randint(
+                        paired_count, (4096, paired_count), generator=generator
+                    )
+                    accuracy_bootstrap = accuracy_delta[indices].mean(dim=1) * 100.0
+                    exact_bootstrap = exact_delta[indices].mean(dim=1) * 100.0
+                    accuracy_ci = torch.quantile(
+                        accuracy_bootstrap, torch.tensor([0.025, 0.975], dtype=torch.float64)
+                    ).tolist()
+                    exact_ci = torch.quantile(
+                        exact_bootstrap, torch.tensor([0.025, 0.975], dtype=torch.float64)
+                    ).tolist()
+                    paired_metrics[track] = {
+                        "episodes": paired_count,
+                        "v3_accuracy_pct": float(enabled_acc.mean().item() * 100.0),
+                        "bypass_accuracy_pct": float(bypass_acc.mean().item() * 100.0),
+                        "accuracy_delta_pp": float(accuracy_delta.mean().item() * 100.0),
+                        "accuracy_delta_bootstrap95_pp": accuracy_ci,
+                        "v3_exact_pct": float(enabled_exact.mean().item() * 100.0),
+                        "bypass_exact_pct": float(bypass_exact.mean().item() * 100.0),
+                        "exact_delta_pp": float(exact_delta.mean().item() * 100.0),
+                        "exact_delta_bootstrap95_pp": exact_ci,
+                    }
+                    print(
+                        f"  [adaptive-v3/paired/{track}] n={paired_count} "
+                        f"accuracy {enabled_acc.mean().item() * 100:.2f}% vs "
+                        f"{bypass_acc.mean().item() * 100:.2f}% "
+                        f"delta={accuracy_delta.mean().item() * 100:+.2f}pp "
+                        f"bootstrap95=[{accuracy_ci[0]:+.2f},{accuracy_ci[1]:+.2f}] "
+                        f"exact {enabled_exact.mean().item() * 100:.2f}% vs "
+                        f"{bypass_exact.mean().item() * 100:.2f}% "
+                        f"delta={exact_delta.mean().item() * 100:+.2f}pp "
+                        f"bootstrap95=[{exact_ci[0]:+.2f},{exact_ci[1]:+.2f}]"
+                    )
+            if bool(getattr(model, "workspace_adaptive_v3_logit_diagnostics_enabled", False)):
+                by_track = {}
+                for track in sorted(set(full_logits) & set(bypass_logits)):
+                    enabled_logits = full_logits[track].float()
+                    bypassed_logits = bypass_logits[track].float()
+                    count = min(enabled_logits.shape[0], bypassed_logits.shape[0])
+                    enabled_logits = enabled_logits[:count]
+                    bypassed_logits = bypassed_logits[:count]
+                    enabled_logits64 = enabled_logits.double()
+                    bypassed_logits64 = bypassed_logits.double()
+                    enabled_logp = enabled_logits64.log_softmax(dim=-1)
+                    bypass_logp = bypassed_logits64.log_softmax(dim=-1)
+                    enabled_prob = enabled_logp.exp()
+                    bypass_prob = bypass_logp.exp()
+                    midpoint = 0.5 * (enabled_prob + bypass_prob)
+                    midpoint_log = midpoint.clamp_min(1e-8).log()
+                    js = 0.5 * (
+                        enabled_prob * (enabled_logp - midpoint_log)
+                    ).sum(dim=-1) + 0.5 * (
+                        bypass_prob * (bypass_logp - midpoint_log)
+                    ).sum(dim=-1)
+                    js = js.clamp_min(0.0)
+                    mean_abs_logit_shift = (
+                        enabled_logits.double() - bypassed_logits.double()
+                    ).abs().mean()
+                    flips = enabled_logits.argmax(dim=-1).ne(
+                        bypassed_logits.argmax(dim=-1)
+                    )
+                    by_track[track] = {
+                        "answer_tokens": int(count),
+                        "mean_js_divergence_nats": float(js.mean().item()) if count else 0.0,
+                        "mean_abs_logit_shift": float(mean_abs_logit_shift.item()) if count else 0.0,
+                        "prediction_flip_fraction": float(flips.float().mean().item()) if count else 0.0,
+                    }
+                    print(
+                        f"  [adaptive-v3/logits/{track}] tokens={count} "
+                        f"JS={by_track[track]['mean_js_divergence_nats']:.6g} nats "
+                        f"mean_abs_logit_shift={by_track[track]['mean_abs_logit_shift']:.6g} "
+                        f"prediction_flips={by_track[track]['prediction_flip_fraction']:.2%}"
+                    )
+                self.last_eval_diagnostics["adaptive_v3_logit_effect"] = by_track
+            self.last_eval_diagnostics["adaptive_v3_paired_metrics"] = paired_metrics
+            return bypass[:2]
+        episodes = self._paired_id_episodes(lesson_idx)
+        return self._evaluate_episodes(
+            model, device, episodes, ablate_workspace_adaptive=True
+        )[:2]
 
     def evaluate_workspace_shuffled(self, model, device, curriculum, lesson_idx):
         episodes = self._paired_id_episodes(lesson_idx)

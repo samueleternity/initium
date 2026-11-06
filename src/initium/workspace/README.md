@@ -28,6 +28,50 @@ bypass control; keyed addressing needs at least one slot, and permutation
 state experiments need at least 16. More slots increase memory and update
 work. Set the count to the largest simultaneously live set the task needs.
 
+## Autonomous functional specialization
+
+Add `--workspace-autoadaptive` to compare a task-trained skill bank against
+the base workspace. The adaptive module has four low-rank pathways selected
+sparsely from the current backbone state, the routed specialist output, and
+workspace broadcast. The task objective trains both the pathways and their
+router; a small load-balance objective discourages immediate collapse onto a
+single pathway. It receives no task IDs and adds no task-specific readout or
+answer logic. The skill bank has fixed capacity: this version learns pathway
+organization inside that capacity instead of creating parameters or changing
+the graph during training.
+
+Training logs report pathway routing frequency and probability, router
+entropy, adaptive residual RMS, learned output scale, and the balance term.
+These measurements show whether pathways are active and whether the residual
+is affecting the model; they do not alone prove that pathways specialize by
+task. To measure causal contribution on the same checkpoint, run evaluation
+with `--eval-only --workspace-autoadaptive --eval-workspace-adaptive-bypass`.
+This keeps ordinary workspace memory active while suppressing the adaptive
+pathway output. Compare against evaluation of the same checkpoint without the
+bypass.
+
+The implementation lives in [`adaptive.py`](adaptive.py), with model integration in
+[`src/initium/mamba_controller/split_graph_dnc.py`](../mamba_controller/split_graph_dnc.py)
+and CLI/checkpoint wiring in [`src/initium/core_training.py`](../core_training.py).
+
+### Adaptive workspace v2
+
+Use `--workspace-autoadaptive-v2` for a separate variant that keeps the same
+task-ID-free interface while giving each pathway its own low-rank output
+projection. Its mutual-information objective encourages the router to make
+context-dependent assignments while using the skill bank broadly. The default
+bank has eight pathways; set `--workspace-autoadaptive-v2-num-skills` to change
+that count and `--workspace-autoadaptive-v2-mi-weight` to adjust the auxiliary
+objective. The pathways still learn their functions through the ordinary task
+loss. This remains a fixed-capacity bank; it does not grow or prune modules.
+
+The v2 trainer logs conditional route entropy, marginal route entropy,
+routing mutual information, per-skill output scales, and residual magnitude.
+Use `--eval-only --workspace-autoadaptive-v2 --eval-workspace-adaptive-bypass`
+to compare a v2 checkpoint against the same checkpoint with its skill output
+disabled. V1 and v2 flags are mutually exclusive, and each checkpoint records
+which variant and v2 settings it uses.
+
 ## Write selection, addressing, and persistence
 
 | Option | What it changes | When to use it |
@@ -57,7 +101,8 @@ RMS relative to its routed writer to reduce state-scale instability.
 | `--workspace-bptt-horizon STEPS` | Detaches recurrent slot gradients every `STEPS` tokens while preserving the same forward state trajectory. `0` means full-sequence backpropagation. | Reduce activation/gradient memory for long sequences or measure the value of long-range gradient flow. |
 | `--workspace-compile-recurrence` | Compiles the sequential slot-update step with CUDA `torch.compile`; token-only projections are prepared over time, while the state recurrence remains sequential. | Keep this enabled for normal workspace training: it has repeatedly improved training throughput. It supports semantic/keyed addressing, reconsideration, write salience, and transactional pair commits. It does not support random writes (`--workspace-no-selection`) or bistable gates. Omit it only for those unsupported modes or an explicit eager-versus-compiled control. |
 | `--workspace-token-id-input` | For the workspace-capability suite, batches integer token IDs and computes the existing split-graph input projection as an embedding lookup. Padding retains the same zero-vector-plus-bias result as the one-hot path. | Opt-in performance A/B against the default one-hot path. The model math and trainable projection weights are unchanged; the run ID records `_tokenidinput`. |
-| `--split-graph-activation-checkpointing` | Recomputes each Mamba backbone block during backward instead of retaining its full-sequence internal activations. The forward sequence and full BPTT gradient path are unchanged; extra compute trades for lower GPU memory. | Use for long lessons when full-sequence backbone activations push GPU memory over capacity. Requires `--split-graph` with a Mamba backbone. This option cannot be combined with CPU activation offload. |
+| `--split-graph-activation-checkpointing` | Recomputes each Mamba backbone block during backward for batches at or above `--split-graph-activation-checkpointing-min-seq-len` (default 256). Short batches retain activations and avoid recompute; set the threshold to 0 to preserve always-on checkpointing. | Use for long lessons when full-sequence backbone activations push GPU memory over capacity. Requires `--split-graph` with a Mamba backbone. This option cannot be combined with CPU activation offload. |
+| `--finite-check-interval N` | Runs synchronizing NaN/Inf scans on outputs and losses every N steps (default 100); gradient norm finiteness remains checked every step. | Use 1 for per-step tensor scans while debugging numerical failures. |
 | `--activation-offload-to-cpu` | Stores tensors saved by autograd in pinned host memory and restores their original strides when transferring them back for backward. `--activation-offload-cpu-budget-mb MIB` caps copied activation payload per training step (default 2048 MiB); extra saves remain on their original device. | Use when long lessons exceed GPU memory and host memory is available. It keeps full BPTT and forward equations but can increase host RAM and transfer time. Console logs show copied/resident save volume and Linux process RSS/pinned RAM when available. CUDA only. |
 
 Frozen mode and gate scope change which parameters are trainable, so give those
@@ -170,3 +215,72 @@ For long training sequences, segment diagnostics sample one training step per
 exhaustive activation and gradient scans; this adds substantial memory traffic
 and runtime. MoE diagnostic metrics are also collected at the log cadence,
 while routing and its auxiliary loss remain active on every step.
+
+## Adaptive workspace V3
+
+V3 is an opt-in learned operator bank inside the workspace recurrent read/compute/write
+loop. Its controller sees routed input features and current slot state, then learns
+operation selection, soft operand binding, destination binding, and categorical result
+values. Teacher labels are used only by auxiliary losses. They are not part of the
+controller input. V1 and V2 remain separate model variants.
+
+V3 requires split-graph, 64 or more workspace slots, semantic entity addressing, and
+positive key-value loss. A typical starting configuration is:
+
+```text
+--split-graph \
+--workspace --workspace-num-slots 64 --workspace-entity-keyed-writes \
+--workspace-semantic-entity-addressing --workspace-key-value-loss-weight 0.1 \
+--workspace-autoadaptive-v3 --workspace-operation-executor \
+--workspace-autoadaptive-v3-feature-off-probability 0.75 \
+--workspace-autoadaptive-v3-always-feature-off-tracks variable_binding \
+--workspace-autoadaptive-v3-eval-episodes-per-track 128 \
+--workspace-autoadaptive-v3-logit-diagnostics
+```
+
+`--workspace-autoadaptive-v3-distillation` (default on) learns from the existing
+mixed-skill and variable-binding executor. Mixed-skill programs cover lookup/copy,
+modular addition, sorting, comparison, selection, and two-item rank. Teacher weight
+uses criterion-based annealing by default: it decreases only while feature-off
+operation, operand, value, and write binding accuracy meet
+`--workspace-autoadaptive-v3-teacher-accuracy-threshold`; it rises again if those
+measures fall, and never drops below `--workspace-autoadaptive-v3-teacher-min-weight`.
+Set `--workspace-autoadaptive-v3-teacher-anneal-steps 0` to keep it fixed.
+Comparison emits a binary greater-than result, selection emits the larger operand,
+and rank emits the first operand's zero-based rank among a pair.
+
+The feature-off probability is sampled independently per example (not by rotating
+training windows). `variable_binding` is always trained without manual execution by
+default, while `mixed_skill` uses the configured probability. Teacher targets remain
+available on those examples. Set `--workspace-autoadaptive-v3-always-feature-off-tracks`
+to choose the permanent feature-off families. `--workspace-autoadaptive-v3-holdout-tracks
+TRACK ...` also removes teacher targets, making those tracks a no-teacher transfer
+probe. The paired V3-on/off check evaluates 128 deterministic matched examples per
+feature-off track by default and prints episode-bootstrap 95% intervals for accuracy
+and exact-match deltas. `--workspace-autoadaptive-v3-logit-diagnostics` adds mean
+logit shift, Jensen–Shannon divergence, and prediction-flip rate.
+
+`--workspace-autoadaptive-v3-learning-rate-scale` changes only the operator bank's
+learning rate. `--workspace-autoadaptive-v3-usage-floor-weight` adds an optional
+operator-usage floor; use it as a separate branch because it encourages activity,
+not correct function. `--workspace-autoadaptive-v3-readback-consistency-weight`
+encourages the value decoder to agree before and after a soft slot write. V3 logs
+per-track operator-route fractions and accumulated teacher losses, accuracies, and
+supervision counts per operator to the console. The manual executor supports the same
+compare, select, and rank definitions used by the expanded mixed-skill pipeline.
+
+The V3 binding and controller changes are independently switchable for ablations:
+`--workspace-autoadaptive-v3-temperature-binding` learns an inverse temperature
+(initialized by `--workspace-autoadaptive-v3-attention-temperature`, default 12),
+`--workspace-autoadaptive-v3-straight-through-binding` uses hard top-1 slot reads
+with soft gradients, and `--workspace-autoadaptive-v3-entity-destinations` predicts
+entity IDs before resolving them through match-or-first-free allocation. Existing
+addresses are preserved; only newly allocated slots receive a new key.
+`--workspace-autoadaptive-v3-split-context-norm` normalizes routed features and
+mean slot content separately, while `--workspace-autoadaptive-v3-use-backbone-context`
+adds the final backbone residual stream. Finally,
+`--workspace-autoadaptive-v3-teacher-forced-operator-outputs` sends output teacher
+loss directly through the labeled operator, independent of its current router
+probability; `--workspace-autoadaptive-v3-class-balanced-operator-loss` balances
+router teacher loss across represented operation classes. Console logs report
+context RMS, binding temperature, and per-operator forced-output loss/count.

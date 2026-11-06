@@ -1,4 +1,4 @@
-"""Dependent lookup/arithmetic/copy/sort pipelines with hidden stage values."""
+"""Dependent pipelines that exercise the workspace's six learned operations."""
 
 from __future__ import annotations
 
@@ -20,7 +20,15 @@ from initium.data.workspace_capability.episode import (
 )
 from initium.data.workspace_capability.tracks._shared import common_metadata
 
-_SKILL_IDS = {"lookup": 0, "arithmetic": 1, "copy": 2, "sort": 3}
+_SKILL_IDS = {
+    "lookup": 0,
+    "arithmetic": 1,
+    "copy": 2,
+    "sort": 3,
+    "compare": 4,
+    "select": 5,
+    "rank": 6,
+}
 
 
 def generate(difficulty: dict, rng: random.Random, *, ood: bool = False) -> TaskEpisode:
@@ -36,7 +44,7 @@ def generate(difficulty: dict, rng: random.Random, *, ood: bool = False) -> Task
     # both ordered outputs without aliasing the next stage's result.
     stage_ids = [ENTITY_COUNT - 16 + 2 * index for index in range(operation_count)]
     skills = ["lookup"] + [
-        ("arithmetic", "copy", "sort")[(index - 1) % 3]
+        ("arithmetic", "copy", "sort", "compare", "select", "rank")[(index - 1) % 6]
         for index in range(1, operation_count)
     ]
     for index, (stage_id, skill) in enumerate(zip(stage_ids, skills)):
@@ -55,9 +63,21 @@ def generate(difficulty: dict, rng: random.Random, *, ood: bool = False) -> Task
         elif skill == "copy":
             result = (int(previous),)
             args = (entity_token(int(previous_stage)),)
-        else:
+        elif skill == "sort":
             right = rng.randrange(SCALAR_COUNT)
             result = tuple(sorted((int(previous), right)))
+            args = (entity_token(int(previous_stage)), scalar_token(right))
+        elif skill == "compare":
+            right = rng.randrange(SCALAR_COUNT)
+            result = (int(int(previous) > right),)
+            args = (entity_token(int(previous_stage)), scalar_token(right))
+        elif skill == "select":
+            right = rng.randrange(SCALAR_COUNT)
+            result = (max(int(previous), right),)
+            args = (entity_token(int(previous_stage)), scalar_token(right))
+        else:  # rank: zero is the higher-ranked operand; one is the lower.
+            right = rng.randrange(SCALAR_COUNT)
+            result = (0 if int(previous) >= right else 1,)
             args = (entity_token(int(previous_stage)), scalar_token(right))
         stream.extend(
             (EV_VECTOR, entity_token(stage_id), source_token(_SKILL_IDS[skill]), *args, SEP)

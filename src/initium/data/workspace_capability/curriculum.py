@@ -67,11 +67,62 @@ def difficulty_for(
             "queries": (1, 1, 2, 3, 4, 8)[level],
             "aggregate": ("recall", "recall", "sum_mod16", "count_even", "parity", "recall")[level],
         }
+    elif track == "capacity_bottleneck":
+        config = {
+            "set_size": (2, 3, 4, 5, 6, 8)[level],
+            "target_count": (2, 3, 4, 5, 6, 8)[level],
+            "tracking_frames": (2, 3, 4, 4, 5, 6)[level],
+            "n_back": (1, 1, 2, 2, 3, 4)[level],
+            "delay_events": (0, 1, 2, 4, 6, 8)[level],
+            "stream_length": (6, 8, 10, 12, 14, 16)[level],
+        }
+    elif track == "belief_tracking":
+        config = {
+            "agents": (2, 2, 3, 4, 5, 5)[level],
+            "objects": (1, 2, 3, 4, 6, 8)[level],
+            "moves": (2, 3, 4, 5, 6, 8)[level],
+        }
+    elif track == "mixed_skill":
+        config = {
+            "operations": (3, 4, 5, 6, 7, 8)[level],
+            "keys": (4, 5, 6, 7, 8, 10)[level],
+        }
+    elif track == "rule_switching":
+        config = {
+            "evidence_trials": (4, 6, 8, 10, 12, 14)[level],
+            "switches": (0, 0, 1, 2, 3, 4)[level],
+            "feedback_noise": (0.20, 0.20, 0.22, 0.25, 0.28, 0.30)[level],
+        }
+    elif track == "attentional_blink":
+        config = {
+            "maximum_lag": (2, 2, 3, 4, 6, 8)[level],
+            "distractors": (4, 6, 8, 10, 12, 14)[level],
+            "lure_probability": (0.40, 0.50, 0.60, 0.70, 0.80, 0.85)[level],
+        }
+    elif track == "variable_binding":
+        config = {
+            "variables": (5, 5, 6, 7, 8, 10)[level],
+            "assignments": (7, 9, 11, 13, 17, 21)[level],
+        }
+    elif track == "ignition":
+        config = {"maximum_strength": (3, 4, 5, 6, 7, 8)[level]}
+    elif track == "psychological_refractory":
+        config = {"maximum_soa": (2, 3, 4, 5, 6, 7)[level]}
+    elif track == "masked_priming":
+        config = {"masked_probability": (0.35, 0.45, 0.55, 0.65, 0.75, 0.8)[level]}
+    elif track == "sustained_maintenance":
+        config = {"maximum_delay": (3, 5, 7, 9, 11, 12)[level]}
+    elif track == "no_report_confidence":
+        config = {"maximum_evidence": (4, 5, 6, 7, 8, 8)[level]}
+    elif track == "bistable_perception":
+        config = {"maximum_frames": (4, 5, 6, 7, 8, 10)[level]}
+    elif track == "trace_conditioning":
+        config = {"maximum_gap": (1, 2, 3, 4, 5, 6)[level]}
     else:
         raise ValueError(f"unknown workspace capability track {track!r}")
     if ood and track != "permutation":
-        # OOD increases temporal interference while keeping each generator's
-        # schema bounds valid and uses its held-out identifier band where able.
+        # OOD increases task-specific load beyond the ID lesson while keeping
+        # each generator's token and sequence bounds valid.
         if track == "entity_state":
             updates = config["updates"]
             distractors = config["distractors"]
@@ -86,6 +137,44 @@ def difficulty_for(
             distractors = config["distractors"]
             assert isinstance(distractors, int)
             config["distractors"] = min(distractors * 2 + 2, 24)
+        elif track == "capacity_bottleneck":
+            config["set_size"] = min(int(config["set_size"]) + 1, 9)
+            config["target_count"] = min(int(config["target_count"]) + 1, 9)
+            config["n_back"] = min(int(config["n_back"]) + 1, 5)
+            config["tracking_frames"] = min(int(config["tracking_frames"]) + 1, 6)
+            config["delay_events"] = min(int(config["delay_events"]) + 2, 10)
+            config["stream_length"] = min(int(config["stream_length"]) + 2, 16)
+        elif track == "belief_tracking":
+            config["moves"] = min(int(config["moves"]) + 2, 10)
+        elif track == "mixed_skill":
+            config["keys"] = min(int(config["keys"]) + 2, 10)
+            config["operations"] = min(int(config["operations"]) + 1, 8)
+        elif track == "rule_switching":
+            config["evidence_trials"] = min(int(config["evidence_trials"]) + 2, 16)
+            config["switches"] = min(int(config["switches"]) + 1, 5)
+            config["feedback_noise"] = min(float(config["feedback_noise"]) + 0.05, 0.35)
+        elif track == "attentional_blink":
+            config["maximum_lag"] = min(int(config["maximum_lag"]) + 1, 9)
+            config["distractors"] = min(int(config["distractors"]) + 2, 16)
+            config["lure_probability"] = min(
+                float(config["lure_probability"]) + 0.05, 0.90
+            )
+        elif track == "variable_binding":
+            config["assignments"] = min(int(config["assignments"]) + 2, 24)
+        elif track == "ignition":
+            config["maximum_strength"] = min(int(config["maximum_strength"]) + 1, 8)
+        elif track == "psychological_refractory":
+            config["maximum_soa"] = min(int(config["maximum_soa"]) + 1, 8)
+        elif track == "masked_priming":
+            config["masked_probability"] = min(float(config["masked_probability"]) + 0.1, 0.9)
+        elif track == "sustained_maintenance":
+            config["maximum_delay"] = min(int(config["maximum_delay"]) + 2, 12)
+        elif track == "no_report_confidence":
+            config["maximum_evidence"] = min(int(config["maximum_evidence"]) + 1, 8)
+        elif track == "bistable_perception":
+            config["maximum_frames"] = min(int(config["maximum_frames"]) + 1, 10)
+        elif track == "trace_conditioning":
+            config["maximum_gap"] = min(int(config["maximum_gap"]) + 1, 6)
         else:
             updates = config["updates"]
             distractors = config["distractors"]
@@ -121,30 +210,52 @@ class WorkspaceCapabilityCurriculum:
 
     def maybe_advance(self, model, device, step=None, optimizer=None, *, allow_advance=True):
         field_log = {}
-        accuracy, perfect, _ = self.dataset.evaluate_id(
-            model,
-            device,
-            self.lesson,
-            num_episodes=64,
-            rng=random.Random(91_000 + self.lesson),
-            field_log=field_log,
-        )
+        evaluate_curriculum = getattr(self.dataset, "evaluate_curriculum_id", None)
+        if callable(evaluate_curriculum):
+            accuracy, perfect, _ = evaluate_curriculum(
+                model, device, self.lesson, field_log=field_log
+            )
+        else:
+            accuracy, perfect, _ = self.dataset.evaluate_id(
+                model,
+                device,
+                self.lesson,
+                num_episodes=64,
+                rng=random.Random(91_000 + self.lesson),
+                field_log=field_log,
+            )
         writer = getattr(self, "field_log_writer", None)
         file = getattr(self, "field_log_file", None)
         if writer is not None and file is not None:
             self.dataset.write_field_log(writer, file, step, self.lesson + 1, "id", field_log)
         per_track = (self.dataset.last_eval_diagnostics or {}).get("tracks", {})
-        all_tracks_ready = self.dataset.task_track != "all" or (
+        progression_groups = (self.dataset.last_eval_diagnostics or {}).get(
+            "progression_groups", {}
+        )
+        groups_ready = True
+        for track in self.dataset._tracks():
+            required = self.dataset._curriculum_groups(track, self.lesson)
+            actual = progression_groups.get(track, {})
+            if any(
+                group not in actual
+                or actual[group]["episodes"] < 16
+                or actual[group]["exact_match"] / 100.0 < self.dataset.advance_threshold
+                for group in required
+            ):
+                groups_ready = False
+                break
+        all_tracks_ready = self.dataset.task_track not in {"all", "new_all", "gnw_all"} or (
             len(per_track) == len(self.dataset._tracks())
             and all(
-                item["accuracy"] / 100.0 >= self.dataset.advance_threshold
+                item["exact_match"] / 100.0 >= self.dataset.advance_threshold
                 for item in per_track.values()
             )
         )
         if (
             allow_advance
-            and accuracy / 100.0 >= self.dataset.advance_threshold
+            and perfect / 100.0 >= self.dataset.advance_threshold
             and all_tracks_ready
+            and groups_ready
             and self.lesson < len(self.table) - 1
         ):
             self.lesson += 1
@@ -155,6 +266,6 @@ class WorkspaceCapabilityCurriculum:
             print(
                 f">>> Workspace-capability curriculum advanced to "
                 f"lesson {self.lesson + 1}/{len(self.table)} "
-                f"({self.dataset.task_track}; answer accuracy {accuracy:.2f}%)"
+                f"({self.dataset.task_track}; episode exact {perfect:.2f}%)"
             )
         return self.lesson, accuracy, perfect

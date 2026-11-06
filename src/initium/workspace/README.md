@@ -28,6 +28,50 @@ bypass control; keyed addressing needs at least one slot, and permutation
 state experiments need at least 16. More slots increase memory and update
 work. Set the count to the largest simultaneously live set the task needs.
 
+## Autonomous functional specialization
+
+Add `--workspace-autoadaptive` to compare a task-trained skill bank against
+the base workspace. The adaptive module has four low-rank pathways selected
+sparsely from the current backbone state, the routed specialist output, and
+workspace broadcast. The task objective trains both the pathways and their
+router; a small load-balance objective discourages immediate collapse onto a
+single pathway. It receives no task IDs and adds no task-specific readout or
+answer logic. The skill bank has fixed capacity: this version learns pathway
+organization inside that capacity instead of creating parameters or changing
+the graph during training.
+
+Training logs report pathway routing frequency and probability, router
+entropy, adaptive residual RMS, learned output scale, and the balance term.
+These measurements show whether pathways are active and whether the residual
+is affecting the model; they do not alone prove that pathways specialize by
+task. To measure causal contribution on the same checkpoint, run evaluation
+with `--eval-only --workspace-autoadaptive --eval-workspace-adaptive-bypass`.
+This keeps ordinary workspace memory active while suppressing the adaptive
+pathway output. Compare against evaluation of the same checkpoint without the
+bypass.
+
+The implementation lives in [`adaptive.py`](adaptive.py), with model integration in
+[`src/initium/mamba_controller/split_graph_dnc.py`](../mamba_controller/split_graph_dnc.py)
+and CLI/checkpoint wiring in [`src/initium/core_training.py`](../core_training.py).
+
+### Adaptive workspace v2
+
+Use `--workspace-autoadaptive-v2` for a separate variant that keeps the same
+task-ID-free interface while giving each pathway its own low-rank output
+projection. Its mutual-information objective encourages the router to make
+context-dependent assignments while using the skill bank broadly. The default
+bank has eight pathways; set `--workspace-autoadaptive-v2-num-skills` to change
+that count and `--workspace-autoadaptive-v2-mi-weight` to adjust the auxiliary
+objective. The pathways still learn their functions through the ordinary task
+loss. This remains a fixed-capacity bank; it does not grow or prune modules.
+
+The v2 trainer logs conditional route entropy, marginal route entropy,
+routing mutual information, per-skill output scales, and residual magnitude.
+Use `--eval-only --workspace-autoadaptive-v2 --eval-workspace-adaptive-bypass`
+to compare a v2 checkpoint against the same checkpoint with its skill output
+disabled. V1 and v2 flags are mutually exclusive, and each checkpoint records
+which variant and v2 settings it uses.
+
 ## Write selection, addressing, and persistence
 
 | Option | What it changes | When to use it |
@@ -38,6 +82,7 @@ work. Set the count to the largest simultaneously live set the task needs.
 | `--workspace-key-match-threshold VALUE` | Cosine-match threshold for treating an address as an existing slot; a weaker match allocates a free slot when available. Default: `0.5`. | Sweep when learned addresses merge unrelated items or fragment one item's writes. Use the same value across matched runs. |
 | `--workspace-semantic-entity-addressing` | Uses fixed one-hot entity-token IDs as addresses. Permutation retains its initialization/swap write schedule; entity-state, relational-join, nth-farthest, and retrieval-aggregation write at complete event boundaries. Slot payloads remain learned. Requires entity-keyed writes. The `all` track requires 64 slots to cover its maximum 64 distinct entities in a retrieval episode. | Test stable per-entity bindings across the workspace capability suite. This metadata is specific to the typed workspace-capability task grammars. |
 | `--workspace-permutation-transactional` | On permutation examples, suppresses the two ordinary swap-commit writes, reads both addressed slot payloads from the same pre-commit state, and exchanges them together at the pair boundary. The semantic decoder supplies answer logits for both object→position and position→object queries. Other tracks use normal semantic event writes and ordinary task logits. | A swap-aware permutation experiment that can be included in an `all`-track run. Requires semantic addressing and at least 16 slots; all-track semantic addressing requires 64 slots. This is a distinct algorithmic variant. |
+| `--workspace-attentional-cue-readout` | Stores each RSVP frame at its stream-order address. Small typed color and shape decoders are supervised at frame boundaries; the existing categorical value decoder is supervised on scalar values. At the final cue, ranks occupied records by the decoded color/shape conjunction, selects the two earliest matches, and decodes their scalar values as T1/T2. | Test cue-conditioned temporal retrieval on `attentional_blink`. Requires workspace, entity-keyed writes, semantic entity addressing, positive `--workspace-key-value-loss-weight`, and at least 26 slots. Only the visible cue is supplied to the readout; target frame locations and values are not metadata inputs. |
 | `--workspace-reset-each-step` | Clears the slot state before every token's write/read cycle, removing persistence between tokens. | Persistence ablation. It is not a useful setting for normal memory training. |
 
 Semantic entity addressing uses entity IDs present in the input stream as
@@ -56,6 +101,8 @@ RMS relative to its routed writer to reduce state-scale instability.
 | `--workspace-bptt-horizon STEPS` | Detaches recurrent slot gradients every `STEPS` tokens while preserving the same forward state trajectory. `0` means full-sequence backpropagation. | Reduce activation/gradient memory for long sequences or measure the value of long-range gradient flow. |
 | `--workspace-compile-recurrence` | Compiles the sequential slot-update step with CUDA `torch.compile`; token-only projections are prepared over time, while the state recurrence remains sequential. | Keep this enabled for normal workspace training: it has repeatedly improved training throughput. It supports semantic/keyed addressing, reconsideration, write salience, and transactional pair commits. It does not support random writes (`--workspace-no-selection`) or bistable gates. Omit it only for those unsupported modes or an explicit eager-versus-compiled control. |
 | `--workspace-token-id-input` | For the workspace-capability suite, batches integer token IDs and computes the existing split-graph input projection as an embedding lookup. Padding retains the same zero-vector-plus-bias result as the one-hot path. | Opt-in performance A/B against the default one-hot path. The model math and trainable projection weights are unchanged; the run ID records `_tokenidinput`. |
+| `--split-graph-activation-checkpointing` | Recomputes each Mamba backbone block during backward for batches at or above `--split-graph-activation-checkpointing-min-seq-len` (default 256). Short batches retain activations and avoid recompute; set the threshold to 0 to preserve always-on checkpointing. | Use for long lessons when full-sequence backbone activations push GPU memory over capacity. Requires `--split-graph` with a Mamba backbone. This option cannot be combined with CPU activation offload. |
+| `--finite-check-interval N` | Runs synchronizing NaN/Inf scans on outputs and losses every N steps (default 100); gradient norm finiteness remains checked every step. | Use 1 for per-step tensor scans while debugging numerical failures. |
 | `--activation-offload-to-cpu` | Stores tensors saved by autograd in pinned host memory and restores their original strides when transferring them back for backward. `--activation-offload-cpu-budget-mb MIB` caps copied activation payload per training step (default 2048 MiB); extra saves remain on their original device. | Use when long lessons exceed GPU memory and host memory is available. It keeps full BPTT and forward equations but can increase host RAM and transfer time. Console logs show copied/resident save volume and Linux process RSS/pinned RAM when available. CUDA only. |
 
 Frozen mode and gate scope change which parameters are trainable, so give those
@@ -115,12 +162,19 @@ the second pass; only the second pass's records are kept as persistent state.
 | Option | What it logs or trains | When to use it |
 | --- | --- | --- |
 | `--workspace-semantic-state-diagnostics` | Replays held-out permutation prefixes, reports accepted entity slots, slot value RMS, decoded state versus oracle state, and a workspace-readback-bypassed comparison. | Diagnose whether writes were accepted and whether readback contains the expected entity state. Evaluation adds runtime, especially when many events are sampled. |
+| `--workspace-operation-diagnostics` | At evaluations, reports keyed source-read accuracy, destination commit rate, committed-value accuracy by operation, and final query answer/exact accuracy for mixed skill and variable binding. | Diagnose whether operation-executor errors come from operand retrieval, destination-slot commitment, stored values, or final answering. Requires `--workspace-operation-executor`; no expected values are passed into execution. |
 | `--workspace-state-diagnostic-max-events N` | Caps sampled state events per diagnostic episode. Default: `16`; `0` includes every event. | Reduce diagnostic cost while keeping a spread of initialization and swap points. |
 | `--workspace-state-loss-weight WEIGHT` | Adds auxiliary cross-entropy for decoding each initialized entity's position after initialization and swap events. | Directly train and observe state content when using semantic addressing on permutation/all. It uses oracle state only as the auxiliary target. Use a fresh run when changing this model/loss configuration. |
 | `--workspace-nth-farthest-exact-readout` | Enables a task-specific positive control for `nth_farthest` rows. At each complete vector event, a six-coordinate decoder is supervised from the addressed slot payload. At the answer token it decodes candidate vectors from workspace slots, computes squared distance to the input query vector, and returns the requested zero-based rank; exact distance ties use ascending entity ID. | Use with `--dataset-type workspace-capability --workspace-task-track nth_farthest` or `all`, semantic entity addressing, and at least 16 slots (`all` still needs 64 slots). This is an algorithmic ceiling/control path, not a general learned comparator. It requires no KV memory. |
 | `--workspace-nth-farthest-vector-loss-weight WEIGHT` | Scales the auxiliary coordinate cross-entropy for every completed candidate-vector write. Training console logs `L_nth_vec`, coordinate accuracy, and supervised coordinates per batch. Must be positive with the exact-readout flag. | Use to test whether workspace slots preserve the quantized vectors. The answer-time exact rank itself is non-differentiable; this loss trains the vector decoder used by that readout. |
 | Nth-farthest workspace evaluation metrics | Console and workspace task-metrics CSV report coordinate accuracy, whole-vector exact accuracy, direct exact-readout accuracy, invalid/missing candidate-state count, and readout by query type, candidate count, dimension, and zero-based rank. | Compare candidate-state preservation against task answer quality. Strong vector accuracy with weak readout accuracy points to rank/query handling; invalid readouts expose missing entity slots; weak vector accuracy points to writes, addressing, or payload stability. |
 | `--workspace-retrieval-exact-readout` | On retrieval rows, supervises a 16-way scalar decoder after every entity write/update, reads the queried entities' current slot values, and applies recall, modulo-16 sum, even-count, or parity to those decoded values. Console and task-metrics CSV report write-value accuracy, query-slot lookup rate, queried-value accuracy, exact readout accuracy, and invalid reads. | Use on `retrieval_aggregation` or `all` with semantic entity addressing and at least 64 slots. This is an algorithmic positive control for separating value storage, entity lookup, and aggregation; it does not require KV. Pair with `--workspace-retrieval-value-loss-weight` (default `0.1`, must be positive). |
+| `--workspace-key-value-loss-weight WEIGHT` | Adds sparse value reconstruction at explicit state commits and query reads, then routes direct keyed answers and supported equality/selection outputs through the addressed slot-value decoder. | Use on `workspace-capability` with entity-keyed writes and semantic entity addressing. Readback bypass and shuffle affect this path, so the existing matched-checkpoint probe measures its answer dependence. |
+| `--workspace-exact-value-comparison` | Compares retrieved location categories with a hard equality/inequality decision and a soft straight-through training gradient. Evaluation reports operand-value accuracy separately from comparison accuracy. | Use for capacity change detection and n-back with key-value readout; requires workspace, entity-keyed writes, semantic entity addressing, and supports `capacity_bottleneck`, `new_all`, or `all`. |
+| `--workspace-exact-selection` | Uses the highest-scoring stored rule category to select one stored scalar category, with a soft straight-through training gradient. Evaluation reports operand accuracy and selected-output accuracy separately. | Use on `rule_switching`, `new_all`, or `all` with key-value readout and semantic entity addressing. |
+| `--workspace-attentional-item-memory` | Stores each RSVP item value in a workspace slot addressed by its stream order, including distractors, and trains the value decoder on those writes. Target positions are not exposed; the model must retrieve relevant items from cue-conditioned workspace readback. | Use on `attentional_blink`, `gnw_all`, `new_all`, or `all` with positive key-value loss, entity-keyed writes, semantic entity addressing, and at least 26 slots for the longest generated OOD stream. |
+| `--workspace-sparse-recurrence` | Batches read-only broadcasts across consecutive tokens where no semantic write or state-side operation occurs. State-changing events retain the ordinary causal recurrent transition. | Use with entity-keyed semantic addressing. It falls back to the ordinary path during workspace telemetry and modes whose per-token state cannot be skipped safely. |
+| `--workspace-operation-executor` | Executes supported mixed-skill and variable-binding lookup/copy/modular-add/sort operations from addressed slots and commits intermediate result(s) back to destination slot(s). Sort commits both outputs to distinct keys. | Requires `--workspace-key-value-loss-weight > 0` and `workspace-capability` track `mixed_skill`, `variable_binding`, `new_all`, or `all`. Operation instructions and literals come from the input stream; auxiliary targets supervise only resulting slot values. |
 | Transactional held-out metrics | With `--workspace-permutation-transactional`, the workspace task-metrics CSV records object→position and position→object answer accuracy, decoded state accuracy by committed swap depth, and successful pair-commit rate. | Use these metrics to separate answer-direction weaknesses, state degradation with repeated swaps, and failed address resolution. |
 | `--eval-workspace-mode checkpoint|reset-each-step|bypass` | Evaluation-only counterfactual: use checkpoint behavior, reset persistent slots every step, or bypass workspace readback. | Measure dependence on persistent readback without retraining. Requires `--eval-only --workspace`; `checkpoint` is the normal behavior. |
 
@@ -151,9 +205,82 @@ fraction, gate mean, slot/readback scale, and address match/allocation/overflow
 rates where applicable. Reconsideration and prediction-error write salience
 also create `run_<id>_workspace_telemetry.csv`. Workspace-capability evaluation
 strata are written to `run_<id>_workspace_task_metrics.csv`.
+For workspace-capability runs, `--workspace-functional-signature-diagnostics`
+adds paired per-track ablations of enabled task-specific helpers to
+`run_<id>_workspace_dependency.csv` as `feature_off/<name>` rows. Ignition
+response rates by stimulus strength are included in the task-metrics log.
 
 For long training sequences, segment diagnostics sample one training step per
 `--log-every` interval by default. Use `--segment-diagnostics-every-step` for
 exhaustive activation and gradient scans; this adds substantial memory traffic
 and runtime. MoE diagnostic metrics are also collected at the log cadence,
 while routing and its auxiliary loss remain active on every step.
+
+## Adaptive workspace V3
+
+V3 is an opt-in learned operator bank inside the workspace recurrent read/compute/write
+loop. Its controller sees routed input features and current slot state, then learns
+operation selection, soft operand binding, destination binding, and categorical result
+values. Teacher labels are used only by auxiliary losses. They are not part of the
+controller input. V1 and V2 remain separate model variants.
+
+V3 requires split-graph, 64 or more workspace slots, semantic entity addressing, and
+positive key-value loss. A typical starting configuration is:
+
+```text
+--split-graph \
+--workspace --workspace-num-slots 64 --workspace-entity-keyed-writes \
+--workspace-semantic-entity-addressing --workspace-key-value-loss-weight 0.1 \
+--workspace-autoadaptive-v3 --workspace-operation-executor \
+--workspace-autoadaptive-v3-feature-off-probability 0.75 \
+--workspace-autoadaptive-v3-always-feature-off-tracks variable_binding \
+--workspace-autoadaptive-v3-eval-episodes-per-track 128 \
+--workspace-autoadaptive-v3-logit-diagnostics
+```
+
+`--workspace-autoadaptive-v3-distillation` (default on) learns from the existing
+mixed-skill and variable-binding executor. Mixed-skill programs cover lookup/copy,
+modular addition, sorting, comparison, selection, and two-item rank. Teacher weight
+uses criterion-based annealing by default: it decreases only while feature-off
+operation, operand, value, and write binding accuracy meet
+`--workspace-autoadaptive-v3-teacher-accuracy-threshold`; it rises again if those
+measures fall, and never drops below `--workspace-autoadaptive-v3-teacher-min-weight`.
+Set `--workspace-autoadaptive-v3-teacher-anneal-steps 0` to keep it fixed.
+Comparison emits a binary greater-than result, selection emits the larger operand,
+and rank emits the first operand's zero-based rank among a pair.
+
+The feature-off probability is sampled independently per example (not by rotating
+training windows). `variable_binding` is always trained without manual execution by
+default, while `mixed_skill` uses the configured probability. Teacher targets remain
+available on those examples. Set `--workspace-autoadaptive-v3-always-feature-off-tracks`
+to choose the permanent feature-off families. `--workspace-autoadaptive-v3-holdout-tracks
+TRACK ...` also removes teacher targets, making those tracks a no-teacher transfer
+probe. The paired V3-on/off check evaluates 128 deterministic matched examples per
+feature-off track by default and prints episode-bootstrap 95% intervals for accuracy
+and exact-match deltas. `--workspace-autoadaptive-v3-logit-diagnostics` adds mean
+logit shift, Jensen–Shannon divergence, and prediction-flip rate.
+
+`--workspace-autoadaptive-v3-learning-rate-scale` changes only the operator bank's
+learning rate. `--workspace-autoadaptive-v3-usage-floor-weight` adds an optional
+operator-usage floor; use it as a separate branch because it encourages activity,
+not correct function. `--workspace-autoadaptive-v3-readback-consistency-weight`
+encourages the value decoder to agree before and after a soft slot write. V3 logs
+per-track operator-route fractions and accumulated teacher losses, accuracies, and
+supervision counts per operator to the console. The manual executor supports the same
+compare, select, and rank definitions used by the expanded mixed-skill pipeline.
+
+The V3 binding and controller changes are independently switchable for ablations:
+`--workspace-autoadaptive-v3-temperature-binding` learns an inverse temperature
+(initialized by `--workspace-autoadaptive-v3-attention-temperature`, default 12),
+`--workspace-autoadaptive-v3-straight-through-binding` uses hard top-1 slot reads
+with soft gradients, and `--workspace-autoadaptive-v3-entity-destinations` predicts
+entity IDs before resolving them through match-or-first-free allocation. Existing
+addresses are preserved; only newly allocated slots receive a new key.
+`--workspace-autoadaptive-v3-split-context-norm` normalizes routed features and
+mean slot content separately, while `--workspace-autoadaptive-v3-use-backbone-context`
+adds the final backbone residual stream. Finally,
+`--workspace-autoadaptive-v3-teacher-forced-operator-outputs` sends output teacher
+loss directly through the labeled operator, independent of its current router
+probability; `--workspace-autoadaptive-v3-class-balanced-operator-loss` balances
+router teacher loss across represented operation classes. Console logs report
+context RMS, binding temperature, and per-operator forced-output loss/count.

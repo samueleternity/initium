@@ -8,7 +8,6 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-
 class AdaptiveWorkspaceOperatorBank(nn.Module):
     """Select, bind, execute, and commit learned workspace operations.
 
@@ -18,13 +17,15 @@ class AdaptiveWorkspaceOperatorBank(nn.Module):
     operation, operand, or destination at inference time.
     """
 
-    _OPERATOR_COUNT = 6
+    _OPERATOR_COUNT = 8
     _COPY = 1
     _ADD = 2
     _COMPARE = 3
     _SELECT = 4
     _RANK = 5
     _SORT = 6
+    _SWAP = 7
+    _REDUCE = 8
 
     def __init__(
         self,
@@ -42,6 +43,7 @@ class AdaptiveWorkspaceOperatorBank(nn.Module):
         use_backbone_context: bool = False,
         teacher_forced_operator_outputs: bool = False,
         class_balanced_operator_loss: bool = False,
+        compile_operators: bool = False,
     ) -> None:
         super().__init__()
         if d_model < 1 or address_dim < 1 or rank < 1:
@@ -70,10 +72,14 @@ class AdaptiveWorkspaceOperatorBank(nn.Module):
         self.use_backbone_context = bool(use_backbone_context)
         self.teacher_forced_operator_outputs = bool(teacher_forced_operator_outputs)
         self.class_balanced_operator_loss = bool(class_balanced_operator_loss)
-        self.context_parts = 2 + int(self.use_backbone_context)
+        self.compile_operators = bool(compile_operators)
+        self.context_parts = 3 + int(self.use_backbone_context)
         self.context_width = self.context_parts * self.d_model
 
         self.controller_norm = nn.LayerNorm(self.context_width)
+        self.event_embedding = nn.Embedding(320, self.d_model)
+        self.event_proj = nn.Linear(6 * self.d_model, self.d_model)
+        self.event_norm = nn.LayerNorm(self.d_model)
         self.routed_context_norm = nn.LayerNorm(self.d_model) if self.split_context_norm else None
         self.slot_context_norm = nn.LayerNorm(self.d_model) if self.split_context_norm else None
         self.backbone_context_norm = (
@@ -82,7 +88,8 @@ class AdaptiveWorkspaceOperatorBank(nn.Module):
             else None
         )
         self.operation_router = nn.Linear(self.context_width, self._OPERATOR_COUNT + 1)
-        self.binding_queries = nn.Linear(self.context_width, 3 * self.address_dim, bias=False)
+        self.reduce_kind_head = nn.Linear(self.context_width, 7)
+        self.binding_queries = nn.Linear(self.context_width, 4 * self.address_dim, bias=False)
         self.register_buffer("semantic_slot_prototypes", torch.eye(self.address_dim))
         self.operator_down = nn.Parameter(
             torch.empty(self._OPERATOR_COUNT, self.context_width + 2 * self.d_model, rank)
@@ -102,12 +109,83 @@ class AdaptiveWorkspaceOperatorBank(nn.Module):
         self._last_training_diagnostics: dict[str, torch.Tensor] = {}
         self._last_training_diagnostic_counts: dict[str, torch.Tensor] = {}
         self._last_route_steps: list[tuple[int, torch.Tensor]] = []
+        self._compiled_operator_forward = None
+        self._compiled_operator_failed = False
+        self._compiled_operator_fallback_warned = False
+
+    @staticmethod
+    def _sum_distribution(p, member):
+        """Distribution of the sum (mod M) of independent categoricals, via FFT product."""
+        f = torch.fft.fft(p.float(), dim=-1)
+        f = torch.where(member.unsqueeze(-1), f, torch.ones_like(f))
+        while f.shape[1] > 1:
+            if f.shape[1] % 2:
+                f = torch.cat((f, torch.ones_like(f[:, :1])), dim=1)
+            f = f[:, 0::2] * f[:, 1::2]
+        return torch.fft.ifft(f[:, 0], dim=-1).real.clamp_min(0)
+
+    def _reduce_distribution(
+        self, address_state, content_state, occupied, tokens, decoder, kind_logits
+    ):
+        """Generic scan/reduce over the slots the current event/query references.
+
+        Scan set = entity tokens after the last event/QUERY marker in the 12-token
+        input window (all occupied slots if none). Scalar field = decoder scalar logits.
+        Returns a distribution over the 320-token vocabulary.
+        """
+        B, S, A = address_state.shape
+        ent = tokens - 32
+        idx = torch.arange(tokens.shape[1], device=tokens.device)
+        marker = (tokens == 4) | ((tokens >= 8) & (tokens <= 23))
+        last = torch.where(marker, idx, torch.full_like(tokens, -1)).amax(-1, keepdim=True)
+        ref = (ent >= 0) & (ent < A) & (idx > last)
+        by_ent = (
+            torch.zeros(B, A, device=tokens.device).scatter_add(1, ent.clamp(0, A - 1), ref.float())
+            > 0
+        )
+        addr = address_state.float().argmax(-1)
+        member = torch.where(ref.any(-1, keepdim=True), by_ent.gather(1, addr) & occupied, occupied)
+        m = member.unsqueeze(-1)
+        p = decoder(content_state.float())[..., 136:152].softmax(-1)  # (B,S,16)
+        total = self._sum_distribution(p, member)
+        q = p[..., 0::2].sum(-1)
+        count = self._sum_distribution(
+            F.pad(torch.stack((1 - q, q), -1), (0, S - 1)), member
+        )
+        count = F.pad(count, (0, max(0, 32 - count.shape[-1])))[:, :32]
+        odd = total[:, 1::2].sum(-1)
+        parity = torch.stack((1 - odd, odd), -1)
+        top = (torch.log(p.cumsum(-1).clamp_min(1e-6)) * m).sum(1).exp()
+        high = top - F.pad(top[:, :-1], (1, 0))
+        bot = (torch.log(p.flip(-1).cumsum(-1).flip(-1).clamp_min(1e-6)) * m).sum(1).exp()
+        low = bot - F.pad(bot[:, 1:], (0, 1))
+        expected = (p * torch.arange(16, device=p.device, dtype=p.dtype)).sum(-1)
+        args = [
+            torch.zeros(B, A, device=p.device).scatter_add(
+                1, addr, (sign * expected).masked_fill(~member, -1e4).softmax(-1)
+            )
+            for sign in (4.0, -4.0)
+        ]
+
+        def vocab(x, base):
+            return F.pad(x, (base, 320 - base - x.shape[-1]))
+
+        candidates = torch.stack(
+            (
+                vocab(total, 136), vocab(count, 152), vocab(parity, 184),
+                vocab(high, 136), vocab(low, 136), vocab(args[0], 32), vocab(args[1], 32),
+            ),
+            dim=1,
+        )
+        return (kind_logits.float().softmax(-1).unsqueeze(-1) * candidates).sum(1)
 
     def begin_sequence(self) -> None:
         self._last_aux_loss = None
         self._last_training_diagnostics = {}
         self._last_training_diagnostic_counts = {}
         self._last_route_steps = []
+        self._route_sum = None
+        self._route_n = 0.0
 
     def last_route_steps(self) -> tuple[tuple[int, torch.Tensor], ...]:
         return tuple(self._last_route_steps)
@@ -155,6 +233,67 @@ class AdaptiveWorkspaceOperatorBank(nn.Module):
         if self.log_inverse_temperature is None:
             return 1.0
         return self.log_inverse_temperature
+
+    def _operator_bank_forward(self, operator_input: torch.Tensor) -> torch.Tensor:
+        """Pure low-rank operator-bank kernel, isolated for optional compilation."""
+        hidden = torch.einsum("bi,kir->bkr", operator_input, self.operator_down)
+        hidden = torch.tanh(hidden + self.operator_bias.unsqueeze(0))
+        return torch.einsum("bkr,krd->bkd", hidden, self.operator_up).view(
+            operator_input.shape[0], self._OPERATOR_COUNT, 2, self.d_model
+        )
+
+    def _operator_bank_outputs(self, operator_input: torch.Tensor) -> torch.Tensor:
+        # Keep evaluation on the eager path: it uses partial batch sizes and
+        # should not create compile specializations or pay compilation latency.
+        if not self.compile_operators or not self.training or self._compiled_operator_failed:
+            return self._operator_bank_forward(operator_input)
+        if not operator_input.is_cuda:
+            raise RuntimeError(
+                "--workspace-autoadaptive-v3-compile-operators requires CUDA"
+            )
+        if self._compiled_operator_forward is None:
+            compiler = getattr(torch, "compile", None)
+            if compiler is None:
+                raise RuntimeError(
+                    "compiled adaptive V3 operators require PyTorch 2.4 or newer"
+                )
+            self._compiled_operator_forward = compiler(
+                self._operator_bank_forward,
+                fullgraph=True,
+                dynamic=False,
+                options={"max_autotune": False},
+            )
+        try:
+            return self._compiled_operator_forward(operator_input)
+        except Exception as exc:
+            compile_error_names = {
+                "BackendCompilerFailed",
+                "InductorError",
+                "SubprocException",
+                "TritonError",
+            }
+            cause: BaseException | None = exc
+            is_compile_error = False
+            while cause is not None:
+                if type(cause).__name__ in compile_error_names:
+                    is_compile_error = True
+                    break
+                cause = cause.__cause__ or cause.__context__
+            if not is_compile_error:
+                raise
+            self._compiled_operator_failed = True
+            self._compiled_operator_forward = None
+            if not self._compiled_operator_fallback_warned:
+                self._compiled_operator_fallback_warned = True
+                import warnings
+
+                warnings.warn(
+                    "torch.compile could not build the adaptive V3 operator bank "
+                    f"({type(exc).__name__}: {str(exc).splitlines()[0]}). "
+                    "Continuing with the equivalent eager operator bank.",
+                    stacklevel=2,
+                )
+            return self._operator_bank_forward(operator_input)
 
     @staticmethod
     def _slot_attention(
@@ -263,6 +402,7 @@ class AdaptiveWorkspaceOperatorBank(nn.Module):
         output1_logits: torch.Tensor,
         operand0_logits: torch.Tensor,
         operand1_logits: torch.Tensor,
+        reduce_kind_logits: torch.Tensor,
         address_state: torch.Tensor,
         occupied: torch.Tensor,
         teacher_targets: torch.Tensor | None,
@@ -283,6 +423,8 @@ class AdaptiveWorkspaceOperatorBank(nn.Module):
         op_class[op_code.eq(6)] = self._SELECT
         op_class[op_code.eq(7)] = self._RANK
         op_class[op_code.eq(4)] = self._SORT
+        op_class[op_code.eq(8)] = self._SWAP
+        op_class[op_code.eq(9)] = self._REDUCE
 
         per_token_op = F.cross_entropy(
             operation_logits.float(),
@@ -309,6 +451,15 @@ class AdaptiveWorkspaceOperatorBank(nn.Module):
             op_loss = op_loss + 0.5 * (per_token_op * negative).sum() / negative.sum().clamp_min(1)
 
         losses = [op_loss]
+        reduce_target = teacher_targets[:, 8].long()
+        reduce_valid = positive & op_code.eq(9) & reduce_target.ge(0)
+        reduce_kind_loss = (
+            F.cross_entropy(
+                reduce_kind_logits.float(), reduce_target.clamp(0, 6), reduction="none"
+            )
+            * reduce_valid
+        ).sum() / reduce_valid.sum().clamp_min(1)
+        losses.append(reduce_kind_loss)
         diagnostics: dict[str, torch.Tensor] = {
             "teacher_operation_loss": op_loss.detach(),
             "teacher_operation_loss_count": valid.sum().detach(),
@@ -335,7 +486,7 @@ class AdaptiveWorkspaceOperatorBank(nn.Module):
                 positive & feature_off
             ).sum().detach(),
         }
-        operator_names = ("noop", "copy", "add_mod", "compare", "select", "rank", "sort")
+        operator_names = ("noop", "copy", "add_mod", "compare", "select", "rank", "sort", "swap", "reduce")
         diagnostics["teacher_events_noop_count"] = negative.sum().detach()
         diagnostics["teacher_op_loss_noop"] = (
             (per_token_op * negative).sum() / negative.sum().clamp_min(1)
@@ -351,7 +502,7 @@ class AdaptiveWorkspaceOperatorBank(nn.Module):
             diagnostics[f"teacher_op_loss_{name}_count"] = operator_valid.sum().detach()
         for column, value_logits in ((7, operand0_logits), (8, operand1_logits)):
             target = teacher_targets[:, column].long()
-            value_valid = positive & target.ge(0)
+            value_valid = positive & target.ge(0) & teacher_targets[:, 3 if column == 7 else 5].eq(1)
             safe_target = target.masked_fill(~value_valid, -100)
             per_item = F.cross_entropy(
                 value_logits.float(), safe_target, reduction="none", ignore_index=-100
@@ -400,7 +551,7 @@ class AdaptiveWorkspaceOperatorBank(nn.Module):
         diagnostics["teacher_feature_off_output_accuracy_count"] = feature_off_output0.sum().detach()
         if self.teacher_forced_operator_outputs and teacher_forced_output0_logits is not None:
             for class_index, name in enumerate(
-                ("copy", "add_mod", "compare", "select", "rank", "sort"), start=1
+                ("copy", "add_mod", "compare", "select", "rank", "sort", "swap", "reduce"), start=1
             ):
                 operator_output_valid = valid_output0 & op_class.eq(class_index)
                 diagnostics[f"teacher_operator_output_loss_{name}"] = (
@@ -507,6 +658,7 @@ class AdaptiveWorkspaceOperatorBank(nn.Module):
         state: torch.Tensor,
         context: torch.Tensor,
         backbone_context: torch.Tensor | None,
+        event_tokens: torch.Tensor,
         semantic_value_decoder: nn.Linear,
         active_mask: torch.Tensor,
         execution_mask: torch.Tensor,
@@ -538,6 +690,7 @@ class AdaptiveWorkspaceOperatorBank(nn.Module):
         if self.use_backbone_context:
             assert backbone_context is not None
             context_parts.append(backbone_context.float())
+        context_parts.append(self.event_proj(self.event_embedding(event_tokens[:, -6:]).flatten(1)).float())
         if self.split_context_norm:
             assert self.routed_context_norm is not None and self.slot_context_norm is not None
             normalized_parts = [
@@ -547,13 +700,15 @@ class AdaptiveWorkspaceOperatorBank(nn.Module):
             if self.use_backbone_context:
                 assert self.backbone_context_norm is not None
                 normalized_parts.append(self.backbone_context_norm(context_parts[2]))
+            normalized_parts.append(self.event_norm(context_parts[-1]))
             normalized_context = torch.cat(normalized_parts, dim=-1)
         else:
             normalized_context = self.controller_norm(torch.cat(context_parts, dim=-1))
         operation_logits = self.operation_router(normalized_context).float()
+        reduce_kind_logits = self.reduce_kind_head(normalized_context).float()
         operation_probabilities = operation_logits.softmax(dim=-1)
         binding_queries = self.binding_queries(normalized_context).view(
-            state.shape[0], 3, self.address_dim
+            state.shape[0], 4, self.address_dim
         )
         left_scores, left_weights = self._slot_attention(
             binding_queries[:, 0], address_state, occupied,
@@ -601,7 +756,7 @@ class AdaptiveWorkspaceOperatorBank(nn.Module):
         # The second result of the sort operator uses an independent learned
         # binding query derived from the same local state, with a disjoint
         # projection slice so the two write heads can learn distinct addresses.
-        destination1_query = binding_queries[:, 2] + binding_queries[:, 0]
+        destination1_query = binding_queries[:, 3]
         if self.entity_destinations:
             destination1_address_state = address_state
             destination1_occupied = occupied
@@ -642,13 +797,21 @@ class AdaptiveWorkspaceOperatorBank(nn.Module):
         right_value = torch.einsum("bs,bsd->bd", right_weights, content_state.float())
         operator_input = torch.cat((normalized_context, left_value, right_value), dim=-1)
 
-        operator_hidden = torch.einsum(
-            "bi,kir->bkr", operator_input, self.operator_down
+        raw_outputs = self._operator_bank_outputs(operator_input)
+        raw_outputs = raw_outputs.clone()
+        raw_outputs[:, self._SWAP - 1, 0] = raw_outputs[:, self._SWAP - 1, 0] + right_value
+        raw_outputs[:, self._SWAP - 1, 1] = raw_outputs[:, self._SWAP - 1, 1] + left_value
+        reduce_probs = self._reduce_distribution(
+            address_state, content_state, occupied, event_tokens,
+            semantic_value_decoder, reduce_kind_logits,
         )
-        operator_hidden = torch.tanh(operator_hidden + self.operator_bias.unsqueeze(0))
-        raw_outputs = torch.einsum(
-            "bkr,krd->bkd", operator_hidden, self.operator_up
-        ).view(state.shape[0], self._OPERATOR_COUNT, 2, self.d_model)
+        reduce_hard = F.one_hot(reduce_probs.argmax(-1), reduce_probs.shape[-1]).to(reduce_probs.dtype)
+        reduce_vec = (reduce_hard + reduce_probs - reduce_probs.detach()) @ semantic_value_decoder.weight.float()
+        reduce_vec = reduce_vec * (
+            1.0 / reduce_vec.detach().square().mean(-1, keepdim=True).sqrt().clamp_min(1e-6)
+        ).clamp(max=1.0)
+        raw_outputs[:, self._REDUCE - 1, 0] = reduce_vec
+        raw_outputs[:, self._REDUCE - 1, 1] = 0.0
         active_probabilities = operation_probabilities[:, 1:].unsqueeze(-1).unsqueeze(-1)
         mixed_outputs = (raw_outputs * active_probabilities).sum(dim=1)
         output0, output1 = mixed_outputs.unbind(dim=1)
@@ -675,7 +838,7 @@ class AdaptiveWorkspaceOperatorBank(nn.Module):
                             teacher_op_class.eq(5), self._COMPARE,
                             torch.where(
                                 teacher_op_class.eq(6), self._SELECT,
-                                torch.where(teacher_op_class.eq(7), self._RANK, self._SORT),
+                                torch.where(teacher_op_class.eq(7), self._RANK, torch.where(teacher_op_class.eq(8), self._SWAP, torch.where(teacher_op_class.eq(9), self._REDUCE, self._SORT))),
                             ),
                         ),
                     ),
@@ -699,6 +862,7 @@ class AdaptiveWorkspaceOperatorBank(nn.Module):
                 output1_logits=output1_logits,
                 operand0_logits=operand0_logits,
                 operand1_logits=operand1_logits,
+                reduce_kind_logits=reduce_kind_logits,
                 address_state=address_state,
                 occupied=occupied,
                 teacher_targets=teacher_targets,
@@ -727,7 +891,12 @@ class AdaptiveWorkspaceOperatorBank(nn.Module):
 
         if self.training:
             previous = self._last_training_diagnostics.get("operation_probability")
-            current = operation_probabilities.detach().mean(dim=0)
+            _w = active_mask.float().unsqueeze(-1)
+            _s = (operation_probabilities.detach() * _w).sum(0)
+            self._route_sum = _s if self._route_sum is None else self._route_sum + _s
+            self._route_n += float(active_mask.sum())
+            current = self._route_sum / max(self._route_n, 1.0)
+            previous = None
             self._last_training_diagnostics["operation_probability"] = (
                 current if previous is None else 0.5 * (previous + current)
             )
@@ -756,7 +925,7 @@ class AdaptiveWorkspaceOperatorBank(nn.Module):
         active_weight = (1.0 - operation_probabilities[:, 0]) * active.to(
             operation_probabilities.dtype
         )
-        sort_weight = operation_probabilities[:, self._SORT] * active.to(
+        sort_weight = (operation_probabilities[:, self._SORT] + operation_probabilities[:, self._SWAP]) * active.to(
             operation_probabilities.dtype
         )
         destination0_mass = active_weight.unsqueeze(-1) * destination0_weights
@@ -790,7 +959,7 @@ class AdaptiveWorkspaceOperatorBank(nn.Module):
                 destination0_allocate & active
             ).unsqueeze(-1).unsqueeze(-1) & destination0_weights.unsqueeze(-1).gt(0)
             destination1_new_mask = (
-                destination1_allocate & active & (operation_probabilities[:, self._SORT].gt(0))
+                destination1_allocate & active & ((operation_probabilities[:, self._SORT] + operation_probabilities[:, self._SWAP]).gt(0))
             ).unsqueeze(-1).unsqueeze(-1) & destination1_weights.unsqueeze(-1).gt(0)
             address = torch.where(
                 destination0_new_mask,

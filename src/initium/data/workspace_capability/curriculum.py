@@ -84,7 +84,8 @@ def difficulty_for(
         }
     elif track == "mixed_skill":
         config = {
-            "operations": (3, 4, 5, 6, 7, 8)[level],
+            "operations": (4, 5, 6, 7, 8, 8)[level],
+            # "operations": (8, 8, 8, 8, 8, 8)[level], # Revert it afterwards. This tests whether the operators can be learned and routed at all, independent of promotion.
             "keys": (4, 5, 6, 7, 8, 10)[level],
         }
     elif track == "rule_switching":
@@ -232,25 +233,73 @@ class WorkspaceCapabilityCurriculum:
         progression_groups = (self.dataset.last_eval_diagnostics or {}).get(
             "progression_groups", {}
         )
+        blockers = []
         groups_ready = True
         for track in self.dataset._tracks():
+            if track == "ignition":
+                continue
             required = self.dataset._curriculum_groups(track, self.lesson)
             actual = progression_groups.get(track, {})
+            for group in required:
+                metrics = actual.get(group)
+                if metrics is None:
+                    blockers.append(f"{track}/{group}=missing")
+                elif metrics["episodes"] < self.dataset.curriculum_eval_episodes_per_group:
+                    blockers.append(
+                        f"{track}/{group}={metrics['exact_match']:.1f}% "
+                        f"n={metrics['episodes']} "
+                        f"(needs n>={self.dataset.curriculum_eval_episodes_per_group})"
+                    )
+                elif metrics["exact_match"] / 100.0 < self.dataset.advance_threshold:
+                    blockers.append(
+                        f"{track}/{group}={metrics['exact_match']:.1f}% "
+                        f"n={metrics['episodes']}"
+                    )
             if any(
                 group not in actual
-                or actual[group]["episodes"] < 16
+                or actual[group]["episodes"] < self.dataset.curriculum_eval_episodes_per_group
                 or actual[group]["exact_match"] / 100.0 < self.dataset.advance_threshold
                 for group in required
             ):
                 groups_ready = False
-                break
-        all_tracks_ready = self.dataset.task_track not in {"all", "new_all", "gnw_all"} or (
+        multi_track_run = len(self.dataset._tracks()) > 1
+        all_tracks_ready = not multi_track_run or (
             len(per_track) == len(self.dataset._tracks())
             and all(
                 item["exact_match"] / 100.0 >= self.dataset.advance_threshold
-                for item in per_track.values()
+                for _t, item in per_track.items() if _t != "ignition"
             )
         )
+        if multi_track_run:
+            for track in self.dataset._tracks():
+                if track == "ignition":
+                    continue
+                metrics = per_track.get(track)
+                if metrics is None:
+                    blockers.append(f"{track}/overall=missing")
+                elif metrics["exact_match"] / 100.0 < self.dataset.advance_threshold:
+                    blockers.append(
+                        f"{track}/overall={metrics['exact_match']:.1f}% "
+                        f"n={metrics['episodes']}"
+                    )
+        if perfect / 100.0 < self.dataset.advance_threshold:
+            blockers.insert(
+                0,
+                f"overall={perfect:.1f}% "
+                f"n={(self.dataset.last_eval_diagnostics or {}).get('n_episodes', 0)}",
+            )
+        if allow_advance and self.lesson < len(self.table) - 1:
+            status = "ready" if not blockers else "blocked"
+            print(
+                f"[workspace-curriculum] lesson {self.lesson + 1} promotion {status}; "
+                f"threshold={self.dataset.advance_threshold * 100:.1f}% exact, "
+                f"episodes/group={self.dataset.curriculum_eval_episodes_per_group}"
+            )
+            for start in range(0, len(blockers), 6):
+                print(
+                    "[workspace-curriculum] blockers: "
+                    + " | ".join(blockers[start : start + 6])
+                )
         if (
             allow_advance
             and perfect / 100.0 >= self.dataset.advance_threshold

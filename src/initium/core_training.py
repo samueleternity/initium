@@ -849,6 +849,8 @@ def load_frozen_workspace_warm_start(
         "workspace_adaptive_v3_use_backbone_context",
         "workspace_adaptive_v3_teacher_forced_operator_outputs",
         "workspace_adaptive_v3_class_balanced_operator_loss",
+        "workspace_adaptive_v3_compile_operators",  # state-dict-compatible execution optimization
+        "workspace_compile_recurrence",  # execution backend only; checkpoint weights are compatible
         "workspace_adaptive_v3_distillation",
         "workspace_adaptive_v3_teacher_weight",
         "workspace_adaptive_v3_teacher_anneal_steps",
@@ -894,6 +896,7 @@ def load_frozen_workspace_warm_start(
         "workspace_token_id_input",  # exact input representation; parameters are shared
         "activation_offload_to_cpu",  # storage policy only; exact gradients are preserved
         "activation_offload_cpu_budget_mb",  # storage policy only
+        "workspace_track_homogeneous_batches",  # training batch scheduler only
         # Exact implementation-only optimization; old checkpoints default
         # to base and remain weight/state compatible with either backend.
         "dnc_implementation",
@@ -1174,6 +1177,7 @@ def run(
     workspace_adaptive_v3_always_feature_off_tracks: tuple[str, ...] = ("variable_binding",),
     workspace_adaptive_v3_holdout_tracks: tuple[str, ...] = (),
     workspace_adaptive_v3_eval_episodes_per_track: int = 128,
+    workspace_curriculum_eval_episodes_per_group: int = 16,
     workspace_adaptive_v3_usage_floor_weight: float = 0.0,
     workspace_adaptive_v3_readback_consistency_weight: float = 0.0,
     workspace_adaptive_v3_attention_temperature: float = 12.0,
@@ -1184,6 +1188,7 @@ def run(
     workspace_adaptive_v3_use_backbone_context: bool = False,
     workspace_adaptive_v3_teacher_forced_operator_outputs: bool = False,
     workspace_adaptive_v3_class_balanced_operator_loss: bool = False,
+    workspace_adaptive_v3_compile_operators: bool = False,
     workspace_adaptive_v3_learning_rate_scale: float = 2.0,
     workspace_adaptive_v3_logit_diagnostics: bool = False,
     workspace_compile_recurrence: bool = False,
@@ -1245,6 +1250,7 @@ def run(
     dataset_link: str | None = DATASET_LINK,
     test_dataset_link: str | None = None,
     workspace_task_track: str = "all",
+    workspace_track_homogeneous_batches: bool = False,
     workspace_semantic_state_diagnostics: bool = False,
     workspace_state_diagnostic_max_events: int = 16,
     workspace_state_loss_weight: float = 0.0,
@@ -1350,7 +1356,7 @@ def run(
         and workspace_semantic_entity_addressing
         and dataset_type == "workspace-capability"
         and str(workspace_task_track).lower().replace("-", "_")
-        in {"mixed_skill", "variable_binding", "new_all", "all"}
+        in {"mixed_skill", "variable_binding", "mixed_binding", "new_all", "all"}
     ):
         raise ValueError(
             "workspace operation executor requires workspace key-value readout, "
@@ -1506,6 +1512,27 @@ def run(
     )
     if getattr(dataset, "name", None) == "workspace-capability":
         dataset.token_id_input = bool(workspace_token_id_input)
+        dataset.v3_swap_operator = bool(workspace_adaptive_v3_enabled)
+        dataset.curriculum_eval_episodes_per_group = int(
+            workspace_curriculum_eval_episodes_per_group
+        )
+        dataset.track_homogeneous_batches = bool(workspace_track_homogeneous_batches)
+        selected_tracks = dataset._tracks()
+        if len(selected_tracks) > 1:
+            if dataset.track_homogeneous_batches:
+                print(
+                    f"[workspace-capability] track-homogeneous batches: {batch_size} "
+                    f"episodes from one track per optimizer step; tracks cycle every "
+                    f"{len(selected_tracks)} steps; padding utilization is logged"
+                )
+            else:
+                per_track_per_step = float(batch_size) / len(selected_tracks)
+                print(
+                    f"[workspace-capability] task exposure: {batch_size} episodes/batch "
+                    f"across {len(selected_tracks)} tracks = {per_track_per_step:.2f} "
+                    f"episodes/track/step on average; standalone batches provide "
+                    f"{len(selected_tracks)}x more examples per track"
+                )
         if not split_graph_enabled or split_graph_variant != "mamba1":
             raise ValueError("workspace-capability training requires split-graph Mamba-1")
         if memory_type not in {"none", "kv"}:
@@ -1911,6 +1938,16 @@ def run(
             "cannot resume a workspace-capability checkpoint with a different task track: "
             f"checkpoint={checkpoint_config.get('workspace_task_track')!r}, "
             f"requested={dataset.task_track!r}"
+        )
+    if (
+        resume_requested
+        and getattr(dataset, "name", None) == "workspace-capability"
+        and bool(checkpoint_config.get("workspace_track_homogeneous_batches", False))
+        != bool(workspace_track_homogeneous_batches)
+    ):
+        raise ValueError(
+            "cannot resume a workspace-capability run with a different "
+            "track-homogeneous batch schedule"
         )
     revised_gnw_tracks = {
         "all",
@@ -3822,6 +3859,9 @@ def run(
             workspace_adaptive_v3_class_balanced_operator_loss=(
                 workspace_adaptive_v3_class_balanced_operator_loss
             ),
+            workspace_adaptive_v3_compile_operators=(
+                workspace_adaptive_v3_compile_operators
+            ),
             workspace_compile_recurrence=workspace_compile_recurrence,
             workspace_sparse_recurrence=workspace_sparse_recurrence,
             workspace_attentional_item_memory=workspace_attentional_item_memory,
@@ -4145,7 +4185,8 @@ def run(
                     f"split_context_norm={workspace_adaptive_v3_split_context_norm} | "
                     f"backbone_context={workspace_adaptive_v3_use_backbone_context} | "
                     f"teacher_forced_outputs={workspace_adaptive_v3_teacher_forced_operator_outputs} | "
-                    f"balanced_op_loss={workspace_adaptive_v3_class_balanced_operator_loss}"
+                    f"balanced_op_loss={workspace_adaptive_v3_class_balanced_operator_loss} | "
+                    f"compiled_operators={workspace_adaptive_v3_compile_operators}"
                 )
         else:
             print(
@@ -4161,6 +4202,9 @@ def run(
         "dataset_type": dataset_type,
         "dataset_name": dataset.name,
         "workspace_task_track": getattr(dataset, "task_track", None),
+        "workspace_track_homogeneous_batches": bool(
+            getattr(dataset, "track_homogeneous_batches", False)
+        ),
         "workspace_gnw_task_design_version": getattr(
             dataset, "gnw_task_design_version", None
         ),
@@ -4242,6 +4286,7 @@ def run(
         "workspace_adaptive_v3_use_backbone_context": workspace_adaptive_v3_use_backbone_context,
         "workspace_adaptive_v3_teacher_forced_operator_outputs": workspace_adaptive_v3_teacher_forced_operator_outputs,
         "workspace_adaptive_v3_class_balanced_operator_loss": workspace_adaptive_v3_class_balanced_operator_loss,
+        "workspace_adaptive_v3_compile_operators": workspace_adaptive_v3_compile_operators,
         "workspace_adaptive_v3_distillation": workspace_adaptive_v3_distillation,
         "workspace_adaptive_v3_teacher_weight": workspace_adaptive_v3_teacher_weight,
         "workspace_adaptive_v3_teacher_anneal_steps": workspace_adaptive_v3_teacher_anneal_steps,
@@ -5257,6 +5302,9 @@ def run(
     running_retrieval_query_slots: Any = 0.0
     running_log_steps = 0
     running_eval_seconds = 0.0
+    running_v3_candidate_tokens = 0
+    running_v3_executed_tokens = 0
+    running_v3_candidate_steps = 0
     last_train_sgr_signal_diagnostics: dict[str, torch.Tensor] = {}
     workspace_reconsideration_window: dict[str, torch.Tensor] | None = None
     if workspace_telemetry_enabled and workspace_reconsideration_enabled:
@@ -5363,6 +5411,8 @@ def run(
             # Anomaly detection must be enabled before this step's forward so
             # PyTorch can retain the originating stack for backward failures.
             torch.autograd.set_detect_anomaly(True, check_nan=True)
+        if getattr(dataset, "name", None) == "workspace-capability":
+            dataset.training_step = step
         batch = dataset.sample_batch(curriculum, batch_size)
         if len(batch) == 3:
             input_seq, target_digits, answer_mask = batch
@@ -5425,6 +5475,21 @@ def run(
                 else value
                 for key, value in workspace_metadata.items()
             }
+            if workspace_sparse_recurrence:
+                # Keep sparse-index discovery on CPU. The old workspace path
+                # called CUDA nonzero().tolist() every forward, synchronizing
+                # the device before it could begin the sequential loop.
+                sparse_steps = set(
+                    int(index)
+                    for index in workspace_metadata["entity_write_mask"]
+                    .any(dim=0)
+                    .nonzero(as_tuple=False)
+                    .flatten()
+                    .tolist()
+                )
+                workspace_forward_kwargs["workspace_sparse_active_steps"] = tuple(
+                    sorted(sparse_steps)
+                )
         if workspace_key_value_loss_weight > 0:
             key_value_metadata = {
                 key: value.to(device, non_blocking=True)
@@ -5449,6 +5514,12 @@ def run(
                     token_rows=workspace_token_rows,
                 ).items()
             }
+            v3_batch_work = getattr(dataset, "last_adaptive_v3_batch_stats", {}).get(
+                "__totals__", {}
+            )
+            running_v3_candidate_tokens += int(v3_batch_work.get("candidate_tokens", 0))
+            running_v3_executed_tokens += int(v3_batch_work.get("executed_tokens", 0))
+            running_v3_candidate_steps += int(v3_batch_work.get("candidate_steps", 0))
             workspace_forward_kwargs.update(
                 {
                     "key_value_entity_ids": key_value_metadata["key_value_entity_ids"],
@@ -5456,6 +5527,29 @@ def run(
                     "key_value_steps": key_value_metadata["key_value_steps"],
                 }
             )
+            if workspace_sparse_recurrence:
+                sparse_steps = set(
+                    workspace_forward_kwargs.get("workspace_sparse_active_steps", ())
+                )
+                for step_key in (
+                    "key_value_steps",
+                    "operation_steps",
+                    "adaptive_operator_steps",
+                    "adaptive_operator_teacher_steps",
+                    "pair_swap_steps",
+                    "permutation_query_steps",
+                    "state_supervision_steps",
+                    "nth_farthest_vector_steps",
+                    "nth_farthest_query_steps",
+                    "retrieval_value_steps",
+                    "retrieval_query_steps",
+                    "attentional_frame_steps",
+                    "attentional_cue_readout_steps",
+                ):
+                    sparse_steps.update(workspace_forward_kwargs.get(step_key, ()))
+                workspace_forward_kwargs["workspace_sparse_active_steps"] = tuple(
+                    sorted(int(value) for value in sparse_steps)
+                )
             if workspace_operation_executor:
                 workspace_forward_kwargs.update(
                     {
@@ -5476,6 +5570,9 @@ def run(
                         ],
                         "adaptive_operator_steps": key_value_metadata[
                             "adaptive_operator_steps"
+                        ],
+                        "adaptive_operator_teacher_steps": key_value_metadata[
+                            "adaptive_operator_teacher_steps"
                         ],
                         "adaptive_operator_teacher_weight": (
                             adaptive_v3_teacher_weight_for_step
@@ -6494,8 +6591,12 @@ def run(
 
         if running_log_steps >= log_every:
             window_steps = running_log_steps
-            elapsed = time.time() - t0
-            t0 = time.time()
+            # CUDA launches are asynchronous. Synchronize at the measurement
+            # boundary, then report training throughput with periodic
+            # evaluation time removed (evaluation remains reported separately).
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            elapsed = max(time.time() - t0 - running_eval_seconds, 1e-9)
             total_elapsed = time.time() - t_run_start  # log addition #5
             avg_task = (
                 running_task_loss.item()
@@ -6668,6 +6769,12 @@ def run(
                 f"[{run_id}] Step {step}/{total_steps} | Lesson {curriculum.lesson + 1}/{len(curriculum.table)}",
                 f"L_task {avg_task:.4f}",
             ]
+            if getattr(dataset, "name", None) == "workspace-capability":
+                parts.append(
+                    f"seq_max/mean {dataset.last_batch_sequence_max}/"
+                    f"{dataset.last_batch_sequence_mean:.1f} "
+                    f"batch_pad_util {dataset.last_batch_padding_utilization:.1%}"
+                )
             if avg_workspace_state_loss is not None:
                 parts.append(
                     f"L_ws_state {avg_workspace_state_loss:.4f} "
@@ -6780,9 +6887,19 @@ def run(
                 ]
                 if context_diagnostics:
                     parts.append(f"adaptive_v3_context[{','.join(context_diagnostics)}]")
+                candidate_events = [
+                    f"{label}:{value}"
+                    for label, value in (
+                        ("tokens", running_v3_candidate_tokens),
+                        ("executed", running_v3_executed_tokens),
+                        ("steps", running_v3_candidate_steps),
+                    )
+                ]
+                if candidate_events:
+                    parts.append(f"adaptive_v3_events[{','.join(candidate_events)}]")
                 operation_probability = v3_diagnostics.get("operation_probability")
                 if operation_probability is not None:
-                    route_names = ("noop", "copy", "add_mod", "compare", "select", "rank", "sort")
+                    route_names = ("noop", "copy", "add_mod", "compare", "select", "rank", "sort", "swap", "reduce")
                     route_summary = ",".join(
                         f"{name}:{float(value):.2f}"
                         for name, value in zip(route_names, operation_probability)
@@ -6827,13 +6944,13 @@ def run(
                 teacher_operator_loss_parts = [
                     f"{name}:{float(v3_diagnostics[f'teacher_op_loss_{name}']):.3f}/"
                     f"{int(v3_diagnostics[f'teacher_op_loss_{name}_count'].item())}"
-                    for name in ("noop", "copy", "add_mod", "compare", "select", "rank", "sort")
+                    for name in ("noop", "copy", "add_mod", "compare", "select", "rank", "sort", "swap", "reduce")
                     if f"teacher_op_loss_{name}" in v3_diagnostics
                 ]
                 teacher_operator_output_parts = [
                     f"{name}:{float(v3_diagnostics[f'teacher_operator_output_loss_{name}']):.3f}/"
                     f"{int(v3_diagnostics[f'teacher_operator_output_loss_{name}_count'].item())}"
-                    for name in ("copy", "add_mod", "compare", "select", "rank", "sort")
+                    for name in ("copy", "add_mod", "compare", "select", "rank", "sort", "swap", "reduce")
                     if f"teacher_operator_output_loss_{name}" in v3_diagnostics
                 ]
                 if teacher_loss_parts or teacher_accuracy_parts:
@@ -7233,8 +7350,15 @@ def run(
             running_retrieval_query_slots = 0.0
             running_log_steps = 0
             running_eval_seconds = 0.0
+            running_v3_candidate_tokens = 0
+            running_v3_executed_tokens = 0
+            running_v3_candidate_steps = 0
             running_postclip_grad_norm = 0.0
             running_finite_grad_steps = 0
+            # Start the next wall-clock window after logging and its host-side
+            # scalar formatting, so console/CSV output does not look like a
+            # model-throughput regression.
+            t0 = time.time()
             running_nonfinite_grad_steps = 0
             running_clipped_grad_steps = 0
             if workspace_reconsideration_window is not None:
@@ -8820,6 +8944,15 @@ if __name__ == "__main__":
         default=False,
         help="Average operation-selection teacher loss per represented operation class.",
     )
+    parser.add_argument(
+        "--workspace-autoadaptive-v3-compile-operators",
+        action="store_true",
+        help=(
+            "Compile V3's pure low-rank operator-bank projection with torch.compile "
+            "on first CUDA use; falls back to the equivalent eager kernel if Inductor "
+            "cannot compile it. Can add startup latency; compare steady-state steps/s."
+        ),
+    )
     parser.add_argument("--workspace-autoadaptive-v3-learning-rate-scale", type=float, default=2.0)
     parser.add_argument(
         "--workspace-autoadaptive-v3-logit-diagnostics",
@@ -8831,6 +8964,15 @@ if __name__ == "__main__":
         type=int,
         default=128,
         help="Paired V3-on/off evaluation episodes per feature-off track.",
+    )
+    parser.add_argument(
+        "--workspace-curriculum-eval-episodes-per-group",
+        type=int,
+        default=16,
+        help=(
+            "Balanced episodes per required track/stratum used by curriculum "
+            "promotion checks; use 128 or more when diagnosing a multi-track stall."
+        ),
     )
     parser.add_argument(
         "--eval-workspace-adaptive-bypass",
@@ -9589,6 +9731,7 @@ if __name__ == "__main__":
             "all",
             "new_all",
             "gnw_all",
+            "mixed_binding",
             "permutation",
             "entity_state",
             "relational_join",
@@ -9612,8 +9755,18 @@ if __name__ == "__main__":
         help=(
             "Track for --dataset-type workspace-capability. 'all' balances all eighteen "
             "tracks; 'new_all' balances the six added capability tracks; 'gnw_all' "
-            "balances the eight GNW functional probes. Multi-track batches "
+            "balances the eight GNW functional probes; 'mixed_binding' balances only "
+            "mixed_skill and variable_binding for a focused interference check. Multi-track batches "
             "include each selected track when batch size is large enough."
+        ),
+    )
+    parser.add_argument(
+        "--workspace-track-homogeneous-batches",
+        action="store_true",
+        help=(
+            "For multi-track workspace-capability training, fill each optimizer "
+            "batch from one track and cycle tracks by step. This can reduce sequence "
+            "padding; it changes per-step task mixing and is an experimental opt-in."
         ),
     )
     parser.add_argument(
@@ -9734,7 +9887,7 @@ if __name__ == "__main__":
             parser.error(
                 "workspace-capability is generated on demand; dataset links/prepared data are unsupported"
             )
-    elif args.workspace_task_track not in ("all", "new_all", "gnw_all"):
+    elif args.workspace_task_track not in ("all", "new_all", "gnw_all", "mixed_binding"):
         parser.error("--workspace-task-track requires --dataset-type workspace-capability")
     if args.workspace_token_id_input and args.dataset_type != "workspace-capability":
         parser.error("--workspace-token-id-input requires --dataset-type workspace-capability")
@@ -10018,6 +10171,8 @@ if __name__ == "__main__":
         and args.workspace_key_value_loss_weight > 0
     ):
         parser.error("--workspace-autoadaptive-v3 requires split-graph, at least 64 slots, semantic entity addressing, and positive key-value loss")
+    if args.workspace_autoadaptive_v3_compile_operators and not args.workspace_autoadaptive_v3:
+        parser.error("--workspace-autoadaptive-v3-compile-operators requires --workspace-autoadaptive-v3")
     if args.workspace_autoadaptive_v3_rank < 1:
         parser.error("--workspace-autoadaptive-v3-rank must be positive")
     if args.workspace_autoadaptive_v3_teacher_anneal_steps < 0:
@@ -10030,6 +10185,8 @@ if __name__ == "__main__":
         parser.error("--workspace-autoadaptive-v3-teacher-accuracy-threshold must be in [0, 1]")
     if args.workspace_autoadaptive_v3_eval_episodes_per_track < 1:
         parser.error("--workspace-autoadaptive-v3-eval-episodes-per-track must be positive")
+    if args.workspace_curriculum_eval_episodes_per_group < 1:
+        parser.error("--workspace-curriculum-eval-episodes-per-group must be positive")
     if not 0 <= args.workspace_autoadaptive_v3_feature_off_probability <= 1:
         parser.error("--workspace-autoadaptive-v3-feature-off-probability must be in [0, 1]")
     if args.workspace_autoadaptive_v2_num_skills < 2:
@@ -10652,7 +10809,13 @@ if __name__ == "__main__":
             run_id = f"{run_id}_ds{args.dataset_type}"
         if args.dataset_type == "workspace-capability":
             run_id += f"_track{args.workspace_task_track}"
-            if args.workspace_task_track in ("all", "gnw_all", "new_all", "mixed_skill"):
+            if args.workspace_track_homogeneous_batches:
+                run_id += "_trackbatch"
+            if args.workspace_autoadaptive_v3_compile_operators:
+                run_id += "_v3compile"
+            if args.workspace_task_track in (
+                "all", "gnw_all", "new_all", "mixed_skill", "mixed_binding"
+            ):
                 run_id += "_mixedops6"
         if args.sgr_pred_loss_weight > 0:
             pred_weight_tag = f"{args.sgr_pred_loss_weight:g}".replace(".", "p")
@@ -10771,6 +10934,9 @@ if __name__ == "__main__":
             workspace_adaptive_v3_always_feature_off_tracks=tuple(args.workspace_autoadaptive_v3_always_feature_off_tracks),
             workspace_adaptive_v3_holdout_tracks=tuple(args.workspace_autoadaptive_v3_holdout_tracks),
             workspace_adaptive_v3_eval_episodes_per_track=args.workspace_autoadaptive_v3_eval_episodes_per_track,
+            workspace_curriculum_eval_episodes_per_group=(
+                args.workspace_curriculum_eval_episodes_per_group
+            ),
             workspace_adaptive_v3_usage_floor_weight=args.workspace_autoadaptive_v3_usage_floor_weight,
             workspace_adaptive_v3_readback_consistency_weight=args.workspace_autoadaptive_v3_readback_consistency_weight,
             workspace_adaptive_v3_attention_temperature=(
@@ -10796,6 +10962,9 @@ if __name__ == "__main__":
             ),
             workspace_adaptive_v3_class_balanced_operator_loss=(
                 args.workspace_autoadaptive_v3_class_balanced_operator_loss
+            ),
+            workspace_adaptive_v3_compile_operators=(
+                args.workspace_autoadaptive_v3_compile_operators
             ),
             workspace_adaptive_v3_learning_rate_scale=args.workspace_autoadaptive_v3_learning_rate_scale,
             workspace_adaptive_v3_logit_diagnostics=args.workspace_autoadaptive_v3_logit_diagnostics,
@@ -10860,6 +11029,9 @@ if __name__ == "__main__":
             dataset_link=args.dataset_link,
             test_dataset_link=args.test_dataset_link,
             workspace_task_track=args.workspace_task_track,
+            workspace_track_homogeneous_batches=(
+                args.workspace_track_homogeneous_batches
+            ),
             workspace_semantic_state_diagnostics=args.workspace_semantic_state_diagnostics,
             workspace_state_diagnostic_max_events=args.workspace_state_diagnostic_max_events,
             workspace_state_loss_weight=args.workspace_state_loss_weight,

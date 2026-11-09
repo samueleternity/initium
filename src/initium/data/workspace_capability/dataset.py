@@ -123,8 +123,9 @@ GNW_TRACKS = (
     "sustained_maintenance", "no_report_confidence", "bistable_perception", "trace_conditioning",
 )
 GNW_ALL_TRACK = "gnw_all"
+MIXED_BINDING_TRACK = "mixed_binding"
 GNW_TASK_DESIGN_VERSION = 2
-MULTI_TRACKS = {ALL_TRACK, NEW_ALL_TRACK, GNW_ALL_TRACK}
+MULTI_TRACKS = {ALL_TRACK, NEW_ALL_TRACK, GNW_ALL_TRACK, MIXED_BINDING_TRACK}
 # Optional task-specific pathways whose causal contribution can be tested at
 # evaluation time. Attribute names are deliberately model-facing so the
 # evaluator only toggles mechanisms that are present and enabled in a run.
@@ -166,6 +167,8 @@ _WORKSPACE_OPERATION_CODES = {
     "compare": 5,
     "select": 6,
     "rank": 7,
+    "swap": 8,
+    "reduce": 9,
 }
 _WORKSPACE_OPERATION_NAMES = {
     1: "lookup",
@@ -175,9 +178,12 @@ _WORKSPACE_OPERATION_NAMES = {
     5: "compare",
     6: "select",
     7: "rank",
+    8: "swap",
+    9: "reduce",
 }
 _WORKSPACE_OPERAND_KEY = 1
 _WORKSPACE_OPERAND_LITERAL = 2
+_REDUCE_RESULT_KEY = 63
 _ENTITY_ADDRESS_EVENT_TOKENS = {
     "capacity_bottleneck": {EV_INIT, EV_MOVE, EV_UPDATE},
     "rule_switching": {EV_ASSERT, EV_VECTOR},
@@ -207,14 +213,24 @@ class WorkspaceCapabilityDataset(BaseDataset):
 
     def __init__(self, task_track: str = ALL_TRACK, *, batch_size_hint: int = 16):
         task_track = (task_track or ALL_TRACK).lower().replace("-", "_")
-        if task_track not in (*TRACKS, ALL_TRACK, NEW_ALL_TRACK, GNW_ALL_TRACK):
+        if task_track not in (*TRACKS, ALL_TRACK, NEW_ALL_TRACK, GNW_ALL_TRACK, MIXED_BINDING_TRACK):
             raise ValueError(
                 "unknown workspace task track "
-                f"{task_track!r}; choose one of {(*TRACKS, ALL_TRACK, NEW_ALL_TRACK, GNW_ALL_TRACK)}"
+                f"{task_track!r}; choose one of "
+                f"{(*TRACKS, ALL_TRACK, NEW_ALL_TRACK, GNW_ALL_TRACK, MIXED_BINDING_TRACK)}"
             )
         self.task_track = task_track
         self.gnw_task_design_version = GNW_TASK_DESIGN_VERSION
         self.batch_size_hint = max(1, int(batch_size_hint))
+        # Promotion checks remain inexpensive by default. Runs that are
+        # diagnosing multi-track stalls can raise this to 128+ so each
+        # required progression stratum has a stable estimate.
+        self.curriculum_eval_episodes_per_group = 16
+        self.track_homogeneous_batches = False
+        self.training_step = 0
+        self.last_batch_padding_utilization = 1.0
+        self.last_batch_sequence_mean = 0.0
+        self.last_batch_sequence_max = 0
         self._output_proj = None
         self.token_id_input = False
         self.last_batch_examples: list[TaskEpisode] = []
@@ -239,6 +255,8 @@ class WorkspaceCapabilityDataset(BaseDataset):
             return NEW_TRACKS
         if self.task_track == GNW_ALL_TRACK:
             return GNW_TRACKS
+        if self.task_track == MIXED_BINDING_TRACK:
+            return ("mixed_skill", "variable_binding")
         return (self.task_track,)
 
     @staticmethod
@@ -279,9 +297,15 @@ class WorkspaceCapabilityDataset(BaseDataset):
         return ("all",)
 
     def _make_curriculum_eval_episodes(
-        self, lesson_idx: int, rng: random.Random, episodes_per_group: int = 16
+        self,
+        lesson_idx: int,
+        rng: random.Random,
+        episodes_per_group: int | None = None,
     ) -> list[TaskEpisode]:
         """Build a balanced, bounded evaluation set for promotion and ablations."""
+        if episodes_per_group is None:
+            episodes_per_group = self.curriculum_eval_episodes_per_group
+        episodes_per_group = max(1, int(episodes_per_group))
         episodes: list[TaskEpisode] = []
         for track in self._tracks():
             required = self._curriculum_groups(track, lesson_idx)
@@ -311,7 +335,18 @@ class WorkspaceCapabilityDataset(BaseDataset):
         episodes = self._make_curriculum_eval_episodes(int(lesson_idx), rng)
         self._last_id_eval_lesson = int(lesson_idx)
         self._last_id_eval_episodes = episodes
-        return self._evaluate_episodes(model, device, episodes, field_log=field_log)
+        result = self._evaluate_episodes(model, device, episodes, field_log=field_log)
+        _t = (self.last_eval_diagnostics or {}).get("tracks", {})
+        # self._track_weights = {t: 0.1 + max(0.0, 1.0 - m["exact_match"] / 100.0) for t, m in _t.items()}
+        self._track_weights = {t: 0.05 for t in _t}
+        _cand = [t for t in _t if t not in ("ignition", "masked_priming")]  # noise-ceiling tracks
+        if _cand:
+            _worst = min(_cand, key=lambda t: _t[t]["exact_match"])
+            self._track_weights[_worst] = 0.05 * (len(_t) - 1)  # ~50% of steps
+        for _t_name in ("ignition", "masked_priming"):
+            if _t_name in self._track_weights:
+                self._track_weights[_t_name] = 0.02
+        return result
 
     def _paired_id_episodes(self, lesson_idx: int) -> list[TaskEpisode]:
         if self._last_id_eval_lesson == int(lesson_idx) and self._last_id_eval_episodes:
@@ -399,13 +434,32 @@ class WorkspaceCapabilityDataset(BaseDataset):
             raise ValueError("batch_size must be >= 1")
         level = int(curriculum.lesson)
         tracks = self._tracks()
-        # Cycle through the track list so each track is represented evenly over
-        # batches; every track appears in each batch when batch_size >= len(tracks).
-        start_track = random.randrange(len(tracks))
-        selected_tracks = [tracks[(start_track + i) % len(tracks)] for i in range(batch_size)]
-        random.shuffle(selected_tracks)
+        if self.track_homogeneous_batches and len(tracks) > 1:
+            # Keep all examples in an optimizer batch on one track. The track
+            # cycles by global optimizer step, so a resumed run preserves the
+            # schedule. This avoids padding every task to the longest episode
+            # in a mixed batch while keeping long-run track exposure balanced.
+            _w = getattr(self, "_track_weights", None)
+            selected_track = (
+                random.choices(tracks, [_w.get(t, 1.0) for t in tracks])[0]
+                if _w
+                else tracks[int(self.training_step) % len(tracks)]
+            )
+            selected_tracks = [selected_track] * batch_size
+        else:
+            # Cycle through tracks so their long-run share remains balanced;
+            # every track appears in each batch when batch_size >= track count.
+            start_track = random.randrange(len(tracks))
+            selected_tracks = [tracks[(start_track + i) % len(tracks)] for i in range(batch_size)]
+            random.shuffle(selected_tracks)
         episodes = [self._make_episode(track, level, random) for track in selected_tracks]
         self.last_batch_examples = episodes
+        lengths = [len(episode.sequence) for episode in episodes]
+        self.last_batch_sequence_mean = sum(lengths) / len(lengths)
+        self.last_batch_sequence_max = max(lengths)
+        valid_tokens = sum(lengths)
+        padded_tokens = batch_size * self.last_batch_sequence_max
+        self.last_batch_padding_utilization = valid_tokens / max(padded_tokens, 1)
         return self._collate(episodes, token_ids_only=self.token_id_input)
 
     @staticmethod
@@ -584,7 +638,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
                         if swap_entities_seen == 2:
                             phase = "swap_done"
                     elif phase == "commit" and commit_entities_seen < 2:
-                        if not paired_swap_commits:
+                        if not (paired_swap_commits or getattr(self, "v3_swap_operator", False)):
                             write_mask[row, position] = True
                         pending_commit_entities.append(entity_id)
                         commit_entities_seen += 1
@@ -1273,14 +1327,16 @@ class WorkspaceCapabilityDataset(BaseDataset):
     @staticmethod
     def _workspace_operation_events(episode: TaskEpisode, tokens: list[int]):
         """Parse supported input programs and simulate labels for sparse loss only."""
-        if episode.track not in ("mixed_skill", "variable_binding"):
+        if episode.track == "retrieval_aggregation":
+            return WorkspaceCapabilityDataset._retrieval_reduce_records(episode, tokens)
+        if episode.track not in ("mixed_skill", "variable_binding", "permutation"):
             return ()
         current_values: dict[int, int] = {}
         records = []
         index = 0
         while index < len(episode.inputs):
             event = int(tokens[index])
-            if event not in (EV_INIT, EV_UPDATE, EV_KV, EV_VECTOR):
+            if event not in (EV_INIT, EV_UPDATE, EV_KV, EV_VECTOR, EV_SWAP):
                 index += 1
                 continue
             end = index + 1
@@ -1300,6 +1356,21 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 if SCALAR_BASE <= value < SCALAR_BASE + SCALAR_COUNT
             ]
             step = end
+            if episode.track == "permutation":
+                if event == EV_INIT and entity_fields:
+                    loc = next((v for v in fields if LOCATION_BASE <= v < LOCATION_BASE + LOCATION_COUNT), None)
+                    if loc is not None:
+                        current_values[entity_fields[0]] = loc
+                elif event == EV_SWAP and len(entity_fields) >= 2:
+                    left, right = entity_fields[:2]
+                    lv, rv = current_values[left], current_values[right]
+                    records.append(
+                        (step, "swap", left, right, (_WORKSPACE_OPERAND_KEY, left),
+                         (_WORKSPACE_OPERAND_KEY, right), (rv, lv), (lv, rv))
+                    )
+                    current_values[left], current_values[right] = rv, lv
+                index = end + 1
+                continue
             if episode.track == "mixed_skill":
                 if event == EV_KV and entity_fields and scalar_fields:
                     current_values[entity_fields[0]] = scalar_fields[0]
@@ -1428,6 +1499,22 @@ class WorkspaceCapabilityDataset(BaseDataset):
             index = end + 1
         return tuple(records)
 
+
+    @staticmethod
+    def _retrieval_reduce_records(episode, tokens):
+        """Reduce teacher record for retrieval aggregate queries (sum/count_even/parity)."""
+        n = len(episode.inputs)
+        q = next((i for i in range(n) if int(tokens[i]) == QUERY), None)
+        kinds = {EV_SUM_QUERY: 0, EV_COUNT_QUERY: 1, EV_PARITY_QUERY: 2}
+        if q is None or q + 1 >= n or int(tokens[q + 1]) not in kinds:
+            return ()
+        return (
+            (
+                n - 1, "reduce", _REDUCE_RESULT_KEY, -1, (0, -1), (0, -1),
+                (int(episode.answer[0]),), (-100, kinds[int(tokens[q + 1])]),
+            ),
+        )
+
     @staticmethod
     def _rule_feedback_targets(episode: TaskEpisode, tokens: list[int]) -> tuple[int, ...]:
         """Infer a current rule from visible cues and noisy choice feedback only."""
@@ -1521,7 +1608,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
         if len(examples) != batch:
             raise RuntimeError("workspace key-value metadata lost batch/episode alignment")
         operand_capacity = (
-            KEY_VALUE_OPERAND_CAPACITY if no_report_confidence_readout else 4
+            KEY_VALUE_OPERAND_CAPACITY
         )
         entity_meta = entity_metadata or self.workspace_entity_address_metadata(
             input_vectors,
@@ -1559,6 +1646,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
             torch.ones((batch, time), dtype=torch.bool) if include_adaptive_v3 else None
         )
         adaptive_steps: set[int] = set()
+        adaptive_teacher_steps: set[int] = set()
         adaptive_v3_batch_stats: dict[str, dict[str, int]] = defaultdict(
             lambda: {
                 "episodes": 0,
@@ -1570,6 +1658,8 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 "compare": 0,
                 "select": 0,
                 "rank": 0,
+                "swap": 0,
+                "reduce": 0,
             }
         )
         operation_diagnostic_targets = (
@@ -1580,6 +1670,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
         operation_steps: set[int] = set()
         read_steps: set[int] = set()
         output_program_specs: list[tuple[int, int, str, int]] = []
+        argmatch_locations: dict[tuple[int, int], int] = {}
 
         for row, (episode, tokens, event_keys, event_writes) in enumerate(
             zip(examples, token_rows, entity_rows, write_rows)
@@ -1588,7 +1679,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
             operation_records = (
                 self._workspace_operation_events(episode, tokens)
                 if include_operations
-                or (include_adaptive_v3 and adaptive_v3_distillation)
+                or include_adaptive_v3
                 else ()
             )
             feature_off = bool(
@@ -1613,7 +1704,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 pending_operator_event = False
                 for candidate_step, token_value in enumerate(tokens[: min(time, len(episode.inputs))]):
                     token = int(token_value)
-                    if token in (EV_INIT, EV_MOVE, EV_UPDATE, EV_ASSERT, EV_KV, EV_VECTOR):
+                    if token in (EV_INIT, EV_MOVE, EV_UPDATE, EV_ASSERT, EV_KV, EV_VECTOR, EV_SWAP, QUERY):
                         pending_operator_event = True
                     elif token == SEP and pending_operator_event:
                         adaptive_candidate_mask[row, candidate_step] = True
@@ -1621,12 +1712,14 @@ class WorkspaceCapabilityDataset(BaseDataset):
                         pending_operator_event = False
                 if (
                     adaptive_teacher_targets is not None
-                    and episode.track in ("mixed_skill", "variable_binding")
                     and episode.track not in adaptive_v3_holdout_tracks
                 ):
                     adaptive_teacher_targets[row, adaptive_candidate_mask[row], 0] = 0
                     adaptive_teacher_targets[row, adaptive_candidate_mask[row], 11] = int(
                         feature_off
+                    )
+                    adaptive_teacher_steps.update(
+                        adaptive_candidate_mask[row].nonzero(as_tuple=False).flatten().tolist()
                     )
                 if feature_off and adaptive_execution_mask is not None:
                     adaptive_execution_mask[row] = True
@@ -1659,13 +1752,13 @@ class WorkspaceCapabilityDataset(BaseDataset):
                     ),
                     dtype=torch.long,
                 )
-                if feature_off:
+                if feature_off or operation == "reduce":
                     operation_metadata[row, step, 0] = 0
                 elif include_operations and adaptive_execution_mask is not None:
                     adaptive_execution_mask[row, step] = False
                 if (
                     adaptive_teacher_targets is not None
-                    and episode.track in ("mixed_skill", "variable_binding")
+                    and episode.track in ("mixed_skill", "variable_binding", "permutation", "retrieval_aggregation")
                     and episode.track not in adaptive_v3_holdout_tracks
                 ):
                     op_code = _WORKSPACE_OPERATION_CODES[operation]
@@ -1712,6 +1805,13 @@ class WorkspaceCapabilityDataset(BaseDataset):
             payload = -100
             source_payload = -1
             rule_trial = 0
+            for _r in operation_records:
+                _a = len(episode.inputs)
+                if _r[1] == "reduce" and _a < time:
+                    key_ids[row, _a, 0] = _REDUCE_RESULT_KEY
+                    targets[row, _a, 0] = int(_r[6][0])
+                    masks[row, _a, 0] = True
+                    read_steps.add(_a)
             rule_feedback_targets = (
                 self._rule_feedback_targets(episode, tokens)
                 if rule_feedback_update and episode.track == "rule_switching"
@@ -1761,6 +1861,8 @@ class WorkspaceCapabilityDataset(BaseDataset):
                     source_payload = token
                 elif LOCATION_BASE <= token < LOCATION_BASE + LOCATION_COUNT:
                     payload = token
+                    if episode.track == "permutation" and event_writes[position]:
+                        per_step.setdefault(position, []).append((int(event_keys[position]), token))
                 elif SCALAR_BASE <= token < SCALAR_BASE + SCALAR_COUNT:
                     payload = token
                     if (
@@ -1917,6 +2019,8 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 targets[row, step, : len(expected_values)] = torch.tensor(expected_values)
                 masks[row, step, : len(answer_keys)] = True
                 output_program_specs.append((row, step, str(operation), len(answer_keys)))
+                if operation == "argmatch":
+                    argmatch_locations[(row, step)] = int(tokens[len(episode.inputs) - 2])
                 read_steps.add(step)
 
         result = {
@@ -1925,6 +2029,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
             "key_value_mask": masks,
             "key_value_steps": tuple(sorted(read_steps)),
             "key_value_output_programs": tuple(output_program_specs),
+            "key_value_argmatch_locations": argmatch_locations,
             "attentional_frame_color_targets": attentional_color_targets,
             "attentional_frame_shape_targets": attentional_shape_targets,
         }
@@ -1939,8 +2044,20 @@ class WorkspaceCapabilityDataset(BaseDataset):
             result["adaptive_operator_candidate_mask"] = adaptive_candidate_mask
             result["adaptive_operator_execution_mask"] = adaptive_execution_mask
             result["adaptive_operator_steps"] = tuple(sorted(adaptive_steps))
+            result["adaptive_operator_teacher_steps"] = tuple(
+                sorted(adaptive_teacher_steps)
+            )
             self.last_adaptive_v3_batch_stats = {
                 track: dict(stats) for track, stats in adaptive_v3_batch_stats.items()
+            }
+            # These CPU-side metadata counts expose V3's event workload without
+            # adding reductions or synchronization to the recurrent CUDA path.
+            self.last_adaptive_v3_batch_stats["__totals__"] = {
+                "candidate_tokens": int(adaptive_candidate_mask.sum()),
+                "executed_tokens": int(
+                    (adaptive_candidate_mask & adaptive_execution_mask).sum()
+                ),
+                "candidate_steps": len(adaptive_steps),
             }
             if adaptive_teacher_targets is not None:
                 result["adaptive_operator_teacher_targets"] = adaptive_teacher_targets
@@ -2097,9 +2214,17 @@ class WorkspaceCapabilityDataset(BaseDataset):
                         hard_token,
                         num_classes=result.shape[-1],
                     ).to(operation_probs.dtype)
+            elif operation == "argmatch":
+                query_location = int(metadata["key_value_argmatch_locations"][(int(row), int(step))]) - LOCATION_BASE
+                match = operands[:, LOCATION_BASE : LOCATION_BASE + LOCATION_COUNT].softmax(dim=-1)[:, query_location]
+                entity_tokens = (
+                    metadata["key_value_entity_ids"][int(row), int(step), : int(operand_count)].long() + ENTITY_BASE
+                ).to(logits.device)
+                operation_probs = torch.zeros(
+                    result.shape[-1], device=logits.device, dtype=torch.float32
+                ).scatter(0, entity_tokens, match / match.sum().clamp_min(1e-6))
             else:
                 raise ValueError(f"unknown workspace key-value output operation {operation!r}")
-
             # Keep probabilities normalized and cap the penalty for an
             # impossible/very-low-probability class at a meaningful finite
             # value. These are log-probabilities, so cross-entropy is a proper
@@ -2591,7 +2716,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
             "readout_by_query_type": {},
         }
         operation_diagnostic_totals: dict[str, list[int]] = defaultdict(lambda: [0] * 6)
-        adaptive_v3_route_totals: dict[str, list[int]] = defaultdict(lambda: [0] * 7)
+        adaptive_v3_route_totals: dict[str, list[int]] = defaultdict(lambda: [0] * 9)
         variable_binding_stage_totals: dict[tuple[str, str], list[int]] = defaultdict(
             lambda: [0] * 6
         )
@@ -3641,7 +3766,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
             "adaptive_v3_operator_routes_by_track": {
                 track: {
                     "candidate_count": int(sum(counts)),
-                    "operator_names": ["noop", "copy", "add_mod", "compare", "select", "rank", "sort"],
+                    "operator_names": ["noop", "copy", "add_mod", "compare", "select", "rank", "sort", "swap", "reduce"],
                     "operator_counts": [int(count) for count in counts],
                     "operator_fractions": [
                         float(count / max(sum(counts), 1)) for count in counts
@@ -4023,7 +4148,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
             route_text = ",".join(
                 f"{name}:{count / total:.1%}"
                 for name, count in zip(
-                    ("noop", "copy", "add_mod", "compare", "select", "rank", "sort"), counts
+                    ("noop", "copy", "add_mod", "compare", "select", "rank", "sort", "swap", "reduce"), counts
                 )
             )
             print(

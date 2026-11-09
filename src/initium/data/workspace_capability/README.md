@@ -381,8 +381,12 @@ Each track has six difficulty levels. `all` rotates the eighteen tracks evenly
 across batches; `new_all` rotates the six capability tracks and `gnw_all`
 rotates the eight GNW probes. Each multi-track
 batch contains every selected track when `batch_size` is at least the selected
-track count. Curriculum evaluation uses a small balanced set per required
-challenge group. Advancement requires at least 80% episode exact match overall,
+track count. Curriculum evaluation uses a balanced set per required
+challenge group (16 episodes by default). Set
+`--workspace-curriculum-eval-episodes-per-group 128` for higher-confidence
+promotion checks; paired V3 on/off evaluation already defaults to 128 episodes
+per feature-off track. The trainer reports each failed track/group and its
+sample count when a lesson is blocked. Advancement requires at least 80% episode exact match overall,
 per track, and in each required group; token accuracy alone cannot advance a
 lesson. Workspace readback-on, bypassed, and shuffled evaluations reuse the
 same balanced episode objects and are logged by track and difficulty group.
@@ -391,7 +395,15 @@ query type. This adds evaluation compute but keeps evaluation microbatching
 bounded by the configured dataset batch size.
 The dataset can also be run
 with `--workspace-task-track <track>` to study one skill without dilution from
-the others. Evaluation uses locally seeded ID and OOD episode generators so
+the others. Use `--workspace-task-track mixed_binding` to balance only
+`mixed_skill` and `variable_binding` as a staged interference diagnostic.
+For a throughput/interference comparison, add
+`--workspace-track-homogeneous-batches`: all examples within an optimizer batch
+come from one track, and the selected track cycles each step. This reduces
+cross-track length padding without changing the model, but changes the
+per-step task mixture. `batch_pad_util` reports the fraction of the padded
+sequence tensor containing real episode tokens.
+Evaluation uses locally seeded ID and OOD episode generators so
 the episode set is reproducible for paired model conditions.
 
 Permutation generalization is additionally logged at periodic and final

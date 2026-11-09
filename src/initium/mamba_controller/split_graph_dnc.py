@@ -265,6 +265,7 @@ class SplitGraphDNC(nn.Module):
         workspace_adaptive_v3_use_backbone_context: bool = False,
         workspace_adaptive_v3_teacher_forced_operator_outputs: bool = False,
         workspace_adaptive_v3_class_balanced_operator_loss: bool = False,
+        workspace_adaptive_v3_compile_operators: bool = False,
         workspace_compile_recurrence: bool = False,
         workspace_sparse_recurrence: bool = False,
         workspace_entity_keyed_writes: bool = False,
@@ -851,6 +852,7 @@ class SplitGraphDNC(nn.Module):
                 adaptive_v3_class_balanced_operator_loss=(
                     workspace_adaptive_v3_class_balanced_operator_loss
                 ),
+                adaptive_v3_compile_operators=workspace_adaptive_v3_compile_operators,
                 sparse_recurrence=workspace_sparse_recurrence,
                 attentional_cue_readout=workspace_attentional_cue_readout,
                 key_match_threshold=workspace_key_match_threshold,
@@ -955,6 +957,8 @@ class SplitGraphDNC(nn.Module):
         adaptive_operator_candidate_mask: torch.Tensor | None = None,
         adaptive_operator_execution_mask: torch.Tensor | None = None,
         adaptive_operator_steps: tuple[int, ...] | None = None,
+        adaptive_operator_teacher_steps: tuple[int, ...] | None = None,
+        workspace_sparse_active_steps: tuple[int, ...] | None = None,
         adaptive_operator_teacher_weight: float = 0.0,
         nth_farthest_vector_entity_ids: torch.Tensor | None = None,
         nth_farthest_vector_mask: torch.Tensor | None = None,
@@ -1322,6 +1326,10 @@ class SplitGraphDNC(nn.Module):
             # state exposed to unscaled expert outputs and defeats this
             # stability control on the write path.
             specialists = specialists[:, start_step:] * self.moe_backbone_residual_scale
+            event_window = None
+            if self.workspace_adaptive_v3_enabled:
+                _ids = input_token_ids if input_token_ids is not None else input.argmax(dim=-1)
+                event_window = torch.nn.functional.pad(_ids, (11, 0)).unfold(1, 12, 1)[:, start_step:]
             self.workspace.adaptive_v3_eval_bypass = bool(
                 self.workspace_adaptive_v3_eval_bypass
             )
@@ -1491,7 +1499,26 @@ class SplitGraphDNC(nn.Module):
                     if adaptive_operator_candidate_mask is not None
                     else None
                 ),
+                adaptive_operator_teacher_steps=(
+                    tuple(
+                        step - start_step
+                        for step in (adaptive_operator_teacher_steps or ())
+                        if step >= start_step
+                    )
+                    if adaptive_operator_candidate_mask is not None
+                    else None
+                ),
+                workspace_sparse_active_steps=(
+                    tuple(
+                        step - start_step
+                        for step in (workspace_sparse_active_steps or ())
+                        if step >= start_step
+                    )
+                    if entity_write_mask is not None
+                    else None
+                ),
                 adaptive_operator_teacher_weight=adaptive_operator_teacher_weight,
+                event_token_window=event_window,
                 nth_farthest_vector_entity_ids=(
                     nth_farthest_vector_entity_ids[:, start_step:]
                     if nth_farthest_vector_entity_ids is not None

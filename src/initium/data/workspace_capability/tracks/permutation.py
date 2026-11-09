@@ -169,6 +169,11 @@ def generate(
             "candidate_count": n,
             "candidate_baseline_pct": 100.0 / n,
             "difficulty": max_swaps,
+            "workspace_output_keys": (int(query_obj), -1) if query_type == "object_to_position" else (),
+            "workspace_output_programs": (
+                (0, "argmatch", tuple(int(o) for o in object_ids),
+                 tuple(location_token(state[o]) for o in object_ids)),
+            ) if query_type == "position_to_object" else (),
             "generalization_axis": str(
                 difficulty.get(
                     "generalization_axis",

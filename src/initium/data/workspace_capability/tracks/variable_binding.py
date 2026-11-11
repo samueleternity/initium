@@ -19,7 +19,9 @@ from initium.data.workspace_capability.episode import (
     scalar_token,
     source_token,
 )
-from initium.data.workspace_capability.tracks._shared import common_metadata
+from initium.data.workspace_capability.tracks._shared import (
+    EXT_OP_NAMES, EXT_UNARY, common_metadata, ext_op_result,
+)
 
 _ASSIGN_ADD = 4
 
@@ -110,7 +112,7 @@ def generate(difficulty: dict, rng: random.Random, *, ood: bool = False) -> Task
 
     while operations < assignment_count:
         destination = rng.choice(variable_ids[:-1])
-        action = rng.randrange(3)
+        action = rng.randrange(5 if difficulty.get("extended_ops") else 3)
         if action == 0:
             source = rng.choice([variable for variable in variable_ids if variable != destination])
             values[destination] = values[source]
@@ -121,6 +123,19 @@ def generate(difficulty: dict, rng: random.Random, *, ood: bool = False) -> Task
             literal_values.add(value)
             values[destination] = value
             stream.extend((EV_UPDATE, entity_token(destination), scalar_token(value), SEP))
+            reassignments += 1
+        elif action >= 3:
+            name = rng.choice([n for n in EXT_OP_NAMES if (n in EXT_UNARY) == (action == 4)])
+            i = EXT_OP_NAMES.index(name)
+            srcs = [v for v in variable_ids if v != destination]
+            left, right = rng.sample(srcs, 2) if action == 3 else (rng.choice(srcs), None)
+            values[destination] = ext_op_result(
+                name, values[left], values[right] if right is not None else 0
+            )
+            stream.extend(
+                (EV_VECTOR, entity_token(destination), source_token(i // 4), source_token(i % 4),
+                 entity_token(left), *((entity_token(right),) if right is not None else ()), SEP)
+            )
             reassignments += 1
         else:
             left, right = rng.sample(

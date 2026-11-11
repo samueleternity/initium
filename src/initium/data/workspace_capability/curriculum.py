@@ -64,8 +64,12 @@ def difficulty_for(
             "keys": (4, 8, 12, 16, 24, 32)[level],
             "updates": (0, 2, 4, 8, 12, 16)[level],
             "distractors": (0, 2, 4, 8, 16, 32)[level],
-            "queries": (1, 1, 2, 3, 4, 8)[level],
-            "aggregate": ("recall", "recall", "sum_mod16", "count_even", "parity", "recall")[level],
+            "queries": (2, 2, 2, 3, 4, 8)[level],
+            "aggregate": (
+                ("recall", "sum_mod16", "count_even", "parity"),
+                ("recall", "sum_mod16", "count_even", "parity"),
+                "sum_mod16", "count_even", "parity", "recall",
+            )[level],
         }
     elif track == "capacity_bottleneck":
         config = {
@@ -236,7 +240,7 @@ class WorkspaceCapabilityCurriculum:
         blockers = []
         groups_ready = True
         for track in self.dataset._tracks():
-            if track == "ignition":
+            if track in ("ignition", "nth_farthest"):
                 continue
             required = self.dataset._curriculum_groups(track, self.lesson)
             actual = progression_groups.get(track, {})
@@ -267,12 +271,12 @@ class WorkspaceCapabilityCurriculum:
             len(per_track) == len(self.dataset._tracks())
             and all(
                 item["exact_match"] / 100.0 >= self.dataset.advance_threshold
-                for _t, item in per_track.items() if _t != "ignition"
+                for _t, item in per_track.items() if _t not in ("ignition", "nth_farthest")
             )
         )
         if multi_track_run:
             for track in self.dataset._tracks():
-                if track == "ignition":
+                if track in ("ignition", "nth_farthest"):
                     continue
                 metrics = per_track.get(track)
                 if metrics is None:

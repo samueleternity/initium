@@ -838,6 +838,7 @@ def load_frozen_workspace_warm_start(
         "workspace_adaptive_v2_num_skills",
         "workspace_adaptive_v2_mi_weight",
         "workspace_adaptive_v3_enabled",
+        "workspace_adaptive_v4_enabled",
         "workspace_adaptive_v3_rank",
         "workspace_adaptive_v3_usage_floor_weight",
         "workspace_adaptive_v3_readback_consistency_weight",
@@ -1189,6 +1190,7 @@ def run(
     workspace_adaptive_v3_teacher_forced_operator_outputs: bool = False,
     workspace_adaptive_v3_class_balanced_operator_loss: bool = False,
     workspace_adaptive_v3_compile_operators: bool = False,
+    workspace_adaptive_v4_enabled: bool = False,
     workspace_adaptive_v3_learning_rate_scale: float = 2.0,
     workspace_adaptive_v3_logit_diagnostics: bool = False,
     workspace_compile_recurrence: bool = False,
@@ -1513,6 +1515,7 @@ def run(
     if getattr(dataset, "name", None) == "workspace-capability":
         dataset.token_id_input = bool(workspace_token_id_input)
         dataset.v3_swap_operator = bool(workspace_adaptive_v3_enabled)
+        dataset.v4_teacher = bool(workspace_adaptive_v4_enabled)
         dataset.curriculum_eval_episodes_per_group = int(
             workspace_curriculum_eval_episodes_per_group
         )
@@ -3863,6 +3866,7 @@ def run(
                 workspace_adaptive_v3_compile_operators
             ),
             workspace_compile_recurrence=workspace_compile_recurrence,
+            workspace_adaptive_v4_enabled=workspace_adaptive_v4_enabled,
             workspace_sparse_recurrence=workspace_sparse_recurrence,
             workspace_attentional_item_memory=workspace_attentional_item_memory,
             workspace_attentional_cue_readout=workspace_attentional_cue_readout,
@@ -4275,6 +4279,7 @@ def run(
         "workspace_enabled": workspace_enabled,
         "workspace_num_slots": workspace_num_slots,
         "workspace_adaptive_v3_enabled": workspace_adaptive_v3_enabled,
+        "workspace_adaptive_v4_enabled": workspace_adaptive_v4_enabled,
         "workspace_adaptive_v3_rank": workspace_adaptive_v3_rank,
         "workspace_adaptive_v3_usage_floor_weight": workspace_adaptive_v3_usage_floor_weight,
         "workspace_adaptive_v3_readback_consistency_weight": workspace_adaptive_v3_readback_consistency_weight,
@@ -4752,7 +4757,7 @@ def run(
         v3_parameters = [
             parameter
             for name, parameter in trainable_named_parameters
-            if name.startswith("rnn.workspace.adaptive_v3.")
+            if name.startswith(("rnn.workspace.adaptive_v3.", "rnn.workspace.adaptive_v4."))
         ]
         v3_ids = {id(parameter) for parameter in v3_parameters}
         base_parameters = [
@@ -6899,7 +6904,7 @@ def run(
                     parts.append(f"adaptive_v3_events[{','.join(candidate_events)}]")
                 operation_probability = v3_diagnostics.get("operation_probability")
                 if operation_probability is not None:
-                    route_names = ("noop", "copy", "add_mod", "compare", "select", "rank", "sort", "swap", "reduce")
+                    route_names = getattr(rnn.workspace.adaptive_v3, "operator_names", ("noop", "copy", "add_mod", "compare", "select", "rank", "sort", "swap", "reduce"))
                     route_summary = ",".join(
                         f"{name}:{float(value):.2f}"
                         for name, value in zip(route_names, operation_probability)
@@ -6944,7 +6949,7 @@ def run(
                 teacher_operator_loss_parts = [
                     f"{name}:{float(v3_diagnostics[f'teacher_op_loss_{name}']):.3f}/"
                     f"{int(v3_diagnostics[f'teacher_op_loss_{name}_count'].item())}"
-                    for name in ("noop", "copy", "add_mod", "compare", "select", "rank", "sort", "swap", "reduce")
+                    for name in getattr(rnn.workspace.adaptive_v3, "operator_names", ("noop", "copy", "add_mod", "compare", "select", "rank", "sort", "swap", "reduce"))
                     if f"teacher_op_loss_{name}" in v3_diagnostics
                 ]
                 teacher_operator_output_parts = [
@@ -8865,6 +8870,11 @@ if __name__ == "__main__":
     )
     parser.add_argument("--workspace-autoadaptive-v3-rank", type=int, default=32)
     parser.add_argument(
+        "--workspace-autoadaptive-v4",
+        action="store_true",
+        help="Adaptive workspace V4: primitive operators, set reductions, 2 sub-ops per event. Exclusive with V1/V2/V3; implies the V3 plumbing. Do not combine with --workspace-operation-executor.",
+    )
+    parser.add_argument(
         "--workspace-autoadaptive-v3-distillation",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -10162,6 +10172,12 @@ if __name__ == "__main__":
         parser.error("non-default --eval-workspace-mode requires --workspace")
     if sum((args.workspace_autoadaptive, args.workspace_autoadaptive_v2, args.workspace_autoadaptive_v3)) > 1:
         parser.error("choose only one adaptive workspace architecture (V1, V2, or V3)")
+    if args.workspace_autoadaptive_v4:
+        if args.workspace_autoadaptive or args.workspace_autoadaptive_v2 or args.workspace_autoadaptive_v3:
+            parser.error("--workspace-autoadaptive-v4 is exclusive with V1/V2/V3")
+        if args.workspace_operation_executor:
+            parser.error("--workspace-autoadaptive-v4 replaces the manual operation executor")
+        args.workspace_autoadaptive_v3 = True
     if (args.workspace_autoadaptive or args.workspace_autoadaptive_v2 or args.workspace_autoadaptive_v3) and not args.workspace:
         parser.error("adaptive workspace variants require --workspace")
     if args.workspace_autoadaptive_v3 and not (
@@ -10727,7 +10743,7 @@ if __name__ == "__main__":
                 feature_off_tag = f"{args.workspace_autoadaptive_v3_feature_off_probability:g}".replace(".", "p")
                 always_off_tag = "-".join(args.workspace_autoadaptive_v3_always_feature_off_tracks) or "none"
                 run_id += (
-                    f"_autoadaptivev3_r{args.workspace_autoadaptive_v3_rank}"
+                    f"_autoadaptive{'v4' if args.workspace_autoadaptive_v4 else 'v3'}_r{args.workspace_autoadaptive_v3_rank}"
                     f"_teacher{teacher_tag}_off{feature_off_tag}_always{always_off_tag}"
                 )
             if args.workspace_entity_keyed_writes:
@@ -10923,6 +10939,7 @@ if __name__ == "__main__":
             workspace_adaptive_v2_num_skills=args.workspace_autoadaptive_v2_num_skills,
             workspace_adaptive_v2_mi_weight=args.workspace_autoadaptive_v2_mi_weight,
             workspace_adaptive_v3_enabled=args.workspace_autoadaptive_v3,
+            workspace_adaptive_v4_enabled=args.workspace_autoadaptive_v4,
             workspace_adaptive_v3_rank=args.workspace_autoadaptive_v3_rank,
             workspace_adaptive_v3_distillation=args.workspace_autoadaptive_v3_distillation,
             workspace_adaptive_v3_teacher_weight=args.workspace_autoadaptive_v3_teacher_weight,

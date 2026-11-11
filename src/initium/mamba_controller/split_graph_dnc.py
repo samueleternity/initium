@@ -266,6 +266,7 @@ class SplitGraphDNC(nn.Module):
         workspace_adaptive_v3_teacher_forced_operator_outputs: bool = False,
         workspace_adaptive_v3_class_balanced_operator_loss: bool = False,
         workspace_adaptive_v3_compile_operators: bool = False,
+        workspace_adaptive_v4_enabled: bool = False,
         workspace_compile_recurrence: bool = False,
         workspace_sparse_recurrence: bool = False,
         workspace_entity_keyed_writes: bool = False,
@@ -853,6 +854,7 @@ class SplitGraphDNC(nn.Module):
                     workspace_adaptive_v3_class_balanced_operator_loss
                 ),
                 adaptive_v3_compile_operators=workspace_adaptive_v3_compile_operators,
+                adaptive_v4_enabled=workspace_adaptive_v4_enabled,
                 sparse_recurrence=workspace_sparse_recurrence,
                 attentional_cue_readout=workspace_attentional_cue_readout,
                 key_match_threshold=workspace_key_match_threshold,

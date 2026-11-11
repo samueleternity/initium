@@ -16,6 +16,7 @@ import torch.nn.functional as F
 from initium.workspace.bistability import BistableWriteGate
 from initium.workspace.nth_farthest import select_nth_farthest
 from initium.workspace.adaptive_v3 import AdaptiveWorkspaceOperatorBank
+from initium.workspace.adaptive_v4 import AdaptiveWorkspaceOperatorBankV4
 
 _WORKSPACE_CAPABILITY_VOCAB_SIZE = 320
 _WORKSPACE_CAPABILITY_SCALAR_BASE = 136
@@ -130,6 +131,7 @@ class WorkspaceBroadcast(nn.Module):
         adaptive_v3_teacher_forced_operator_outputs: bool = False,
         adaptive_v3_class_balanced_operator_loss: bool = False,
         adaptive_v3_compile_operators: bool = False,
+        adaptive_v4_enabled: bool = False,
         sparse_recurrence: bool = False,
         attentional_cue_readout: bool = False,
         key_match_threshold: float = 0.5,
@@ -248,10 +250,18 @@ class WorkspaceBroadcast(nn.Module):
                 class_balanced_operator_loss=adaptive_v3_class_balanced_operator_loss,
                 compile_operators=adaptive_v3_compile_operators,
             )
-            if self.adaptive_v3_enabled
+            if self.adaptive_v3_enabled and not adaptive_v4_enabled
             else None
         )
         self.adaptive_v3_eval_bypass = False
+        self.adaptive_v4 = (
+            AdaptiveWorkspaceOperatorBankV4(d_model, self._address_dim, compile_ops=adaptive_v3_compile_operators)
+            if adaptive_v4_enabled
+            else None
+        )
+        if self.adaptive_v4 is not None:
+            # Non-registered alias so the V3 call sites drive V4; checkpoint keys stay adaptive_v4.*
+            object.__setattr__(self, "adaptive_v3", self.adaptive_v4)
         self.semantic_attentional_color_decoder = (
             nn.Linear(d_model, _WORKSPACE_CAPABILITY_SOURCE_COUNT)
             if self.attentional_cue_readout_enabled
@@ -2031,7 +2041,7 @@ class WorkspaceBroadcast(nn.Module):
                 or adaptive_operator_candidate_mask.dtype != torch.bool
                 or adaptive_operator_execution_mask.dtype != torch.bool
                 or (adaptive_operator_teacher_targets is not None
-                    and adaptive_operator_teacher_targets.shape != (*expected_adaptive_shape, 12))
+                    and adaptive_operator_teacher_targets.shape != (*expected_adaptive_shape, getattr(self.adaptive_v3, "teacher_width", 12)))
             ):
                 raise ValueError(
                     "adaptive V3 requires candidate/execution masks and optional (B,T,11) teacher targets"
@@ -2379,6 +2389,15 @@ class WorkspaceBroadcast(nn.Module):
             compiled_zero_reconsideration_scores = state.new_zeros(
                 state.shape[:2], dtype=torch.float32
             )
+        v4_parse = {}
+        if (
+            self.adaptive_v4 is not None
+            and adaptive_operator_step_set
+            and time_major_event_tokens is not None
+        ):
+            _ps = sorted(adaptive_operator_step_set)
+            _pre = self.adaptive_v4.parse_steps(time_major_event_tokens[_ps])
+            v4_parse = {s: self.adaptive_v4.pick_parse(_pre, i) for i, s in enumerate(_ps)}
         sparse_active_steps: set[int] = set()
         sparse_recurrence = bool(
             self.sparse_recurrence_enabled
@@ -2801,6 +2820,7 @@ class WorkspaceBroadcast(nn.Module):
                         else 0.0
                     ),
                     step_index=step,
+                    **({"parsed": v4_parse[step]} if v4_parse else {}),
                 )
             if operation_step_set and step in operation_step_set:
                 assert operation_metadata is not None

@@ -11,6 +11,9 @@ import torch
 import torch.nn.functional as F
 
 from initium.data.base_dataset import BaseDataset
+from initium.data.workspace_capability.tracks._shared import (
+    EXT_OP_IDS, EXT_OP_NAMES, EXT_UNARY, ext_op_result,
+)
 from initium.data.workspace_capability.curriculum import (
     WorkspaceCapabilityCurriculum,
     difficulty_for,
@@ -169,6 +172,7 @@ _WORKSPACE_OPERATION_CODES = {
     "rank": 7,
     "swap": 8,
     "reduce": 9,
+    **{name: 20 + i for i, name in enumerate(EXT_OP_NAMES)},
 }
 _WORKSPACE_OPERATION_NAMES = {
     1: "lookup",
@@ -244,6 +248,51 @@ class WorkspaceCapabilityDataset(BaseDataset):
 
     def make_curriculum(self):
         return WorkspaceCapabilityCurriculum(self)
+
+    @staticmethod
+    def _v4_teacher_row(episode, tokens, operation, d0, d1, op0, op1, outputs, expected):
+        """Convert a V3 operation record into two V4 sub-op rows: [op, dest, out, key0..key7]."""
+
+        def key(o):
+            return o[1] if o[0] == _WORKSPACE_OPERAND_KEY else 64 if o[0] == _WORKSPACE_OPERAND_LITERAL else -1
+
+        k0, k1 = key(op0), key(op1)
+        o0 = int(outputs[0])
+        o1 = int(outputs[1]) if len(outputs) > 1 else -100
+        COPY, GT, SUM, MAX, MIN, CNT, PAR = range(1, 8)
+        if operation in ("lookup", "copy"):
+            rows = [(COPY, d0, o0, [k0])]
+        elif operation == "add":
+            rows = [(SUM, d0, o0, [k0, k1])]
+        elif operation == "sort":
+            rows = [(MIN, d0, o0, [k0, k1]), (MAX, d1, o1, [k0, k1])]
+        elif operation == "compare":
+            rows = [(GT, d0, o0, [k0, k1])]
+        elif operation == "rank":
+            rows = [(GT, d0, o0, [k1, k0])]
+        elif operation == "select":
+            rows = [(MAX, d0, o0, [k0, k1])]
+        elif operation == "swap":
+            rows = [(COPY, d0, o0, [k1]), (COPY, d1, o1, [k0])]
+        elif operation in EXT_OP_IDS:
+            rows = [(EXT_OP_IDS[operation], d0, o0, [k0] if operation in EXT_UNARY else [k0, k1])]
+        else:  # "reduce": aggregate over the entities named by the query
+            n = len(episode.inputs)
+            q = max(i for i in range(n) if int(tokens[i]) == QUERY)
+            ks = [
+                int(t) - ENTITY_BASE
+                for t in tokens[q + 2 : n]
+                if ENTITY_BASE <= int(t) < ENTITY_BASE + ENTITY_COUNT
+            ][:8]
+            rows = [((SUM, CNT, PAR)[int(expected[1])], d0, o0, ks)]
+        flat = []
+        for r in range(4):
+            if r < len(rows):
+                op, dest, out, ks = rows[r]
+                flat += [op, dest, out, *(ks + [-1] * (8 - len(ks)))]
+            else:
+                flat += [0] + [-100] * 10
+        return torch.tensor(flat, dtype=torch.long)
 
     def set_output_proj(self, proj):
         self._output_proj = proj
@@ -339,11 +388,11 @@ class WorkspaceCapabilityDataset(BaseDataset):
         _t = (self.last_eval_diagnostics or {}).get("tracks", {})
         # self._track_weights = {t: 0.1 + max(0.0, 1.0 - m["exact_match"] / 100.0) for t, m in _t.items()}
         self._track_weights = {t: 0.05 for t in _t}
-        _cand = [t for t in _t if t not in ("ignition", "masked_priming")]  # noise-ceiling tracks
+        _cand = [t for t in _t if t not in ("ignition", "masked_priming", "nth_farthest")]
         if _cand:
             _worst = min(_cand, key=lambda t: _t[t]["exact_match"])
             self._track_weights[_worst] = 0.05 * (len(_t) - 1)  # ~50% of steps
-        for _t_name in ("ignition", "masked_priming"):
+        for _t_name in ("ignition", "masked_priming", "nth_farthest"):
             if _t_name in self._track_weights:
                 self._track_weights[_t_name] = 0.02
         return result
@@ -368,6 +417,8 @@ class WorkspaceCapabilityDataset(BaseDataset):
         generalization_axis=None,
     ) -> TaskEpisode:
         difficulty = difficulty_for(track, level, ood=ood, ood_axes=ood_axes)
+        if track == "variable_binding" and getattr(self, "v4_teacher", False):
+            difficulty["extended_ops"] = True
         if track == "permutation" and generalization_axis is not None:
             difficulty["generalization_axis"] = generalization_axis
             difficulty["report_generalization_axis"] = True
@@ -1472,6 +1523,25 @@ class WorkspaceCapabilityDataset(BaseDataset):
                         )
                     )
                     current_values[destination] = value
+                elif event == EV_VECTOR and sum(
+                    SOURCE_BASE <= v < SOURCE_BASE + SOURCE_COUNT for v in fields
+                ) == 2:
+                    codes = [v - SOURCE_BASE for v in fields if SOURCE_BASE <= v < SOURCE_BASE + SOURCE_COUNT]
+                    name = EXT_OP_NAMES[codes[0] * 4 + codes[1]]
+                    destination, left = entity_fields[:2]
+                    right = entity_fields[2] if len(entity_fields) > 2 else None
+                    a = current_values[left] - SCALAR_BASE
+                    b = current_values[right] - SCALAR_BASE if right is not None else 0
+                    result = SCALAR_BASE + ext_op_result(name, a, b)
+                    records.append(
+                        (
+                            step, name, destination, -1,
+                            (_WORKSPACE_OPERAND_KEY, left),
+                            (_WORKSPACE_OPERAND_KEY, right) if right is not None else (0, -1),
+                            (result,), (current_values[left], -100),
+                        )
+                    )
+                    current_values[destination] = result
                 elif event == EV_VECTOR and len(entity_fields) >= 3:
                     destination, left, right = entity_fields[:3]
                     if not any(
@@ -1635,7 +1705,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
             else None
         )
         adaptive_teacher_targets = (
-            torch.full((batch, time, 12), -100, dtype=torch.long)
+            torch.full((batch, time, 44 if getattr(self, "v4_teacher", False) else 12), -100, dtype=torch.long)
             if include_adaptive_v3 and adaptive_v3_distillation
             else None
         )
@@ -1698,6 +1768,8 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 )
                 feature_off = is_holdout or always_off or sampled_off
             if adaptive_candidate_mask is not None:
+                if getattr(self, "v4_teacher", False):
+                    feature_off = False
                 stats = adaptive_v3_batch_stats[episode.track]
                 stats["episodes"] += 1
                 stats["manual_off"] += int(feature_off)
@@ -1735,7 +1807,9 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 expected_operands,
             ) in operation_records:
                 if episode.track in adaptive_v3_batch_stats:
-                    adaptive_v3_batch_stats[episode.track][operation] += 1
+                    adaptive_v3_batch_stats[episode.track][operation] = (
+                        adaptive_v3_batch_stats[episode.track].get(operation, 0) + 1
+                    )
                 if operation_metadata is None:
                     raise RuntimeError("operation metadata storage was not initialized")
                 if not 0 <= step < min(time, len(episode.inputs)):
@@ -1759,6 +1833,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 if (
                     adaptive_teacher_targets is not None
                     and episode.track in ("mixed_skill", "variable_binding", "permutation", "retrieval_aggregation")
+                    and not getattr(self, "v4_teacher", False)
                     and episode.track not in adaptive_v3_holdout_tracks
                 ):
                     op_code = _WORKSPACE_OPERATION_CODES[operation]
@@ -1778,6 +1853,16 @@ class WorkspaceCapabilityDataset(BaseDataset):
                             int(feature_off),
                         ),
                         dtype=torch.long,
+                    )
+                if (
+                    getattr(self, "v4_teacher", False)
+                    and adaptive_teacher_targets is not None
+                    and episode.track in ("mixed_skill", "variable_binding", "permutation", "retrieval_aggregation")
+                    and episode.track not in adaptive_v3_holdout_tracks
+                ):
+                    adaptive_teacher_targets[row, step] = self._v4_teacher_row(
+                        episode, tokens, operation, destination0, destination1,
+                        operand0, operand1, output_values, expected_operands,
                     )
                 if operation_diagnostic_targets is not None:
                     operation_diagnostic_targets[row, step] = torch.tensor(
@@ -2716,7 +2801,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
             "readout_by_query_type": {},
         }
         operation_diagnostic_totals: dict[str, list[int]] = defaultdict(lambda: [0] * 6)
-        adaptive_v3_route_totals: dict[str, list[int]] = defaultdict(lambda: [0] * 9)
+        adaptive_v3_route_totals: dict[str, list[int]] = defaultdict(lambda: [0] * 32)
         variable_binding_stage_totals: dict[tuple[str, str], list[int]] = defaultdict(
             lambda: [0] * 6
         )
@@ -3766,7 +3851,8 @@ class WorkspaceCapabilityDataset(BaseDataset):
             "adaptive_v3_operator_routes_by_track": {
                 track: {
                     "candidate_count": int(sum(counts)),
-                    "operator_names": ["noop", "copy", "add_mod", "compare", "select", "rank", "sort", "swap", "reduce"],
+                    "operator_names": list(getattr(getattr(workspace, "adaptive_v3", None), "operator_names", ("noop", "copy", "add_mod", "compare", "select", "rank", "sort", "swap", "reduce"))),
+                    "_pad": 0,
                     "operator_counts": [int(count) for count in counts],
                     "operator_fractions": [
                         float(count / max(sum(counts), 1)) for count in counts
@@ -4148,7 +4234,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
             route_text = ",".join(
                 f"{name}:{count / total:.1%}"
                 for name, count in zip(
-                    ("noop", "copy", "add_mod", "compare", "select", "rank", "sort", "swap", "reduce"), counts
+                    getattr(getattr(workspace, "adaptive_v3", None), "operator_names", ("noop", "copy", "add_mod", "compare", "select", "rank", "sort", "swap", "reduce")), counts
                 )
             )
             print(

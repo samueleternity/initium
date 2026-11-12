@@ -123,6 +123,11 @@ def difficulty_for(
         config = {"maximum_frames": (4, 5, 6, 7, 8, 10)[level]}
     elif track == "trace_conditioning":
         config = {"maximum_gap": (1, 2, 3, 4, 5, 6)[level]}
+    elif track == "conditional_ops":
+        config = {
+            "operations": (2, 3, 4, 5, 6, 8)[level],
+            "keys": (4, 5, 6, 7, 8, 10)[level],
+        }
     else:
         raise ValueError(f"unknown workspace capability track {track!r}")
     if ood and track != "permutation":
@@ -180,6 +185,9 @@ def difficulty_for(
             config["maximum_frames"] = min(int(config["maximum_frames"]) + 1, 10)
         elif track == "trace_conditioning":
             config["maximum_gap"] = min(int(config["maximum_gap"]) + 1, 6)
+        elif track == "conditional_ops":
+            config["keys"] = min(int(config["keys"]) + 2, 12)
+            config["operations"] = min(int(config["operations"]) + 1, 8)
         else:
             updates = config["updates"]
             distractors = config["distractors"]

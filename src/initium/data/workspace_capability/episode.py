@@ -75,7 +75,7 @@ def track_marker_info(tokens: tuple[int, ...] | list[int]) -> tuple[int | None, 
         return None, 0
     if int(tokens[2]) == TRACK_TOKEN_IDS[-1] and len(tokens) >= 5:
         extension = int(tokens[3])
-        if SOURCE_BASE <= extension < SOURCE_BASE + 7 and int(tokens[4]) == SEP:
+        if SOURCE_BASE <= extension < SOURCE_BASE + 8 and int(tokens[4]) == SEP:
             return len(TRACK_TOKEN_IDS) + extension - SOURCE_BASE, 5
         return None, 0
     index = track_index(int(tokens[1]))

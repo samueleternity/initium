@@ -81,6 +81,7 @@ from initium.data.workspace_capability.tracks import (
     sustained_maintenance,
     trace_conditioning,
     variable_binding,
+    conditional_ops,
 )
 from initium.data.workspace_capability.gnw_metrics import (
     binary_brier,
@@ -109,6 +110,7 @@ _GENERATORS = {
     "no_report_confidence": no_report_confidence.generate,
     "bistable_perception": bistable_perception.generate,
     "trace_conditioning": trace_conditioning.generate,
+    "conditional_ops": conditional_ops.generate,
 }
 TRACKS = tuple(_GENERATORS)
 ALL_TRACK = "all"
@@ -172,6 +174,8 @@ _WORKSPACE_OPERATION_CODES = {
     "rank": 7,
     "swap": 8,
     "reduce": 9,
+    "sub": 10, "mul": 11, "neg": 12, "inc": 13, "dec": 14, "eq": 15, "member": 16,
+    "cond_copy": 17, "and": 18, "or": 19, "xor": 20, "not": 21, "max": 22,
     **{name: 20 + i for i, name in enumerate(EXT_OP_NAMES)},
 }
 _WORKSPACE_OPERATION_NAMES = {
@@ -188,10 +192,15 @@ _WORKSPACE_OPERATION_NAMES = {
 _WORKSPACE_OPERAND_KEY = 1
 _WORKSPACE_OPERAND_LITERAL = 2
 _REDUCE_RESULT_KEY = 63
+# Must match adaptive_v4.py ids (copy=1 ... halt=20).
+_V4_COND_OP_IDS = {"sub": 8, "and": 9, "or": 10, "xor": 11, "not": 12, "mul": 13,
+                   "neg": 14, "inc": 15, "dec": 16, "eq": 17, "member": 18,
+                   "cond_copy": 19, "max": 4}
 _ENTITY_ADDRESS_EVENT_TOKENS = {
     "capacity_bottleneck": {EV_INIT, EV_MOVE, EV_UPDATE},
     "rule_switching": {EV_ASSERT, EV_VECTOR},
     "variable_binding": {EV_INIT, EV_KV, EV_UPDATE, EV_VECTOR},
+    "conditional_ops": {EV_INIT, EV_VECTOR},
     "entity_state": {EV_PUT, EV_ASSERT, EV_MOVE, EV_REMOVE, EV_SUPERSEDE},
     "relational_join": {EV_FACT},
     "nth_farthest": {EV_VECTOR},
@@ -260,7 +269,16 @@ class WorkspaceCapabilityDataset(BaseDataset):
         o0 = int(outputs[0])
         o1 = int(outputs[1]) if len(outputs) > 1 else -100
         COPY, GT, SUM, MAX, MIN, CNT, PAR = range(1, 8)
-        if operation in ("lookup", "copy"):
+        if operation in _V4_COND_OP_IDS:
+            ks = [k0, k1]
+            if operation in ("member", "max"):
+                ks = [k0, k1] + ([d1] if d1 >= 0 else [])
+            elif operation in ("neg", "inc", "dec", "not"):
+                ks = [k0]
+            if operation == "cond_copy" and int(expected[1]) != SCALAR_BASE + 1:
+                o0 = -1  # flag false: no write
+            rows = [(_V4_COND_OP_IDS[operation], d0, o0, ks)]
+        elif operation in ("lookup", "copy"):
             rows = [(COPY, d0, o0, [k0])]
         elif operation == "add":
             rows = [(SUM, d0, o0, [k0, k1])]
@@ -817,7 +835,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
                         valid_event = has_location
                     elif track == "rule_switching":
                         valid_event = has_scalar or has_boolean
-                    elif track == "variable_binding":
+                    elif track in ("variable_binding", "conditional_ops"):
                         valid_event = has_scalar or len(event_entities) >= 2
                     elif track == "trace_conditioning":
                         valid_event = has_scalar or has_boolean
@@ -1380,6 +1398,8 @@ class WorkspaceCapabilityDataset(BaseDataset):
         """Parse supported input programs and simulate labels for sparse loss only."""
         if episode.track == "retrieval_aggregation":
             return WorkspaceCapabilityDataset._retrieval_reduce_records(episode, tokens)
+        if episode.track == "conditional_ops":
+            return conditional_ops.parse_records(tokens, len(episode.inputs))
         if episode.track not in ("mixed_skill", "variable_binding", "permutation"):
             return ()
         current_values: dict[int, int] = {}
@@ -1807,9 +1827,8 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 expected_operands,
             ) in operation_records:
                 if episode.track in adaptive_v3_batch_stats:
-                    adaptive_v3_batch_stats[episode.track][operation] = (
-                        adaptive_v3_batch_stats[episode.track].get(operation, 0) + 1
-                    )
+                    _s = adaptive_v3_batch_stats[episode.track]
+                    _s[operation] = _s.get(operation, 0) + 1
                 if operation_metadata is None:
                     raise RuntimeError("operation metadata storage was not initialized")
                 if not 0 <= step < min(time, len(episode.inputs)):
@@ -1857,7 +1876,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 if (
                     getattr(self, "v4_teacher", False)
                     and adaptive_teacher_targets is not None
-                    and episode.track in ("mixed_skill", "variable_binding", "permutation", "retrieval_aggregation")
+                    and episode.track in ("mixed_skill", "variable_binding", "permutation", "retrieval_aggregation", "conditional_ops")
                     and episode.track not in adaptive_v3_holdout_tracks
                 ):
                     adaptive_teacher_targets[row, step] = self._v4_teacher_row(

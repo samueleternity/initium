@@ -3302,6 +3302,39 @@ def run(
                         f"complete for {','.join(sorted(adaptive_tracks))}; "
                         "see [adaptive-v3/paired/*] for matched-set deltas and intervals"
                     )
+                    _restore_rng_state(id_eval_rng_state)
+                    matched_acc, matched_exact, _ = dataset._evaluate_paired_id(
+                        rnn, device, lesson_value - 1, ablate_workspace_adaptive=True
+                    )
+                    matched_tracks = getattr(dataset, "last_eval_diagnostics", {}).get("tracks", {})
+                    workspace_check_writer.writerow(
+                        [
+                            step_value, lesson_value, "all", "adaptive_pathway_bypassed",
+                            matched_acc, matched_exact,
+                            baseline_accuracy - matched_acc, baseline_exact - matched_exact,
+                        ]
+                    )
+                    for track in sorted(set(base_tracks) & set(matched_tracks)):
+                        full_m, off_m = base_tracks[track], matched_tracks[track]
+                        workspace_check_writer.writerow(
+                            [
+                                step_value, lesson_value, track, "adaptive_pathway_bypassed",
+                                off_m["accuracy"], off_m["exact_match"],
+                                full_m["accuracy"] - off_m["accuracy"],
+                                full_m["exact_match"] - off_m["exact_match"],
+                            ]
+                        )
+                        ws_m = ablated_tracks.get(track, {})
+                        print(
+                            f"[{run_id}] Step {step_value} dependence/{track} (exact): "
+                            f"full {full_m['exact_match']:.1f}% | operators-off "
+                            f"{off_m['exact_match']:.1f}% | workspace-off "
+                            f"{ws_m.get('exact_match', float('nan')):.1f}%"
+                        )
+                    print(
+                        f"[{run_id}] Step {step_value} operator dependence on matched ID episodes: "
+                        f"full {baseline_accuracy:.2f}% -> operators-off {matched_acc:.2f}%"
+                    )
                 else:
                     print(
                         f"[{run_id}] Step {step_value} adaptive pathway dependency: "
@@ -9760,6 +9793,7 @@ if __name__ == "__main__":
             "no_report_confidence",
             "bistable_perception",
             "trace_conditioning",
+            "conditional_ops",
         ],
         default="all",
         help=(

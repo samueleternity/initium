@@ -5,6 +5,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 from torch.nn import functional as F
+import math
 
 from initium.workspace.adaptive_v3 import AdaptiveWorkspaceOperatorBank as _V3
 
@@ -31,20 +32,32 @@ def _norm(x):
     return x / x.sum(-1, keepdim=True).clamp_min(1e-6)
 
 
-def _sum_dist(P, m):
-    f = torch.fft.fft(P, dim=-1)
-    f = (1 - m).unsqueeze(-1) + m.unsqueeze(-1) * f
-    return _norm(torch.fft.ifft(_tree_prod(f), dim=-1).real)
+def _ctree(re, im):
+    while re.shape[1] > 1:
+        if re.shape[1] % 2:
+            re = torch.cat((re, torch.ones_like(re[:, :1])), 1)
+            im = torch.cat((im, torch.zeros_like(im[:, :1])), 1)
+        re, im = (re[:, 0::2] * re[:, 1::2] - im[:, 0::2] * im[:, 1::2],
+                  re[:, 0::2] * im[:, 1::2] + im[:, 0::2] * re[:, 1::2])
+    return re[:, 0], im[:, 0]
 
 
-def _count_dist(P, m):
-    q = m * P[..., 0::2].sum(-1)
-    f = torch.fft.fft(F.pad(torch.stack((1 - q, q), -1), (0, 30)), dim=-1)
-    return _norm(torch.fft.ifft(_tree_prod(f), dim=-1).real)
+def _sum_dist(P, m, C, S):
+    mm = m.unsqueeze(-1)
+    re, im = _ctree((1 - mm) + mm * (P @ C), -mm * (P @ S))
+    return _norm((re @ C - im @ S) / C.shape[0])
 
 
-def _sub_dist(a, b):
-    return _norm(torch.fft.ifft(torch.fft.fft(a, dim=-1) * torch.fft.fft(b, dim=-1).conj(), dim=-1).real)
+def _count_dist(P, m, C, S):
+    q = (m * P[..., 0::2].sum(-1)).unsqueeze(-1)
+    re, im = _ctree((1 - q) * C[0] + q * C[1], -q * S[1])
+    return _norm((re @ C - im @ S) / C.shape[0])
+
+
+def _sub_dist(a, b, C, S):
+    ar, ai, br, bi = a @ C, -(a @ S), b @ C, -(b @ S)
+    re, im = ar * br + ai * bi, ai * br - ar * bi
+    return _norm((re @ C - im @ S) / C.shape[0])
 
 
 def _extreme_dist(P, m, largest):
@@ -102,6 +115,10 @@ class AdaptiveWorkspaceOperatorBankV4(nn.Module):
             self.right_gain[0, 8] = 4.0
             self.left_gain[1:, 9] = 3.0  # later sub-ops default to reading the previous result
         self.eval_bypass = False
+        for n in (16, 32):
+            t = 2 * math.pi * torch.outer(torch.arange(n), torch.arange(n)).double() / n
+            self.register_buffer(f"C{n}", t.cos().float(), persistent=False)
+            self.register_buffer(f"S{n}", t.sin().float(), persistent=False)
         self._last_aux_loss = None
         self._last_training_diagnostics = {}
         self._last_training_diagnostic_counts = {}
@@ -139,7 +156,7 @@ class AdaptiveWorkspaceOperatorBankV4(nn.Module):
             warnings.warn(f"V4 '{key}' compile failed ({type(exc).__name__}); using eager.")
             return fn(*args)
 
-    def _dist_math(self, P, V, wl, wr, m, op_probs, W, bias):
+    def _dist_math(self, P, V, wl, wr, m, op_probs, W, bias, C16, S16, C32, S32):
         B, C = P.shape[0], len(_NAMES)
         dev = P.device
         PL, PR = (wl.unsqueeze(-1) * P).sum(1), (wr.unsqueeze(-1) * P).sum(1)
@@ -147,7 +164,7 @@ class AdaptiveWorkspaceOperatorBankV4(nn.Module):
         p_gt = (PL[:, 1:] * PR.cumsum(-1)[:, :-1]).sum(-1)
         vec_copy = (wl.unsqueeze(-1) * V).sum(1)
         d_copy = F.softmax(F.linear(vec_copy, W, bias), -1)
-        tot = _sum_dist(P, m)
+        tot = _sum_dist(P, m, C16, S16)
         odd = tot[:, 1::2].sum(-1)
 
         def bit(p):
@@ -170,8 +187,8 @@ class AdaptiveWorkspaceOperatorBankV4(nn.Module):
             (
                 d_copy, bit(p_gt), _voc(tot, 136),
                 _voc(_extreme_dist(P, m, True), 136), _voc(_extreme_dist(P, m, False), 136),
-                _voc(_count_dist(P, m), 152), _voc(torch.stack((1 - odd, odd), -1), 184),
-                _voc(_sub_dist(PL, PR), 136),
+                _voc(_count_dist(P, m, C32, S32), 152), _voc(torch.stack((1 - odd, odd), -1), 184),
+                _voc(_sub_dist(PL, PR, C16, S16), 136),
                 bit(l1 * r1), bit(l1 + r1 - l1 * r1), bit(l1 + r1 - 2 * l1 * r1), bit(1 - l1),
                 d_mul, d_neg, d_inc, d_dec, bit(p_eq), bit(p_in),
                 d_copy,
@@ -247,6 +264,7 @@ class AdaptiveWorkspaceOperatorBankV4(nn.Module):
         tok = event_tokens.long()
         ps = parsed if parsed is not None else self._call("parse", self._parse, tok)
         a, has_lit, lit_tok = ps["a"], ps["has_lit"], ps["lit_tok"]
+        a_t = torch.stack(a, -1)  # (B,4)
         lit_f = has_lit.float()
         P_lit = F.one_hot((lit_tok - 136).clamp(0, 15), 16).float().mul(lit_f.unsqueeze(-1)).unsqueeze(1)
         V_lit = (W[lit_tok.clamp(0, 319)] * lit_f.unsqueeze(-1)).unsqueeze(1)
@@ -256,10 +274,7 @@ class AdaptiveWorkspaceOperatorBankV4(nn.Module):
             return F.one_hot(x.clamp(min=0), A).float() * (x >= 0).float().unsqueeze(-1)
 
         def match(ids, occ):
-            f = torch.zeros(B, S, 4, device=dev)
-            for j in range(4):
-                f[..., j] = ((ids == a[j].unsqueeze(1)) & occ & (a[j] >= 0).unsqueeze(1)).float()
-            return f
+            return ((ids.unsqueeze(-1) == a_t.unsqueeze(1)) & occ.unsqueeze(-1) & a_t.ge(0).unsqueeze(1)).float()
 
         ev_ids = torch.cat((tok[:, -6:], ps["tok_m"].unsqueeze(1), ps["tok_n"].unsqueeze(1)), 1)
         ev = self.event_proj(self.event_embedding(ev_ids).flatten(1))
@@ -286,10 +301,12 @@ class AdaptiveWorkspaceOperatorBankV4(nn.Module):
             op_probs = op_logits.softmax(-1)
             route_ops.append(op_probs)
 
-            need_t = (op_logits.argmax(-1).gt(0) & active).any()
-            if use_teacher:
-                need_t = need_t | teacher_targets[:, k * 11].gt(0).any()
-            need = bool(need_t)
+            if k == 0:
+                _al = self.router(base.unsqueeze(1) + self.sub_embed.weight)
+                need_t = (_al.argmax(-1).gt(0) & active.unsqueeze(1)).any()
+                if use_teacher:
+                    need_t = need_t | teacher_targets[:, 0 : K * 11 : 11].gt(0).any()
+                need = bool(need_t)
             occ_c = torch.cat((occupied, run_occ, has_lit.unsqueeze(1)), 1)
             addr_c = F.normalize(
                 torch.cat((address, run_addr, self.literal_key.view(1, 1, A).expand(B, 1, A)), 1), dim=-1
@@ -325,7 +342,8 @@ class AdaptiveWorkspaceOperatorBankV4(nn.Module):
                 P = torch.cat((P_snap, P_run, P_lit), 1)
                 V = torch.cat((content, V_run, V_lit), 1)
                 dists, r1, out_vec, sel, wsel, gates = self._call(
-                    "dist", self._dist_math, P, V, wl, wr, m, op_probs, W, decoder.bias.float()
+                    "dist", self._dist_math, P, V, wl, wr, m, op_probs, W, decoder.bias.float(),
+                    self.C16, self.S16, self.C32, self.S32,
                 )
                 mass = (wsel[:, 1 : C - 1] * gates).sum(-1) * active.float() * alive
             else:
@@ -381,6 +399,8 @@ class AdaptiveWorkspaceOperatorBankV4(nn.Module):
             lce = F.cross_entropy(left_logits, lt.masked_fill(~lv, -100), reduction="none", ignore_index=-100)
             rce = F.cross_entropy(right_logits, rt.masked_fill(~rv, -100), reduction="none", ignore_index=-100)
             kv = keys.ge(0)
+            # member(x, S): keys[0] is the probe operand, not a set element.
+            keys = torch.cat((torch.where(op_t.eq(_MEM), torch.full_like(keys[:, 0], -1), keys[:, 0]).unsqueeze(1), keys[:, 1:]), 1)
             tset = torch.cat(
                 (
                     ((aid.unsqueeze(-1) == keys.unsqueeze(1)) & ((keys >= 0) & (keys < _LIT)).unsqueeze(1)).any(-1) & occupied,
@@ -400,7 +420,7 @@ class AdaptiveWorkspaceOperatorBankV4(nn.Module):
             cw = op_t.eq(_CW)
             gl = F.binary_cross_entropy(r1.clamp(1e-4, 1 - 1e-4), out_t.ge(0).float(), reduction="none")
             losses += [op_loss, mean(lce, lv), mean(rce, rv), mean(bce, sv), mean(dce, dv), mean(nll, ov), mean(gl, cw)]
-            if self.training and step_index % 8 == 0:
+            if self.training:
                 pred = op_logits.argmax(-1)
                 cnt = lambda mk: mk.sum().detach()  # noqa: E731
                 diag = {
@@ -435,8 +455,8 @@ class AdaptiveWorkspaceOperatorBankV4(nn.Module):
         if self.training:
             _s = (route_ops[0].detach() * active_mask.float().unsqueeze(-1)).sum(0)
             self._route_sum = _s if self._route_sum is None else self._route_sum + _s
-            self._route_n += float(active_mask.sum())
-            self._last_training_diagnostics["operation_probability"] = self._route_sum / max(self._route_n, 1.0)
+            self._route_n = self._route_n + active_mask.sum()
+            self._last_training_diagnostics["operation_probability"] = self._route_sum / torch.as_tensor(self._route_n, device=self._route_sum.device).clamp_min(1.0)
         else:
             r = route_ops[0].argmax(-1)
             for ro in route_ops[1:]:

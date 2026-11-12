@@ -26,6 +26,9 @@ from initium.data.workspace_capability.episode import (
     ENTITY_BASE,
     ENTITY_COUNT,
     EOS,
+    FACT_BASE,
+    FACT_COUNT,
+    NONE_TOKEN,
     EV_ASSERT,
     EV_COMMIT,
     EV_COUNT_QUERY,
@@ -82,6 +85,8 @@ from initium.data.workspace_capability.tracks import (
     trace_conditioning,
     variable_binding,
     conditional_ops,
+    developmental,
+    production,
 )
 from initium.data.workspace_capability.gnw_metrics import (
     binary_brier,
@@ -111,8 +116,13 @@ _GENERATORS = {
     "bistable_perception": bistable_perception.generate,
     "trace_conditioning": trace_conditioning.generate,
     "conditional_ops": conditional_ops.generate,
+    "developmental": developmental.generate,
+    "developmental_production": production.generate,
+    "developmental_production_unkeyed": production.generate_unkeyed,
 }
-TRACKS = tuple(_GENERATORS)
+DEV_TRACKS = ("developmental", "developmental_production", "developmental_production_unkeyed")
+PRODUCTION_TRACKS = DEV_TRACKS[1:]
+TRACKS = tuple(t for t in _GENERATORS if t not in DEV_TRACKS)  # marker space holds 19 tracks
 ALL_TRACK = "all"
 NEW_TRACKS = (
     "capacity_bottleneck",
@@ -226,7 +236,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
 
     def __init__(self, task_track: str = ALL_TRACK, *, batch_size_hint: int = 16):
         task_track = (task_track or ALL_TRACK).lower().replace("-", "_")
-        if task_track not in (*TRACKS, ALL_TRACK, NEW_ALL_TRACK, GNW_ALL_TRACK, MIXED_BINDING_TRACK):
+        if task_track not in (*_GENERATORS, ALL_TRACK, NEW_ALL_TRACK, GNW_ALL_TRACK, MIXED_BINDING_TRACK):
             raise ValueError(
                 "unknown workspace task track "
                 f"{task_track!r}; choose one of "
@@ -240,6 +250,10 @@ class WorkspaceCapabilityDataset(BaseDataset):
         # required progression stratum has a stable estimate.
         self.curriculum_eval_episodes_per_group = 16
         self.track_homogeneous_batches = False
+        self.teacher_forced_answers = False
+        self.generation_eval = False
+        self.sample_print_per_group = 2
+        self._last_eval_preds: dict[int, list[int]] = {}
         self.training_step = 0
         self.last_batch_padding_utilization = 1.0
         self.last_batch_sequence_mean = 0.0
@@ -315,6 +329,162 @@ class WorkspaceCapabilityDataset(BaseDataset):
     def set_output_proj(self, proj):
         self._output_proj = proj
 
+    def evaluate_dev_axes(self, model, device, num_episodes, rng, verbose_n=0, field_log=None):
+        """Paired label-only / length-only / combo-only / combined OOD splits."""
+        rng = rng or random.Random(171_001)
+        splits = (("in_distribution", ()), ("label_only", ("labels",)), ("length_only", ("length",)),
+                  ("combo_only", ("combos",)), ("combined", ("labels", "length", "combos")))
+        episodes = []
+        for _ in range(max(8, int(num_episodes) // 5)):
+            seed = rng.getrandbits(64)
+            for name, axes in splits:
+                ep = self._make_episode(self.task_track, 5, random.Random(seed), ood_axes=axes)
+                ep.metadata["axis"] = name
+                episodes.append(ep)
+        self._evaluate_episodes(model, device, episodes, field_log=field_log, verbose_n=verbose_n)
+        self._print_samples(episodes, "ood", self.sample_print_per_group // 2 or (1 if self.sample_print_per_group else 0))
+        stat = {n: [0, 0, 0, 0] for n, _ in splits}
+        for ep in episodes:
+            p, s = self._last_eval_preds[id(ep)], stat[ep.metadata["axis"]]
+            s[0] += sum(a == b for a, b in zip(p, ep.answer))
+            s[1] += len(ep.answer)
+            s[2] += p == list(ep.answer)
+            s[3] += 1
+        res = {n: {"accuracy": 100.0 * s[0] / max(s[1], 1), "exact_match": 100.0 * s[2] / max(s[3], 1),
+                   "episodes": s[3]} for n, s in stat.items()}
+        self.last_eval_diagnostics["axis_generalization"] = res
+        return res["combined"]["accuracy"], res["combined"]["exact_match"], {}
+
+    def _production_metrics(self, episodes):
+        out: dict[str, list[int]] = {}
+        for e in episodes:
+            s, p = e.metadata.get("answer_stride"), self._last_eval_preds.get(id(e))
+            if not s or p is None:
+                continue
+            chunk = lambda a: [tuple(a[i : i + s]) for i in range(0, len(a) - 1, s)]  # noqa: E731
+            gf, pf = chunk(list(e.answer)), chunk(p)
+            m = out.setdefault(e.metadata["progression_group"], [0, 0, 0, 0])
+            m[0] += set(pf) == set(gf)
+            m[1] += 1
+            m[2] += sum(f in pf for f in gf)
+            m[3] += len(gf)
+        return {g: {"fact_set_match": 100.0 * m[0] / m[1], "fact_accuracy": 100.0 * m[2] / max(m[3], 1),
+                    "episodes": m[1]} for g, m in out.items()}
+
+    def _production_gap(self, model, device, lesson_idx, n=64):
+        """Same world/seed asked both ways: concept->word (p_entity) vs word->concept (p_comp)."""
+        rng, base = random.Random(97_000 + lesson_idx), difficulty_for(self.task_track, lesson_idx)
+        eps: dict[str, list] = {"p_entity": [], "p_comp": []}
+        for _ in range(n):
+            seed = rng.getrandbits(64)
+            for g in eps:
+                eps[g].append(validate_episode(
+                    _GENERATORS[self.task_track]({**base, "groups": (g,)}, random.Random(seed))))
+        ex = {g: self._evaluate_episodes(model, device, lst)[1] for g, lst in eps.items()}
+        return {"p_entity": {"production_exact": ex["p_entity"], "comprehension_exact": ex["p_comp"],
+                             "gap_pp": ex["p_entity"] - ex["p_comp"], "episodes": n}}
+
+    def _generation_metrics(self, model, device, episodes, cap=16):
+        """Free-running generation: re-forward with fed-back tokens; causality lets padding stay inert."""
+        import contextlib
+        import io
+
+        eps = [e for e in episodes if e.metadata.get("answer_stride")]
+        if not eps:
+            return {}
+        gen, done, sink = [[] for _ in eps], [False] * len(eps), io.StringIO()
+        for t in range(min(cap, max(len(e.answer) for e in eps) + 2)):
+            batch = []
+            for e, g in zip(eps, gen):
+                kk = tuple(e.metadata.get("workspace_output_keys", ()))[: t + 1]
+                kk += (-1,) * (t + 2 - len(kk))
+                batch.append(TaskEpisode(
+                    e.track, e.inputs, tuple(g) + (EOS,) * (t - len(g)) + (FACT_BASE, EOS),
+                    {**e.metadata, "workspace_output_keys": kk}))
+            with contextlib.redirect_stdout(sink):
+                self._evaluate_episodes(model, device, batch, teacher_forced=True)
+            for i, b in enumerate(batch):
+                if not done[i]:
+                    tok = self._last_eval_preds[id(b)][t]
+                    gen[i].append(tok)
+                    done[i] = tok == EOS
+            if all(done):
+                break
+        n = len(eps)
+        exact = tok_acc = length_ok = rep = rep_n = fs = 0
+        for e, g in zip(eps, gen):
+            a, s = list(e.answer), e.metadata["answer_stride"]
+            ch = lambda q: {tuple(q[i : i + s]) for i in range(0, len(q) - 1, s)}  # noqa: E731
+            exact += g == a
+            tok_acc += sum(x == y for x, y in zip(g, a)) / len(a)
+            length_ok += len(g) == len(a) and g[-1] == EOS
+            rep += sum(x == y for x, y in zip(g, g[1:]))
+            rep_n += max(len(g) - 1, 0)
+            fs += ch(g) == ch(a)
+        self._last_eval_preds = {id(e): g for e, g in zip(eps, gen)}
+        self._print_samples(eps, "free-gen")
+        with contextlib.redirect_stdout(sink):
+            tf_exact = self._evaluate_episodes(model, device, eps, teacher_forced=True)[1]
+        ge = 100.0 * exact / n
+        return {"exact": ge, "token_accuracy": 100.0 * tok_acc / n, "length_accuracy": 100.0 * length_ok / n,
+                "repetition_rate": 100.0 * rep / max(rep_n, 1), "fact_set_match": 100.0 * fs / n,
+                "teacher_forced_exact": tf_exact, "gap_pp": tf_exact - ge,
+                "free_over_tf": ge / max(tf_exact, 1e-9), "episodes": n}
+
+    def _print_samples(self, episodes, label, per_group=None):
+        """Console: model guess vs gold (+concept gloss) per progression group, failures first."""
+        k = self.sample_print_per_group if per_group is None else per_group
+        if k <= 0:
+            return
+        picked = {}
+        for e in episodes:
+            p = self._last_eval_preds.get(id(e))
+            g = e.metadata.get("progression_group")
+            if p is None or g is None:
+                continue
+            picked.setdefault((e.metadata.get("axis", label), str(g)), ([], []))[p == list(e.answer)].append((e, p))
+        for (lab, group), (bad, good) in sorted(picked.items()):
+            for e, p in (bad + good)[:k]:
+                ok = "OK" if p == list(e.answer) else "XX"
+                print(f"  [sample/{lab}/{group}] {ok} | {e.metadata['query_type']} | {self._fmt_answer(e, p)}")
+
+    @staticmethod
+    def _fmt_answer(e, pred):
+        rev = {int(t): int(c) for c, t in e.metadata.get("lexicon", ())}
+        stride = int(e.metadata.get("answer_stride") or 0)
+
+        def tok(t):
+            t = int(t)
+            if t == EOS:
+                return "EOS"
+            if t == NONE_TOKEN:
+                return "NONE"
+            if t >= FACT_BASE:
+                return f"w{t - FACT_BASE}" + (f"=c{rev[t]}" if t in rev else "")
+            if ENTITY_BASE <= t < ENTITY_BASE + ENTITY_COUNT:
+                return f"e{t - ENTITY_BASE}"
+            if LOCATION_BASE <= t < LOCATION_BASE + LOCATION_COUNT:
+                return f"l{t - LOCATION_BASE}"
+            return str(t)
+
+        def seq(a):
+            a = list(a)
+            step = stride or len(a)
+            return " / ".join(" ".join(map(tok, a[i : i + step])) for i in range(0, len(a), step))
+
+        concepts = e.metadata.get("answer_concepts", ())
+        gloss = f" | concepts: {' '.join(f'c{c}' for c in concepts)}" if concepts else ""
+        return f"guess: {seq(pred)} | gold: {seq(e.answer)}{gloss}"
+
+    def _attach_production_diagnostics(self, model, device, episodes, lesson_idx):
+        diag = self.last_eval_diagnostics
+        diag["production"] = self._production_metrics(episodes)  # must precede other evals (uses preds)
+        self._print_samples(episodes, "id")
+        diag["production_gap"] = self._production_gap(model, device, lesson_idx)
+        if self.generation_eval:
+            diag["production_generation"] = {"all": self._generation_metrics(model, device, episodes)}
+        self.last_eval_diagnostics = diag
+
     def _tracks(self):
         if self.task_track == ALL_TRACK:
             return TRACKS
@@ -354,6 +524,10 @@ class WorkspaceCapabilityDataset(BaseDataset):
         if track == "variable_binding":
             chain = "long" if int(difficulty["assignments"]) >= 12 else "short"
             return (f"computed_chain_{chain}",)
+        if track in PRODUCTION_TRACKS:
+            return tuple(difficulty["groups"])
+        if track == "developmental":
+            return tuple(difficulty["families"])
         if track == "ignition":
             return ("all",)
         if track in {
@@ -403,6 +577,10 @@ class WorkspaceCapabilityDataset(BaseDataset):
         self._last_id_eval_lesson = int(lesson_idx)
         self._last_id_eval_episodes = episodes
         result = self._evaluate_episodes(model, device, episodes, field_log=field_log)
+        if self.task_track in PRODUCTION_TRACKS:
+            self._attach_production_diagnostics(model, device, episodes, int(lesson_idx))
+        elif self.task_track == "developmental":
+            self._print_samples(episodes, "id")
         _t = (self.last_eval_diagnostics or {}).get("tracks", {})
         # self._track_weights = {t: 0.1 + max(0.0, 1.0 - m["exact_match"] / 100.0) for t, m in _t.items()}
         self._track_weights = {t: 0.05 for t in _t}
@@ -529,10 +707,10 @@ class WorkspaceCapabilityDataset(BaseDataset):
         valid_tokens = sum(lengths)
         padded_tokens = batch_size * self.last_batch_sequence_max
         self.last_batch_padding_utilization = valid_tokens / max(padded_tokens, 1)
-        return self._collate(episodes, token_ids_only=self.token_id_input)
+        return self._collate(episodes, token_ids_only=self.token_id_input, teacher_forced=self.teacher_forced_answers)
 
     @staticmethod
-    def _collate(episodes: list[TaskEpisode], *, token_ids_only: bool = False):
+    def _collate(episodes: list[TaskEpisode], *, token_ids_only: bool = False, teacher_forced: bool = False):
         sequences = [episode.sequence for episode in episodes]
         max_len = max(map(len, sequences))
         batch = len(episodes)
@@ -543,7 +721,10 @@ class WorkspaceCapabilityDataset(BaseDataset):
         targets = torch.zeros(batch, max_len, dtype=torch.long)
         mask = torch.zeros(batch, max_len, dtype=torch.float32)
         for row, (episode, sequence) in enumerate(zip(episodes, sequences)):
-            row_token_ids = torch.tensor(sequence, dtype=torch.long)
+            seq = list(sequence)
+            if teacher_forced:  # input at answer position t>0 = gold token t-1; position 0 keeps ANSWER
+                seq[len(episode.inputs) + 1 :] = episode.answer[:-1]
+            row_token_ids = torch.tensor(seq, dtype=torch.long)
             length = row_token_ids.numel()
             if token_ids_only:
                 inputs[row, :length] = row_token_ids
@@ -795,6 +976,16 @@ class WorkspaceCapabilityDataset(BaseDataset):
             )
             return
         event_tokens = _ENTITY_ADDRESS_EVENT_TOKENS.get(track, set())
+        if track in PRODUCTION_TRACKS:
+            WorkspaceCapabilityDataset._add_developmental_address_writes(
+                row, tokens, entity_ids, write_mask
+            )
+            return
+        if track == "developmental":
+            WorkspaceCapabilityDataset._add_developmental_address_writes(
+                row, tokens, entity_ids, write_mask
+            )
+            return
         if not event_tokens:
             return
 
@@ -863,6 +1054,26 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 has_relation = True
             elif token in (BOOL_FALSE, BOOL_TRUE):
                 has_boolean = True
+
+    @staticmethod
+    def _add_developmental_address_writes(row, tokens, entity_ids, write_mask) -> None:
+        """Key each write event by its concept entity (EV_FACT: by fact ordinal 24+i); queries only read."""
+        event, key, facts = -1, -1, 0
+        for position, token_value in enumerate(tokens):
+            token = int(token_value)
+            if ENTITY_BASE <= token < ENTITY_BASE + ENTITY_COUNT:
+                entity_ids[row, position] = token - ENTITY_BASE
+                if event >= 0 and key < 0 and event != EV_FACT:
+                    key = token - ENTITY_BASE
+            elif token == SEP:
+                if event == EV_FACT:
+                    key, facts = 24 + min(facts, 7), facts + 1
+                if event >= 0 and key >= 0:
+                    entity_ids[row, position] = key
+                    write_mask[row, position] = True
+                event, key = -1, -1
+            elif token in (EV_INIT, EV_MOVE, EV_UPDATE, EV_ASSERT, EV_KV, EV_FACT):
+                event, key = token, -1
 
     @staticmethod
     def _add_masked_prime_trace_write(row, tokens, entity_ids, write_mask) -> None:
@@ -1949,6 +2160,8 @@ class WorkspaceCapabilityDataset(BaseDataset):
                                     rule_feedback_targets[rule_trial]
                                 )
                         rule_trial += 1
+                elif episode.track in DEV_TRACKS and active_event == EV_KV and token >= FACT_BASE:
+                    payload = token
                 elif (
                     include_operations
                     and episode.track in ("mixed_skill", "variable_binding")
@@ -2319,11 +2532,18 @@ class WorkspaceCapabilityDataset(BaseDataset):
                         num_classes=result.shape[-1],
                     ).to(operation_probs.dtype)
             elif operation == "argmatch":
-                query_location = int(metadata["key_value_argmatch_locations"][(int(row), int(step))]) - LOCATION_BASE
-                match = operands[:, LOCATION_BASE : LOCATION_BASE + LOCATION_COUNT].softmax(dim=-1)[:, query_location]
+                query_token = int(metadata["key_value_argmatch_locations"][(int(row), int(step))])
+                base, size = (
+                    (FACT_BASE, FACT_COUNT) if query_token >= FACT_BASE else (LOCATION_BASE, LOCATION_COUNT)
+                )
+                match = operands[:, base : base + size].softmax(dim=-1)[:, query_token - base]
                 entity_tokens = (
                     metadata["key_value_entity_ids"][int(row), int(step), : int(operand_count)].long() + ENTITY_BASE
                 ).to(logits.device)
+                if base == FACT_BASE:
+                    # No operand holds the queried word -> NONE (noisy-OR mass).
+                    entity_tokens = torch.cat((entity_tokens, entity_tokens.new_tensor([NONE_TOKEN])))
+                    match = torch.cat((match, (1.0 - match).prod().unsqueeze(0)))
                 operation_probs = torch.zeros(
                     result.shape[-1], device=logits.device, dtype=torch.float32
                 ).scatter(0, entity_tokens, match / match.sum().clamp_min(1e-6))
@@ -2685,6 +2905,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
         ablate_workspace_adaptive=False,
         ablate_workspace_operation_executor=False,
         shuffle_workspace_readback=False,
+        teacher_forced=None,
         ablate_workspace_feature: str | None = None,
         combiner_skip_stages=None,
         field_log=None,
@@ -2695,6 +2916,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
         was_training = model.training
         prior_workspace_bypass = getattr(model, "workspace_eval_bypass", None)
         prior_workspace_shuffle = getattr(model, "workspace_eval_shuffle_readback", None)
+        self._last_eval_preds = {}
         prior_adaptive_bypass = getattr(model, "workspace_adaptive_eval_bypass", None)
         prior_adaptive_v3_bypass = getattr(model, "workspace_adaptive_v3_eval_bypass", None)
         adaptive_eval_bypass = bool(prior_adaptive_bypass)
@@ -2861,6 +3083,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 ):
                     x, _targets, _mask = self._collate(
                         group,
+                        teacher_forced=self.teacher_forced_answers if teacher_forced is None else teacher_forced,
                         token_ids_only=bool(getattr(model, "workspace_token_id_input", False)),
                     )
                     sequence_valid_mask = None
@@ -3590,6 +3813,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
                     for local_idx, episode in enumerate(group):
                         start = len(episode.inputs)
                         pred = predictions[local_idx, start : start + len(episode.answer)].tolist()
+                        self._last_eval_preds[id(episode)] = pred
                         expected = list(episode.answer)
                         n_correct = sum(int(a == b) for a, b in zip(pred, expected))
                         n_answers = len(expected)
@@ -4859,6 +5083,8 @@ class WorkspaceCapabilityDataset(BaseDataset):
         return self._evaluate_episodes(model, device, episodes, **kwargs)
 
     def evaluate_ood(self, model, device, num_episodes, rng, verbose_n=0, field_log=None):
+        if self.task_track in DEV_TRACKS:
+            return self.evaluate_dev_axes(model, device, num_episodes, rng, verbose_n, field_log)
         rng = rng or random.Random(171_001)
         tracks = self._tracks()
         episodes = [

@@ -6,6 +6,7 @@ import random
 from collections.abc import Iterable
 
 _LEVELS = 6
+_DEV = ("developmental", "developmental_production", "developmental_production_unkeyed")
 
 
 def difficulty_for(
@@ -24,10 +25,10 @@ def difficulty_for(
             axes = {"legacy"} if ood else set()
     else:
         axes = {str(axis).strip().lower() for axis in ood_axes}
-        unknown_axes = axes - {"labels", "length"}
+        unknown_axes = axes - ({"labels", "length", "combos"} if track in _DEV else {"labels", "length"})
         if unknown_axes:
             raise ValueError(f"unknown OOD axes for {track!r}: {sorted(unknown_axes)}")
-        if track != "permutation":
+        if track != "permutation" and track not in _DEV:
             raise ValueError("explicit OOD axes are currently supported only for permutation")
     config: dict[str, int | float | str | bool | tuple[str, ...]]
     if track == "permutation":
@@ -128,8 +129,47 @@ def difficulty_for(
             "operations": (2, 3, 4, 5, 6, 8)[level],
             "keys": (4, 5, 6, 7, 8, 10)[level],
         }
+    elif track in _DEV[1:]:
+        config = {
+            "groups": ("p_entity", "p_relation", "p_property", "p_all2", "p_all3", "p_order")[: (1, 2, 3, 3, 4, 6)[level]],
+            "concepts": (4, 5, 6, 6, 8, 10)[level],
+            "scenes": (3, 4, 5, 6, 8, 10)[level],
+            "ambiguity": (2, 2, 3, 3, 4, 4)[level],
+            "noise": 0.0,
+            "heldout": 0.0,
+            "combos": 0,
+            "ambiguity_prob": (0.0, 0.0, 0.0, 0.5, 0.5, 0.5)[level],
+            "facts_a": (1, 2, 2, 3, 3, 3)[level],
+            "distractors": (0, 0, 0, 0, 0, 2)[level],
+            "ordering": level >= 5,
+        }
+    elif track == "developmental":
+        config = {
+            "families": ("d1_naming", "d2_cross", "d3_attribute", "d4_relation", "d5_temporal", "d6_compose", "d5_action")[
+                : (1, 3, 4, 5, 6, 6)[level]
+            ],
+            "concepts": (3, 4, 5, 6, 7, 8)[level],
+            "scenes": (3, 4, 5, 6, 8, 10)[level],
+            "ambiguity": (2, 2, 3, 3, 4, 4)[level],
+            "noise": (0.0, 0.0, 0.0, 0.0, 0.15, 0.25)[level],
+            "heldout": 0.0,
+            "combos": 0,
+        }
     else:
         raise ValueError(f"unknown workspace capability track {track!r}")
+    if track in _DEV and ood_axes is not None:
+        if "labels" in axes:
+            config["heldout"] = 1.0
+        if "combos" in axes:
+            config["combos"] = 1
+        if "length" in axes:
+            config["scenes"] = min(int(config["scenes"]) + 3, 12)
+            config["ambiguity"] = min(int(config["ambiguity"]) + 1, 5)
+            config["concepts"] = min(int(config["concepts"]) + 2, 12)
+            config["noise"] = min(float(config["noise"]) + 0.05, 0.3)
+            for key in ("facts_a", "distractors"):
+                if key in config:
+                    config[key] = min(int(config[key]) + 1, 3)
     if ood and track != "permutation":
         # OOD increases task-specific load beyond the ID lesson while keeping
         # each generator's token and sequence bounds valid.
@@ -185,6 +225,13 @@ def difficulty_for(
             config["maximum_frames"] = min(int(config["maximum_frames"]) + 1, 10)
         elif track == "trace_conditioning":
             config["maximum_gap"] = min(int(config["maximum_gap"]) + 1, 6)
+        elif track in _DEV:
+            config["heldout"] = 1.0
+            config["combos"] = 1
+            config["scenes"] = min(int(config["scenes"]) + 3, 12)
+            config["ambiguity"] = min(int(config["ambiguity"]) + 1, 5)
+            config["concepts"] = min(int(config["concepts"]) + 2, 12)
+            config["noise"] = min(float(config["noise"]) + 0.05, 0.3)
         elif track == "conditional_ops":
             config["keys"] = min(int(config["keys"]) + 2, 12)
             config["operations"] = min(int(config["operations"]) + 1, 8)

@@ -898,6 +898,7 @@ def load_frozen_workspace_warm_start(
         "activation_offload_to_cpu",  # storage policy only; exact gradients are preserved
         "activation_offload_cpu_budget_mb",  # storage policy only
         "workspace_track_homogeneous_batches",  # training batch scheduler only
+        "workspace_teacher_forced_answers",  # input feeding policy only
         # Exact implementation-only optimization; old checkpoints default
         # to base and remain weight/state compatible with either backend.
         "dnc_implementation",
@@ -1283,6 +1284,12 @@ def run(
     sgr_gate_eval_override: str = "none",
     sgr_dnc_write_salience: bool = False,
     sgr_workspace_write_salience: bool = False,
+    workspace_teacher_forced_answers: bool = False,
+    workspace_generation_eval: bool = False,
+    workspace_eval_samples_per_group: int = 2,
+    workspace_scheduled_sampling: float = 0.0,
+    workspace_scheduled_sampling_steps: int = 20_000,
+    init_from: str | None = None,
 ):
     original_run_id = run_id
     run_id = _filesystem_safe_run_id(run_id)
@@ -1520,6 +1527,9 @@ def run(
             workspace_curriculum_eval_episodes_per_group
         )
         dataset.track_homogeneous_batches = bool(workspace_track_homogeneous_batches)
+        dataset.teacher_forced_answers = bool(workspace_teacher_forced_answers)
+        dataset.generation_eval = bool(workspace_generation_eval)
+        dataset.sample_print_per_group = max(0, int(workspace_eval_samples_per_group))
         selected_tracks = dataset._tracks()
         if len(selected_tracks) > 1:
             if dataset.track_homogeneous_batches:
@@ -3069,6 +3079,14 @@ def run(
                     *([None] * 8),
                 ]
             )
+        for _key in ("production", "production_generation", "production_gap", "axis_generalization"):
+            for _label, _metrics in sorted((diagnostics.get(_key) or {}).items()):
+                for _metric, _value in sorted(_metrics.items()):
+                    if _metric != "episodes":
+                        workspace_task_writer.writerow(
+                            [step_value, lesson_value, eval_type, f"{_key}/{_label}/{_metric}", _value,
+                             None, _metrics.get("episodes"), None, *([None] * 8)]
+                        )
         workspace_task_file.flush()
 
     def write_workspace_dependency(
@@ -4339,6 +4357,7 @@ def run(
         "workspace_adaptive_v3_logit_diagnostics": workspace_adaptive_v3_logit_diagnostics,
         "workspace_compile_recurrence": workspace_compile_recurrence,
         "workspace_token_id_input": workspace_token_id_input,
+        "workspace_teacher_forced_answers": workspace_teacher_forced_answers,
         "workspace_entity_keyed_writes": workspace_entity_keyed_writes,
         "workspace_permutation_transactional": workspace_permutation_transactional,
         "workspace_state_loss_weight": workspace_state_loss_weight,
@@ -5316,6 +5335,16 @@ def run(
     )
     rnn.train(not eval_only)
     output_proj.train(not eval_only)
+    if init_from is not None and not resume_requested:  # weights only: fresh optimizer/curriculum/step
+        _init = load_checkpoint_for_resume(init_from, device)
+        _cfg = _init.get("model_config", {})
+        for _k in ("input_size", "split_graph_num_blocks", "workspace_num_slots", "moe_num_experts", "memory_type"):
+            if _k in _cfg and _cfg[_k] != expected_resume_model_config.get(_k):
+                raise ValueError(f"--init-from mismatch on {_k}: {_cfg[_k]!r} vs {expected_resume_model_config.get(_k)!r}")
+        _loaded = rnn.load_state_dict(_init["rnn_state_dict"], strict=False)
+        output_proj.load_state_dict(_init["output_proj_state_dict"])
+        print(f"[{run_id}] warm-started weights from {init_from} (missing={len(_loaded.missing_keys)}, "
+              f"unexpected={len(_loaded.unexpected_keys)}); optimizer/curriculum/step fresh")
     if not eval_only:
         set_lr(step)  # Phase 1 FIX: ensure correct clamped LR from the very first
     # iteration -- otherwise a resumed run's first step would briefly use
@@ -5710,6 +5739,22 @@ def run(
                 )
         hidden: Any = (None, None, None)
         optimizer.zero_grad(set_to_none=True)
+        if workspace_scheduled_sampling > 0 and input_seq.ndim == 2:
+            p_ss = workspace_scheduled_sampling * min(1.0, step / max(1, workspace_scheduled_sampling_steps))
+            if p_ss > 0:
+                with torch.no_grad(), torch.amp.autocast("cuda", enabled=amp_enabled):
+                    ss_out, _ = rnn(input_seq, (None, None, None), reset_experience=True,
+                                    timespans=timespans, **workspace_forward_kwargs)
+                    ss_logits = output_proj(ss_out.transpose(0, 1))
+                    if workspace_key_value_loss_weight > 0:
+                        ss_logits = dataset.apply_workspace_key_value_readout_logits(
+                            ss_logits, rnn.workspace.pop_key_value_predictions(), key_value_metadata, answer_mask)
+                for _layer in getattr(rnn, "moe_layers", ()):
+                    _layer.pop_aux_loss()
+                prev = ss_logits.argmax(-1)[:, :-1]
+                ans = answer_mask.bool()
+                swap = ans[:, 1:] & ans[:, :-1] & (torch.rand(prev.shape, device=device) < p_ss)
+                input_seq = torch.cat((input_seq[:, :1], torch.where(swap, prev, input_seq[:, 1:])), 1)
 
         if dnc_backward_trace and split_graph_enabled:
             rnn.memories[0].set_backward_trace(True, step=step)
@@ -9794,6 +9839,9 @@ if __name__ == "__main__":
             "bistable_perception",
             "trace_conditioning",
             "conditional_ops",
+            "developmental",
+            "developmental_production",
+            "developmental_production_unkeyed",
         ],
         default="all",
         help=(
@@ -9905,7 +9953,29 @@ if __name__ == "__main__":
         action="store_true",
         help="prepare and optionally save the dataset, then exit without training.",
     )
+    parser.add_argument("--workspace-teacher-forced-answers", action="store_true",
+                        help="Feed the gold previous answer token at answer positions t>0 (production tracks only).")
+    parser.add_argument("--workspace-generation-eval", action="store_true",
+                        help="Report free-running generation vs teacher-forced metrics (production tracks).")
+    parser.add_argument("--workspace-eval-samples-per-group", type=int, default=2, metavar="N",
+                        help="Console samples (guess vs gold, failures first) per progression group at each developmental/production evaluation; 0 disables.")
+    parser.add_argument("--workspace-scheduled-sampling", type=float, default=0.0, metavar="P",
+                        help="Max prob of replacing a gold previous token with the model argmax (needs teacher forcing + token-id input).")
+    parser.add_argument("--workspace-scheduled-sampling-steps", type=int, default=20_000)
+    parser.add_argument("--init-from", type=str, default=None,
+                        help="Load model weights only (fresh optimizer/curriculum), e.g. a Stage 1 checkpoint.")
     args = parser.parse_args()
+    _prod = args.dataset_type == "workspace-capability" and args.workspace_task_track.startswith("developmental_production")
+    if (args.workspace_teacher_forced_answers or args.workspace_generation_eval
+            or args.workspace_scheduled_sampling > 0) and not _prod:
+        parser.error("teacher forcing/generation/scheduled sampling require a developmental_production* track")
+    if not 0.0 <= args.workspace_scheduled_sampling <= 1.0:
+        parser.error("--workspace-scheduled-sampling must be in [0, 1]")
+    if args.workspace_scheduled_sampling > 0 and not (
+            args.workspace_teacher_forced_answers and args.workspace_token_id_input):
+        parser.error("scheduled sampling requires --workspace-teacher-forced-answers and --workspace-token-id-input")
+    if args.init_from and args.resume:
+        parser.error("--init-from and --resume are mutually exclusive")
 
     if args.prepare_only and args.load_prepared:
         parser.error("--prepare-only cannot be combined with --load-prepared")
@@ -11117,6 +11187,12 @@ if __name__ == "__main__":
             sgr_gate_eval_override=args.sgr_gate_eval_override,
             sgr_dnc_write_salience=args.sgr_dnc_write_salience,
             sgr_workspace_write_salience=args.sgr_workspace_write_salience,
+            workspace_teacher_forced_answers=args.workspace_teacher_forced_answers,
+            workspace_generation_eval=args.workspace_generation_eval,
+            workspace_eval_samples_per_group=args.workspace_eval_samples_per_group,
+            workspace_scheduled_sampling=args.workspace_scheduled_sampling,
+            workspace_scheduled_sampling_steps=args.workspace_scheduled_sampling_steps,
+            init_from=args.init_from,
         )
         all_summaries.append(summary)
 

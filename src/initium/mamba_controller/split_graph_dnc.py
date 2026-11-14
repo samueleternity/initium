@@ -299,6 +299,7 @@ class SplitGraphDNC(nn.Module):
         workspace_write_to_kv: bool = False,
         workspace_kv_read_scale: float = 0.1,
         workspace_token_id_input: bool = False,
+        workspace_slot_readout: bool = False,
         activation_checkpointing: bool = False,
         sgr_write_salience_enabled: bool = False,
         sgr_workspace_salience_enabled: bool = False,
@@ -447,6 +448,7 @@ class SplitGraphDNC(nn.Module):
             )
         self.workspace_enabled = workspace_enabled
         self.workspace_token_id_input = bool(workspace_token_id_input)
+        self.workspace_slot_readout_enabled = bool(workspace_slot_readout)
         if self.workspace_token_id_input and not (mamba_variant == "mamba1" and input_size == 320):
             raise ValueError(
                 "token-ID input is currently supported only for the 320-token "
@@ -856,6 +858,7 @@ class SplitGraphDNC(nn.Module):
                 adaptive_v3_compile_operators=workspace_adaptive_v3_compile_operators,
                 adaptive_v4_enabled=workspace_adaptive_v4_enabled,
                 sparse_recurrence=workspace_sparse_recurrence,
+                slot_readout=workspace_slot_readout,
                 attentional_cue_readout=workspace_attentional_cue_readout,
                 key_match_threshold=workspace_key_match_threshold,
             )
@@ -913,6 +916,20 @@ class SplitGraphDNC(nn.Module):
 
         if self.device is not None and getattr(self.device, "type", None) == "cuda":
             self.to(self.device)
+
+    def apply_slot_readout(self, logits, features, state, answer_mask):
+        """Add slot-pointer word logits at answer positions; honours bypass/shuffle ablations."""
+        ws = self.workspace
+        chx = state[0] if isinstance(state, tuple) else None
+        if ws is None or ws.slot_pointer is None or not isinstance(chx, dict):
+            return logits
+        slots = chx["_initium_workspace_state"]
+        if self.workspace_eval_bypass:
+            slots = torch.zeros_like(slots)
+        elif self.workspace_eval_shuffle_readback and slots.shape[0] > 1:
+            slots = slots.roll(1, 0)
+        delta = ws.slot_readout_logits(features, slots).to(logits.dtype)
+        return logits + delta * answer_mask.to(device=logits.device, dtype=logits.dtype).unsqueeze(-1)
 
     def set_sgr_prediction_decoder(self, decoder: nn.Module | None, signal_mode: str) -> None:
         object.__setattr__(

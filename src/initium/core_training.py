@@ -154,6 +154,7 @@ from initium.data.common.causal_prediction import (
     masked_input_prediction_loss,
 )
 from initium.data.dataset_registry import get_dataset
+from initium.data.workspace_capability.tracks import _dev_lexicon
 from initium.data.graph_traversal.order_probe import (
     build_q99_probe_batch,
     evaluate_q99_order_sensitivity,
@@ -899,6 +900,10 @@ def load_frozen_workspace_warm_start(
         "activation_offload_cpu_budget_mb",  # storage policy only
         "workspace_track_homogeneous_batches",  # training batch scheduler only
         "workspace_teacher_forced_answers",  # input feeding policy only
+        "workspace_stage3_manifest_sha256",  # data provenance, not architecture
+        "workspace_lexicon_mode",
+        "workspace_lexical_family",
+        "workspace_lexical_unkeyed",
         # Exact implementation-only optimization; old checkpoints default
         # to base and remain weight/state compatible with either backend.
         "dnc_implementation",
@@ -1290,6 +1295,10 @@ def run(
     workspace_scheduled_sampling: float = 0.0,
     workspace_scheduled_sampling_steps: int = 20_000,
     init_from: str | None = None,
+    workspace_lexicon_mode: str = "stable",
+    workspace_lexical_family: str = "words",
+    workspace_lexical_unkeyed: bool = False,
+    workspace_slot_readout: bool = False,
 ):
     original_run_id = run_id
     run_id = _filesystem_safe_run_id(run_id)
@@ -1530,6 +1539,16 @@ def run(
         dataset.teacher_forced_answers = bool(workspace_teacher_forced_answers)
         dataset.generation_eval = bool(workspace_generation_eval)
         dataset.sample_print_per_group = max(0, int(workspace_eval_samples_per_group))
+        _dev_lexicon.configure(
+            lexicon_mode=workspace_lexicon_mode,
+            family=workspace_lexical_family,
+            unkeyed=workspace_lexical_unkeyed,
+        )
+        if dataset.task_track in _dev_lexicon.STAGE3_TRACKS:
+            print(
+                f"[stage3] lexicon_mode={workspace_lexicon_mode} family={workspace_lexical_family} "
+                f"unkeyed={workspace_lexical_unkeyed} manifest_sha256={_dev_lexicon.manifest_sha256()[:16]}"
+            )
         selected_tracks = dataset._tracks()
         if len(selected_tracks) > 1:
             if dataset.track_homogeneous_batches:
@@ -3079,8 +3098,7 @@ def run(
                     *([None] * 8),
                 ]
             )
-        for _key in ("production", "production_generation", "production_gap", "axis_generalization"):
-            for _label, _metrics in sorted((diagnostics.get(_key) or {}).items()):
+        for _key in ("production", "production_generation", "production_gap", "axis_generalization", "stage3_counterfactual", "stage3_ood"):            for _label, _metrics in sorted((diagnostics.get(_key) or {}).items()):
                 for _metric, _value in sorted(_metrics.items()):
                     if _metric != "episodes":
                         workspace_task_writer.writerow(
@@ -3925,6 +3943,7 @@ def run(
             workspace_no_report_confidence_readout=workspace_no_report_confidence_readout,
             workspace_masked_prime_trace=workspace_masked_prime_trace,
             workspace_token_id_input=workspace_token_id_input,
+            workspace_slot_readout=workspace_slot_readout,
             workspace_entity_keyed_writes=workspace_entity_keyed_writes,
             workspace_semantic_entity_addressing=workspace_semantic_entity_addressing,
             workspace_permutation_transactional=workspace_permutation_transactional,
@@ -4387,6 +4406,11 @@ def run(
     }
     if workspace_adaptive_enabled:
         extra_model_config["workspace_adaptive_enabled"] = True
+    if getattr(dataset, "task_track", None) in _dev_lexicon.STAGE3_TRACKS:
+        extra_model_config["workspace_stage3_manifest_sha256"] = _dev_lexicon.manifest_sha256()
+        extra_model_config["workspace_lexicon_mode"] = workspace_lexicon_mode
+        extra_model_config["workspace_lexical_family"] = workspace_lexical_family
+        extra_model_config["workspace_lexical_unkeyed"] = bool(workspace_lexical_unkeyed)
     if workspace_adaptive_v2_enabled:
         extra_model_config["workspace_adaptive_v2_enabled"] = True
         extra_model_config["workspace_adaptive_v2_num_skills"] = (
@@ -5894,7 +5918,10 @@ def run(
                 # selected logits carry no useful gradient. Clear its graph.
                 rnn.workspace.pop_nth_farthest_query_predictions()
             output = output.transpose(0, 1)  # (B, T, 92); Linear accepts non-contiguous input.
+            _slot_features = output
             output = output_proj(output)  # (B, T, 90)
+            if workspace_slot_readout:
+                output = rnn.apply_slot_readout(output, _slot_features, hidden, answer_mask)
             key_value_predictions = []
             if workspace_key_value_loss_weight > 0:
                 workspace_module = getattr(rnn, "workspace", None)
@@ -9842,6 +9869,11 @@ if __name__ == "__main__":
             "developmental",
             "developmental_production",
             "developmental_production_unkeyed",
+            "developmental_production_aux",
+            "developmental_lexical",
+            "developmental_semantic",
+            "developmental_production_semantic",
+            "developmental_production_semantic_unkeyed",
         ],
         default="all",
         help=(
@@ -9962,6 +9994,14 @@ if __name__ == "__main__":
     parser.add_argument("--workspace-scheduled-sampling", type=float, default=0.0, metavar="P",
                         help="Max prob of replacing a gold previous token with the model argmax (needs teacher forcing + token-id input).")
     parser.add_argument("--workspace-scheduled-sampling-steps", type=int, default=20_000)
+    parser.add_argument("--workspace-lexicon-mode", choices=("stable", "episodic"), default="stable",
+                        help="Stage 3: real stable word ids, or arbitrary per-episode ids (Stage 2 calibration arm).")
+    parser.add_argument("--workspace-lexical-family", choices=("words", "senses", "all"), default="words",
+                        help="developmental_lexical groups: 3a words, 3b senses, or both.")
+    parser.add_argument("--workspace-lexical-unkeyed", action="store_true",
+                        help="Stage 3a/3b/3c: drop workspace_output_keys (3d has *_unkeyed tracks).")
+    parser.add_argument("--workspace-slot-readout", action="store_true",
+                        help="Stage 3d unkeyed: learned concept-pointer readout over workspace slots at answer positions.")
     parser.add_argument("--init-from", type=str, default=None,
                         help="Load model weights only (fresh optimizer/curriculum), e.g. a Stage 1 checkpoint.")
     args = parser.parse_args()
@@ -10931,6 +10971,14 @@ if __name__ == "__main__":
             run_id += f"_track{args.workspace_task_track}"
             if args.workspace_track_homogeneous_batches:
                 run_id += "_trackbatch"
+            if args.workspace_task_track in _dev_lexicon.STAGE3_TRACKS:
+                run_id += f"_lex{args.workspace_lexicon_mode}"
+                if args.workspace_task_track == "developmental_lexical":
+                    run_id += f"_fam{args.workspace_lexical_family}"
+                if args.workspace_lexical_unkeyed:
+                    run_id += "_unkeyed"
+            if args.workspace_slot_readout:
+                run_id += "_slotptr"
             if args.workspace_autoadaptive_v3_compile_operators:
                 run_id += "_v3compile"
             if args.workspace_task_track in (
@@ -11193,6 +11241,10 @@ if __name__ == "__main__":
             workspace_scheduled_sampling=args.workspace_scheduled_sampling,
             workspace_scheduled_sampling_steps=args.workspace_scheduled_sampling_steps,
             init_from=args.init_from,
+            workspace_lexicon_mode=args.workspace_lexicon_mode,
+            workspace_lexical_family=args.workspace_lexical_family,
+            workspace_lexical_unkeyed=args.workspace_lexical_unkeyed,
+            workspace_slot_readout=args.workspace_slot_readout,
         )
         all_summaries.append(summary)
 
@@ -11205,7 +11257,7 @@ if __name__ == "__main__":
     # once all processes finish. Only the no-arg (full sequential) path
     # produces a complete combined summary in one file.
     summary_suffix = "_".join(f"b{b}".replace(".", "p") for b in betas_to_run)
-    summary_path = os.path.join(LOG_DIR, f"gate1_sweep_summary_{summary_suffix}.csv")
+    summary_path = os.path.join(LOG_DIR, f"gate_sweep_summary_{summary_suffix}.csv")
     with open(summary_path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(all_summaries[0].keys()))
         w.writeheader()

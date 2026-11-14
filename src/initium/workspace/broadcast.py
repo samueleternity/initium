@@ -134,6 +134,7 @@ class WorkspaceBroadcast(nn.Module):
         adaptive_v4_enabled: bool = False,
         sparse_recurrence: bool = False,
         attentional_cue_readout: bool = False,
+        slot_readout: bool = False,
         key_match_threshold: float = 0.5,
         diagnostics_enabled: bool = True,
     ):
@@ -262,6 +263,12 @@ class WorkspaceBroadcast(nn.Module):
         if self.adaptive_v4 is not None:
             # Non-registered alias so the V3 call sites drive V4; checkpoint keys stay adaptive_v4.*
             object.__setattr__(self, "adaptive_v3", self.adaptive_v4)
+        if slot_readout and not self.key_value_readout:
+            raise ValueError("slot readout requires key-value readout")
+        self.slot_pointer = (
+            nn.Linear(d_model, self._SEMANTIC_ENTITY_COUNT) if slot_readout else None
+        )
+        self.slot_readout_scale = nn.Parameter(torch.ones(())) if slot_readout else None
         self.semantic_attentional_color_decoder = (
             nn.Linear(d_model, _WORKSPACE_CAPABILITY_SOURCE_COUNT)
             if self.attentional_cue_readout_enabled
@@ -376,6 +383,17 @@ class WorkspaceBroadcast(nn.Module):
         if self.prediction_error_to_write_gate is not None:
             nn.init.zeros_(self.prediction_error_to_write_gate.weight)
 
+    def slot_readout_logits(self, features: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
+        """Learned concept pointer per position -> addressed slot content -> vocabulary logits."""
+        address, content = torch.split(state.float(), [self._address_dim, self.d_model], dim=-1)
+        occupied = (address.square().sum(-1) > 1e-12).float()
+        slot_ids = address.argmax(-1)
+        pointer = self.slot_pointer(features.float()).softmax(-1)
+        weights = pointer.gather(-1, slot_ids.unsqueeze(1).expand(-1, pointer.shape[1], -1))
+        weights = weights * occupied.unsqueeze(1)
+        read = torch.einsum("bts,bsd->btd", weights, content)
+        return self.slot_readout_scale * self.semantic_value_decoder(read)
+    
     def pop_semantic_state_predictions(self) -> list[tuple[int, torch.Tensor]]:
         """Return and clear auxiliary predictions from the most recent call."""
         predictions = self._last_semantic_state_predictions

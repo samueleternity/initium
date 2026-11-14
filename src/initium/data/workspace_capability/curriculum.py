@@ -5,8 +5,13 @@ from __future__ import annotations
 import random
 from collections.abc import Iterable
 
+from initium.data.workspace_capability.tracks import _dev_lexicon
+
 _LEVELS = 6
-_DEV = ("developmental", "developmental_production", "developmental_production_unkeyed")
+_STAGE3 = _dev_lexicon.STAGE3_TRACKS
+_DEV = ("developmental", "developmental_production", "developmental_production_unkeyed", "developmental_production_aux", *_STAGE3)
+_LEX_WORDS = ("d1_naming", "d2_cross", "d3_attribute", "d4_relation", "p_entity", "p_relation", "p_property")
+_LEX_SENSES = ("s_s2w", "s_w2s", "s_s2c", "s_disambig")
 
 
 def difficulty_for(
@@ -129,6 +134,37 @@ def difficulty_for(
             "operations": (2, 3, 4, 5, 6, 8)[level],
             "keys": (4, 5, 6, 7, 8, 10)[level],
         }
+    elif track == "developmental_lexical":
+        family = _dev_lexicon.settings["family"]
+        config = {
+            "groups": (_LEX_WORDS[: (1, 3, 4, 5, 6, 7)[level]] if family != "senses" else ())
+            + (_LEX_SENSES[: (1, 2, 3, 4, 4, 4)[level]] if family != "words" else ()),
+            "concepts": (4, 5, 6, 6, 8, 10)[level], "scenes": (3, 4, 5, 6, 8, 10)[level],
+            "ambiguity": (2, 2, 3, 3, 4, 4)[level], "noise": 0.0, "heldout": (0.0, 0.0, 0.15, 0.15, 0.15, 0.15)[level], "combos": 0,
+            "ambiguity_prob": (0.0, 0.0, 0.0, 0.5, 0.5, 0.5)[level],
+            "facts_a": (1, 2, 2, 3, 3, 3)[level], "distractors": (0, 0, 0, 0, 0, 2)[level],
+            "ordering": False, "polysemy": (0.25, 0.25, 0.3, 0.4, 0.5, 0.5)[level],
+            "senses": (3, 4, 4, 5, 5, 6)[level],
+        }
+    elif track == "developmental_semantic":
+        config = {
+            "groups": ("direct", "compose2", "distractor", "unsupported")[: (1, 2, 3, 4, 4, 4)[level]],
+            "concepts": (4, 5, 6, 6, 8, 10)[level], "scenes": (3, 4, 5, 6, 8, 10)[level],
+            "ambiguity": (2, 2, 3, 3, 4, 4)[level], "noise": 0.0, "heldout": (0.0, 0.0, 0.15, 0.15, 0.15, 0.15)[level], "combos": 0,
+            "ambiguity_prob": (0.0, 0.0, 0.0, 0.3, 0.3, 0.3)[level],
+            "facts_a": (2, 3, 3, 4, 4, 5)[level], "distractors": (0, 1, 2, 2, 3, 3)[level],
+            "counterfactual": (0.0, 0.0, 0.1, 0.2, 0.3, 0.3)[level],
+        }
+    elif track in ("developmental_production_semantic", "developmental_production_semantic_unkeyed"):
+        config = {
+            "groups": ("p_entity", "p_all2", "p_all3")[: (1, 2, 2, 3, 3, 3)[level]],
+            "concepts": (4, 5, 6, 6, 8, 10)[level], "scenes": (3, 4, 5, 6, 8, 10)[level],
+            "ambiguity": (2, 2, 3, 3, 4, 4)[level], "noise": 0.0, "heldout": (0.0, 0.0, 0.15, 0.15, 0.15, 0.15)[level], "combos": 0,
+            "ambiguity_prob": (0.0, 0.0, 0.0, 0.3, 0.3, 0.3)[level],
+            "distractors": (1, 1, 2, 2, 3, 3)[level],
+            "counterfactual": (0.0, 0.0, 0.1, 0.2, 0.3, 0.3)[level],
+            "state_change": (0.0, 0.0, 0.0, 0.3, 0.5, 0.5)[level],
+        }
     elif track in _DEV[1:]:
         config = {
             "groups": ("p_entity", "p_relation", "p_property", "p_all2", "p_all3", "p_order")[: (1, 2, 3, 3, 4, 6)[level]],
@@ -139,6 +175,7 @@ def difficulty_for(
             "heldout": 0.0,
             "combos": 0,
             "ambiguity_prob": (0.0, 0.0, 0.0, 0.5, 0.5, 0.5)[level],
+            "heldout": (0.0, 0.0, 0.15, 0.15, 0.15, 0.15)[level],
             "facts_a": (1, 2, 2, 3, 3, 3)[level],
             "distractors": (0, 0, 0, 0, 0, 2)[level],
             "ordering": level >= 5,
@@ -169,7 +206,7 @@ def difficulty_for(
             config["noise"] = min(float(config["noise"]) + 0.05, 0.3)
             for key in ("facts_a", "distractors"):
                 if key in config:
-                    config[key] = min(int(config[key]) + 1, 3)
+                    config[key] = min(int(config[key]) + 1, 6 if track in _STAGE3 else 3)
     if ood and track != "permutation":
         # OOD increases task-specific load beyond the ID lesson while keeping
         # each generator's token and sequence bounds valid.

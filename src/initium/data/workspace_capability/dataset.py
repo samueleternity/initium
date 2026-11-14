@@ -87,6 +87,10 @@ from initium.data.workspace_capability.tracks import (
     conditional_ops,
     developmental,
     production,
+    developmental_lexical,
+    developmental_semantic,
+    developmental_production_semantic,
+    _dev_lexicon,
 )
 from initium.data.workspace_capability.gnw_metrics import (
     binary_brier,
@@ -119,9 +123,17 @@ _GENERATORS = {
     "developmental": developmental.generate,
     "developmental_production": production.generate,
     "developmental_production_unkeyed": production.generate_unkeyed,
+    "developmental_lexical": developmental_lexical.generate,
+    "developmental_semantic": developmental_semantic.generate,
+    "developmental_production_semantic": developmental_production_semantic.generate,
+    "developmental_production_semantic_unkeyed": developmental_production_semantic.generate_unkeyed,
 }
-DEV_TRACKS = ("developmental", "developmental_production", "developmental_production_unkeyed")
-PRODUCTION_TRACKS = DEV_TRACKS[1:]
+STAGE3_TRACKS = _dev_lexicon.STAGE3_TRACKS
+PRODUCTION_TRACKS = (
+    "developmental_production", "developmental_production_unkeyed",
+    "developmental_production_semantic", "developmental_production_semantic_unkeyed",
+)
+DEV_TRACKS = ("developmental", "developmental_production", "developmental_production_unkeyed", *STAGE3_TRACKS)
 TRACKS = tuple(t for t in _GENERATORS if t not in DEV_TRACKS)  # marker space holds 19 tracks
 ALL_TRACK = "all"
 NEW_TRACKS = (
@@ -171,7 +183,7 @@ _WORKSPACE_MODULE_FEATURE_ABLATIONS = {
     "retrieval_exact_readout": "retrieval_exact_readout",
     "operation_executor": "operation_executor",
 }
-KEY_VALUE_OPERAND_CAPACITY = 16
+KEY_VALUE_OPERAND_CAPACITY = 48
 _EVAL_KV_ATTENTION_BUDGET_BYTES = 512 * 1024 * 1024
 _SDPA_MATH_WORKSPACE_MULTIPLIER = 2
 _WORKSPACE_OPERATION_CODES = {
@@ -352,6 +364,31 @@ class WorkspaceCapabilityDataset(BaseDataset):
             s[3] += 1
         res = {n: {"accuracy": 100.0 * s[0] / max(s[1], 1), "exact_match": 100.0 * s[2] / max(s[3], 1),
                    "episodes": s[3]} for n, s in stat.items()}
+        sp: dict[str, list[int]] = {}
+        for ep in episodes:
+            p = self._last_eval_preds.get(id(ep))
+            if p is None:
+                continue
+            ok = int(p == list(ep.answer))
+            labs = [f"heldout_{'yes' if ep.metadata.get('heldout_words') else 'no'}"]
+            if ep.metadata.get("counterfactual") is not None:
+                labs.append("counterfactual" if ep.metadata["counterfactual"] else "factual")
+            for lab in labs:
+                for ax in (ep.metadata["axis"], "all_axes"):
+                    s = sp.setdefault(f"{ax}/{lab}", [0, 0])
+                    s[0] += ok
+                    s[1] += 1
+        ood = {k: {"exact_match": 100.0 * a / n, "episodes": n} for k, (a, n) in sp.items()}
+        for ax in [n for n, _ in splits] + ["all_axes"]:
+            for lo, hi, name in (("factual", "counterfactual", "cf_gap"), ("heldout_no", "heldout_yes", "heldout_gap")):
+                a, b = ood.get(f"{ax}/{lo}"), ood.get(f"{ax}/{hi}")
+                if a and b:
+                    ood[f"{ax}/{name}"] = {"gap_pp": a["exact_match"] - b["exact_match"],
+                                           "episodes": min(a["episodes"], b["episodes"])}
+        self.last_eval_diagnostics["stage3_ood"] = ood
+        for k, v in sorted(ood.items()):
+            val = f"gap {v['gap_pp']:+.1f} pp" if "gap_pp" in v else f"exact {v['exact_match']:.1f}%"
+            print(f"  [ood-split/{k}] {val} n={v['episodes']}")
         self.last_eval_diagnostics["axis_generalization"] = res
         return res["combined"]["accuracy"], res["combined"]["exact_match"], {}
 
@@ -460,7 +497,8 @@ class WorkspaceCapabilityDataset(BaseDataset):
             if t == NONE_TOKEN:
                 return "NONE"
             if t >= FACT_BASE:
-                return f"w{t - FACT_BASE}" + (f"=c{rev[t]}" if t in rev else "")
+                name = _dev_lexicon.word_name(t - FACT_BASE) if e.metadata.get("stage3_words") else f"w{t - FACT_BASE}"
+                return name + (f"=c{rev[t]}" if t in rev else "")
             if ENTITY_BASE <= t < ENTITY_BASE + ENTITY_COUNT:
                 return f"e{t - ENTITY_BASE}"
             if LOCATION_BASE <= t < LOCATION_BASE + LOCATION_COUNT:
@@ -479,10 +517,38 @@ class WorkspaceCapabilityDataset(BaseDataset):
     def _attach_production_diagnostics(self, model, device, episodes, lesson_idx):
         diag = self.last_eval_diagnostics
         diag["production"] = self._production_metrics(episodes)  # must precede other evals (uses preds)
+        if self.task_track in STAGE3_TRACKS:
+            diag["stage3_counterfactual"] = self._stage3_metrics(episodes)
         self._print_samples(episodes, "id")
         diag["production_gap"] = self._production_gap(model, device, lesson_idx)
         if self.generation_eval:
             diag["production_generation"] = {"all": self._generation_metrics(model, device, episodes)}
+        self.last_eval_diagnostics = diag
+
+    def _stage3_metrics(self, episodes):
+        acc = {}
+        for e in episodes:
+            p, cf = self._last_eval_preds.get(id(e)), e.metadata.get("counterfactual")
+            if p is not None and cf is not None:
+                a = acc.setdefault("counterfactual" if cf else "factual", [0, 0])
+                a[0] += p == list(e.answer)
+                a[1] += 1
+        res = {k: {"exact_match": 100.0 * a / n, "episodes": n} for k, (a, n) in acc.items()}
+        if len(res) == 2:
+            n = min(v["episodes"] for v in res.values())
+            res["cf_gap"] = {"gap_pp": res["factual"]["exact_match"] - res["counterfactual"]["exact_match"],
+                             "episodes": n}
+        for k, v in sorted(res.items()):
+            val = f"gap {v['gap_pp']:+.1f} pp" if "gap_pp" in v else f"exact {v['exact_match']:.1f}%"
+            print(f"  [id-split/{k}] {val} n={v['episodes']}")
+        return res
+
+    def _attach_stage3_diagnostics(self, model, device, episodes, lesson_idx):
+        diag = self.last_eval_diagnostics
+        diag["stage3_counterfactual"] = self._stage3_metrics(episodes)
+        self._print_samples(episodes, "id")
+        if self.task_track == "developmental_lexical" and _dev_lexicon.settings["family"] != "senses":
+            diag["production_gap"] = self._production_gap(model, device, lesson_idx)
         self.last_eval_diagnostics = diag
 
     def _tracks(self):
@@ -525,6 +591,8 @@ class WorkspaceCapabilityDataset(BaseDataset):
             chain = "long" if int(difficulty["assignments"]) >= 12 else "short"
             return (f"computed_chain_{chain}",)
         if track in PRODUCTION_TRACKS:
+            return tuple(difficulty["groups"])
+        if track in ("developmental_lexical", "developmental_semantic"):
             return tuple(difficulty["groups"])
         if track == "developmental":
             return tuple(difficulty["families"])
@@ -579,6 +647,8 @@ class WorkspaceCapabilityDataset(BaseDataset):
         result = self._evaluate_episodes(model, device, episodes, field_log=field_log)
         if self.task_track in PRODUCTION_TRACKS:
             self._attach_production_diagnostics(model, device, episodes, int(lesson_idx))
+        elif self.task_track in STAGE3_TRACKS:
+            self._attach_stage3_diagnostics(model, device, episodes, int(lesson_idx))
         elif self.task_track == "developmental":
             self._print_samples(episodes, "id")
         _t = (self.last_eval_diagnostics or {}).get("tracks", {})
@@ -981,7 +1051,12 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 row, tokens, entity_ids, write_mask
             )
             return
-        if track == "developmental":
+        if track == "developmental_semantic":
+            WorkspaceCapabilityDataset._add_semantic_fact_address_writes(
+                row, tokens, entity_ids, write_mask
+            )
+            return
+        if track in ("developmental", "developmental_lexical", "developmental_semantic"):
             WorkspaceCapabilityDataset._add_developmental_address_writes(
                 row, tokens, entity_ids, write_mask
             )
@@ -1074,6 +1149,27 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 event, key = -1, -1
             elif token in (EV_INIT, EV_MOVE, EV_UPDATE, EV_ASSERT, EV_KV, EV_FACT):
                 event, key = token, -1
+
+    @staticmethod
+    def _add_semantic_fact_address_writes(row, tokens, entity_ids, write_mask) -> None:
+        """3c: concept events as in developmental; each EV_FACT writes subject/relation/object
+        entity tokens to slots 24+i / 48+i / 32+i at their own token positions."""
+        WorkspaceCapabilityDataset._add_developmental_address_writes(
+            row, tokens, entity_ids, write_mask
+        )
+        in_fact, role, i = False, 0, 0
+        for pos, tv in enumerate(tokens):
+            t = int(tv)
+            if t == EV_FACT:
+                in_fact, role = True, 0
+            elif in_fact and ENTITY_BASE <= t < ENTITY_BASE + ENTITY_COUNT and role < 3:
+                entity_ids[row, pos] = (24, 48, 32)[role] + min(i, 7)
+                write_mask[row, pos] = True
+                role += 1
+            elif in_fact and t == SEP:
+                entity_ids[row, pos] = -1
+                write_mask[row, pos] = False
+                in_fact, i = False, i + 1
 
     @staticmethod
     def _add_masked_prime_trace_write(row, tokens, entity_ids, write_mask) -> None:
@@ -2160,6 +2256,12 @@ class WorkspaceCapabilityDataset(BaseDataset):
                                     rule_feedback_targets[rule_trial]
                                 )
                         rule_trial += 1
+                elif (
+                    episode.track in STAGE3_TRACKS
+                    and active_event == EV_KV
+                    and COUNT_BASE <= token < COUNT_BASE + 32
+                ):
+                    payload = token
                 elif episode.track in DEV_TRACKS and active_event == EV_KV and token >= FACT_BASE:
                     payload = token
                 elif (
@@ -2217,6 +2319,9 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 if token == SEP:
                     active_event, payload, source_payload = -1, -100, -1
 
+            for _s, _k, _t in episode.metadata.get("workspace_event_writes", ()):
+                if 0 <= int(_s) < min(time, len(episode.inputs)):
+                    per_step.setdefault(int(_s), []).append((int(_k), int(_t)))
             # Updates are supervised only where a token stream explicitly
             # carries the stored value. Copy/compute events receive pressure
             # from a later query instead of a fabricated scalar target.
@@ -2338,6 +2443,14 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 output_program_specs.append((row, step, str(operation), len(answer_keys)))
                 if operation == "argmatch":
                     argmatch_locations[(row, step)] = int(tokens[len(episode.inputs) - 2])
+                if operation == "factmatch":
+                    nc = sum(1 for k_ in answer_keys if k_ < 24 or k_ >= 56)
+                    nw = 3 if episode.metadata.get("progression_group") == "compose2" else 2
+                    argmatch_locations[(row, step)] = (
+                        tuple(int(x) for x in tokens[len(episode.inputs) - 1 - nw : len(episode.inputs) - 1]),
+                        nc,
+                        (len(answer_keys) - nc) // 3,
+                    )
                 read_steps.add(step)
 
         result = {
@@ -2531,10 +2644,36 @@ class WorkspaceCapabilityDataset(BaseDataset):
                         hard_token,
                         num_classes=result.shape[-1],
                     ).to(operation_probs.dtype)
+            elif operation == "factmatch":
+                words, nc, nf = metadata["key_value_argmatch_locations"][(int(row), int(step))]
+                nv = result.shape[-1]
+                ctok = (
+                    metadata["key_value_entity_ids"][int(row), int(step), :nc].long() + ENTITY_BASE
+                ).to(logits.device)
+
+                def _w2c(word):
+                    m = operands[:nc, FACT_BASE : FACT_BASE + FACT_COUNT].softmax(dim=-1)[:, word - FACT_BASE]
+                    return torch.zeros(nv, device=logits.device).scatter_add(0, ctok, m) / m.sum().clamp_min(1e-6)
+
+                P = operands[nc : nc + 3 * nf].softmax(dim=-1)
+                S_, R_, O_ = P[:nf], P[nf : 2 * nf], P[2 * nf :]
+                subj = _w2c(words[0])
+                for qi in range(1, len(words)):  # subject, relation[, relation2]
+                    m = (S_ @ subj) * (R_ @ _w2c(words[qi]))
+                    hop = (m.unsqueeze(-1) * O_).sum(0)
+                    none = (1.0 - m).prod()
+                    subj = hop / hop.sum().clamp_min(1e-6)
+                operation_probs = hop.clone()
+                operation_probs[NONE_TOKEN] = operation_probs[NONE_TOKEN] + none
+                operation_probs = operation_probs / operation_probs.sum().clamp_min(1e-6)
             elif operation == "argmatch":
                 query_token = int(metadata["key_value_argmatch_locations"][(int(row), int(step))])
                 base, size = (
-                    (FACT_BASE, FACT_COUNT) if query_token >= FACT_BASE else (LOCATION_BASE, LOCATION_COUNT)
+                    (FACT_BASE, FACT_COUNT)
+                    if query_token >= FACT_BASE
+                    else (COUNT_BASE, 32)
+                    if COUNT_BASE <= query_token < COUNT_BASE + 32
+                    else (LOCATION_BASE, LOCATION_COUNT)
                 )
                 match = operands[:, base : base + size].softmax(dim=-1)[:, query_token - base]
                 entity_tokens = (
@@ -3281,7 +3420,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
                         )
                         # fmt: on
                     try:
-                        output, _ = model(
+                        output, eval_state = model(
                             x,
                             hidden,
                             reset_experience=True,
@@ -3809,6 +3948,10 @@ class WorkspaceCapabilityDataset(BaseDataset):
                                     total_counts["episodes"] += counts["episodes"]
                             else:
                                 retrieval_totals[metric] += value
+                    if getattr(model, "workspace_slot_readout_enabled", False):
+                        logits = model.apply_slot_readout(
+                            logits, output.transpose(0, 1), eval_state, _mask.to(device)
+                        )
                     predictions = logits.argmax(dim=-1)
                     for local_idx, episode in enumerate(group):
                         start = len(episode.inputs)

@@ -3098,7 +3098,8 @@ def run(
                     *([None] * 8),
                 ]
             )
-        for _key in ("production", "production_generation", "production_gap", "axis_generalization", "stage3_counterfactual", "stage3_ood"):            for _label, _metrics in sorted((diagnostics.get(_key) or {}).items()):
+        for _key in ("production", "production_generation", "production_gap", "axis_generalization", "stage3_counterfactual", "stage3_ood"):            
+            for _label, _metrics in sorted((diagnostics.get(_key) or {}).items()):
                 for _metric, _value in sorted(_metrics.items()):
                     if _metric != "episodes":
                         workspace_task_writer.writerow(

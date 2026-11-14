@@ -28,6 +28,8 @@ def generate(difficulty: dict, rng: random.Random, *, ood: bool = False) -> Task
     distractors = int(difficulty.get("distractors", 0))
     query_count = min(int(difficulty.get("queries", 1)), num_keys)
     aggregate = difficulty.get("aggregate", "recall")
+    if isinstance(aggregate, (tuple, list)):
+        aggregate = rng.choice(tuple(aggregate))
     if not 1 <= num_keys <= 32 or not 1 <= query_count <= num_keys:
         raise ValueError("retrieval task requires 1..32 keys and valid query count")
     key_start = 32 if ood else 0

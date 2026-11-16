@@ -7,6 +7,7 @@ from itertools import chain
 from typing import Any
 
 VOCAB_SIZE = 320
+VOCAB_LIMIT = 1 << 15  # Stage-4 text vocabulary ceiling (legacy typed vocabulary stays 320)
 PAD = 0
 BOS = 1
 EOS = 2
@@ -62,6 +63,13 @@ BOOL_FALSE, BOOL_TRUE = 184, 185
 NONE_TOKEN = 186
 SOURCE_PRIORITY_POLICY = 187
 FACT_BASE, FACT_COUNT = 192, 128
+# Stage 4 control tokens (320-383) and text base
+LANG_TRACK_BASE, LANG_TRACK_COUNT = 320, 16
+MARK_S, MARK_R, MARK_O = 336, 337, 338
+SPK_USER, SPK_SYS, TURN_END = 339, 340, 341
+TASK_QA, TASK_RETELL, TASK_PARA, TASK_D2T, TASK_T2D, TASK_ACCEPT, TASK_CLOZE, TASK_FIRST = range(342, 350)
+MASK_TOKEN = 350
+TEXT_BASE = 384
 
 
 def track_marker_info(tokens: tuple[int, ...] | list[int]) -> tuple[int | None, int]:
@@ -140,7 +148,7 @@ class TaskEpisode:
             raise ValueError("episode input must begin with BOS")
         if not self.answer or self.answer[-1] != EOS:
             raise ValueError("episode answer must end with EOS")
-        if any(token < 0 or token >= VOCAB_SIZE for token in chain(self.inputs, self.answer)):
+        if any(token < 0 or token >= VOCAB_LIMIT for token in chain(self.inputs, self.answer)):
             raise ValueError("episode contains a token outside the configured vocabulary")
         if not self.metadata.get("query_type"):
             raise ValueError("episode metadata must include query_type")

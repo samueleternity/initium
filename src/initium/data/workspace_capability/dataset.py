@@ -129,6 +129,7 @@ _GENERATORS = {
     "developmental_production_semantic_unkeyed": developmental_production_semantic.generate_unkeyed,
 }
 STAGE3_TRACKS = _dev_lexicon.STAGE3_TRACKS
+from initium.data.workspace_capability.tracks._lang_text import LANG_TRACK_NAMES
 PRODUCTION_TRACKS = (
     "developmental_production", "developmental_production_unkeyed",
     "developmental_production_semantic", "developmental_production_semantic_unkeyed",
@@ -246,9 +247,16 @@ class WorkspaceCapabilityDataset(BaseDataset):
     advance_threshold = 0.80
     old_lesson_mix_rate = 0.0
 
+    def __new__(cls, task_track: str = ALL_TRACK, *args, **kwargs):
+        if cls is WorkspaceCapabilityDataset and str(task_track or "").lower().replace("-", "_") in LANG_TRACK_NAMES:
+            from initium.data.workspace_capability.lang_dataset import LanguageDataset
+
+            cls = LanguageDataset
+        return super().__new__(cls)
+
     def __init__(self, task_track: str = ALL_TRACK, *, batch_size_hint: int = 16):
         task_track = (task_track or ALL_TRACK).lower().replace("-", "_")
-        if task_track not in (*_GENERATORS, ALL_TRACK, NEW_ALL_TRACK, GNW_ALL_TRACK, MIXED_BINDING_TRACK):
+        if task_track not in (*_GENERATORS, ALL_TRACK, NEW_ALL_TRACK, GNW_ALL_TRACK, MIXED_BINDING_TRACK, *LANG_TRACK_NAMES):
             raise ValueError(
                 "unknown workspace task track "
                 f"{task_track!r}; choose one of "
@@ -344,8 +352,10 @@ class WorkspaceCapabilityDataset(BaseDataset):
     def evaluate_dev_axes(self, model, device, num_episodes, rng, verbose_n=0, field_log=None):
         """Paired label-only / length-only / combo-only / combined OOD splits."""
         rng = rng or random.Random(171_001)
+        lang = self.task_track in LANG_TRACK_NAMES
         splits = (("in_distribution", ()), ("label_only", ("labels",)), ("length_only", ("length",)),
-                  ("combo_only", ("combos",)), ("combined", ("labels", "length", "combos")))
+                  ("combo_only", ("combos",)), *((("template_only", ("templates",)),) if lang else ()),
+                  ("combined", ("labels", "length", "combos") + (("templates",) if lang else ())))
         episodes = []
         for _ in range(max(8, int(num_episodes) // 5)):
             seed = rng.getrandbits(64)
@@ -654,7 +664,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
         _t = (self.last_eval_diagnostics or {}).get("tracks", {})
         # self._track_weights = {t: 0.1 + max(0.0, 1.0 - m["exact_match"] / 100.0) for t, m in _t.items()}
         self._track_weights = {t: 0.05 for t in _t}
-        _cand = [t for t in _t if t not in ("ignition", "masked_priming", "nth_farthest")]
+        _cand = [t for t in _t if t not in ("ignition", "masked_priming", "nth_farthest", "lang_open")]
         if _cand:
             _worst = min(_cand, key=lambda t: _t[t]["exact_match"])
             self._track_weights[_worst] = 0.05 * (len(_t) - 1)  # ~50% of steps
@@ -768,6 +778,12 @@ class WorkspaceCapabilityDataset(BaseDataset):
             # every track appears in each batch when batch_size >= track count.
             start_track = random.randrange(len(tracks))
             selected_tracks = [tracks[(start_track + i) % len(tracks)] for i in range(batch_size)]
+            _w = getattr(self, "_track_weights", None) if getattr(self, "_weighted_sampling", False) else None
+            selected_tracks = (
+                random.choices(tracks, [_w.get(t, 1.0) for t in tracks], k=batch_size)
+                if _w
+                else [tracks[(start_track + i) % len(tracks)] for i in range(batch_size)]
+            )
             random.shuffle(selected_tracks)
         episodes = [self._make_episode(track, level, random) for track in selected_tracks]
         self.last_batch_examples = episodes

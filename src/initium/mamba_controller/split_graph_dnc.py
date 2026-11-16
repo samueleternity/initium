@@ -449,7 +449,7 @@ class SplitGraphDNC(nn.Module):
         self.workspace_enabled = workspace_enabled
         self.workspace_token_id_input = bool(workspace_token_id_input)
         self.workspace_slot_readout_enabled = bool(workspace_slot_readout)
-        if self.workspace_token_id_input and not (mamba_variant == "mamba1" and input_size == 320):
+        if self.workspace_token_id_input and not (mamba_variant == "mamba1" and input_size >= 320):
             raise ValueError(
                 "token-ID input is currently supported only for the 320-token "
                 "workspace-capability vocabulary with Mamba-1"
@@ -835,6 +835,7 @@ class SplitGraphDNC(nn.Module):
                 nth_farthest_exact_readout=workspace_nth_farthest_exact_readout,
                 retrieval_exact_readout=workspace_retrieval_exact_readout,
                 key_value_readout=workspace_key_value_readout,
+                value_vocab_size=input_size,
                 operation_executor=workspace_operation_executor,
                 operation_diagnostics=workspace_operation_diagnostics,
                 adaptive_v3_enabled=workspace_adaptive_v3_enabled,
@@ -928,8 +929,16 @@ class SplitGraphDNC(nn.Module):
             slots = torch.zeros_like(slots)
         elif self.workspace_eval_shuffle_readback and slots.shape[0] > 1:
             slots = slots.roll(1, 0)
-        delta = ws.slot_readout_logits(features, slots).to(logits.dtype)
-        return logits + delta * answer_mask.to(device=logits.device, dtype=logits.dtype).unsqueeze(-1)
+        out = ws.slot_readout_logits(features, slots)
+        if ws.slot_text_head is None:
+            delta = out.to(logits.dtype)
+            return logits + delta * answer_mask.to(device=logits.device, dtype=logits.dtype).unsqueeze(-1)
+        sel = answer_mask.to(logits.device).bool()
+        rows = logits[sel]
+        rows[:, ws.slot_text_cols] = (ws.slot_readout_scale * ws.slot_text_head(out[sel])).to(rows.dtype)
+        result = logits.clone()
+        result[sel] = rows
+        return result
 
     def set_sgr_prediction_decoder(self, decoder: nn.Module | None, signal_mode: str) -> None:
         object.__setattr__(

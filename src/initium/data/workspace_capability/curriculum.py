@@ -6,12 +6,54 @@ import random
 from collections.abc import Iterable
 
 from initium.data.workspace_capability.tracks import _dev_lexicon
+from initium.data.workspace_capability.tracks import _lang_text
 
 _LEVELS = 6
 _STAGE3 = _dev_lexicon.STAGE3_TRACKS
 _DEV = ("developmental", "developmental_production", "developmental_production_unkeyed", "developmental_production_aux", *_STAGE3)
 _LEX_WORDS = ("d1_naming", "d2_cross", "d3_attribute", "d4_relation", "p_entity", "p_relation", "p_property")
 _LEX_SENSES = ("s_s2w", "s_w2s", "s_s2c", "s_disambig")
+
+_LANG = _lang_text.LANG_SINGLE
+
+
+def _lang_scale(c):
+    for key, cap in (("facts", 10), ("distractors", 4), ("events", 14), ("turns", 8), ("words", 120), ("filler", 48)):
+        if key in c:
+            c[key] = min(int(c[key]) + 2, cap)
+
+
+def _lang_config(track, level):
+    L = level
+    c = {
+        "external": int(bool(_lang_text.settings["external"])),
+        "heldout": (0.0, 0.0, 0.15, 0.15, 0.15, 0.15)[L], "combos": 0, "templates": 0,
+        "facts": (2, 3, 4, 5, 6, 7)[L], "distractors": (0, 0, 1, 1, 2, 3)[L],
+        "variety": (1, 1, 1, 2, 2, 2)[L], "plural": int(L >= 3), "past": int(L >= 4),
+        "passive": int(L >= 4), "conj": int(L >= 3),
+        "counterfactual": (0.0, 0.0, 0.1, 0.2, 0.3, 0.3)[L],
+        "filler": (0, 0, 0, 8, 16, 32)[L],
+    }
+    ext = ("external",) if c["external"] else ()
+    if track == "lang_template":
+        c["groups"] = ("qa_wh", "qa_yn", "retell", "paraphrase", "unsupported")[: (1, 2, 3, 4, 5, 5)[L]]
+    elif track == "lang_nlg":
+        c["groups"] = ("d2t", "t2d", "retell_all")[: (1, 2, 3, 3, 3, 3)[L]] + ext
+    elif track == "lang_story_qa":
+        g = ("where_person", "where_object", "who_has", "yes_no", "carry", "false_belief", "true_belief", "reality")
+        c["groups"] = g[: (1, 2, 4, 5, 5, 8)[L]] + ext
+        c["events"] = (3, 4, 5, 6, 8, 10)[L]
+    elif track == "lang_dialogue":
+        c["groups"] = ("fresh", "pronoun", "ellipsis", "unsupported")[: (1, 2, 3, 4, 4, 4)[L]]
+        c["turns"] = (1, 2, 3, 4, 5, 6)[L]
+        c["facts"] = (4, 5, 6, 7, 8, 8)[L]
+    elif track == "lang_syntax_probes":
+        c["groups"] = ("good", "agree", "detnum", "order")[: (2, 3, 4, 4, 4, 4)[L]] + ext
+        c["heldout"] = 0.0
+    else:  # lang_open (always external)
+        c["groups"] = ("cloze", "first")[: (1, 1, 2, 2, 2, 2)[L]]
+        c["words"] = (24, 32, 48, 64, 80, 96)[L]
+    return c
 
 
 def difficulty_for(
@@ -30,10 +72,10 @@ def difficulty_for(
             axes = {"legacy"} if ood else set()
     else:
         axes = {str(axis).strip().lower() for axis in ood_axes}
-        unknown_axes = axes - ({"labels", "length", "combos"} if track in _DEV else {"labels", "length"})
+        unknown_axes = axes - (({"labels", "length", "combos"} | ({"templates"} if track in _LANG else set())) if (track in _DEV or track in _LANG) else {"labels", "length"})
         if unknown_axes:
             raise ValueError(f"unknown OOD axes for {track!r}: {sorted(unknown_axes)}")
-        if track != "permutation" and track not in _DEV:
+        if track != "permutation" and track not in _DEV and track not in _LANG:
             raise ValueError("explicit OOD axes are currently supported only for permutation")
     config: dict[str, int | float | str | bool | tuple[str, ...]]
     if track == "permutation":
@@ -180,6 +222,8 @@ def difficulty_for(
             "distractors": (0, 0, 0, 0, 0, 2)[level],
             "ordering": level >= 5,
         }
+    elif track in _LANG:
+        config = _lang_config(track, level)
     elif track == "developmental":
         config = {
             "families": ("d1_naming", "d2_cross", "d3_attribute", "d4_relation", "d5_temporal", "d6_compose", "d5_action")[
@@ -207,6 +251,15 @@ def difficulty_for(
             for key in ("facts_a", "distractors"):
                 if key in config:
                     config[key] = min(int(config[key]) + 1, 6 if track in _STAGE3 else 3)
+    if track in _LANG and ood_axes is not None:
+        if "templates" in axes:
+            config["templates"] = 1
+        if "labels" in axes:
+            config["heldout"] = 1.0
+        if "combos" in axes:
+            config["combos"] = 1
+        if "length" in axes:
+            _lang_scale(config)
     if ood and track != "permutation":
         # OOD increases task-specific load beyond the ID lesson while keeping
         # each generator's token and sequence bounds valid.
@@ -262,6 +315,10 @@ def difficulty_for(
             config["maximum_frames"] = min(int(config["maximum_frames"]) + 1, 10)
         elif track == "trace_conditioning":
             config["maximum_gap"] = min(int(config["maximum_gap"]) + 1, 6)
+        elif track in _LANG:
+            config["templates"] = 1
+            config["heldout"] = 1.0
+            _lang_scale(config)
         elif track in _DEV:
             config["heldout"] = 1.0
             config["combos"] = 1
@@ -332,7 +389,7 @@ class WorkspaceCapabilityCurriculum:
         blockers = []
         groups_ready = True
         for track in self.dataset._tracks():
-            if track in ("ignition", "nth_farthest"):
+            if track in ("ignition", "nth_farthest", "lang_open"):
                 continue
             required = self.dataset._curriculum_groups(track, self.lesson)
             actual = progression_groups.get(track, {})
@@ -363,12 +420,12 @@ class WorkspaceCapabilityCurriculum:
             len(per_track) == len(self.dataset._tracks())
             and all(
                 item["exact_match"] / 100.0 >= self.dataset.advance_threshold
-                for _t, item in per_track.items() if _t not in ("ignition", "nth_farthest")
+                for _t, item in per_track.items() if _t not in ("ignition", "nth_farthest", "lang_open")
             )
         )
         if multi_track_run:
             for track in self.dataset._tracks():
-                if track in ("ignition", "nth_farthest"):
+                if track in ("ignition", "nth_farthest", "lang_open"):
                     continue
                 metrics = per_track.get(track)
                 if metrics is None:

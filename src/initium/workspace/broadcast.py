@@ -116,6 +116,7 @@ class WorkspaceBroadcast(nn.Module):
         nth_farthest_exact_readout: bool = False,
         retrieval_exact_readout: bool = False,
         key_value_readout: bool = False,
+        value_vocab_size: int = _WORKSPACE_CAPABILITY_VOCAB_SIZE,
         operation_executor: bool = False,
         operation_diagnostics: bool = False,
         adaptive_v3_enabled: bool = False,
@@ -232,7 +233,7 @@ class WorkspaceBroadcast(nn.Module):
             nn.Linear(d_model, 16) if self.retrieval_exact_readout else None
         )
         self.semantic_value_decoder = (
-            nn.Linear(d_model, 320) if self.key_value_readout else None
+            nn.Linear(d_model, int(value_vocab_size)) if self.key_value_readout else None
         )
         self.adaptive_v3 = (
             AdaptiveWorkspaceOperatorBank(
@@ -269,6 +270,8 @@ class WorkspaceBroadcast(nn.Module):
             nn.Linear(d_model, self._SEMANTIC_ENTITY_COUNT) if slot_readout else None
         )
         self.slot_readout_scale = nn.Parameter(torch.ones(())) if slot_readout else None
+        self.slot_text_head = None
+        self.register_buffer("slot_text_cols", None, persistent=False)
         self.semantic_attentional_color_decoder = (
             nn.Linear(d_model, _WORKSPACE_CAPABILITY_SOURCE_COUNT)
             if self.attentional_cue_readout_enabled
@@ -392,7 +395,16 @@ class WorkspaceBroadcast(nn.Module):
         weights = pointer.gather(-1, slot_ids.unsqueeze(1).expand(-1, pointer.shape[1], -1))
         weights = weights * occupied.unsqueeze(1)
         read = torch.einsum("bts,bsd->btd", weights, content)
+        if self.slot_text_head is not None:
+            return read
         return self.slot_readout_scale * self.semantic_value_decoder(read)
+
+    def enable_slot_text(self, cols):
+        """Logit columns `cols` are produced only from slot content."""
+        if self.slot_pointer is None:
+            raise ValueError("slot text readout requires slot_readout")
+        self.slot_text_head = nn.Linear(self.d_model, len(cols))
+        self.slot_text_cols = torch.as_tensor(list(cols), dtype=torch.long)
     
     def pop_semantic_state_predictions(self) -> list[tuple[int, torch.Tensor]]:
         """Return and clear auxiliary predictions from the most recent call."""

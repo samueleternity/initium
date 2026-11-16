@@ -260,7 +260,7 @@ class AdaptiveWorkspaceOperatorBankV4(nn.Module):
         address, content = torch.split(state, [A, D], dim=-1)
         occupied = address.square().sum(-1).gt(1e-12)
         aid = address.argmax(-1)
-        W = decoder.weight.float()
+        W = decoder.weight.float()[:320]
         tok = event_tokens.long()
         ps = parsed if parsed is not None else self._call("parse", self._parse, tok)
         a, has_lit, lit_tok = ps["a"], ps["has_lit"], ps["lit_tok"]
@@ -342,7 +342,7 @@ class AdaptiveWorkspaceOperatorBankV4(nn.Module):
                 P = torch.cat((P_snap, P_run, P_lit), 1)
                 V = torch.cat((content, V_run, V_lit), 1)
                 dists, r1, out_vec, sel, wsel, gates = self._call(
-                    "dist", self._dist_math, P, V, wl, wr, m, op_probs, W, decoder.bias.float(),
+                    "dist", self._dist_math, P, V, wl, wr, m, op_probs, W, decoder.bias.float()[:320],
                     self.C16, self.S16, self.C32, self.S32,
                 )
                 mass = (wsel[:, 1 : C - 1] * gates).sum(-1) * active.float() * alive

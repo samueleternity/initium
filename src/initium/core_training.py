@@ -155,6 +155,7 @@ from initium.data.common.causal_prediction import (
 )
 from initium.data.dataset_registry import get_dataset
 from initium.data.workspace_capability.tracks import _dev_lexicon
+from initium.data.workspace_capability.tracks import _lang_text
 from initium.data.graph_traversal.order_probe import (
     build_q99_probe_batch,
     evaluate_q99_order_sensitivity,
@@ -904,6 +905,7 @@ def load_frozen_workspace_warm_start(
         "workspace_lexicon_mode",
         "workspace_lexical_family",
         "workspace_lexical_unkeyed",
+        "workspace_lang_manifest_sha256",
         # Exact implementation-only optimization; old checkpoints default
         # to base and remain weight/state compatible with either backend.
         "dnc_implementation",
@@ -1652,6 +1654,15 @@ def run(
                 "semantic entity addressing on belief_tracking/new_all requires at least 48 "
                 "workspace slots "
                 "to cover all agent/object belief keys"
+            )
+        if (
+            workspace_semantic_entity_addressing
+            and dataset.task_track in _lang_text.LANG_TRACK_NAMES
+            and workspace_num_slots < 48
+        ):
+            raise ValueError(
+                "semantic entity addressing on lang_* tracks requires at least 48 workspace "
+                "slots (24 discourse entities + 8 clause facts x 3 roles)"
             )
         if workspace_permutation_transactional:
             if not (
@@ -3312,7 +3323,9 @@ def run(
                 f"on {baseline_accuracy:.2f}% exact {baseline_exact:.2f}% | "
                 f"bypassed {ablated_accuracy:.2f}% | shuffled {shuffled_accuracy:.2f}% | "
                 f"accuracy drops {baseline_accuracy - ablated_accuracy:.2f}/"
-                f"{baseline_accuracy - shuffled_accuracy:.2f} pp"
+                f"{baseline_accuracy - shuffled_accuracy:.2f} pp | exact "
+                f"{baseline_exact:.2f} -> {ablated_exact:.2f}/{shuffled_exact:.2f} "
+                f"(drops {baseline_exact - ablated_exact:.2f}/{baseline_exact - shuffled_exact:.2f} pp)"
             )
             adaptive_ablated_evaluator = getattr(
                 dataset, "evaluate_workspace_adaptive_ablated", None
@@ -4037,6 +4050,9 @@ def run(
         rnn.workspace_adaptive_v3_holdout_tracks = tuple(
             workspace_adaptive_v3_holdout_tracks
         )
+    if workspace_slot_readout and dataset.task_track in _lang_text.LANG_TRACK_NAMES:
+        rnn.workspace.enable_slot_text(dataset.slot_text_columns())
+        rnn.workspace.to(device)
 
     if dnc_compile_memory and not isinstance(rnn, SurpriseRecallBackboneOnly):
         for memory in rnn.memories:
@@ -4412,6 +4428,8 @@ def run(
         extra_model_config["workspace_lexicon_mode"] = workspace_lexicon_mode
         extra_model_config["workspace_lexical_family"] = workspace_lexical_family
         extra_model_config["workspace_lexical_unkeyed"] = bool(workspace_lexical_unkeyed)
+    if getattr(dataset, "task_track", None) in _lang_text.LANG_TRACK_NAMES:
+        extra_model_config["workspace_lang_manifest_sha256"] = _lang_text.manifest_sha256()
     if workspace_adaptive_v2_enabled:
         extra_model_config["workspace_adaptive_v2_enabled"] = True
         extra_model_config["workspace_adaptive_v2_num_skills"] = (
@@ -9875,6 +9893,13 @@ if __name__ == "__main__":
             "developmental_semantic",
             "developmental_production_semantic",
             "developmental_production_semantic_unkeyed",
+            "lang_template",
+            "lang_nlg",
+            "lang_story_qa",
+            "lang_dialogue",
+            "lang_syntax_probes",
+            "lang_open",
+            "lang_all",
         ],
         default="all",
         help=(
@@ -10003,10 +10028,18 @@ if __name__ == "__main__":
                         help="Stage 3a/3b/3c: drop workspace_output_keys (3d has *_unkeyed tracks).")
     parser.add_argument("--workspace-slot-readout", action="store_true",
                         help="Stage 3d unkeyed: learned concept-pointer readout over workspace slots at answer positions.")
+    parser.add_argument("--workspace-lang-annotator-free", action="store_true",
+                        help="Stage 4 control arm: no annotator (no keys, no fact markers, no slot supervision).")
+    parser.add_argument("--workspace-lang-shuffled-context", action="store_true",
+                        help="Stage 4 control arm: context facts come from an unrelated world; gold answers unchanged.")
+    parser.add_argument("--workspace-lang-external", action="store_true",
+                        help="Stage 4: mix in external corpora (nlg/story/accept jsonl built by tools/build_stage4_corpus.py).")
     parser.add_argument("--init-from", type=str, default=None,
                         help="Load model weights only (fresh optimizer/curriculum), e.g. a Stage 1 checkpoint.")
     args = parser.parse_args()
-    _prod = args.dataset_type == "workspace-capability" and args.workspace_task_track.startswith("developmental_production")
+    _prod = args.dataset_type == "workspace-capability" and args.workspace_task_track.startswith(
+        ("developmental_production", "lang_")
+    )
     if (args.workspace_teacher_forced_answers or args.workspace_generation_eval
             or args.workspace_scheduled_sampling > 0) and not _prod:
         parser.error("teacher forcing/generation/scheduled sampling require a developmental_production* track")
@@ -10017,6 +10050,16 @@ if __name__ == "__main__":
         parser.error("scheduled sampling requires --workspace-teacher-forced-answers and --workspace-token-id-input")
     if args.init_from and args.resume:
         parser.error("--init-from and --resume are mutually exclusive")
+    _lang_text.configure(
+        annotator=not args.workspace_lang_annotator_free,
+        shuffled_context=args.workspace_lang_shuffled_context,
+        external=args.workspace_lang_external,
+    )
+    if args.dataset_type == "workspace-capability" and args.workspace_task_track in _lang_text.LANG_TRACK_NAMES:
+        if not args.workspace_token_id_input:
+            parser.error("lang_* tracks require --workspace-token-id-input")
+        if args.memory_type != "none":
+            parser.error("lang_* tracks require --memory-type none (vocab expansion covers the DNC-free path)")
 
     if args.prepare_only and args.load_prepared:
         parser.error("--prepare-only cannot be combined with --load-prepared")
@@ -10980,6 +11023,12 @@ if __name__ == "__main__":
                     run_id += "_unkeyed"
             if args.workspace_slot_readout:
                 run_id += "_slotptr"
+            if args.workspace_lang_annotator_free:
+                run_id += "_annfree"
+            if args.workspace_lang_shuffled_context:
+                run_id += "_shufctx"
+            if args.workspace_lang_external:
+                run_id += "_langext"
             if args.workspace_autoadaptive_v3_compile_operators:
                 run_id += "_v3compile"
             if args.workspace_task_track in (

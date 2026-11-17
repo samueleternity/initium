@@ -21,6 +21,8 @@ from initium.data.workspace_capability.dataset import (
 from initium.data.workspace_capability.episode import (
     BOOL_FALSE,
     BOOL_TRUE,
+    ENTITY_BASE,
+    ENTITY_COUNT,
     EOS,
     FACT_BASE,
     FACT_COUNT,
@@ -65,19 +67,35 @@ class LanguageDataset(WorkspaceCapabilityDataset):
         super().__init__(task_track, batch_size_hint=batch_size_hint)
         self.input_dim = self.output_dim = lt.tokenizer().total
         self.diag_episodes = 48  # episodes per slot-probe / surgery / paraphrase diagnostic
-        self.generation_eval_per_group = 32
+        # Generation re-forwards the model once per output token. Keep this
+        # diagnostic small enough to avoid dominating each curriculum eval.
+        self.generation_eval_per_group = 8
         self.generation_max_tokens = 64
         self._lang_ready = True
         self._weighted_sampling = True
         self._seg_queue: list = []
         self.segment_continue = False
+        self._track_exact_history: dict[str, list[float]] = {}
 
     @staticmethod
     def slot_text_columns():
         if lt.settings["stage5"]:
             tk = lt.tokenizer()
             skip = {t for w in (*lg.FUNCTION, *lg.PUNCT, *_EXTRA_FUNC, "|", ";") for t in tk.word(w)}
-            return sorted((set(range(TEXT_BASE, tk.total)) - skip) | {BOOL_FALSE, BOOL_TRUE})
+            # Stage-5 slot values store a word's first SentencePiece only. Keep
+            # continuation pieces on the backbone path so the slot head is not
+            # asked to hallucinate pieces that were never written to memory.
+            word_starts = {
+                TEXT_BASE + piece_id
+                for piece_id in range(tk.text_size)
+                if tk.sp.id_to_piece(piece_id).startswith("▁")
+            }
+            return sorted(
+                (word_starts - skip)
+                | set(range(ENTITY_BASE, ENTITY_BASE + ENTITY_COUNT))
+                | set(range(RELATION_BASE, RELATION_BASE + RELATION_COUNT))
+                | {BOOL_FALSE, BOOL_TRUE, l5.NEG_TOK, l5.PLU_TOK}
+            )
         G, tk = lg.grammar(), lt.tokenizer()
         skip = {tk.word(w)[0] for w in (*lg.FUNCTION, *lg.NAMES, *lg.OBJS, *lg.PUNCT)}
         words = {tk.word(G.word[i])[0] for i in G.ok} | {tk.word(w)[0] for w in lg.PLACES}
@@ -143,15 +161,42 @@ class LanguageDataset(WorkspaceCapabilityDataset):
         cap = KEY_VALUE_OPERAND_CAPACITY
         used: dict[tuple[int, int], int] = {}
         rr, ss, cc, kk, tt = [], [], [], [], []
+        route_mask = torch.ones((batch, time), dtype=torch.bool)
+        slot_target_ids = torch.full((batch, time), -1, dtype=torch.long)
+        binding_aux_targets = torch.full((batch, time), -100, dtype=torch.long)
         for row, episode in enumerate(examples):
             limit = min(time, len(episode.inputs))
             md = episode.metadata
+            for step, target in md.get("workspace_binding_aux", ()):
+                step, target = int(step), int(target)
+                if 0 <= step < limit and 0 <= target < self.output_dim:
+                    binding_aux_targets[row, step] = target
             for step, key, target in (*md.get("workspace_event_writes", ()), *md.get("workspace_query_reads", ())):
                 col = used.get((row, step), 0)
                 if step >= limit or col >= cap:
                     continue
                 used[(row, step)] = col + 1
                 rr.append(row), ss.append(step), cc.append(col), kk.append(key), tt.append(target)
+            output_keys = tuple(md.get("workspace_output_keys", ()))
+            output_kv_targets = md.get("workspace_output_kv_targets")
+            for offset, key in enumerate(output_keys):
+                key = int(key)
+                step = len(episode.inputs) + offset
+                if key >= 128:
+                    raise ValueError("language workspace output key is outside [0, 128)")
+                if key < 0 or step >= time or offset >= len(episode.answer):
+                    continue
+                slot_target_ids[row, step] = key
+                if output_kv_targets is None:
+                    continue
+                col = used.get((row, step), 0)
+                if col >= cap:
+                    continue
+                if offset >= len(output_kv_targets):
+                    continue
+                used[(row, step)] = col + 1
+                rr.append(row), ss.append(step), cc.append(col), kk.append(key), tt.append(int(output_kv_targets[offset]))
+                route_mask[row, step] = False
         ids = torch.full((batch, time, cap), -1, dtype=torch.long)
         targets = torch.full((batch, time, cap), -100, dtype=torch.long)
         mask = torch.zeros((batch, time, cap), dtype=torch.bool)
@@ -162,6 +207,9 @@ class LanguageDataset(WorkspaceCapabilityDataset):
             "key_value_entity_ids": ids,
             "key_value_targets": targets,
             "key_value_mask": mask,
+            "key_value_route_mask": route_mask,
+            "workspace_slot_target_ids": slot_target_ids,
+            "workspace_binding_aux_targets": binding_aux_targets,
             "key_value_steps": tuple(sorted(set(ss))),
             "key_value_output_programs": (),
             "key_value_argmatch_locations": {},
@@ -295,21 +343,66 @@ class LanguageDataset(WorkspaceCapabilityDataset):
             if len(e.answer) <= cap and seen[key] < self.generation_eval_per_group:
                 seen[key] += 1
                 picked.append(e)
-        return super()._generation_metrics(model, device, picked, cap=cap) if picked else {}
+        if not picked:
+            return {}
+        generate = super()._generation_metrics
+        by_track = {
+            track: generate(model, device, [e for e in picked if e.track == track], cap=cap)
+            for track in sorted({e.track for e in picked})
+        }
+        total = sum(int(values.get("episodes", 0)) for values in by_track.values())
+        overall = {}
+        for metric in ("exact", "token_accuracy", "length_accuracy", "repetition_rate", "fact_set_match", "teacher_forced_exact"):
+            overall[metric] = sum(
+                float(values.get(metric, 0.0)) * int(values.get("episodes", 0))
+                for values in by_track.values()
+            ) / max(total, 1)
+        overall["gap_pp"] = overall["teacher_forced_exact"] - overall["exact"]
+        overall["free_over_tf"] = overall["exact"] / max(overall["teacher_forced_exact"], 1e-9)
+        overall["episodes"] = total
+        return {"all": overall, "by_track": by_track}
 
     def evaluate_curriculum_id(self, model, device, lesson_idx, *, field_log=None):
         result = super().evaluate_curriculum_id(model, device, lesson_idx, field_log=field_log)
-        self._track_weights = {
+        raw_weights = {
             t: 0.02 if t == "lang_open" else 0.02 + max(0.0, 0.9 - v["exact_match"] / 100.0)
             for t, v in self.last_eval_diagnostics.get("tracks", {}).items()
         }
+        stalled = set()
+        for track, values in self.last_eval_diagnostics.get("tracks", {}).items():
+            history = self._track_exact_history.setdefault(track, [])
+            history.append(float(values["exact_match"]))
+            del history[:-3]
+            if len(history) == 3 and max(history) - min(history) < 2.0:
+                stalled.add(track)
+        active = sorted(value for track, value in raw_weights.items() if track != "lang_open")
+        median = active[len(active) // 2] if active else 1.0
+        self._track_weights = {}
+        for track, weight in raw_weights.items():
+            if track == "lang_open":
+                self._track_weights[track] = weight
+                continue
+            # Induction now has direct query-binding supervision. Keep exposing
+            # it even when exact-match history is flat; capping it as a stalled
+            # track would suppress the very examples that can now teach it.
+            cap_scale = 3.0 if track == "lang_induce" else (1.5 if track in stalled else 3.0)
+            self._track_weights[track] = min(weight, max(0.02, cap_scale * median))
         diagnostics, episodes, preds = self.last_eval_diagnostics, self._last_id_eval_episodes, self._last_eval_preds
         self._print_samples(episodes, "id")
         diagnostics["stage3_counterfactual"] = self._stage3_metrics(episodes)
         extra: dict = {}
         try:
             if self.generation_eval:
-                diagnostics["production_generation"] = {"all": self._generation_metrics(model, device, episodes)}
+                generation = self._generation_metrics(model, device, episodes)
+                diagnostics["production_generation"] = generation
+                for track, values in generation.get("by_track", {}).items():
+                    print(
+                        f"  [lang/free-generation/{track}] "
+                        f"exact={values.get('exact', 0.0):.1f}% "
+                        f"teacher_forced={values.get('teacher_forced_exact', 0.0):.1f}% "
+                        f"gap={values.get('gap_pp', 0.0):+.1f}pp "
+                        f"n={int(values.get('episodes', 0))}"
+                    )
             workspace = getattr(model, "workspace", None)
             if workspace is not None and getattr(model, "workspace_semantic_entity_addressing", False):
                 if getattr(model, "workspace_key_value_readout_enabled", False):

@@ -65,6 +65,10 @@ class KeyAllocator(nn.Module):
         B, T = has.shape
         t = torch.arange(T, device=has.device).expand(B, T)
         hv = has > 0
+        has_prob = has.sigmoid()
+        flag_conf = torch.where(hv, has_prob, 1.0 - has_prob)
+        pointer_conf = ptr.softmax(-1).amax(-1)
+        confidence = torch.minimum(flag_conf, torch.where(hv, pointer_conf, torch.ones_like(pointer_conf)))
         sel = torch.where(hv, ptr.argmax(-1), t)
         is_key = sel >= T
         root = torch.where(is_key, t, sel)
@@ -73,4 +77,4 @@ class KeyAllocator(nn.Module):
         is_new = hv & (sel == t)
         key_node = torch.where(is_key, sel - T, occ_keys.sum(1, keepdim=True) + is_new.cumsum(1) - 1)
         pid = torch.where(hv, key_node.gather(1, root).clamp(0, self.keys - 1), torch.full_like(t, -1))
-        return pid, (wr > 0) & hv
+        return pid, (wr > 0) & hv, confidence

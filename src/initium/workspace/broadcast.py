@@ -401,6 +401,36 @@ class WorkspaceBroadcast(nn.Module):
             return read
         return self.slot_readout_scale * self.semantic_value_decoder(read)
 
+    def slot_pointer_loss(
+        self,
+        features: torch.Tensor,
+        state: torch.Tensor,
+        target_keys: torch.Tensor,
+    ) -> torch.Tensor:
+        """Supervise answer-time slot selection without routing gold keys at inference."""
+        if self.slot_pointer is None:
+            return features.new_zeros((), dtype=torch.float32)
+        address, _content = torch.split(
+            state.float(), [self._address_dim, self.d_model], dim=-1
+        )
+        occupied = address.square().sum(-1) > 1e-12
+        slot_keys = address.argmax(-1)
+        key_counts = torch.zeros(
+            address.shape[0],
+            self.slot_pointer.out_features,
+            dtype=torch.int32,
+            device=address.device,
+        ).scatter_add_(1, slot_keys, occupied.to(torch.int32))
+        key_present = key_counts > 0
+        logits = self.slot_pointer(features.float()).float()
+        targets = target_keys.to(device=logits.device, dtype=torch.long)
+        valid = targets.ge(0) & targets.lt(logits.shape[-1])
+        safe_targets = targets.clamp(0, logits.shape[-1] - 1)
+        valid &= key_present.gather(1, safe_targets)
+        if not valid.any():
+            return logits.sum() * 0.0
+        return F.cross_entropy(logits[valid], targets[valid])
+
     def enable_slot_text(self, cols):
         """Logit columns `cols` are produced only from slot content."""
         if self.slot_pointer is None:

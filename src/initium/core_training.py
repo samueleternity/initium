@@ -4280,6 +4280,17 @@ def run(
                 f"compute_precision={'fp32' if workspace_active else 'bypass'} | "
                 "scope=final-backbone-MoE-bank; each specialist reads shared slots"
             )
+            if getattr(dataset, "task_track", None) in _lang_text.LANG_TRACK_NAMES:
+                slot_columns = dataset.slot_text_columns() if workspace_slot_readout else ()
+                print(
+                    f"[{run_id}] language readout | "
+                    f"slot_readout={'on' if workspace_slot_readout else 'off'} "
+                    f"columns={len(slot_columns)} "
+                    f"answer_pointer_supervision={bool(workspace_slot_readout and workspace_key_value_loss_weight > 0)} "
+                    f"pointer_loss_scale={workspace_key_value_loss_weight if workspace_slot_readout else 0.0:g} "
+                    f"query_binding_aux={bool(workspace_key_value_loss_weight > 0)} "
+                    f"binding_aux_scale={2.0 * workspace_key_value_loss_weight:g}"
+                )
             if workspace_adaptive_v3_enabled:
                 print(
                     f"[{run_id}] adaptive V3 | rank={workspace_adaptive_v3_rank} | "
@@ -4457,6 +4468,17 @@ def run(
         extra_model_config["workspace_lexical_unkeyed"] = bool(workspace_lexical_unkeyed)
     if getattr(dataset, "task_track", None) in _lang_text.LANG_TRACK_NAMES:
         extra_model_config["workspace_lang_manifest_sha256"] = _lang_text.manifest_sha256()
+        if workspace_slot_readout:
+            _slot_columns = dataset.slot_text_columns()
+            _slot_manifest = ",".join(str(int(token)) for token in _slot_columns).encode("ascii")
+            extra_model_config["workspace_slot_readout"] = True
+            extra_model_config["workspace_slot_text_columns_count"] = len(_slot_columns)
+            extra_model_config["workspace_slot_text_columns_sha256"] = hashlib.sha256(
+                _slot_manifest
+            ).hexdigest()
+            extra_model_config["workspace_slot_pointer_supervision"] = bool(
+                workspace_key_value_loss_weight > 0
+            )
     if workspace_adaptive_v2_enabled:
         extra_model_config["workspace_adaptive_v2_enabled"] = True
         extra_model_config["workspace_adaptive_v2_num_skills"] = (
@@ -5597,6 +5619,7 @@ def run(
             rnn._initium_carry = (
                 [seg_carry] if getattr(dataset, "segment_continue", False) and seg_carry is not None else []
             )
+            scheduled_sampling_carry = list(rnn._initium_carry)
         if len(batch) == 3:
             input_seq, target_digits, answer_mask = batch
             timespans = None
@@ -5859,12 +5882,30 @@ def run(
             p_ss = workspace_scheduled_sampling * min(1.0, step / max(1, workspace_scheduled_sampling_steps))
             if p_ss > 0:
                 with torch.no_grad(), torch.amp.autocast("cuda", enabled=amp_enabled):
-                    ss_out, _ = rnn(input_seq, (None, None, None), reset_experience=True,
-                                    timespans=timespans, **workspace_forward_kwargs)
-                    ss_logits = output_proj(ss_out.transpose(0, 1))
+                    ss_out, ss_hidden = rnn(
+                        input_seq,
+                        (None, None, None),
+                        reset_experience=True,
+                        timespans=timespans,
+                        **workspace_forward_kwargs,
+                    )
+                    # This no-grad pass consumes the carry entry. Restore it so
+                    # the gradient-bearing pass sees the same prior segment.
+                    if isinstance(rnn, SplitGraphDNC):
+                        rnn._initium_carry = list(scheduled_sampling_carry)
+                    ss_features = ss_out.transpose(0, 1)
+                    ss_logits = output_proj(ss_features)
+                    if workspace_slot_readout:
+                        ss_logits = rnn.apply_slot_readout(
+                            ss_logits, ss_features, ss_hidden, answer_mask
+                        )
                     if workspace_key_value_loss_weight > 0:
                         ss_logits = dataset.apply_workspace_key_value_readout_logits(
-                            ss_logits, rnn.workspace.pop_key_value_predictions(), key_value_metadata, answer_mask)
+                            ss_logits,
+                            rnn.workspace.pop_key_value_predictions(),
+                            key_value_metadata,
+                            answer_mask,
+                        )
                 for _layer in getattr(rnn, "moe_layers", ()):
                     _layer.pop_aux_loss()
                 prev = ss_logits.argmax(-1)[:, :-1]
@@ -6074,6 +6115,33 @@ def run(
                     device=device,
                     dtype=task_loss.dtype,
                 )
+                slot_target_ids = key_value_metadata.get("workspace_slot_target_ids")
+                if workspace_slot_readout and slot_target_ids is not None:
+                    workspace_module = getattr(rnn, "workspace", None)
+                    if workspace_module is not None and isinstance(hidden, tuple) and isinstance(hidden[0], dict):
+                        slot_state = hidden[0].get("_initium_workspace_state")
+                        if slot_state is not None:
+                            # Train answer-time key selection directly. The target
+                            # is auxiliary supervision only; inference still has
+                            # to predict the key from the answer-prefix features.
+                            workspace_key_value_loss = workspace_key_value_loss + (
+                                workspace_module.slot_pointer_loss(
+                                    _slot_features, slot_state, slot_target_ids
+                                ).to(dtype=task_loss.dtype)
+                            )
+                binding_aux_targets = key_value_metadata.get("workspace_binding_aux_targets")
+                if binding_aux_targets is not None:
+                    binding_mask = binding_aux_targets.ge(0)
+                    if binding_mask.any():
+                        # Stage-5 induction needs an explicit intermediate
+                        # objective: infer the bound MR/surface value at each
+                        # query token before serializing the full answer.
+                        # These labels are only attached to query positions,
+                        # after the in-context examples have been observed.
+                        workspace_key_value_loss = workspace_key_value_loss + nn.functional.cross_entropy(
+                            output[binding_mask],
+                            binding_aux_targets[binding_mask].to(dtype=torch.long),
+                        ).to(dtype=task_loss.dtype) * 2.0
                 if workspace_attentional_cue_readout:
                     workspace_module = getattr(rnn, "workspace", None)
                     if workspace_module is None or key_value_metadata is None:
@@ -6737,7 +6805,21 @@ def run(
         if alloc_enabled and step % 100 == 0 and rnn.allocator_stats:
             _d = 100.0 / max(1, workspace_allocator_anneal_steps)
             _acc = min(float(v) for v in rnn.allocator_stats.values())
-            alloc_p = min(1.0, alloc_p + _d) if _acc >= 0.95 else max(0.0, alloc_p - _d)
+            # Increase self-key exposure in stages. A strict 0.95 gate left
+            # this run at 10% predicted keys for all 19k steps, so almost every
+            # workspace write still saw an oracle address. Confidence filtering
+            # in _allocate protects low-confidence predictions during the ramp.
+            target_alloc_p = (
+                1.0 if _acc >= 0.95
+                else 0.75 if _acc >= 0.85
+                else 0.4 if _acc >= 0.75
+                else 0.1
+            )
+            alloc_p = (
+                min(target_alloc_p, alloc_p + _d)
+                if alloc_p < target_alloc_p
+                else max(target_alloc_p, alloc_p - _d)
+            )
             rnn.allocator_use_prob = alloc_p
             rnn.allocator.use_prob.fill_(alloc_p)
             print(
@@ -6813,7 +6895,9 @@ def run(
             # evaluation time removed (evaluation remains reported separately).
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
-            elapsed = max(time.time() - t0 - running_eval_seconds, 1e-9)
+            # t0 is advanced by each evaluation duration below, so evaluation
+            # time is already excluded from this training-only window.
+            elapsed = max(time.time() - t0, 1e-9)
             total_elapsed = time.time() - t_run_start  # log addition #5
             avg_task = (
                 running_task_loss.item()
@@ -10162,8 +10246,6 @@ if __name__ == "__main__":
     if args.dataset_type == "workspace-capability" and args.workspace_task_track in _lang_text.LANG_TRACK_NAMES:
         if not args.workspace_token_id_input:
             parser.error("lang_* tracks require --workspace-token-id-input")
-        if args.memory_type != "none":
-            parser.error("lang_* tracks require --memory-type none (vocab expansion covers the DNC-free path)")
 
     if args.prepare_only and args.load_prepared:
         parser.error("--prepare-only cannot be combined with --load-prepared")

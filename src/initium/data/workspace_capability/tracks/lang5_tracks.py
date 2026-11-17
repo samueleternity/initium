@@ -36,6 +36,7 @@ class Ep5(lg.Ep):
     def __init__(self, marker, annotate=True):
         super().__init__(marker, annotate)
         self.nc = self.clock = self.evict = self.evc = 0
+        self.binding_aux: list[tuple[int, int]] = []
         self.closed = set()  # entities already answered about and not re-mentioned: recycled first
         self.last = {}
         self.truth = lt.settings["identity"] == "truth"
@@ -125,6 +126,47 @@ class Ep5(lg.Ep):
             if ctx:
                 self.evw.append((pos, k, self.piece(m[1])))
 
+    def bind_surface(self, ws, bindings, *, write=True):
+        """Attach an oracle concept key and typed value to each mapped surface word."""
+        sp = self._enc(ws)
+        if not self.ann:
+            return
+        for i, word in enumerate(ws):
+            binding = bindings.get(word.strip(lg.PUNCT))
+            if binding is None:
+                continue
+            key, target = binding
+            pos = self._pos(ws, sp, i)
+            self.addr.append((pos, int(key), bool(write)))
+            if write:
+                self.evw.append((pos, int(key), int(target)))
+            else:
+                self.binding_aux.append((pos, int(target)))
+
+    def bind_mr(self, values, bindings, *, write=True):
+        """Append typed MR tokens and annotate their reverse lexical bindings."""
+        for value in values:
+            pos = len(self.t)
+            self.t.append(int(value))
+            binding = bindings.get(int(value))
+            if binding is None or not self.ann:
+                continue
+            key, target = binding
+            self.addr.append((pos, int(key), bool(write)))
+            if write:
+                self.evw.append((pos, int(key), int(target)))
+            else:
+                self.binding_aux.append((pos, int(target)))
+
+    def output_keys(self, words, key_by_word):
+        """Expand word-level semantic keys to answer-token positions."""
+        keys = []
+        for word in words:
+            pieces = self.tk.word(word)
+            key = int(key_by_word.get(word.strip(lg.PUNCT), -1))
+            keys.extend((key,) + (-1,) * (len(pieces) - 1))
+        return tuple(keys) + (-1,)
+
     def story_ws(self, ws, ments):
         """ments: (word_idx, name, loc|None, is_pronoun); loc -> slot write of location_token at that word."""
         sp = self._enc(ws)
@@ -157,6 +199,8 @@ class Ep5(lg.Ep):
             self.closed.add(name)
 
     def done(self, track, answer, qtype, group, kind="text", **meta):
+        if self.binding_aux:
+            meta.setdefault("workspace_binding_aux", tuple(self.binding_aux))
         return super().done(track, answer, qtype, group, kind, evictions=self.evict, closed_evictions=self.evc, **meta)
 
 
@@ -251,7 +295,22 @@ def _g_define(cfg, rng):
             ep.text(G.ask_wh(target[0], target[1]), ctx=False)
             ans = _canon_say(G, target)
             ep.ask(target)
-        return ep.done("lang_define", _toks(ans), grp, grp, grammar_checked=True, heldout_words=band == "B", pseudo=True)
+        key_by_word = {}
+        for word in ans:
+            parsed = G.surf.get(word.strip(lg.PUNCT))
+            if parsed is not None:
+                key_by_word[word.strip(lg.PUNCT)] = ep.ent.get(parsed[0], -1)
+        return ep.done(
+            "lang_define",
+            _toks(ans),
+            grp,
+            grp,
+            grammar_checked=True,
+            heldout_words=band == "B",
+            pseudo=True,
+            workspace_output_keys=ep.output_keys(ans, key_by_word),
+            workspace_output_kv_targets=tuple(_toks(ans)),
+        )
 
 
 # ---------------------------------------------------------------- 5c induce
@@ -264,7 +323,30 @@ def _g_induce(cfg, rng):
     n = cfg["nouns"]
     W = pseudo(rng, n + 5)
     N, V, NP, PP = W[:n], W[n : n + 3], W[n + 3], W[n + 4]
-    surf = {w: (("n", i), w) for i, w in enumerate(N)}
+    surface_to_semantic = {
+        **{word: (48 + i, entity_token(i)) for i, word in enumerate(N)},
+        **{word: (112 + i, relation_token(i)) for i, word in enumerate(V)},
+        NP: (115, NEG_TOK),
+        PP: (116, PLU_TOK),
+    }
+    mr_to_surface = {
+        **{entity_token(i): (80 + i, lt.tokenizer().word(word)[0]) for i, word in enumerate(N)},
+        **{relation_token(i): (120 + i, lt.tokenizer().word(word)[0]) for i, word in enumerate(V)},
+        NEG_TOK: (123, lt.tokenizer().word(NP)[0]),
+        PLU_TOK: (124, lt.tokenizer().word(PP)[0]),
+    }
+    semantic_output_key = {
+        **{entity_token(i): 48 + i for i in range(n)},
+        **{relation_token(i): 112 + i for i in range(len(V))},
+        NEG_TOK: 115,
+        PLU_TOK: 116,
+    }
+    surface_output_key = {
+        **{word: 80 + i for i, word in enumerate(N)},
+        **{word: 120 + i for i, word in enumerate(V)},
+        NP: 123,
+        PP: 124,
+    }
 
     def build(s, v, o, neg, plu):
         S = ([PP, N[s]] if plupos == 0 else [N[s], PP]) if plu else [N[s]]
@@ -287,17 +369,26 @@ def _g_induce(cfg, rng):
     ep = Ep5(8)
     for e in ex:
         ws, mr = build(*e)
-        ep.manual(ws, surf)
-        ep.ctl(MARK_R, *mr, TURN_END)
+        ep.bind_surface(ws, surface_to_semantic, write=True)
+        ep.ctl(MARK_R)
+        ep.bind_mr(mr, mr_to_surface, write=True)
+        ep.ctl(TURN_END)
     ws, mr = build(*q)
     if grp == "ind_s2mr":
         ep.ctl(TASK_S2MR)
-        ep.manual(ws, surf, ctx=False)
+        ep.bind_surface(ws, surface_to_semantic, write=False)
         ans, kind = mr, "mr"
+        output_keys = tuple(semantic_output_key.get(int(t), -1) for t in mr) + (-1,)
     else:
-        ep.ctl(TASK_MR2S, *mr)
+        ep.ctl(TASK_MR2S)
+        ep.bind_mr(mr, mr_to_surface, write=False)
         ans, kind = _toks(ws), "text"
-    return ep.done("lang_induce", ans, f"{grp}_c{c}", grp, kind=kind, heldout_combo=held, grammar_checked=False)
+        output_keys = ep.output_keys(ws, surface_output_key)
+    return ep.done(
+        "lang_induce", ans, f"{grp}_c{c}", grp, kind=kind, heldout_combo=held,
+        grammar_checked=False, workspace_output_keys=output_keys,
+        workspace_output_kv_targets=tuple(ans),
+    )
 
 
 # ---------------------------------------------------------------- 5d logic
@@ -385,7 +476,20 @@ def _g_logic(cfg, rng):
     ep.manual(q, surf, ctx=False)
     for f in derived:  # derivation scaffold: placeholder tokens whose slots must hold the derived facts
         ep._commit(*f)
-    return ep.done("lang_logic", _toks(ans), f"{grp}_d{d}", grp, grammar_checked=False, depth=d)
+    key_by_word = {
+        word: ep.ent.get(binding[0], -1)
+        for word, binding in surf.items()
+    }
+    return ep.done(
+        "lang_logic",
+        _toks(ans),
+        f"{grp}_d{d}",
+        grp,
+        grammar_checked=False,
+        depth=d,
+        workspace_output_keys=ep.output_keys(ans, key_by_word),
+        workspace_output_kv_targets=tuple(_toks(ans)),
+    )
 
 
 # ---------------------------------------------------------------- 5e/5f shared world
@@ -518,7 +622,27 @@ def _g_discourse(cfg, rng):
         ep.ctl(SPK_SYS)
         for name, tgt in rd:
             ep.read_slot(name, tgt)
-        segs.append(ep.done("lang_discourse", _toks(ans), f"{kind}_turn{k + 1}", kind, grammar_checked=False, coref_dist=cd))
+        key_by_word = {}
+        # These entity slots contain location values, not the entity names.
+        # Route only the location word through memory; keep names on the
+        # backbone path so a slot cannot be trained to emit two different
+        # lexical values from the same payload.
+        location_key = ep.ent.get(rd[0][0], -1) if rd else -1
+        for place in lg.PLACES:
+            if location_key >= 0:
+                key_by_word[place] = location_key
+        segs.append(
+            ep.done(
+                "lang_discourse",
+                _toks(ans),
+                f"{kind}_turn{k + 1}",
+                kind,
+                grammar_checked=False,
+                coref_dist=cd,
+                workspace_output_keys=ep.output_keys(ans, key_by_word),
+                workspace_output_kv_targets=tuple(_toks(ans)),
+            )
+        )
 
         if k < T - 1:
             ep = w.ep = ep.fork(10)
@@ -580,7 +704,25 @@ def _g_act(cfg, rng):
         ep.ctl(SPK_SYS)
         for name, tgt in rd:
             ep.read_slot(name, tgt)
-        segs.append(ep.done("lang_act", _toks(ans), f"{act}_turn{k + 1}", act, grammar_checked=False, response_act=resp))
+        key_by_word = {}
+        if rd:
+            entity = rd[0][0]
+            entity_key = ep.ent.get(entity, -1)
+            for place in lg.PLACES:
+                if entity_key >= 0:
+                    key_by_word[place] = entity_key
+        segs.append(
+            ep.done(
+                "lang_act",
+                _toks(ans),
+                f"{act}_turn{k + 1}",
+                act,
+                grammar_checked=False,
+                response_act=resp,
+                workspace_output_keys=ep.output_keys(ans, key_by_word),
+                workspace_output_kv_targets=tuple(_toks(ans)),
+            )
+        )
         if k < T - 1:
             ep = w.ep = ep.fork(11)
     segs[-1].metadata["prev"] = tuple(segs[:-1])

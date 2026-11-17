@@ -2531,11 +2531,16 @@ class WorkspaceCapabilityDataset(BaseDataset):
             return logits
         result = logits.clone()
         masks = metadata["key_value_mask"].to(device=logits.device)
+        route_mask = metadata.get("key_value_route_mask")
+        if route_mask is not None:
+            route_mask = route_mask.to(device=logits.device).bool()
         answer_mask = answer_mask.to(device=logits.device).bool()
         for step, value_logits in predictions:
             if not 0 <= int(step) < logits.shape[1]:
                 continue
             active = masks[:, int(step), 0] & answer_mask[:, int(step)]
+            if route_mask is not None:
+                active &= route_mask[:, int(step)]
             routed = value_logits[:, 0].to(device=logits.device, dtype=logits.dtype)
             result[:, int(step)] = torch.where(active.unsqueeze(-1), routed, result[:, int(step)])
         predictions_by_step = {int(step): value for step, value in predictions}

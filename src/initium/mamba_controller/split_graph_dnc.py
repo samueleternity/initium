@@ -145,6 +145,19 @@ from initium.workspace.broadcast import WorkspaceBroadcast
 from initium.workspace.kv_bridge import WorkspaceKVBridge, WorkspaceKVState
 
 
+def _detach_state_tree(value):
+    if isinstance(value, torch.Tensor):
+        return value.detach()
+    if isinstance(value, dict):
+        return {key: _detach_state_tree(child) for key, child in value.items()}
+    if isinstance(value, list):
+        return [_detach_state_tree(child) for child in value]
+    if isinstance(value, tuple):
+        children = tuple(_detach_state_tree(child) for child in value)
+        return type(value)(*children) if hasattr(value, "_fields") else children
+    return value
+
+
 class _ModelCapacityMetadata:
     """Legacy trainer/checkpoint capacity metadata without DNC state."""
 
@@ -956,8 +969,32 @@ class SplitGraphDNC(nn.Module):
             delta = out.to(logits.dtype)
             return logits + delta * answer_mask.to(device=logits.device, dtype=logits.dtype).unsqueeze(-1)
         sel = answer_mask.to(logits.device).bool()
+        if not sel.any():
+            return logits
         rows = logits[sel]
-        rows[:, ws.slot_text_cols] = (ws.slot_readout_scale * ws.slot_text_head(out[sel])).to(rows.dtype)
+        slot_logits = (ws.slot_readout_scale * ws.slot_text_head(out[sel])).to(rows.dtype)
+
+        # Let the backbone handle words that are absent from memory or whose
+        # pointer is still uncertain. Slot values are useful as a grounded
+        # residual once the pointer has confidence, but overwriting these logits
+        # makes early training depend entirely on randomly initialized slots.
+        address, _content = torch.split(slots.float(), [ws._address_dim, ws.d_model], dim=-1)
+        occupied = address.square().sum(-1) > 1e-12
+        slot_ids = address.argmax(-1)
+        pointer = ws.slot_pointer(features.float()).softmax(-1)
+        pointer_on_occupied = pointer.gather(
+            -1, slot_ids.unsqueeze(1).expand(-1, pointer.shape[1], -1)
+        ) * occupied.unsqueeze(1).to(pointer.dtype)
+        confidence = pointer_on_occupied.amax(dim=-1)[sel]
+        chance = 1.0 / max(int(ws.slot_pointer.out_features), 1)
+        # Confidence ramps from chance-level to full slot influence. This keeps
+        # the backbone path available while answer-time pointer supervision is
+        # still learning.
+        slot_gate = ((confidence - chance) / max(0.75 - chance, 1e-6)).clamp(0.0, 1.0)
+        cols = ws.slot_text_cols
+        base_logits = rows[:, cols]
+        gate = slot_gate.to(rows.dtype).unsqueeze(-1)
+        rows[:, cols] = base_logits + gate * (slot_logits - base_logits)
         result = logits.clone()
         result[sel] = rows
         return result
@@ -970,8 +1007,12 @@ class SplitGraphDNC(nn.Module):
             e = self.allocator_stats
             self.allocator_stats = st if not e else {k: 0.99 * e[k] + 0.01 * v for k, v in st.items()}
         if self.allocator_use_prob > 0.0:
-            pid, pw = a.predict(out)
-            use = torch.rand(ids.shape[0], 1, device=ids.device) < self.allocator_use_prob
+            pid, pw, confidence = a.predict(out)
+            use = (
+                (torch.rand(ids.shape, device=ids.device) < self.allocator_use_prob)
+                & confidence.ge(0.2)
+                & ids.ge(0)
+            )
             ids, wm = torch.where(use, pid, ids), torch.where(use, pw, wm)
         return ids, wm
 
@@ -1078,10 +1119,16 @@ class SplitGraphDNC(nn.Module):
         """
         original_hx = hx
         chx, mhx, last_read = hx
-        if self._initium_carry:  # segment-carry: slots only, older tokens dropped
+        if self._initium_carry:  # segment-carry: recurrent stores survive after old tokens are dropped
             _c = self._initium_carry.pop(0)
             if _c is not None:
-                chx, reset_experience = _c, False
+                if "chx" in _c:
+                    chx = _c["chx"]
+                    mhx = _c.get("mhx", mhx)
+                    last_read = _c.get("last_read", last_read)
+                else:  # compatibility with workspace-only carry payloads
+                    chx = _c
+                reset_experience = False
         if self.workspace_token_id_input:
             if input.ndim != 2 or input.dtype not in (torch.int32, torch.int64):
                 raise ValueError(
@@ -1338,12 +1385,6 @@ class SplitGraphDNC(nn.Module):
             prediction_features = features
             compute_prediction_error(features)
 
-        def observe_allocator_features(features):
-            # The allocator is trained as a small head over frozen block-0
-            # representations, matching its former no-grad feature pass.
-            nonlocal prediction_features
-            prediction_features = features.detach()
-
         if self.workspace is not None:
             backbone_stages = (
                 list(self.backbone) if isinstance(self.backbone, nn.Sequential) else [self.backbone]
@@ -1372,8 +1413,6 @@ class SplitGraphDNC(nn.Module):
                     if return_backbone_features
                     or self.sgr_write_salience_enabled
                     or workspace_error_consumer
-                    else observe_allocator_features
-                    if self.allocator is not None and entity_ids is not None
                     else None
                 ),
             }
@@ -1396,10 +1435,11 @@ class SplitGraphDNC(nn.Module):
                 stage_input, **specialist_kwargs
             )
             if self.allocator is not None and entity_ids is not None:
-                if prediction_features is None:
-                    raise RuntimeError("allocator requires block-0 backbone features")
+                # Use the final contextual backbone representation. The old
+                # block-0 side pass added a full extra backbone execution and
+                # gave the allocator less context for coreference decisions.
                 entity_ids, entity_write_mask = self._allocate(
-                    prediction_features.detach(), workspace_state, entity_ids, entity_write_mask, input_valid_mask
+                    base.detach(), workspace_state, entity_ids, entity_write_mask, input_valid_mask
                 )
             if inter_layer_memory_enabled:
                 inter_layer_memory_read_done = True
@@ -1911,6 +1951,9 @@ class SplitGraphDNC(nn.Module):
                 if self.workspace_kv_memory is not None:
                     chx["_initium_workspace_kv_state"] = workspace_kv_state
             state = (chx, memory_states, last_read)
+            self._carry_out = _detach_state_tree(
+                {"chx": chx, "mhx": memory_states, "last_read": last_read}
+            )
             if return_backbone_features:
                 assert backbone_features is not None
                 if return_prediction_logits:
@@ -1925,15 +1968,22 @@ class SplitGraphDNC(nn.Module):
             # backbone (and optional MoE/workspace path above) is the model.
             # There is no memory reset, combiner, read/write loop, or DNC
             # output projection on this path.
-            output = H[:, start_step:].transpose(0, 1)
+            if not self.sequence_memory_enabled:
+                output = H[:, start_step:].transpose(0, 1)
             if self.workspace is not None:
                 chx = {"_initium_workspace_state": workspace_state}
+                if self.workspace_kv_memory is not None:
+                    chx["_initium_workspace_kv_state"] = workspace_kv_state
             else:
                 chx = None
-            self._carry_out = (
-                None if chx is None else {"_initium_workspace_state": workspace_state.detach()}
+            state = (
+                chx,
+                memory_states if self.sequence_memory_enabled else None,
+                last_read if self.sequence_memory_enabled else None,
             )
-            state = (chx, None, None)
+            self._carry_out = _detach_state_tree(
+                {"chx": chx, "mhx": state[1], "last_read": last_read}
+            )
             if return_backbone_features:
                 assert backbone_features is not None
                 if return_prediction_logits:

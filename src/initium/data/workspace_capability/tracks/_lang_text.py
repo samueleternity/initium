@@ -11,17 +11,26 @@ from initium.data.workspace_capability.episode import TEXT_BASE
 
 LANG_SINGLE = (
     "lang_template", "lang_nlg", "lang_story_qa", "lang_dialogue", "lang_syntax_probes", "lang_open",
+    "lang_parse", "lang_define", "lang_induce", "lang_logic", "lang_discourse", "lang_act", "lang_nlu_external",
 )
+LANG_V5_TRACKS = LANG_SINGLE[6:]
+RETIRED = ("lang_open",)
 LANG_TRACK_NAMES = (*LANG_SINGLE, "lang_all")
 DATA_DIR = Path(__file__).resolve().parent.parent / "stage4"
-EXTERNAL_FILES = {"nlg": "nlg.jsonl", "story": "story.jsonl", "accept": "accept.jsonl", "open": "open.jsonl"}
-settings = {"annotator": True, "shuffled_context": False, "external": False}
+EXTERNAL_FILES = {"nlg": "nlg.jsonl", "story": "story.jsonl", "accept": "accept.jsonl", "open": "open.jsonl",
+                  "nlu_triples": "nlu_triples.jsonl", "nli": "nli.jsonl", "qa": "qa.jsonl"}
+settings = {"annotator": True, "shuffled_context": False, "external": False, "identity": "truth", "stage5": False}
 
 
-def configure(annotator=None, shuffled_context=None, external=None):
-    for key, value in (("annotator", annotator), ("shuffled_context", shuffled_context), ("external", external)):
+def configure(annotator=None, shuffled_context=None, external=None, identity=None, stage5=None):
+    for key, value in (("annotator", annotator), ("shuffled_context", shuffled_context),
+                       ("external", external), ("stage5", stage5)):
         if value is not None:
             settings[key] = bool(value)
+    if identity is not None:
+        if identity not in ("annotator", "truth"):
+            raise ValueError("identity must be 'annotator' or 'truth'")
+        settings["identity"] = identity
 
 
 def _path(name):
@@ -40,7 +49,10 @@ def ext_available(name):
 
 
 def available_tracks():
-    return tuple(t for t in LANG_SINGLE if t != "lang_open" or ext_available("open"))
+    return tuple(
+        t for t in LANG_SINGLE
+        if t not in RETIRED and (t != "lang_nlu_external" or all(ext_available(n) for n in ("nlu_triples", "nli", "qa")))
+    )
 
 
 class LangTokenizer:
@@ -67,6 +79,8 @@ class LangTokenizer:
         r = self._cache.get(w)
         if r is None:
             r = tuple(TEXT_BASE + i for i in self.sp.encode(w, out_type=int))
+            if len(self._cache) >= 262_144:
+                self._cache.clear()
             self._cache[w] = r
         return r
 

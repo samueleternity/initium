@@ -35,8 +35,8 @@ from initium.data.workspace_capability.tracks import _lang_text as lt  # noqa: E
 
 PUNCT = ".,?!;:|"
 _PUNCT_RE = re.compile("([" + re.escape(PUNCT) + "])")
-KINDS = ("nlg", "story", "accept", "open")
-TOKEN_BUDGET = {"story": 480, "nlg": 480, "accept": 100, "open": 460}  # episode cap is 512 incl. answer
+KINDS = ("nlg", "story", "accept", "open", "nlu_triples", "nli", "qa")
+TOKEN_BUDGET = {"story": 480, "nlg": 480, "accept": 100, "open": 460, "nlu_triples": 400, "nli": 300, "qa": 400}
 ALIASES = {
     "nlg": {
         "triples": ("triples", "modified_triple_sets", "triple_set", "mtriple_set", "input"),
@@ -53,6 +53,16 @@ ALIASES = {
         "group": ("phenomenon", "UID", "linguistics_term", "field"),
     },
     "open": {"text": ("text", "story", "content")},
+    "nli": {
+        "premise": ("premise", "sentence1"),
+        "hypothesis": ("hypothesis", "sentence2"),
+        "label": ("label",),
+    },
+    "qa": {
+        "context": ("context", "story", "passage"),
+        "question": ("question",),
+        "answer": ("answer", "answers", "target"),
+    },
 }
 
 
@@ -187,14 +197,47 @@ def open_records(row, over):
         words = norm(t).split()[:120]
         if len(words) >= 20:
             yield {"text": " ".join(words)}
+_NLI = {0: "entailment", 1: "neutral", 2: "contradiction"}
 
 
-ADAPTERS = {"nlg": nlg_records, "story": story_records, "accept": accept_records, "open": open_records}
+def nlu_triples_records(row, over):  # same schema as nlg; --map nlu_triples.<field>=<col> is honoured
+    return nlg_records(row, {k.replace("nlu_triples.", "nlg.", 1): v for k, v in over.items()})
+
+
+def nli_records(row, over):
+    p, h, y = (col(row, "nli", k, over) for k in ("premise", "hypothesis", "label"))
+    if isinstance(y, str) and y.lstrip("-").isdigit():
+        y = int(y)
+    y = _NLI.get(y) if isinstance(y, int) else (y if y in _NLI.values() else None)
+    if isinstance(p, str) and isinstance(h, str) and y:
+        yield {"premise": norm(p), "hypothesis": norm(h), "label": y}
+
+
+def _first(a):
+    if isinstance(a, dict):
+        a = a.get("text") or a.get("input_text")
+    if hasattr(a, "tolist"):
+        a = a.tolist()
+    return (a[0] if a else None) if isinstance(a, (list, tuple)) else a
+
+
+def qa_records(row, over):
+    c, q = (col(row, "qa", k, over) for k in ("context", "question"))
+    a = _first(col(row, "qa", "answer", over))
+    if all(isinstance(x, str) and x for x in (c, q, a)):
+        yield {"context": norm(c), "question": norm(q), "answer": norm(a)}
+
+
+ADAPTERS = {"nlg": nlg_records, "story": story_records, "accept": accept_records, "open": open_records,
+            "nlu_triples": nlu_triples_records, "nli": nli_records, "qa": qa_records}
 SPLIT_KEY = {
     "nlg": lambda r: r["text"],
     "story": lambda r: r["context"] + r["question"],
     "accept": lambda r: r.pop("_key"),
     "open": lambda r: r["text"],
+    "nlu_triples": lambda r: r["text"],
+    "nli": lambda r: r["premise"] + r["hypothesis"],
+    "qa": lambda r: r["context"] + r["question"],
 }
 
 
@@ -213,9 +256,13 @@ def build_external(kind, src, over, limit):
 
 
 def record_lines(kind, r):
-    if kind == "nlg":
+    if kind in ("nlg", "nlu_triples"):
         return [" ".join(f"{s} | {rel} | {o} ;" for s, rel, o in r["triples"]), r["text"]]
     if kind == "story":
+        return [r["context"], r["question"], r["answer"]]
+    if kind == "nli":
+        return [r["premise"], r["hypothesis"], r["label"]]
+    if kind == "qa":
         return [r["context"], r["question"], r["answer"]]
     return [r["sentence"] if kind == "accept" else r["text"]]
 

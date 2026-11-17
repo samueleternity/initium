@@ -32,6 +32,8 @@ from initium.data.workspace_capability.tracks import _dev_lexicon
 from initium.data.workspace_capability.tracks import _lang_grammar as lg
 from initium.data.workspace_capability.tracks import _lang_text as lt
 from initium.data.workspace_capability.tracks import lang_tracks as ltr
+from initium.data.workspace_capability.tracks import lang5_tracks as l5
+from initium.data.workspace_capability.episode import BOS, SEP, TEXT_BASE, TaskEpisode
 
 _GEN = {
     "lang_template": ltr._g_template,
@@ -42,6 +44,11 @@ _GEN = {
     "lang_open": ltr._g_open,
 }
 _RETRIES = 64
+_GEN.update(l5.GENERATORS)
+_SLOT_RANGES5 = ((48, 80, 0), (80, 112, 1), (112, 128, 2))
+_DUMMY = TaskEpisode("lang_pad", (BOS, SEP), (EOS,), {"query_type": "pad"})
+_EXTRA_FUNC = ("ok", "hello", "goodbye", "welcome", "mean", "carrying", "nothing", "everything", "consistent",
+               "zero", "one", "two", "three", "four", "five", "in", "is", "yes,", "no,", "ok,")
 _SLOT_KINDS = ("subject", "object", "relation", "word")
 _SLOT_RANGES = ((24, 32, 0), (32, 40, 1), (48, 56, 2))
 
@@ -62,9 +69,15 @@ class LanguageDataset(WorkspaceCapabilityDataset):
         self.generation_max_tokens = 64
         self._lang_ready = True
         self._weighted_sampling = True
+        self._seg_queue: list = []
+        self.segment_continue = False
 
     @staticmethod
     def slot_text_columns():
+        if lt.settings["stage5"]:
+            tk = lt.tokenizer()
+            skip = {t for w in (*lg.FUNCTION, *lg.PUNCT, *_EXTRA_FUNC, "|", ";") for t in tk.word(w)}
+            return sorted((set(range(TEXT_BASE, tk.total)) - skip) | {BOOL_FALSE, BOOL_TRUE})
         G, tk = lg.grammar(), lt.tokenizer()
         skip = {tk.word(w)[0] for w in (*lg.FUNCTION, *lg.NAMES, *lg.OBJS, *lg.PUNCT)}
         words = {tk.word(G.word[i])[0] for i in G.ok} | {tk.word(w)[0] for w in lg.PLACES}
@@ -160,6 +173,89 @@ class LanguageDataset(WorkspaceCapabilityDataset):
             result["adaptive_operator_teacher_steps"] = ()
         return result
 
+    # ------------------------------------------------------------------ segment-carry (Stage 5)
+    def _emit(self, group, cont):
+        group = [g if g is not None else _DUMMY for g in group]
+        self.last_batch_examples, self.segment_continue = group, cont
+        x, y, m = self._collate(group, token_ids_only=True, teacher_forced=self.teacher_forced_answers)
+        m[torch.tensor([g is _DUMMY for g in group])] = 0.0
+        return x, y, m
+
+    def sample_batch(self, curriculum, batch_size):
+        if self._seg_queue:
+            return self._emit(self._seg_queue.pop(0), True)
+        batch = super().sample_batch(curriculum, batch_size)
+        self.segment_continue = False
+        chains = [tuple(e.metadata.get("prev", ())) + (e,) for e in self.last_batch_examples]
+        n = max(map(len, chains))
+        if n == 1:
+            return batch
+        steps = [[c[i - (n - len(c))] if i >= n - len(c) else None for c in chains] for i in range(n)]
+        self._seg_queue = steps[1:]
+        return self._emit(steps[0], False)
+
+    def _evaluate_episodes(self, model, device, episodes, **kw):
+        if not any(e.metadata.get("prev") for e in episodes) or not hasattr(model, "_initium_carry"):
+            return super()._evaluate_episodes(model, device, episodes, **kw)
+        hint, carries = min(self.batch_size_hint, max(1, len(episodes))), []
+        for off in range(0, len(episodes), hint):
+            chains = [tuple(e.metadata.get("prev", ())) for e in episodes[off : off + hint]]
+            n, carry = max(map(len, chains)), None
+            for i in range(n):
+                group = [c[i - (n - len(c))] if i >= n - len(c) else _DUMMY for c in chains]
+                model._initium_carry = [carry]
+                self._probe_forward(model, device, group, lambda *a: None)
+                carry = model._carry_out
+            carries.append(carry)
+        model._initium_carry = carries
+        try:
+            return super()._evaluate_episodes(model, device, episodes, **kw)
+        finally:
+            model._initium_carry = []
+
+    def _ungrounded(self, episodes):
+        """Approximate ungrounded-token rate: content pieces in answers that never occur in the input."""
+        tk = lt.tokenizer()
+        func = {t for w in (*lg.FUNCTION, *lg.PUNCT, *_EXTRA_FUNC) for t in tk.word(w)}
+        bad = tot = n = 0
+        for e in episodes:
+            p = self._last_eval_preds.get(id(e))
+            if p is None or e.metadata.get("answer_kind", "text") not in ("text", "mr"):
+                continue
+            ins, n = set(e.inputs), n + 1
+            for t in p:
+                if t >= TEXT_BASE and t not in func:
+                    tot += 1
+                    bad += t not in ins
+        return {"ungrounded_tokens": {"rate_pct": 100.0 * bad / max(tot, 1), "episodes": n}} if n else {}
+    def _lang5_metrics(self, episodes):
+        """Coreference-by-distance, derivation-by-depth and clarification P/R (also printed by the caller)."""
+        preds, clar = self._last_eval_preds, [*ltr._toks(["who", "do", "you", "mean?"]), EOS]
+        acc: dict[str, list[int]] = defaultdict(lambda: [0, 0])
+        tp = pc = gc = 0
+        for e in episodes:
+            p = preds.get(id(e))
+            if p is None:
+                continue
+            m, ok = e.metadata, p == list(e.answer)
+            if m.get("coref_dist", -1) >= 0:
+                a = acc[f"coref_dist_{min(m['coref_dist'], 6)}"]
+                a[0] += ok
+                a[1] += 1
+            if e.track == "lang_logic":
+                a = acc[f"derivation_depth_{m.get('depth', 0)}"]
+                a[0] += ok
+                a[1] += 1
+            if e.track == "lang_act":
+                g, c = m.get("response_act") == "clarify", p == clar
+                tp += g and c
+                pc += c
+                gc += g
+        out = {k: {"exact_pct": 100.0 * a / n, "episodes": n} for k, (a, n) in sorted(acc.items())}
+        if gc or pc:
+            out["clarify"] = {"precision_pct": 100.0 * tp / max(pc, 1), "recall_pct": 100.0 * tp / max(gc, 1), "episodes": gc}
+        return out
+
     # ------------------------------------------------------------------ display
     @staticmethod
     def _fmt_answer(e, pred):
@@ -170,6 +266,8 @@ class LanguageDataset(WorkspaceCapabilityDataset):
             toks = toks[: toks.index(EOS)] if EOS in toks else toks
             if kind == "bool":
                 return " ".join("yes" if t == BOOL_TRUE else "no" if t == BOOL_FALSE else "?" for t in toks)
+            if kind == "mr":
+                return " ".join(lt.tokenizer().decode([t]) if t >= TEXT_BASE else f"<{t}>" for t in toks)
             if kind == "typed":
                 return " ".join(
                     _dev_lexicon.word_name(t - FACT_BASE)
@@ -218,9 +316,14 @@ class LanguageDataset(WorkspaceCapabilityDataset):
                     extra.update(self._slot_probe(model, device, episodes))
                 extra.update(self._slot_surgery(model, device, int(lesson_idx)))
             extra.update(self._paraphrase_probe(model, device, int(lesson_idx)))
+            self._last_eval_preds = preds  # the probes above overwrote it; the metrics below need ID predictions
+            extra.update(self._ungrounded(episodes))
+            extra.update(self._lang5_metrics(episodes))
         except (RuntimeError, ValueError, KeyError) as exc:  # diagnostics must not kill a long run
             print(f"[lang-diagnostics] skipped: {exc!r}")
         diagnostics["production"] = extra
+        for k, v in sorted(extra.items()):
+            print(f"  [lang/{k}] " + " ".join(f"{a}={b:.1f}" for a, b in v.items() if a != "episodes") + f" n={v.get('episodes', 0)}")
         self.last_eval_diagnostics, self._last_eval_preds = diagnostics, preds
         return result
 
@@ -272,7 +375,7 @@ class LanguageDataset(WorkspaceCapabilityDataset):
                 hit = logits.argmax(-1).cpu().eq(kv["key_value_targets"][:, step])
                 retention = last.eq(step).expand_as(mask)
                 kinds = torch.full_like(keys, 3)
-                for lo, hi, idx in _SLOT_RANGES:
+                for lo, hi, idx in (_SLOT_RANGES5 if lt.settings["stage5"] else _SLOT_RANGES):
                     kinds[(keys >= lo) & (keys < hi)] = idx
                 for phase, flag in (("write", False), ("retention", True)):
                     in_phase = mask & (retention == flag)

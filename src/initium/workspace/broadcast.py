@@ -136,6 +136,7 @@ class WorkspaceBroadcast(nn.Module):
         sparse_recurrence: bool = False,
         attentional_cue_readout: bool = False,
         slot_readout: bool = False,
+        semantic_entity_count: int = 64,
         key_match_threshold: float = 0.5,
         diagnostics_enabled: bool = True,
     ):
@@ -177,6 +178,7 @@ class WorkspaceBroadcast(nn.Module):
         self.compile_recurrence = bool(compile_recurrence)
         self.entity_keyed_writes = bool(entity_keyed_writes)
         self.semantic_entity_addressing = bool(semantic_entity_addressing)
+        self._SEMANTIC_ENTITY_COUNT = int(semantic_entity_count)
         # Semantic IDs are exact one-hot keys over the 64-entity vocabulary.
         # Keeping padded d_model-wide key vectors through every recurrent
         # state duplicates 448 guaranteed-zero features per slot and token.

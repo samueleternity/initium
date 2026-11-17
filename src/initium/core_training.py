@@ -1301,6 +1301,9 @@ def run(
     workspace_lexical_family: str = "words",
     workspace_lexical_unkeyed: bool = False,
     workspace_slot_readout: bool = False,
+    workspace_semantic_entity_count: int = 64,
+    workspace_allocator: bool = False,
+    workspace_allocator_anneal_steps: int = 20_000,
 ):
     original_run_id = run_id
     run_id = _filesystem_safe_run_id(run_id)
@@ -1321,6 +1324,24 @@ def run(
         raise ValueError("workspace_gnw_balanced_eval_episodes_per_cell must be >= 0")
     if memory_type not in {"none", "dnc", "kv", "delta"}:
         raise ValueError("memory_type must be none, dnc, kv, or delta")
+    if workspace_semantic_entity_count not in (64, 128):
+        raise ValueError("workspace_semantic_entity_count must be 64 or 128")
+    if workspace_semantic_entity_count == 128 and workspace_enabled and workspace_num_slots < 128:
+        raise ValueError("128 semantic keys require --workspace-num-slots >= 128")
+    if workspace_semantic_entity_addressing and workspace_semantic_entity_count != 128 and (
+        str(workspace_task_track).replace("-", "_") in (*_lang_text.LANG_V5_TRACKS, "lang_all")
+    ):
+        raise ValueError("Stage 5 lang tracks and lang_all use keys up to 127: pass --workspace-semantic-entity-count 128 --workspace-num-slots 128")
+    if str(workspace_task_track).replace("-", "_") in _lang_text.LANG_TRACK_NAMES:
+        if sgr_prediction_loss_weight > 0:
+            raise ValueError("language tracks forbid next-token prediction loss (Stage 5 hard rule 1)")
+        if workspace_task_track == "lang_open" and not eval_only:
+            raise ValueError("lang_open is retired from training (eval-only probe)")
+    if workspace_allocator and (workspace_sparse_recurrence or not workspace_token_id_input):
+        raise ValueError(
+            "--workspace-allocator requires --workspace-token-id-input and excludes "
+            "--workspace-sparse-recurrence (predicted writes need every step)"
+        )
     if workspace_attentional_cue_readout:
         # Cue readout depends on structured per-frame storage; the single flag
         # enables that prerequisite while retaining the same validation.
@@ -3958,6 +3979,8 @@ def run(
             workspace_masked_prime_trace=workspace_masked_prime_trace,
             workspace_token_id_input=workspace_token_id_input,
             workspace_slot_readout=workspace_slot_readout,
+            workspace_semantic_entity_count=workspace_semantic_entity_count,
+            workspace_allocator=workspace_allocator,
             workspace_entity_keyed_writes=workspace_entity_keyed_writes,
             workspace_semantic_entity_addressing=workspace_semantic_entity_addressing,
             workspace_permutation_transactional=workspace_permutation_transactional,
@@ -4423,6 +4446,10 @@ def run(
     }
     if workspace_adaptive_enabled:
         extra_model_config["workspace_adaptive_enabled"] = True
+    if workspace_semantic_entity_count != 64:
+        extra_model_config["workspace_semantic_entity_count"] = int(workspace_semantic_entity_count)
+    if workspace_allocator:
+        extra_model_config["workspace_allocator"] = True
     if getattr(dataset, "task_track", None) in _dev_lexicon.STAGE3_TRACKS:
         extra_model_config["workspace_stage3_manifest_sha256"] = _dev_lexicon.manifest_sha256()
         extra_model_config["workspace_lexicon_mode"] = workspace_lexicon_mode
@@ -5383,11 +5410,48 @@ def run(
         _cfg = _init.get("model_config", {})
         for _k in ("input_size", "split_graph_num_blocks", "workspace_num_slots", "moe_num_experts", "memory_type"):
             if _k in _cfg and _cfg[_k] != expected_resume_model_config.get(_k):
-                raise ValueError(f"--init-from mismatch on {_k}: {_cfg[_k]!r} vs {expected_resume_model_config.get(_k)!r}")
-        _loaded = rnn.load_state_dict(_init["rnn_state_dict"], strict=False)
+                expanding_workspace = (
+                    _k == "workspace_num_slots"
+                    and int(_cfg[_k]) < int(expected_resume_model_config.get(_k, 0))
+                    and workspace_semantic_entity_count == 128
+                )
+                if not expanding_workspace:
+                    raise ValueError(f"--init-from mismatch on {_k}: {_cfg[_k]!r} vs {expected_resume_model_config.get(_k)!r}")
+        _warm_state = dict(_init["rnn_state_dict"])
+        _model_state = rnn.state_dict()
+        _dropped_warm_keys = []
+        _expanded_warm_keys = []
+        for _key, _value in list(_warm_state.items()):
+            _target = _model_state.get(_key)
+            if _key.startswith("workspace.slot_text_head.") and workspace_semantic_entity_count == 128:
+                # Even an equal-sized legacy head uses a different column
+                # map, so Stage 5 always starts this head from fresh weights.
+                del _warm_state[_key]
+                _dropped_warm_keys.append(_key)
+                continue
+            if _target is None or _value.shape == _target.shape:
+                continue
+            if (
+                _key in ("workspace.slot_pointer.weight", "workspace.slot_pointer.bias")
+                and _value.ndim == _target.ndim
+                and _value.shape[1:] == _target.shape[1:]
+                and _value.shape[0] < _target.shape[0]
+                and workspace_semantic_entity_count == 128
+            ):
+                _expanded = _target.clone()
+                _expanded[: _value.shape[0]].copy_(_value)
+                _warm_state[_key] = _expanded
+                _expanded_warm_keys.append(_key)
+            else:
+                raise ValueError(
+                    f"--init-from tensor shape mismatch for {_key}: "
+                    f"{tuple(_value.shape)} vs {tuple(_target.shape)}"
+                )
+        _loaded = rnn.load_state_dict(_warm_state, strict=False)
         output_proj.load_state_dict(_init["output_proj_state_dict"])
         print(f"[{run_id}] warm-started weights from {init_from} (missing={len(_loaded.missing_keys)}, "
-              f"unexpected={len(_loaded.unexpected_keys)}); optimizer/curriculum/step fresh")
+              f"unexpected={len(_loaded.unexpected_keys)}, resized={len(_expanded_warm_keys)}, "
+              f"reinitialized={len(_dropped_warm_keys)}); optimizer/curriculum/step fresh")
     if not eval_only:
         set_lr(step)  # Phase 1 FIX: ensure correct clamped LR from the very first
     # iteration -- otherwise a resumed run's first step would briefly use
@@ -5470,6 +5534,11 @@ def run(
     t_run_start = time.time()
 
     adaptive_v3_teacher_weight_current = float(workspace_adaptive_v3_teacher_weight)
+    seg_carry = None
+    alloc_enabled = bool(isinstance(rnn, SplitGraphDNC) and rnn.allocator is not None)
+    alloc_p = float(rnn.allocator.use_prob) if alloc_enabled else 0.0
+    if alloc_enabled:
+        rnn.allocator_use_prob = alloc_p
     while step < total_steps and not eval_only:
         adaptive_v3_teacher_weight_for_step = adaptive_v3_teacher_weight_current
         moe_diagnostics_due = bool(moe_diagnostics_enabled and running_log_steps + 1 >= log_every)
@@ -5524,6 +5593,10 @@ def run(
         if getattr(dataset, "name", None) == "workspace-capability":
             dataset.training_step = step
         batch = dataset.sample_batch(curriculum, batch_size)
+        if isinstance(rnn, SplitGraphDNC):
+            rnn._initium_carry = (
+                [seg_carry] if getattr(dataset, "segment_continue", False) and seg_carry is not None else []
+            )
         if len(batch) == 3:
             input_seq, target_digits, answer_mask = batch
             timespans = None
@@ -5901,6 +5974,8 @@ def run(
                     getattr(rnn, "last_sgr_signal_diagnostics", {})
                 )
             bistable_forward_debug = format_bistable_forward_debug()
+            if isinstance(rnn, SplitGraphDNC):
+                seg_carry = rnn._carry_out
             if workspace_train_scope == "gate":
                 exceeded, maximum, segment = segment_diagnostics.activation_absmax_exceeded("train")
                 if exceeded:
@@ -6280,6 +6355,7 @@ def run(
             raise FloatingPointError(
                 f"[{run_id}] non-finite adaptive workspace V3 loss at step {step}; stopping."
             )
+        alloc_loss = rnn.pop_allocator_loss() if isinstance(rnn, SplitGraphDNC) else None
         global_ramp = min(1.0, (step - anneal_start_step) / max(1, KL_ANNEAL_STEPS))
         lesson_dip_ramp = min(1.0, (step - lesson_dip_start_step) / max(1, LESSON_KL_DIP_STEPS))
         beta_eff = beta_target * global_ramp * lesson_dip_ramp
@@ -6310,6 +6386,7 @@ def run(
             + moe_aux_loss
             + (adaptive_skill_loss if adaptive_skill_loss is not None else 0.0)
             + (adaptive_v3_loss if adaptive_v3_loss is not None else 0.0)
+            + (alloc_loss if alloc_loss is not None else 0.0)
         )
         if split_graph_forward_trace is not None and split_graph_forward_trace.active:
             split_graph_forward_trace.observe("training.total_loss", loss)
@@ -6657,6 +6734,17 @@ def run(
                     )
 
         running_log_steps += 1
+        if alloc_enabled and step % 100 == 0 and rnn.allocator_stats:
+            _d = 100.0 / max(1, workspace_allocator_anneal_steps)
+            _acc = min(float(v) for v in rnn.allocator_stats.values())
+            alloc_p = min(1.0, alloc_p + _d) if _acc >= 0.95 else max(0.0, alloc_p - _d)
+            rnn.allocator_use_prob = alloc_p
+            rnn.allocator.use_prob.fill_(alloc_p)
+            print(
+                f"[{run_id}] Step {step} allocator acc="
+                + ",".join(f"{k}:{float(v):.3f}" for k, v in rnn.allocator_stats.items())
+                + f" predicted-key prob={alloc_p:.3f}"
+            )
         current_lr = set_lr(step)  # Phase 1 FIX: clamped manual LR, replaces scheduler.step()
 
         # Dynamic-N (usage-triggered), macro-scale: record this just-finished
@@ -9899,6 +9987,13 @@ if __name__ == "__main__":
             "lang_dialogue",
             "lang_syntax_probes",
             "lang_open",
+            "lang_parse",
+            "lang_define",
+            "lang_induce",
+            "lang_logic",
+            "lang_discourse",
+            "lang_act",
+            "lang_nlu_external",
             "lang_all",
         ],
         default="all",
@@ -10036,6 +10131,13 @@ if __name__ == "__main__":
                         help="Stage 4: mix in external corpora (nlg/story/accept jsonl built by tools/build_stage4_corpus.py).")
     parser.add_argument("--init-from", type=str, default=None,
                         help="Load model weights only (fresh optimizer/curriculum), e.g. a Stage 1 checkpoint.")
+    parser.add_argument("--workspace-semantic-entity-count", type=int, choices=(64, 128), default=64,
+                        help="Semantic key space (Stage 5: 128; needs --workspace-num-slots 128).")
+    parser.add_argument("--workspace-allocator", action="store_true",
+                        help="Learned key allocator (Stage 5); labels distilled from generator, predicted keys annealed in.")
+    parser.add_argument("--workspace-allocator-anneal-steps", type=int, default=20000)
+    parser.add_argument("--workspace-lang-identity", choices=("annotator", "truth"), default="truth",
+                        help="Stage 5 key labels: annotator (no pronoun/coreference labels) or generator ground truth.")
     args = parser.parse_args()
     _prod = args.dataset_type == "workspace-capability" and args.workspace_task_track.startswith(
         ("developmental_production", "lang_")
@@ -10054,6 +10156,8 @@ if __name__ == "__main__":
         annotator=not args.workspace_lang_annotator_free,
         shuffled_context=args.workspace_lang_shuffled_context,
         external=args.workspace_lang_external,
+        identity=args.workspace_lang_identity,
+        stage5=args.workspace_semantic_entity_count == 128,
     )
     if args.dataset_type == "workspace-capability" and args.workspace_task_track in _lang_text.LANG_TRACK_NAMES:
         if not args.workspace_token_id_input:
@@ -11029,6 +11133,10 @@ if __name__ == "__main__":
                 run_id += "_shufctx"
             if args.workspace_lang_external:
                 run_id += "_langext"
+            if args.workspace_semantic_entity_count == 128:
+                run_id += "_k128"
+            if args.workspace_allocator:
+                run_id += "_alloc"
             if args.workspace_autoadaptive_v3_compile_operators:
                 run_id += "_v3compile"
             if args.workspace_task_track in (
@@ -11295,6 +11403,9 @@ if __name__ == "__main__":
             workspace_lexical_family=args.workspace_lexical_family,
             workspace_lexical_unkeyed=args.workspace_lexical_unkeyed,
             workspace_slot_readout=args.workspace_slot_readout,
+            workspace_semantic_entity_count=args.workspace_semantic_entity_count,
+            workspace_allocator=args.workspace_allocator,
+            workspace_allocator_anneal_steps=args.workspace_allocator_anneal_steps,
         )
         all_summaries.append(summary)
 

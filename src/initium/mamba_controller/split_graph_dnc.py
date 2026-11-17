@@ -140,6 +140,7 @@ from initium.memory_manipulation.dnc_mechanisms import build_memory
 from initium.memory_manipulation.sequence_memories import CausalKVMemory, GatedDeltaMemory
 from initium.workspace.adaptive import AdaptiveWorkspaceSkills
 from initium.workspace.adaptive_v2 import AdaptiveWorkspaceSkillsV2
+from initium.workspace.allocator import KeyAllocator
 from initium.workspace.broadcast import WorkspaceBroadcast
 from initium.workspace.kv_bridge import WorkspaceKVBridge, WorkspaceKVState
 
@@ -300,6 +301,8 @@ class SplitGraphDNC(nn.Module):
         workspace_kv_read_scale: float = 0.1,
         workspace_token_id_input: bool = False,
         workspace_slot_readout: bool = False,
+        workspace_semantic_entity_count: int = 64,
+        workspace_allocator: bool = False,
         activation_checkpointing: bool = False,
         sgr_write_salience_enabled: bool = False,
         sgr_workspace_salience_enabled: bool = False,
@@ -860,6 +863,7 @@ class SplitGraphDNC(nn.Module):
                 adaptive_v4_enabled=workspace_adaptive_v4_enabled,
                 sparse_recurrence=workspace_sparse_recurrence,
                 slot_readout=workspace_slot_readout,
+                semantic_entity_count=workspace_semantic_entity_count,
                 attentional_cue_readout=workspace_attentional_cue_readout,
                 key_match_threshold=workspace_key_match_threshold,
             )
@@ -882,6 +886,24 @@ class SplitGraphDNC(nn.Module):
                 self.workspace_adaptive = AdaptiveWorkspaceSkills(hidden_size, moe_num_experts)
             torch.random.set_rng_state(adaptive_rng_state)
         self.workspace_adaptive_eval_bypass = False
+        self._initium_carry: list = []
+        self._carry_out = None
+        self.allocator_use_prob = 0.0
+        self.allocator_stats: dict = {}
+        self._alloc_loss = None
+        self.allocator = None
+        if workspace_allocator:
+            if (
+                self.workspace is None
+                or not (self.workspace_token_id_input and workspace_semantic_entity_addressing)
+                or num_backbone_blocks < 2
+            ):
+                raise ValueError(
+                    "allocator requires workspace + semantic addressing + token-ID input + >=2 backbone blocks"
+                )
+            _rs = torch.random.get_rng_state()
+            self.allocator = KeyAllocator(hidden_size, self.workspace._address_dim)
+            torch.random.set_rng_state(_rs)
         self.workspace_adaptive_v3_eval_bypass = False
         if self.workspace_write_to_kv:
             # Keep this optional sidecar from changing the random stream used
@@ -939,7 +961,23 @@ class SplitGraphDNC(nn.Module):
         result = logits.clone()
         result[sel] = rows
         return result
+    def _allocate(self, feats, state, ids, wm, valid):
+        a = self.allocator
+        out = a(feats.float(), state.float())
+        if self.training:
+            loss, st = a.loss(out, ids, wm, valid)
+            self._alloc_loss = loss
+            e = self.allocator_stats
+            self.allocator_stats = st if not e else {k: 0.99 * e[k] + 0.01 * v for k, v in st.items()}
+        if self.allocator_use_prob > 0.0:
+            pid, pw = a.predict(out)
+            use = torch.rand(ids.shape[0], 1, device=ids.device) < self.allocator_use_prob
+            ids, wm = torch.where(use, pid, ids), torch.where(use, pw, wm)
+        return ids, wm
 
+    def pop_allocator_loss(self):
+        loss, self._alloc_loss = self._alloc_loss, None
+        return loss
     def set_sgr_prediction_decoder(self, decoder: nn.Module | None, signal_mode: str) -> None:
         object.__setattr__(
             self,
@@ -1040,6 +1078,10 @@ class SplitGraphDNC(nn.Module):
         """
         original_hx = hx
         chx, mhx, last_read = hx
+        if self._initium_carry:  # segment-carry: slots only, older tokens dropped
+            _c = self._initium_carry.pop(0)
+            if _c is not None:
+                chx, reset_experience = _c, False
         if self.workspace_token_id_input:
             if input.ndim != 2 or input.dtype not in (torch.int32, torch.int64):
                 raise ValueError(
@@ -1296,6 +1338,12 @@ class SplitGraphDNC(nn.Module):
             prediction_features = features
             compute_prediction_error(features)
 
+        def observe_allocator_features(features):
+            # The allocator is trained as a small head over frozen block-0
+            # representations, matching its former no-grad feature pass.
+            nonlocal prediction_features
+            prediction_features = features.detach()
+
         if self.workspace is not None:
             backbone_stages = (
                 list(self.backbone) if isinstance(self.backbone, nn.Sequential) else [self.backbone]
@@ -1324,6 +1372,8 @@ class SplitGraphDNC(nn.Module):
                     if return_backbone_features
                     or self.sgr_write_salience_enabled
                     or workspace_error_consumer
+                    else observe_allocator_features
+                    if self.allocator is not None and entity_ids is not None
                     else None
                 ),
             }
@@ -1345,6 +1395,12 @@ class SplitGraphDNC(nn.Module):
             base, specialists, route_indices, route_weights = forward_with_specialists(
                 stage_input, **specialist_kwargs
             )
+            if self.allocator is not None and entity_ids is not None:
+                if prediction_features is None:
+                    raise RuntimeError("allocator requires block-0 backbone features")
+                entity_ids, entity_write_mask = self._allocate(
+                    prediction_features.detach(), workspace_state, entity_ids, entity_write_mask, input_valid_mask
+                )
             if inter_layer_memory_enabled:
                 inter_layer_memory_read_done = True
             # Workspace mode bypasses MoEBlock's ordinary residual add, so
@@ -1874,6 +1930,9 @@ class SplitGraphDNC(nn.Module):
                 chx = {"_initium_workspace_state": workspace_state}
             else:
                 chx = None
+            self._carry_out = (
+                None if chx is None else {"_initium_workspace_state": workspace_state.detach()}
+            )
             state = (chx, None, None)
             if return_backbone_features:
                 assert backbone_features is not None

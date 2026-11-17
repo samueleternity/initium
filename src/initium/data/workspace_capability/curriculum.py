@@ -18,9 +18,9 @@ _LANG = _lang_text.LANG_SINGLE
 
 
 def _lang_scale(c):
-    for key, cap in (("facts", 10), ("distractors", 4), ("events", 14), ("turns", 8), ("words", 120), ("filler", 48)):
+    for key, cap in (("facts", 10), ("distractors", 4), ("events", 14), ("turns", 14), ("words", 120), ("filler", 48), ("depth", 6), ("examples", 12), ("pseudo", 6)):
         if key in c:
-            c[key] = min(int(c[key]) + 2, cap)
+            c[key] = max(int(c[key]), min(int(c[key]) + 2, cap))
 
 
 def _lang_config(track, level):
@@ -50,6 +50,25 @@ def _lang_config(track, level):
     elif track == "lang_syntax_probes":
         c["groups"] = ("good", "agree", "detnum", "order")[: (2, 3, 4, 4, 4, 4)[L]] + ext
         c["heldout"] = 0.0
+    elif track == "lang_parse":
+        c["groups"] = ("parse_basic", "parse_neg", "parse_conj", "parse_ctx")[: (1, 2, 3, 4, 4, 4)[L]]
+    elif track == "lang_define":
+        c["groups"] = ("def_new", "def_prop", "def_redef", "def_unknown")[: (1, 2, 3, 4, 4, 4)[L]]
+        c["pseudo"] = (1, 2, 2, 3, 3, 4)[L]
+    elif track == "lang_induce":
+        c.update(groups=("ind_s2mr", "ind_mr2s")[: (1, 2, 2, 2, 2, 2)[L]], examples=(5, 6, 7, 8, 9, 10)[L],
+                 nouns=(3, 3, 4, 4, 5, 6)[L], rules=(1, 2, 2, 3, 3, 3)[L])
+    elif track == "lang_logic":
+        c.update(groups=("l_chain", "l_neg", "l_unknown", "l_contra", "l_count", "l_some", "l_cond")[: (1, 3, 3, 4, 6, 7)[L]],
+                 depth=(1, 1, 2, 2, 3, 4)[L])
+    elif track == "lang_discourse":
+        c.update(groups=("d_where", "d_pron", "d_dist", "d_update", "d_retell")[: (1, 2, 3, 4, 5, 5)[L]],
+                 turns=(1, 2, 3, 4, 5, 6)[L], events=(3, 4, 5, 6, 8, 10)[L], distract=(0, 1, 2, 3, 4, 6)[L])
+    elif track == "lang_act":
+        c.update(groups=("a_inform", "a_ask", "a_confirm", "a_correct", "a_social", "a_clarify", "a_refuse")[: (2, 3, 4, 5, 6, 7)[L]],
+                 turns=(2, 3, 4, 6, 8, 12)[L])
+    elif track == "lang_nlu_external":
+        c["groups"] = ("triples", "nli", "qa")
     else:  # lang_open (always external)
         c["groups"] = ("cloze", "first")[: (1, 1, 2, 2, 2, 2)[L]]
         c["words"] = (24, 32, 48, 64, 80, 96)[L]

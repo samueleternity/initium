@@ -56,7 +56,10 @@ def _lang_config(track, level):
         c["groups"] = ("def_new", "def_prop", "def_redef", "def_unknown")[: (1, 2, 3, 4, 4, 4)[L]]
         c["pseudo"] = (1, 2, 2, 3, 3, 4)[L]
     elif track == "lang_induce":
-        c.update(groups=("ind_s2mr", "ind_mr2s")[: (1, 2, 2, 2, 2, 2)[L]], examples=(5, 6, 7, 8, 9, 10)[L],
+        # Reverse generation requires storing complete multi-piece words. The
+        # current slots keep only a first piece, so only score the supported
+        # surface-to-MR direction until that representation is implemented.
+        c.update(groups=("ind_s2mr",), examples=(5, 6, 7, 8, 9, 10)[L],
                  nouns=(3, 3, 4, 4, 5, 6)[L], rules=(1, 2, 2, 3, 3, 3)[L])
     elif track == "lang_logic":
         c.update(groups=("l_chain", "l_neg", "l_unknown", "l_contra", "l_count", "l_some", "l_cond")[: (1, 3, 3, 4, 6, 7)[L]],
@@ -377,16 +380,26 @@ class WorkspaceCapabilityCurriculum:
             for level in range(_LEVELS)
         ]
         self.lesson = 0
+        self.track_lessons = (
+            {track: 0 for track in dataset._tracks()}
+            if dataset.task_track in ("lang_all", _lang_text.LANG_V5_SELECTOR)
+            else None
+        )
+        self.dataset._curriculum_track_levels = self.track_lessons
         # Split-graph sequence memories do not use DNC N, but retain this
         # interface for generic training/checkpoint code.
         self.lesson_nr_cells = [max(128, 32 * (i + 1)) for i in range(_LEVELS)]
 
+    def level_for(self, track):
+        return int(self.track_lessons.get(track, self.lesson)) if self.track_lessons is not None else self.lesson
+
     def maybe_advance(self, model, device, step=None, optimizer=None, *, allow_advance=True):
         field_log = {}
         evaluate_curriculum = getattr(self.dataset, "evaluate_curriculum_id", None)
+        lesson_arg = dict(self.track_lessons) if self.track_lessons is not None else self.lesson
         if callable(evaluate_curriculum):
             accuracy, perfect, _ = evaluate_curriculum(
-                model, device, self.lesson, field_log=field_log
+                model, device, lesson_arg, field_log=field_log
             )
         else:
             accuracy, perfect, _ = self.dataset.evaluate_id(
@@ -405,6 +418,37 @@ class WorkspaceCapabilityCurriculum:
         progression_groups = (self.dataset.last_eval_diagnostics or {}).get(
             "progression_groups", {}
         )
+        if self.track_lessons is not None:
+            promoted = []
+            for track, level in self.track_lessons.items():
+                if level >= len(self.table) - 1:
+                    continue
+                groups = self.dataset._curriculum_groups(track, level)
+                stats = progression_groups.get(track, {})
+                ready = all(
+                    group in stats
+                    and stats[group]["episodes"] >= self.dataset.curriculum_eval_episodes_per_group
+                    and stats[group]["exact_match"] / 100.0 >= self.dataset.advance_threshold
+                    for group in groups
+                )
+                overall = per_track.get(track, {}).get("exact_match", 0.0) / 100.0
+                ready = ready and overall >= self.dataset.advance_threshold
+                if allow_advance and ready:
+                    self.track_lessons[track] = level + 1
+                    promoted.append(f"{track}:{level + 1}")
+            self.lesson = max(self.track_lessons.values(), default=0)
+            self.dataset._curriculum_track_levels = self.track_lessons
+            self.dataset.last_eval_diagnostics["active_track_lessons_after_eval"] = dict(self.track_lessons)
+            advance_writer = getattr(self, "advance_log_writer", None)
+            if promoted and advance_writer is not None:
+                advance_writer.writerow([step, self.lesson + 1, len(self.table)])
+                self.advance_log_file.flush()
+            print(
+                f"[workspace-curriculum] active per-track lessons after evaluation "
+                + ", ".join(f"{t}={l + 1}" for t, l in self.track_lessons.items())
+                + (f"; promoted {', '.join(promoted)}" if promoted else "; no track promoted")
+            )
+            return self.lesson, accuracy, perfect
         blockers = []
         groups_ready = True
         for track in self.dataset._tracks():

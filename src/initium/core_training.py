@@ -741,6 +741,7 @@ def save_checkpoint(
         "optimizer_state_dict": optimizer.state_dict(),
         "scaler_state_dict": scaler.state_dict(),  # v3 fix
         "curriculum_lesson": curriculum.lesson,
+        "curriculum_track_lessons": getattr(curriculum, "track_lessons", None),
         "prior_state": get_prior_state(stochastic_heads),  # v5 (Phase 2)
         "ood_rng_state": ood_rng.getstate(),  # v6
         "dynamic_n_state": dynamic_n_state,  # Dynamic-N (macro-scale); None if not dynamic_n_mode
@@ -1304,6 +1305,7 @@ def run(
     workspace_semantic_entity_count: int = 64,
     workspace_allocator: bool = False,
     workspace_allocator_anneal_steps: int = 20_000,
+    workspace_allocator_label_addresses_only: bool = False,
 ):
     original_run_id = run_id
     run_id = _filesystem_safe_run_id(run_id)
@@ -1329,7 +1331,8 @@ def run(
     if workspace_semantic_entity_count == 128 and workspace_enabled and workspace_num_slots < 128:
         raise ValueError("128 semantic keys require --workspace-num-slots >= 128")
     if workspace_semantic_entity_addressing and workspace_semantic_entity_count != 128 and (
-        str(workspace_task_track).replace("-", "_") in (*_lang_text.LANG_V5_TRACKS, "lang_all")
+        str(workspace_task_track).replace("-", "_")
+        in (*_lang_text.LANG_V5_TRACKS, "lang_all", _lang_text.LANG_V5_SELECTOR)
     ):
         raise ValueError("Stage 5 lang tracks and lang_all use keys up to 127: pass --workspace-semantic-entity-count 128 --workspace-num-slots 128")
     if str(workspace_task_track).replace("-", "_") in _lang_text.LANG_TRACK_NAMES:
@@ -2490,8 +2493,16 @@ def run(
     def write_workspace_task_metrics(step_value, lesson_value, eval_type, diagnostics):
         if workspace_task_writer is None or workspace_task_file is None or not diagnostics:
             return
+        evaluated_lessons = diagnostics.get("evaluation_track_lessons", {})
+
+        def track_lesson(track):
+            return int(evaluated_lessons.get(track, lesson_value))
         overall_track = (
-            "permutation/all_conditions" if diagnostics.get("permutation_generalization") else "all"
+            "permutation/all_conditions"
+            if diagnostics.get("permutation_generalization")
+            else "all/max_track_lesson"
+            if evaluated_lessons
+            else "all"
         )
         workspace_task_writer.writerow(
             [
@@ -2517,7 +2528,7 @@ def run(
             workspace_task_writer.writerow(
                 [
                     step_value,
-                    lesson_value,
+                    track_lesson(track),
                     eval_type,
                     track,
                     values.get("accuracy"),
@@ -2567,7 +2578,7 @@ def run(
                 workspace_task_writer.writerow(
                     [
                         step_value,
-                        lesson_value,
+                        track_lesson(track),
                         f"{eval_type}/adaptive-pathway-bypassed",
                         f"{track}/adaptive_pathway_bypassed",
                         values.get("adaptive_pathway_bypassed_accuracy_pct"),
@@ -2587,7 +2598,7 @@ def run(
                     adaptive_route_writer.writerow(
                         [
                             step_value,
-                            lesson_value,
+                            track_lesson(track),
                             eval_type,
                             track,
                             skill_id,
@@ -2601,7 +2612,7 @@ def run(
                 workspace_task_writer.writerow(
                     [
                         step_value,
-                        lesson_value,
+                        track_lesson(track),
                         eval_type,
                         f"{track}/difficulty/{group}",
                         values.get("accuracy"),
@@ -2616,7 +2627,7 @@ def run(
                 workspace_task_writer.writerow(
                     [
                         step_value,
-                        lesson_value,
+                        track_lesson(track),
                         eval_type,
                         f"{track}/query/{query_type}",
                         values.get("accuracy"),
@@ -4074,7 +4085,7 @@ def run(
             workspace_adaptive_v3_holdout_tracks
         )
     if workspace_slot_readout and dataset.task_track in _lang_text.LANG_TRACK_NAMES:
-        rnn.workspace.enable_slot_text(dataset.slot_text_columns())
+        rnn.workspace.enable_slot_text(dataset.slot_text_columns(), tied_input_embedding=True)
         rnn.workspace.to(device)
 
     if dnc_compile_memory and not isinstance(rnn, SurpriseRecallBackboneOnly):
@@ -5302,6 +5313,13 @@ def run(
         # than needing migration.
         if not frozen_workspace_warm_start:
             curriculum.lesson = ckpt["curriculum_lesson"]
+            if getattr(curriculum, "track_lessons", None) is not None:
+                restored = ckpt.get("curriculum_track_lessons")
+                if isinstance(restored, dict):
+                    curriculum.track_lessons.update({k: int(v) for k, v in restored.items() if k in curriculum.track_lessons})
+                else:
+                    curriculum.track_lessons = {k: int(curriculum.lesson) for k in curriculum.track_lessons}
+                dataset._curriculum_track_levels = curriculum.track_lessons
         # Dynamic-N (macro-scale): restore the usage-EMA/cooldown/growth
         # history, so a resumed run doesn't silently reset the trigger's
         # sustained-saturation window back to 0 (which would just delay the
@@ -5559,6 +5577,10 @@ def run(
     seg_carry = None
     alloc_enabled = bool(isinstance(rnn, SplitGraphDNC) and rnn.allocator is not None)
     alloc_p = float(rnn.allocator.use_prob) if alloc_enabled else 0.0
+    if alloc_enabled and workspace_allocator_label_addresses_only:
+        alloc_p = 0.0
+        rnn.allocator.use_prob.zero_()
+        print(f"[{run_id}] allocator routing disabled; generator-labeled addresses remain authoritative")
     if alloc_enabled:
         rnn.allocator_use_prob = alloc_p
     while step < total_steps and not eval_only:
@@ -6126,7 +6148,8 @@ def run(
                             # to predict the key from the answer-prefix features.
                             workspace_key_value_loss = workspace_key_value_loss + (
                                 workspace_module.slot_pointer_loss(
-                                    _slot_features, slot_state, slot_target_ids
+                                    _slot_features, slot_state, slot_target_ids,
+                                    hidden[0].get("_initium_workspace_match_keys"),
                                 ).to(dtype=task_loss.dtype)
                             )
                 binding_aux_targets = key_value_metadata.get("workspace_binding_aux_targets")
@@ -6802,19 +6825,14 @@ def run(
                     )
 
         running_log_steps += 1
-        if alloc_enabled and step % 100 == 0 and rnn.allocator_stats:
+        if alloc_enabled and not workspace_allocator_label_addresses_only and step % 100 == 0 and rnn.allocator_stats:
             _d = 100.0 / max(1, workspace_allocator_anneal_steps)
             _acc = min(float(v) for v in rnn.allocator_stats.values())
-            # Increase self-key exposure in stages. A strict 0.95 gate left
-            # this run at 10% predicted keys for all 19k steps, so almost every
-            # workspace write still saw an oracle address. Confidence filtering
-            # in _allocate protects low-confidence predictions during the ramp.
-            target_alloc_p = (
-                1.0 if _acc >= 0.95
-                else 0.75 if _acc >= 0.85
-                else 0.4 if _acc >= 0.75
-                else 0.1
-            )
+            # Predicted addresses are not aligned with the gold KV/readout
+            # targets yet. Keep them fully out of the routing path until both
+            # allocator heads are at least 95% accurate; Stage-5 runs should
+            # normally use --workspace-allocator-label-addresses-only.
+            target_alloc_p = 1.0 if _acc >= 0.95 else 0.0
             alloc_p = (
                 min(target_alloc_p, alloc_p + _d)
                 if alloc_p < target_alloc_p
@@ -7066,8 +7084,21 @@ def run(
                     f"ema {dynamic_n_ctrl.ema:.3f} cooldown {dynamic_n_ctrl.cooldown_remaining}] "
                 )
 
+            track_lesson_state = getattr(curriculum, "track_lessons", None)
+            if isinstance(track_lesson_state, dict):
+                track_lesson_text = ",".join(
+                    f"{track.removeprefix('lang_')}={level + 1}"
+                    for track, level in track_lesson_state.items()
+                )
+                lesson_status = (
+                    f"MaxLesson {curriculum.lesson + 1}/{len(curriculum.table)} "
+                    f"| TrackLessons[{track_lesson_text}]"
+                )
+            else:
+                lesson_status = f"Lesson {curriculum.lesson + 1}/{len(curriculum.table)}"
+
             parts = [
-                f"[{run_id}] Step {step}/{total_steps} | Lesson {curriculum.lesson + 1}/{len(curriculum.table)}",
+                f"[{run_id}] Step {step}/{total_steps} | {lesson_status}",
                 f"L_task {avg_task:.4f}",
             ]
             if getattr(dataset, "name", None) == "workspace-capability":
@@ -10079,6 +10110,7 @@ if __name__ == "__main__":
             "lang_act",
             "lang_nlu_external",
             "lang_all",
+            "lang-stage5",
         ],
         default="all",
         help=(
@@ -10086,7 +10118,8 @@ if __name__ == "__main__":
             "tracks; 'new_all' balances the six added capability tracks; 'gnw_all' "
             "balances the eight GNW functional probes; 'mixed_binding' balances only "
             "mixed_skill and variable_binding for a focused interference check. Multi-track batches "
-            "include each selected track when batch size is large enough."
+            "include each selected track when batch size is large enough. 'lang-stage5' selects "
+            "only the Stage 5 language tracks that are available in the local corpus."
         ),
     )
     parser.add_argument(
@@ -10220,6 +10253,8 @@ if __name__ == "__main__":
     parser.add_argument("--workspace-allocator", action="store_true",
                         help="Learned key allocator (Stage 5); labels distilled from generator, predicted keys annealed in.")
     parser.add_argument("--workspace-allocator-anneal-steps", type=int, default=20000)
+    parser.add_argument("--workspace-allocator-label-addresses-only", action="store_true",
+                        help="Keep generator-provided workspace keys; train the allocator but never route writes through predicted keys.")
     parser.add_argument("--workspace-lang-identity", choices=("annotator", "truth"), default="truth",
                         help="Stage 5 key labels: annotator (no pronoun/coreference labels) or generator ground truth.")
     args = parser.parse_args()
@@ -10243,7 +10278,7 @@ if __name__ == "__main__":
         identity=args.workspace_lang_identity,
         stage5=args.workspace_semantic_entity_count == 128,
     )
-    if args.dataset_type == "workspace-capability" and args.workspace_task_track in _lang_text.LANG_TRACK_NAMES:
+    if args.dataset_type == "workspace-capability" and args.workspace_task_track.replace("-", "_") in _lang_text.LANG_TRACK_NAMES:
         if not args.workspace_token_id_input:
             parser.error("lang_* tracks require --workspace-token-id-input")
 
@@ -11488,6 +11523,7 @@ if __name__ == "__main__":
             workspace_semantic_entity_count=args.workspace_semantic_entity_count,
             workspace_allocator=args.workspace_allocator,
             workspace_allocator_anneal_steps=args.workspace_allocator_anneal_steps,
+            workspace_allocator_label_addresses_only=args.workspace_allocator_label_addresses_only,
         )
         all_summaries.append(summary)
 

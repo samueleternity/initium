@@ -358,6 +358,13 @@ process metrics remain in that file as well.
 
 ### Combined all-task run
 
+For focused Stage 5 language training, use `--workspace-task-track lang-stage5`.
+It selects the Stage 5 tracks (`lang_parse`, `lang_define`, `lang_induce`,
+`lang_logic`, `lang_discourse`, `lang_act`, and `lang_nlu_external` when its
+corpus is installed). Each selected track has its own curriculum lesson, so a
+weak track does not hold back promotion of the others. Existing `lang_all`
+behavior remains the full available language-track mixture.
+
 `all` selects all eighteen workspace-capability tracks and does not include
 graph traversal, which belongs to a separate dataset. The following run uses
 the known 4-block Mamba-1/MoE/workspace settings and enables the available

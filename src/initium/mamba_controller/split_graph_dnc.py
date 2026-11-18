@@ -964,15 +964,25 @@ class SplitGraphDNC(nn.Module):
             slots = torch.zeros_like(slots)
         elif self.workspace_eval_shuffle_readback and slots.shape[0] > 1:
             slots = slots.roll(1, 0)
-        out = ws.slot_readout_logits(features, slots)
-        if ws.slot_text_head is None:
+        match_features = chx.get("_initium_workspace_match_keys")
+        out = ws.slot_readout_logits(features, slots, match_features=match_features)
+        if ws.slot_text_cols is None:
             delta = out.to(logits.dtype)
             return logits + delta * answer_mask.to(device=logits.device, dtype=logits.dtype).unsqueeze(-1)
         sel = answer_mask.to(logits.device).bool()
         if not sel.any():
             return logits
         rows = logits[sel]
-        slot_logits = (ws.slot_readout_scale * ws.slot_text_head(out[sel])).to(rows.dtype)
+        adapter = getattr(self.backbone, "in_adapter", None)
+        if isinstance(adapter, nn.Linear) and adapter.weight.shape[0] == out.shape[-1]:
+            # Copy logits share the input token embeddings. A token unseen as a
+            # slot-head target can still be emitted when its input embedding
+            # has been learned.
+            slot_logits = (ws.slot_readout_scale * (out[sel] @ adapter.weight[:, ws.slot_text_cols])).to(rows.dtype)
+        else:
+            if ws.slot_text_head is None:
+                raise RuntimeError("slot-text copy requires a compatible token input embedding")
+            slot_logits = (ws.slot_readout_scale * ws.slot_text_head(out[sel])).to(rows.dtype)
 
         # Let the backbone handle words that are absent from memory or whose
         # pointer is still uncertain. Slot values are useful as a grounded
@@ -981,7 +991,10 @@ class SplitGraphDNC(nn.Module):
         address, _content = torch.split(slots.float(), [ws._address_dim, ws.d_model], dim=-1)
         occupied = address.square().sum(-1) > 1e-12
         slot_ids = address.argmax(-1)
-        pointer = ws.slot_pointer(features.float()).softmax(-1)
+        present = torch.zeros(address.shape[0], ws._SEMANTIC_ENTITY_COUNT, dtype=torch.int32, device=address.device)
+        present.scatter_add_(1, slot_ids, occupied.to(torch.int32))
+        present = present > 0
+        pointer = ws.slot_pointer_logits(features, match_features, present).softmax(-1)
         pointer_on_occupied = pointer.gather(
             -1, slot_ids.unsqueeze(1).expand(-1, pointer.shape[1], -1)
         ) * occupied.unsqueeze(1).to(pointer.dtype)
@@ -1039,6 +1052,8 @@ class SplitGraphDNC(nn.Module):
         prediction_valid_mask: torch.Tensor | None = None,
         entity_ids: torch.Tensor | None = None,
         entity_write_mask: torch.Tensor | None = None,
+        workspace_match_entity_ids: torch.Tensor | None = None,
+        workspace_match_write_mask: torch.Tensor | None = None,
         pair_swap_entity_ids: torch.Tensor | None = None,
         pair_swap_mask: torch.Tensor | None = None,
         pair_swap_steps: tuple[int, ...] | None = None,
@@ -1203,6 +1218,12 @@ class SplitGraphDNC(nn.Module):
                 workspace_state = self.workspace.init_state(
                     B, device=input.device, dtype=recurrent_state_dtype
                 )
+        workspace_match_keys = None
+        if self.workspace is not None and self.workspace.slot_pointer is not None:
+            if isinstance(chx, dict) and not reset_experience:
+                workspace_match_keys = chx.get("_initium_workspace_match_keys")
+            if workspace_match_keys is None or reset_experience:
+                workspace_match_keys = torch.zeros((B, self.workspace._SEMANTIC_ENTITY_COUNT, self.workspace.d_model), device=input.device, dtype=recurrent_state_dtype)
         if start_step:
             if not (0 < start_step < T):
                 raise ValueError(f"start_step={start_step} must be in (0, T={T})")
@@ -1434,6 +1455,16 @@ class SplitGraphDNC(nn.Module):
             base, specialists, route_indices, route_weights = forward_with_specialists(
                 stage_input, **specialist_kwargs
             )
+            if workspace_match_keys is not None and workspace_match_entity_ids is not None and workspace_match_write_mask is not None:
+                match_ids = workspace_match_entity_ids[:, start_step:]
+                match_mask = workspace_match_write_mask[:, start_step:] & match_ids.ge(0)
+                positions = torch.arange(match_ids.shape[1], device=input.device).expand_as(match_ids)
+                src = torch.where(match_mask, positions, torch.full_like(positions, -1))
+                latest = torch.full_like(workspace_match_keys[:, :, 0], -1, dtype=torch.long)
+                latest.scatter_reduce_(1, match_ids.clamp(0, self.workspace._SEMANTIC_ENTITY_COUNT - 1), src, reduce="amax", include_self=True)
+                observed = base[:, start_step:]
+                gathered = observed.gather(1, latest.clamp_min(0).unsqueeze(-1).expand(-1, -1, observed.shape[-1]))
+                workspace_match_keys = torch.where(latest.ge(0).unsqueeze(-1), gathered, workspace_match_keys)
             if self.allocator is not None and entity_ids is not None:
                 # Use the final contextual backbone representation. The old
                 # block-0 side pass added a full extra backbone execution and
@@ -1890,6 +1921,8 @@ class SplitGraphDNC(nn.Module):
                         prediction_valid_mask=prediction_valid_mask,
                         entity_ids=entity_ids,
                         entity_write_mask=entity_write_mask,
+                        workspace_match_entity_ids=workspace_match_entity_ids,
+                        workspace_match_write_mask=workspace_match_write_mask,
                         pair_swap_entity_ids=pair_swap_entity_ids,
                         pair_swap_mask=pair_swap_mask,
                         pair_swap_steps=pair_swap_steps,
@@ -1948,6 +1981,8 @@ class SplitGraphDNC(nn.Module):
                 }
             if self.workspace is not None:
                 chx = {"_initium_workspace_state": workspace_state}
+                if workspace_match_keys is not None:
+                    chx["_initium_workspace_match_keys"] = workspace_match_keys
                 if self.workspace_kv_memory is not None:
                     chx["_initium_workspace_kv_state"] = workspace_kv_state
             state = (chx, memory_states, last_read)
@@ -1972,6 +2007,8 @@ class SplitGraphDNC(nn.Module):
                 output = H[:, start_step:].transpose(0, 1)
             if self.workspace is not None:
                 chx = {"_initium_workspace_state": workspace_state}
+                if workspace_match_keys is not None:
+                    chx["_initium_workspace_match_keys"] = workspace_match_keys
                 if self.workspace_kv_memory is not None:
                     chx["_initium_workspace_kv_state"] = workspace_kv_state
             else:
@@ -2115,6 +2152,8 @@ class SplitGraphDNC(nn.Module):
                     combiner_hx if self.combiner_mode == "controller" else combiner_hx_in
                 ),
             }
+            if workspace_match_keys is not None:
+                chx["_initium_workspace_match_keys"] = workspace_match_keys
 
         mhx = [mem_state]
         output = torch.stack(outputs, dim=0)  # (T, B, input_size)

@@ -14,8 +14,9 @@ LANG_SINGLE = (
     "lang_parse", "lang_define", "lang_induce", "lang_logic", "lang_discourse", "lang_act", "lang_nlu_external",
 )
 LANG_V5_TRACKS = LANG_SINGLE[6:]
+LANG_V5_SELECTOR = "lang_stage5"
 RETIRED = ("lang_open",)
-LANG_TRACK_NAMES = (*LANG_SINGLE, "lang_all")
+LANG_TRACK_NAMES = (*LANG_SINGLE, "lang_all", LANG_V5_SELECTOR)
 DATA_DIR = Path(__file__).resolve().parent.parent / "stage4"
 EXTERNAL_FILES = {"nlg": "nlg.jsonl", "story": "story.jsonl", "accept": "accept.jsonl", "open": "open.jsonl",
                   "nlu_triples": "nlu_triples.jsonl", "nli": "nli.jsonl", "qa": "qa.jsonl"}

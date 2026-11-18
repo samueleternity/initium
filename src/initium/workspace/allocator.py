@@ -75,6 +75,17 @@ class KeyAllocator(nn.Module):
         for _ in range(max(1, (T - 1).bit_length())):
             root = root.gather(1, root)
         is_new = hv & (sel == t)
-        key_node = torch.where(is_key, sel - T, occ_keys.sum(1, keepdim=True) + is_new.cumsum(1) - 1)
-        pid = torch.where(hv, key_node.gather(1, root).clamp(0, self.keys - 1), torch.full_like(t, -1))
+        # New semantic addresses must use actual free ids. Counting occupied
+        # keys is incorrect when a carried workspace contains sparse key ranges.
+        new_roots = is_new & root.eq(t)
+        new_rank = new_roots.long().cumsum(1) - 1
+        free_ids = (~occ_keys).long().argsort(dim=1, descending=True)
+        free_count = (~occ_keys).sum(1, keepdim=True)
+        new_key = free_ids.gather(1, new_rank.clamp_min(0).clamp_max(self.keys - 1))
+        new_key = torch.where(new_rank < free_count, new_key, torch.zeros_like(new_key))
+        key_node = torch.where(is_key, sel - T, new_key)
+        root_key_ref = is_key.gather(1, root)
+        root_has_capacity = free_count.expand(-1, T).gather(1, root).gt(0)
+        valid_key = hv & (root_key_ref | root_has_capacity)
+        pid = torch.where(valid_key, key_node.gather(1, root).clamp(0, self.keys - 1), torch.full_like(t, -1))
         return pid, (wr > 0) & hv, confidence

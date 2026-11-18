@@ -271,6 +271,8 @@ class WorkspaceBroadcast(nn.Module):
         self.slot_pointer = (
             nn.Linear(d_model, self._SEMANTIC_ENTITY_COUNT) if slot_readout else None
         )
+        self.slot_match_query = nn.Linear(d_model, d_model, bias=False) if slot_readout else None
+        self.slot_match_key = nn.Linear(d_model, d_model, bias=False) if slot_readout else None
         self.slot_readout_scale = nn.Parameter(torch.ones(())) if slot_readout else None
         self.slot_text_head = None
         self.register_buffer("slot_text_cols", None, persistent=False)
@@ -388,16 +390,32 @@ class WorkspaceBroadcast(nn.Module):
         if self.prediction_error_to_write_gate is not None:
             nn.init.zeros_(self.prediction_error_to_write_gate.weight)
 
-    def slot_readout_logits(self, features: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
+    def slot_pointer_logits(self, features: torch.Tensor, match_features=None, slot_present=None) -> torch.Tensor:
+        if match_features is None:
+            return self.slot_pointer(features.float()).float()
+        query = self.slot_match_query(features.float())
+        keys = self.slot_match_key(match_features.float())
+        logits = torch.einsum("btd,bkd->btk", query, keys) / (self.d_model ** 0.5)
+        present = match_features.float().square().sum(-1) > 1e-12
+        if slot_present is not None:
+            present = present & slot_present.to(device=present.device, dtype=torch.bool)
+        logits = logits.masked_fill(~present.unsqueeze(1), -1e4)
+        fallback = self.slot_pointer(features.float()).float()
+        return torch.where(present.any(-1).view(-1, 1, 1), logits, fallback)
+
+    def slot_readout_logits(self, features: torch.Tensor, state: torch.Tensor, match_features=None) -> torch.Tensor:
         """Learned concept pointer per position -> addressed slot content -> vocabulary logits."""
         address, content = torch.split(state.float(), [self._address_dim, self.d_model], dim=-1)
         occupied = (address.square().sum(-1) > 1e-12).float()
         slot_ids = address.argmax(-1)
-        pointer = self.slot_pointer(features.float()).softmax(-1)
+        present = torch.zeros(address.shape[0], self._SEMANTIC_ENTITY_COUNT, dtype=torch.int32, device=address.device)
+        present.scatter_add_(1, slot_ids, occupied.to(torch.int32))
+        present = present > 0
+        pointer = self.slot_pointer_logits(features, match_features, present).softmax(-1)
         weights = pointer.gather(-1, slot_ids.unsqueeze(1).expand(-1, pointer.shape[1], -1))
         weights = weights * occupied.unsqueeze(1)
         read = torch.einsum("bts,bsd->btd", weights, content)
-        if self.slot_text_head is not None:
+        if self.slot_text_cols is not None:
             return read
         return self.slot_readout_scale * self.semantic_value_decoder(read)
 
@@ -406,6 +424,7 @@ class WorkspaceBroadcast(nn.Module):
         features: torch.Tensor,
         state: torch.Tensor,
         target_keys: torch.Tensor,
+        match_features=None,
     ) -> torch.Tensor:
         """Supervise answer-time slot selection without routing gold keys at inference."""
         if self.slot_pointer is None:
@@ -422,7 +441,7 @@ class WorkspaceBroadcast(nn.Module):
             device=address.device,
         ).scatter_add_(1, slot_keys, occupied.to(torch.int32))
         key_present = key_counts > 0
-        logits = self.slot_pointer(features.float()).float()
+        logits = self.slot_pointer_logits(features, match_features, key_present)
         targets = target_keys.to(device=logits.device, dtype=torch.long)
         valid = targets.ge(0) & targets.lt(logits.shape[-1])
         safe_targets = targets.clamp(0, logits.shape[-1] - 1)
@@ -431,11 +450,11 @@ class WorkspaceBroadcast(nn.Module):
             return logits.sum() * 0.0
         return F.cross_entropy(logits[valid], targets[valid])
 
-    def enable_slot_text(self, cols):
+    def enable_slot_text(self, cols, *, tied_input_embedding=False):
         """Logit columns `cols` are produced only from slot content."""
         if self.slot_pointer is None:
             raise ValueError("slot text readout requires slot_readout")
-        self.slot_text_head = nn.Linear(self.d_model, len(cols))
+        self.slot_text_head = None if tied_input_embedding else nn.Linear(self.d_model, len(cols))
         self.slot_text_cols = torch.as_tensor(list(cols), dtype=torch.long)
     
     def pop_semantic_state_predictions(self) -> list[tuple[int, torch.Tensor]]:

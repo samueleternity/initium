@@ -37,6 +37,7 @@ class Ep5(lg.Ep):
         super().__init__(marker, annotate)
         self.nc = self.clock = self.evict = self.evc = 0
         self.binding_aux: list[tuple[int, int]] = []
+        self.match_writes: list[tuple[int, int]] = []
         self.closed = set()  # entities already answered about and not re-mentioned: recycled first
         self.last = {}
         self.truth = lt.settings["identity"] == "truth"
@@ -45,6 +46,7 @@ class Ep5(lg.Ep):
         n = Ep5(marker, self.ann)
         n.ent, n.last, n.clock, n.cl, n.nc, n.evict = self.ent, self.last, self.clock, self.cl, self.nc, self.evict
         n.closed, n.evc = self.closed, self.evc
+        n.match_writes = self.match_writes
         return n
 
     def piece(self, x):
@@ -126,7 +128,7 @@ class Ep5(lg.Ep):
             if ctx:
                 self.evw.append((pos, k, self.piece(m[1])))
 
-    def bind_surface(self, ws, bindings, *, write=True):
+    def bind_surface(self, ws, bindings, *, write=True, aux=False, match_key=False):
         """Attach an oracle concept key and typed value to each mapped surface word."""
         sp = self._enc(ws)
         if not self.ann:
@@ -137,26 +139,37 @@ class Ep5(lg.Ep):
                 continue
             key, target = binding
             pos = self._pos(ws, sp, i)
+            if match_key and write is False:
+                self.match_writes.append((pos, int(key)))
             self.addr.append((pos, int(key), bool(write)))
             if write:
                 self.evw.append((pos, int(key), int(target)))
-            else:
+            elif aux:
                 self.binding_aux.append((pos, int(target)))
 
-    def bind_mr(self, values, bindings, *, write=True):
+    def bind_mr(self, values, bindings, *, write=True, semantic_bindings=None):
         """Append typed MR tokens and annotate their reverse lexical bindings."""
         for value in values:
             pos = len(self.t)
             self.t.append(int(value))
             binding = bindings.get(int(value))
             if binding is None or not self.ann:
-                continue
-            key, target = binding
-            self.addr.append((pos, int(key), bool(write)))
-            if write:
-                self.evw.append((pos, int(key), int(target)))
+                pass
             else:
-                self.binding_aux.append((pos, int(target)))
+                key, target = binding
+                self.addr.append((pos, int(key), bool(write)))
+                if write:
+                    self.evw.append((pos, int(key), int(target)))
+                else:
+                    self.binding_aux.append((pos, int(target)))
+            semantic = (semantic_bindings or {}).get(int(value))
+            if semantic is not None and self.ann:
+                key, target = semantic
+                self.addr.append((pos, int(key), bool(write)))
+                if write:
+                    self.evw.append((pos, int(key), int(target)))
+                else:
+                    self.binding_aux.append((pos, int(target)))
 
     def output_keys(self, words, key_by_word):
         """Expand word-level semantic keys to answer-token positions."""
@@ -167,7 +180,7 @@ class Ep5(lg.Ep):
             keys.extend((key,) + (-1,) * (len(pieces) - 1))
         return tuple(keys) + (-1,)
 
-    def story_ws(self, ws, ments):
+    def story_ws(self, ws, ments, *, match_keys=True):
         """ments: (word_idx, name, loc|None, is_pronoun); loc -> slot write of location_token at that word."""
         sp = self._enc(ws)
         if not self.ann:
@@ -179,6 +192,8 @@ class Ep5(lg.Ep):
             if k is None:
                 continue
             pos = self._pos(ws, sp, i)
+            if match_keys and not pron:
+                self.match_writes.append((pos, int(k)))
             self.addr.append((pos, k, loc is not None))
             if loc is not None:
                 self.evw.append((pos, k, location_token(loc)))
@@ -201,6 +216,8 @@ class Ep5(lg.Ep):
     def done(self, track, answer, qtype, group, kind="text", **meta):
         if self.binding_aux:
             meta.setdefault("workspace_binding_aux", tuple(self.binding_aux))
+        if self.match_writes:
+            meta.setdefault("workspace_match_writes", tuple(self.match_writes))
         return super().done(track, answer, qtype, group, kind, evictions=self.evict, closed_evictions=self.evc, **meta)
 
 
@@ -266,10 +283,22 @@ def _g_define(cfg, rng):
     G, grp = lg.grammar(), rng.choice(cfg["groups"])
     band = "B" if rng.random() < cfg["heldout"] else "A"
     pool = G.tails[band][0]
+    # Definition learning is an in-context task: the episode states a fact
+    # about a pseudo-noun and asks the model to retrieve it.  Requiring that
+    # the offline knowledge graph contain HasProperty edges makes this group
+    # disappear entirely for lexicons/bands with sparse relation coverage.
+    # Keep graph properties when available, then fall back to adjectives from
+    # the same lexical band so the task remains generatable without leaking
+    # held-out vocabulary across bands.
     props = G.tails[band][1]
+    if not props:
+        band_words = set(G.L.bands.get(band, ()))
+        props = [i for i in sorted(G.ok & band_words) if G._tp(1, i)]
     n = max(1, cfg["pseudo"])
 
-    if len(pool) < n + 2 or (grp == "def_prop" and not props):
+    # `cats` samples n + 1 items; the previous n + 2 guard rejected a
+    # feasible three-category pool at the two-pseudo-noun lesson.
+    if len(pool) < n + 1 or (grp == "def_prop" and not props):
         raise OverflowError
     cats, W = rng.sample(pool, n + 1), pseudo(rng, n + 1)
     with _pseudo_nouns(G, W) as ids:
@@ -329,6 +358,12 @@ def _g_induce(cfg, rng):
         NP: (115, NEG_TOK),
         PP: (116, PLU_TOK),
     }
+    semantic_by_token = {
+        **{entity_token(i): (48 + i, entity_token(i)) for i in range(n)},
+        **{relation_token(i): (112 + i, relation_token(i)) for i in range(len(V))},
+        NEG_TOK: (115, NEG_TOK),
+        PLU_TOK: (116, PLU_TOK),
+    }
     mr_to_surface = {
         **{entity_token(i): (80 + i, lt.tokenizer().word(word)[0]) for i, word in enumerate(N)},
         **{relation_token(i): (120 + i, lt.tokenizer().word(word)[0]) for i, word in enumerate(V)},
@@ -369,14 +404,17 @@ def _g_induce(cfg, rng):
     ep = Ep5(8)
     for e in ex:
         ws, mr = build(*e)
-        ep.bind_surface(ws, surface_to_semantic, write=True)
+        # The pseudo-word's MR identity is not knowable at the word position.
+        # Keep the surface as a content-match key and commit its binding only
+        # when the corresponding typed MR token is observed.
+        ep.bind_surface(ws, surface_to_semantic, write=False, match_key=True)
         ep.ctl(MARK_R)
-        ep.bind_mr(mr, mr_to_surface, write=True)
+        ep.bind_mr(mr, mr_to_surface, write=True, semantic_bindings=semantic_by_token)
         ep.ctl(TURN_END)
     ws, mr = build(*q)
     if grp == "ind_s2mr":
         ep.ctl(TASK_S2MR)
-        ep.bind_surface(ws, surface_to_semantic, write=False)
+        ep.bind_surface(ws, surface_to_semantic, write=False, aux=True, match_key=False)
         ans, kind = mr, "mr"
         output_keys = tuple(semantic_output_key.get(int(t), -1) for t in mr) + (-1,)
     else:
@@ -618,7 +656,7 @@ def _g_discourse(cfg, rng):
             rd = [(("o", o), location_token(w.objloc(o)))]
         else:
             q, ments, ans = ["where", "is", lg.NAMES[p] + "?"], [(2, ("p", p), None, False)], w.where_p(p)
-        ep.story_ws(q, ments)
+        ep.story_ws(q, ments, match_keys=False)
         ep.ctl(SPK_SYS)
         for name, tgt in rd:
             ep.read_slot(name, tgt)
@@ -657,12 +695,12 @@ def _act(w, act):
         w.event()
         return ["ok."], [], "ack"
     if act == "a_ask":
-        ep.story_ws(["where", "is", lg.NAMES[p] + "?"], [(2, ("p", p), None, False)])
+        ep.story_ws(["where", "is", lg.NAMES[p] + "?"], [(2, ("p", p), None, False)], match_keys=False)
         return w.where_p(p), [(("p", p), location_token(w.pl[p]))], "answer"
     if act == "a_confirm":
         yes = r.random() < 0.5
         l = w.pl[p] if yes else r.choice([x for x in range(6) if x != w.pl[p]])
-        ep.story_ws(["is", lg.NAMES[p], "in", "the", lg.PLACES[l] + "?"], [(1, ("p", p), None, False)])
+        ep.story_ws(["is", lg.NAMES[p], "in", "the", lg.PLACES[l] + "?"], [(1, ("p", p), None, False)], match_keys=False)
         ans = (["yes,"] + w.where_p(p)) if yes else ["no,", lg.NAMES[p], "is", "not", "in", "the", lg.PLACES[l] + "."]
         return ans, [(("p", p), location_token(w.pl[p]))], "confirm" if yes else "deny"
     if act == "a_correct":

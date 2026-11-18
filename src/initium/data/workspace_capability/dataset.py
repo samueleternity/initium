@@ -357,10 +357,12 @@ class WorkspaceCapabilityDataset(BaseDataset):
                   ("combo_only", ("combos",)), *((("template_only", ("templates",)),) if lang else ()),
                   ("combined", ("labels", "length", "combos") + (("templates",) if lang else ())))
         episodes = []
+        track_levels = getattr(self, "_curriculum_track_levels", None)
         for _ in range(max(8, int(num_episodes) // 5)):
             seed = rng.getrandbits(64)
             for name, axes in splits:
-                ep = self._make_episode(self.task_track, 5, random.Random(seed), ood_axes=axes)
+                level = track_levels if track_levels else 5
+                ep = self._make_episode(self.task_track, level, random.Random(seed), ood_axes=axes)
                 ep.metadata["axis"] = name
                 episodes.append(ep)
         self._evaluate_episodes(model, device, episodes, field_log=field_log, verbose_n=verbose_n)
@@ -617,7 +619,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
 
     def _make_curriculum_eval_episodes(
         self,
-        lesson_idx: int,
+        lesson_idx: int | dict[str, int],
         rng: random.Random,
         episodes_per_group: int | None = None,
     ) -> list[TaskEpisode]:
@@ -627,7 +629,8 @@ class WorkspaceCapabilityDataset(BaseDataset):
         episodes_per_group = max(1, int(episodes_per_group))
         episodes: list[TaskEpisode] = []
         for track in self._tracks():
-            required = self._curriculum_groups(track, lesson_idx)
+            track_level = int(lesson_idx.get(track, 0)) if isinstance(lesson_idx, dict) else int(lesson_idx)
+            required = self._curriculum_groups(track, track_level)
             counts = {group: 0 for group in required}
             attempts = 0
             max_attempts = max(256, len(required) * episodes_per_group * 64)
@@ -641,7 +644,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
                     raise RuntimeError(
                         f"could not balance {track} curriculum evaluation groups: {missing}"
                     )
-                episode = self._make_episode(track, lesson_idx, rng)
+                episode = self._make_episode(track, track_level, rng)
                 group = str(episode.metadata.get("progression_group", "all"))
                 attempts += 1
                 if group in counts and counts[group] < episodes_per_group:
@@ -650,15 +653,17 @@ class WorkspaceCapabilityDataset(BaseDataset):
         return episodes
 
     def evaluate_curriculum_id(self, model, device, lesson_idx, *, field_log=None):
-        rng = random.Random(91_000 + int(lesson_idx))
-        episodes = self._make_curriculum_eval_episodes(int(lesson_idx), rng)
-        self._last_id_eval_lesson = int(lesson_idx)
+        seed_level = sum((i + 1) * int(v) for i, v in enumerate(lesson_idx.values())) if isinstance(lesson_idx, dict) else int(lesson_idx)
+        rng = random.Random(91_000 + seed_level)
+        episodes = self._make_curriculum_eval_episodes(lesson_idx, rng)
+        self._last_id_eval_lesson = lesson_idx
         self._last_id_eval_episodes = episodes
         result = self._evaluate_episodes(model, device, episodes, field_log=field_log)
+        diag_level = max(lesson_idx.values(), default=0) if isinstance(lesson_idx, dict) else int(lesson_idx)
         if self.task_track in PRODUCTION_TRACKS:
-            self._attach_production_diagnostics(model, device, episodes, int(lesson_idx))
+            self._attach_production_diagnostics(model, device, episodes, diag_level)
         elif self.task_track in STAGE3_TRACKS:
-            self._attach_stage3_diagnostics(model, device, episodes, int(lesson_idx))
+            self._attach_stage3_diagnostics(model, device, episodes, diag_level)
         elif self.task_track == "developmental":
             self._print_samples(episodes, "id")
         _t = (self.last_eval_diagnostics or {}).get("tracks", {})
@@ -674,6 +679,11 @@ class WorkspaceCapabilityDataset(BaseDataset):
         return result
 
     def _paired_id_episodes(self, lesson_idx: int) -> list[TaskEpisode]:
+        # Multi-track language evaluations may contain a different lesson per
+        # track. Paired ablations must replay those exact episodes; a single
+        # scalar lesson cannot reconstruct the mixed-level evaluation set.
+        if self.task_track in ("lang_all", "lang_stage5") and self._last_id_eval_episodes:
+            return self._last_id_eval_episodes
         if self._last_id_eval_lesson == int(lesson_idx) and self._last_id_eval_episodes:
             return self._last_id_eval_episodes
         rng = random.Random(91_000 + int(lesson_idx))
@@ -760,6 +770,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
         if int(batch_size) < 1:
             raise ValueError("batch_size must be >= 1")
         level = int(curriculum.lesson)
+        level_for = getattr(curriculum, "level_for", None)
         tracks = self._tracks()
         if self.track_homogeneous_batches and len(tracks) > 1:
             # Keep all examples in an optimizer batch on one track. The track
@@ -785,7 +796,10 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 else [tracks[(start_track + i) % len(tracks)] for i in range(batch_size)]
             )
             random.shuffle(selected_tracks)
-        episodes = [self._make_episode(track, level, random) for track in selected_tracks]
+        episodes = [
+            self._make_episode(track, int(level_for(track)) if callable(level_for) else level, random)
+            for track in selected_tracks
+        ]
         self.last_batch_examples = episodes
         lengths = [len(episode.sequence) for episode in episodes]
         self.last_batch_sequence_mean = sum(lengths) / len(lengths)
@@ -4190,6 +4204,16 @@ class WorkspaceCapabilityDataset(BaseDataset):
             sum(values[index] for values in metadata_totals.values()) for index in range(8)
         ]
         total_episodes = max(len(episodes), 1)
+        episode_lessons: dict[str, Counter[int]] = defaultdict(Counter)
+        for episode in episodes:
+            level = episode.metadata.get("curriculum_lesson")
+            if level is not None:
+                episode_lessons[episode.track][int(level)] += 1
+        evaluation_track_lessons = {
+            track: int(sorted(levels.items(), key=lambda item: (-item[1], item[0]))[0][0])
+            for track, levels in episode_lessons.items()
+            if levels
+        }
         # Task-specific strata are emitted through the dataset-owned field log;
         # the shared hop CSV calls its accuracy column "triple_acc" and is
         # intentionally reserved for graph traversal.
@@ -4199,6 +4223,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
             "accuracy": accuracy,
             "episode_exact_match": perfect,
             "n_episodes": len(episodes),
+            "evaluation_track_lessons": evaluation_track_lessons,
             "mean_context_tokens": total_meta[0] / total_episodes,
             "mean_relevant_updates": total_meta[1] / total_episodes,
             "mean_distractors": total_meta[2] / total_episodes,
@@ -4858,16 +4883,33 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 f"program output={metrics['output_accuracy']:.1f}% "
                 f"({metrics['outputs_correct']}/{metrics['outputs_total']})"
             )
-        for track, metrics in diagnostics["tracks"].items():
+        evaluation_track_lessons = diagnostics.get("evaluation_track_lessons", {})
+        if evaluation_track_lessons:
             print(
-                f"  [{track}] answer {metrics['accuracy']:.2f}% | "
+                "  [evaluation-track-lessons] "
+                + ", ".join(
+                    f"{track}={level + 1}" for track, level in sorted(evaluation_track_lessons.items())
+                )
+                + " (lessons used to generate these evaluation episodes)"
+            )
+        for track, metrics in diagnostics["tracks"].items():
+            level_text = (
+                f" lesson={evaluation_track_lessons[track] + 1}"
+                if track in evaluation_track_lessons else ""
+            )
+            print(
+                f"  [{track}{level_text}] answer {metrics['accuracy']:.2f}% | "
                 f"exact {metrics['exact_match']:.2f}% | "
                 f"context={metrics['mean_context_tokens']:.1f} tokens | n={metrics['episodes']}"
             )
         for track, groups in diagnostics.get("progression_groups", {}).items():
+            level_text = (
+                f" lesson={evaluation_track_lessons[track] + 1}"
+                if track in evaluation_track_lessons else ""
+            )
             for group, metrics in sorted(groups.items()):
                 print(
-                    f"    [{track}/{group}] exact={metrics['exact_match']:.1f}% "
+                    f"    [{track}{level_text}/{group}] exact={metrics['exact_match']:.1f}% "
                     f"answer={metrics['accuracy']:.1f}% n={metrics['episodes']}"
                 )
         for query_type, metrics in sorted(

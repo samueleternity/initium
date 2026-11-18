@@ -35,7 +35,7 @@ from initium.data.workspace_capability.tracks import _lang_grammar as lg
 from initium.data.workspace_capability.tracks import _lang_text as lt
 from initium.data.workspace_capability.tracks import lang_tracks as ltr
 from initium.data.workspace_capability.tracks import lang5_tracks as l5
-from initium.data.workspace_capability.episode import BOS, SEP, TEXT_BASE, TaskEpisode
+from initium.data.workspace_capability.episode import BOS, SEP, TEXT_BASE, TASK_PARA, TASK_RETELL, TASK_T2D, TASK_QA, TaskEpisode
 
 _GEN = {
     "lang_template": ltr._g_template,
@@ -61,7 +61,7 @@ def _contains(seq, sub):
 
 
 class LanguageDataset(WorkspaceCapabilityDataset):
-    """Language tracks lang_template/nlg/story_qa/dialogue/syntax_probes/open and the lang_all mix."""
+    """Language tracks, the Stage 5 subset, and the full lang_all mix."""
 
     def __init__(self, task_track: str = "lang_all", *, batch_size_hint: int = 16):
         super().__init__(task_track, batch_size_hint=batch_size_hint)
@@ -111,24 +111,76 @@ class LanguageDataset(WorkspaceCapabilityDataset):
 
     # ------------------------------------------------------------------ tracks / episodes
     def _tracks(self):
-        return lt.available_tracks() if self.task_track == "lang_all" else (self.task_track,)
+        if self.task_track == "lang_all":
+            return lt.available_tracks()
+        if self.task_track == lt.LANG_V5_SELECTOR:
+            available = set(lt.available_tracks())
+            return tuple(track for track in lt.LANG_V5_TRACKS if track in available)
+        return (self.task_track,)
 
     @staticmethod
     def _curriculum_groups(track, lesson):
         return tuple(difficulty_for(track, lesson)["groups"])
 
     def _make_episode(self, track, level, rng, *, ood=False, ood_axes=None, generalization_axis=None):
+        track_level = level
         if track == "lang_all":
             pool = self._tracks()
             track = pool[min(int(rng.random() * len(pool)), len(pool) - 1)]
-        cfg = difficulty_for(track, level, ood=ood, ood_axes=ood_axes)
+        if isinstance(level, dict):
+            track_level = int(level.get(track, 0))
+        cfg = difficulty_for(track, track_level, ood=ood, ood_axes=ood_axes)
         generate = _GEN[track]
         for _ in range(_RETRIES):
             try:
-                return validate_episode(generate(cfg, rng))
+                episode = validate_episode(generate(cfg, rng))
+                # Preserve the exact difficulty level used to generate this
+                # episode. Curriculum promotion happens after evaluation, so
+                # the live lesson map may already differ by the time metrics
+                # are written or paired ablations run.
+                episode.metadata["curriculum_lesson"] = int(track_level)
+                return self._split_context_query(episode)
             except OverflowError:  # generator-signalled resample (length/feasibility)
                 continue
-        raise RuntimeError(f"{track}: no valid episode after {_RETRIES} attempts at level {level}")
+        raise RuntimeError(f"{track}: no valid episode after {_RETRIES} attempts at level {track_level}")
+
+    @staticmethod
+    def _split_context_query(episode):
+        """Train context-only workspace carry for tasks whose facts and query shared one stream."""
+        markers = {
+            "lang_template": {TASK_QA, TASK_RETELL, TASK_PARA},
+            "lang_nlg": {TASK_RETELL, TASK_T2D},
+            "lang_parse": {l5.TASK_MR},
+            "lang_define": {TASK_QA},
+            "lang_induce": {l5.TASK_S2MR, l5.TASK_MR2S},
+            "lang_logic": {l5.TASK_LOGIC},
+        }.get(episode.track)
+        if not markers or episode.metadata.get("prev"):
+            return episode
+        prefix_len = 3
+        cut = next((i for i, token in enumerate(episode.inputs[prefix_len:], prefix_len) if token in markers), None)
+        if cut is None or cut <= prefix_len or cut >= len(episode.inputs) - 1:
+            return episode
+        prefix = episode.inputs[:prefix_len]
+        context_inputs = episode.inputs[:cut]
+        query_inputs = prefix + episode.inputs[cut:]
+        context_meta, query_meta = dict(episode.metadata), dict(episode.metadata)
+        position_fields = ("lang_addr", "workspace_event_writes", "workspace_query_reads", "workspace_match_writes", "workspace_binding_aux")
+        for field in position_fields:
+            vals = episode.metadata.get(field, ())
+            left, right = [], []
+            for row in vals:
+                pos = int(row[0])
+                if pos < cut:
+                    left.append(row)
+                else:
+                    mapped = (prefix_len + pos - cut, *row[1:])
+                    right.append(mapped)
+            context_meta[field], query_meta[field] = tuple(left), tuple(right)
+        context_meta.update(context_only=True, answer_count=0, workspace_output_keys=(), workspace_output_kv_targets=None)
+        query_meta["prev"] = (TaskEpisode(episode.track, tuple(context_inputs), (EOS,), context_meta),)
+        query_meta["sequence_length"] = len(query_inputs)
+        return validate_episode(TaskEpisode(episode.track, tuple(query_inputs), episode.answer, query_meta))
 
     # ------------------------------------------------------------------ workspace metadata
     def workspace_entity_address_metadata(self, input_vectors, *, episodes=None, **_):
@@ -137,6 +189,7 @@ class LanguageDataset(WorkspaceCapabilityDataset):
         if len(examples) != batch:
             raise RuntimeError("language address metadata lost batch/episode alignment")
         rows, pos, keys, writes = [], [], [], []
+        match_rows, match_pos, match_keys = [], [], []
         for row, episode in enumerate(examples):
             for p, key, write in episode.metadata.get("lang_addr", ()):
                 if p < time:
@@ -144,14 +197,26 @@ class LanguageDataset(WorkspaceCapabilityDataset):
                     pos.append(p)
                     keys.append(key)
                     writes.append(write)
+            for p, key in episode.metadata.get("workspace_match_writes", ()):
+                if p < time:
+                    match_rows.append(row)
+                    match_pos.append(p)
+                    match_keys.append(key)
         ids = torch.full((batch, time), -1, dtype=torch.long)
         mask = torch.zeros((batch, time), dtype=torch.bool)
         if rows:
             r, p = torch.tensor(rows), torch.tensor(pos)
             ids[r, p] = torch.tensor(keys)
             mask[r, p] = torch.tensor(writes)
+        match_ids = torch.full((batch, time), -1, dtype=torch.long)
+        match_mask = torch.zeros((batch, time), dtype=torch.bool)
+        if match_rows:
+            mr, mp = torch.tensor(match_rows), torch.tensor(match_pos)
+            match_ids[mr, mp] = torch.tensor(match_keys)
+            match_mask[mr, mp] = True
         device = input_vectors.device
-        return {"entity_ids": ids.to(device), "entity_write_mask": mask.to(device)}
+        return {"entity_ids": ids.to(device), "entity_write_mask": mask.to(device),
+                "workspace_match_entity_ids": match_ids.to(device), "workspace_match_write_mask": match_mask.to(device)}
 
     def workspace_key_value_metadata(self, input_vectors, episodes=None, *, include_adaptive_v3=False, **_):
         examples = self.last_batch_examples if episodes is None else episodes
@@ -227,6 +292,9 @@ class LanguageDataset(WorkspaceCapabilityDataset):
         self.last_batch_examples, self.segment_continue = group, cont
         x, y, m = self._collate(group, token_ids_only=True, teacher_forced=self.teacher_forced_answers)
         m[torch.tensor([g is _DUMMY for g in group])] = 0.0
+        for row, episode in enumerate(group):
+            if episode.metadata.get("context_only"):
+                m[row].zero_()
         return x, y, m
 
     def sample_batch(self, curriculum, batch_size):
@@ -363,7 +431,13 @@ class LanguageDataset(WorkspaceCapabilityDataset):
         return {"all": overall, "by_track": by_track}
 
     def evaluate_curriculum_id(self, model, device, lesson_idx, *, field_log=None):
+        self._curriculum_track_levels = (
+            dict(lesson_idx) if isinstance(lesson_idx, dict)
+            else {track: int(lesson_idx) for track in self._tracks()}
+        )
         result = super().evaluate_curriculum_id(model, device, lesson_idx, field_log=field_log)
+        diagnostics = self.last_eval_diagnostics
+        evaluation_track_lessons = diagnostics.get("evaluation_track_lessons", {})
         raw_weights = {
             t: 0.02 if t == "lang_open" else 0.02 + max(0.0, 0.9 - v["exact_match"] / 100.0)
             for t, v in self.last_eval_diagnostics.get("tracks", {}).items()
@@ -382,10 +456,10 @@ class LanguageDataset(WorkspaceCapabilityDataset):
             if track == "lang_open":
                 self._track_weights[track] = weight
                 continue
-            # Induction now has direct query-binding supervision. Keep exposing
-            # it even when exact-match history is flat; capping it as a stalled
-            # track would suppress the very examples that can now teach it.
-            cap_scale = 3.0 if track == "lang_induce" else (1.5 if track in stalled else 3.0)
+            # Induction receives an explicit binding target but remains far
+            # harder than the other tracks. Bound its share so a flat exact
+            # curve cannot consume the optimizer budget.
+            cap_scale = 0.5 if track == "lang_induce" else (1.5 if track in stalled else 3.0)
             self._track_weights[track] = min(weight, max(0.02, cap_scale * median))
         diagnostics, episodes, preds = self.last_eval_diagnostics, self._last_id_eval_episodes, self._last_eval_preds
         self._print_samples(episodes, "id")
@@ -397,7 +471,8 @@ class LanguageDataset(WorkspaceCapabilityDataset):
                 diagnostics["production_generation"] = generation
                 for track, values in generation.get("by_track", {}).items():
                     print(
-                        f"  [lang/free-generation/{track}] "
+                        f"  [lang/free-generation/{track} lesson="
+                        f"{evaluation_track_lessons.get(track, 0) + 1}] "
                         f"exact={values.get('exact', 0.0):.1f}% "
                         f"teacher_forced={values.get('teacher_forced_exact', 0.0):.1f}% "
                         f"gap={values.get('gap_pp', 0.0):+.1f}pp "
@@ -407,8 +482,10 @@ class LanguageDataset(WorkspaceCapabilityDataset):
             if workspace is not None and getattr(model, "workspace_semantic_entity_addressing", False):
                 if getattr(model, "workspace_key_value_readout_enabled", False):
                     extra.update(self._slot_probe(model, device, episodes))
-                extra.update(self._slot_surgery(model, device, int(lesson_idx)))
-            extra.update(self._paraphrase_probe(model, device, int(lesson_idx)))
+                probe_level = max(lesson_idx.values(), default=0) if isinstance(lesson_idx, dict) else int(lesson_idx)
+                extra.update(self._slot_surgery(model, device, probe_level))
+            probe_level = max(lesson_idx.values(), default=0) if isinstance(lesson_idx, dict) else int(lesson_idx)
+            extra.update(self._paraphrase_probe(model, device, probe_level))
             self._last_eval_preds = preds  # the probes above overwrote it; the metrics below need ID predictions
             extra.update(self._ungrounded(episodes))
             extra.update(self._lang5_metrics(episodes))

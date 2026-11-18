@@ -365,6 +365,20 @@ corpus is installed). Each selected track has its own curriculum lesson, so a
 weak track does not hold back promotion of the others. Existing `lang_all`
 behavior remains the full available language-track mixture.
 
+Language promotion averages the last two evaluations at the current lesson.
+Logic promotion reports verdict and rationale-token accuracy separately, and
+requires both to meet the threshold. Induction lesson 1 fixes surface order to
+SVO to isolate lexical/role binding; later lessons introduce SOV and VSO.
+Induction reports each MR answer-token position separately and reports EOS
+accuracy apart from content-token accuracy. Act-context turns are sampled only
+from response acts introduced by the active lesson. Act answer-token accuracy
+is reported by response act and answer position. Logic, induction, and act
+train a context-token copy pointer for answer tokens present in their visible
+context; this lets act answers copy mentioned entity names while the workspace
+readout supplies stored locations.
+OOD summaries are balanced by selected track and use that track's active
+lesson, with separate results for each held-out axis.
+
 `all` selects all eighteen workspace-capability tracks and does not include
 graph traversal, which belongs to a separate dataset. The following run uses
 the known 4-block Mamba-1/MoE/workspace settings and enables the available

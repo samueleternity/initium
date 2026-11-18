@@ -358,24 +358,60 @@ class WorkspaceCapabilityDataset(BaseDataset):
                   ("combined", ("labels", "length", "combos") + (("templates",) if lang else ())))
         episodes = []
         track_levels = getattr(self, "_curriculum_track_levels", None)
-        for _ in range(max(8, int(num_episodes) // 5)):
-            seed = rng.getrandbits(64)
-            for name, axes in splits:
-                level = track_levels if track_levels else 5
-                ep = self._make_episode(self.task_track, level, random.Random(seed), ood_axes=axes)
-                ep.metadata["axis"] = name
-                episodes.append(ep)
+        eval_tracks = self._tracks() if lang else (self.task_track,)
+        strata_count = max(1, len(splits) * len(eval_tracks))
+        samples_per_track_axis = max(
+            1, (int(num_episodes) + strata_count - 1) // strata_count
+        )
+        if len(eval_tracks) == 1:
+            samples_per_track_axis = max(8, int(num_episodes) // max(1, len(splits)))
+        for track in eval_tracks:
+            level = (
+                int(track_levels.get(track, 5))
+                if isinstance(track_levels, dict)
+                else int(track_levels) if track_levels is not None else 5
+            )
+            for _ in range(samples_per_track_axis):
+                seed = rng.getrandbits(64)
+                for name, axes in splits:
+                    ep = self._make_episode(track, level, random.Random(seed), ood_axes=axes)
+                    ep.metadata["axis"] = name
+                    episodes.append(ep)
         self._evaluate_episodes(model, device, episodes, field_log=field_log, verbose_n=verbose_n)
         self._print_samples(episodes, "ood", self.sample_print_per_group // 2 or (1 if self.sample_print_per_group else 0))
-        stat = {n: [0, 0, 0, 0] for n, _ in splits}
+        stat_by_track_axis: dict[tuple[str, str], list[int]] = defaultdict(lambda: [0, 0, 0, 0])
         for ep in episodes:
-            p, s = self._last_eval_preds[id(ep)], stat[ep.metadata["axis"]]
+            p = self._last_eval_preds[id(ep)]
+            s = stat_by_track_axis[(ep.track, ep.metadata["axis"])]
             s[0] += sum(a == b for a, b in zip(p, ep.answer))
             s[1] += len(ep.answer)
             s[2] += p == list(ep.answer)
             s[3] += 1
-        res = {n: {"accuracy": 100.0 * s[0] / max(s[1], 1), "exact_match": 100.0 * s[2] / max(s[3], 1),
-                   "episodes": s[3]} for n, s in stat.items()}
+        aggregate_axes = {n: [0, 0, 0, 0] for n, _ in splits}
+        by_track: dict[str, dict[str, dict[str, float | int]]] = defaultdict(dict)
+        for (track, axis), counts in stat_by_track_axis.items():
+            aggregate = aggregate_axes[axis]
+            for index, value in enumerate(counts):
+                aggregate[index] += value
+            level = (
+                int(track_levels.get(track, 5))
+                if isinstance(track_levels, dict)
+                else int(track_levels) if track_levels is not None else 5
+            )
+            by_track[track][axis] = {
+                "lesson": level + 1,
+                "accuracy": 100.0 * counts[0] / max(counts[1], 1),
+                "exact_match": 100.0 * counts[2] / max(counts[3], 1),
+                "episodes": counts[3],
+            }
+        res = {
+            name: {
+                "accuracy": 100.0 * counts[0] / max(counts[1], 1),
+                "exact_match": 100.0 * counts[2] / max(counts[3], 1),
+                "episodes": counts[3],
+            }
+            for name, counts in aggregate_axes.items()
+        }
         sp: dict[str, list[int]] = {}
         for ep in episodes:
             p = self._last_eval_preds.get(id(ep))
@@ -402,6 +438,14 @@ class WorkspaceCapabilityDataset(BaseDataset):
             val = f"gap {v['gap_pp']:+.1f} pp" if "gap_pp" in v else f"exact {v['exact_match']:.1f}%"
             print(f"  [ood-split/{k}] {val} n={v['episodes']}")
         self.last_eval_diagnostics["axis_generalization"] = res
+        self.last_eval_diagnostics["axis_generalization_by_track"] = dict(by_track)
+        for track, axes in sorted(by_track.items()):
+            for axis, metrics in sorted(axes.items()):
+                print(
+                    f"  [ood-axis/{track}/lesson={metrics['lesson']}/{axis}] "
+                    f"exact={metrics['exact_match']:.1f}% "
+                    f"answer={metrics['accuracy']:.1f}% n={metrics['episodes']}"
+                )
         return res["combined"]["accuracy"], res["combined"]["exact_match"], {}
 
     def _production_metrics(self, episodes):
@@ -3176,6 +3220,9 @@ class WorkspaceCapabilityDataset(BaseDataset):
         progression_totals: dict[tuple[str, str], list[int]] = defaultdict(
             lambda: [0, 0, 0, 0]
         )
+        logic_quality_totals: dict[tuple[str, str], list[int]] = defaultdict(
+            lambda: [0, 0, 0, 0, 0, 0]
+        )
         query_type_totals: dict[tuple[str, str], list[int]] = defaultdict(
             lambda: [0, 0, 0, 0]
         )
@@ -3985,7 +4032,14 @@ class WorkspaceCapabilityDataset(BaseDataset):
                                 retrieval_totals[metric] += value
                     if getattr(model, "workspace_slot_readout_enabled", False):
                         logits = model.apply_slot_readout(
-                            logits, output.transpose(0, 1), eval_state, _mask.to(device)
+                            logits,
+                            output.transpose(0, 1),
+                            eval_state,
+                            _mask.to(device),
+                            copy_source_token_ids=(key_value_metadata or {}).get(
+                                "workspace_copy_source_token_ids"
+                            ),
+                            copy_source_mask=(key_value_metadata or {}).get("workspace_copy_source_mask"),
                         )
                     predictions = logits.argmax(dim=-1)
                     for local_idx, episode in enumerate(group):
@@ -4002,6 +4056,24 @@ class WorkspaceCapabilityDataset(BaseDataset):
                         progression_group = str(
                             episode.metadata.get("progression_group", "all")
                         )
+                        if episode.track == "lang_logic":
+                            verdict_len = max(
+                                0, min(int(episode.metadata.get("verdict_len", 0)), n_answers)
+                            )
+                            if verdict_len:
+                                quality = logic_quality_totals[(episode.track, progression_group)]
+                                quality[0] += int(pred[:verdict_len] == expected[:verdict_len])
+                                quality[1] += 1
+                                justification = expected[verdict_len:]
+                                predicted_justification = pred[verdict_len:]
+                                quality[2] += sum(
+                                    int(a == b)
+                                    for a, b in zip(predicted_justification, justification)
+                                )
+                                quality[3] += len(justification)
+                                if justification:
+                                    quality[4] += int(predicted_justification == justification)
+                                    quality[5] += 1
                         if (
                             episode.track == "rule_switching"
                             and bool(
@@ -4328,6 +4400,20 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 for query_type, counts in sorted(blink_t2_totals.items())
             },
         }
+        for (track, group), counts in logic_quality_totals.items():
+            group_metrics = diagnostics["progression_groups"].setdefault(track, {}).setdefault(group, {})
+            group_metrics.update(
+                verdict_exact_match=100.0 * counts[0] / max(counts[1], 1),
+                verdict_episodes=int(counts[1]),
+                justification_token_accuracy=(
+                    100.0 * counts[2] / counts[3] if counts[3] else 100.0
+                ),
+                justification_exact_match=(
+                    100.0 * counts[4] / counts[5] if counts[5] else 100.0
+                ),
+                justification_tokens=int(counts[3]),
+                justification_episodes=int(counts[5]),
+            )
         if gnw_process_totals:
             signatures = {}
             for (track, condition), counts in sorted(gnw_process_totals.items()):
@@ -4908,9 +4994,16 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 if track in evaluation_track_lessons else ""
             )
             for group, metrics in sorted(groups.items()):
+                quality_text = ""
+                if "verdict_exact_match" in metrics:
+                    quality_text = (
+                        f" verdict={metrics['verdict_exact_match']:.1f}%"
+                        f" rationale_token={metrics['justification_token_accuracy']:.1f}%"
+                        f" rationale_exact={metrics['justification_exact_match']:.1f}%"
+                    )
                 print(
                     f"    [{track}{level_text}/{group}] exact={metrics['exact_match']:.1f}% "
-                    f"answer={metrics['accuracy']:.1f}% n={metrics['episodes']}"
+                    f"answer={metrics['accuracy']:.1f}%{quality_text} n={metrics['episodes']}"
                 )
         for query_type, metrics in sorted(
             diagnostics.get("attentional_blink_by_lag_mask", {}).items()

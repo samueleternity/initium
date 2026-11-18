@@ -742,6 +742,7 @@ def save_checkpoint(
         "scaler_state_dict": scaler.state_dict(),  # v3 fix
         "curriculum_lesson": curriculum.lesson,
         "curriculum_track_lessons": getattr(curriculum, "track_lessons", None),
+        "curriculum_promotion_history": getattr(curriculum, "promotion_history", None),
         "prior_state": get_prior_state(stochastic_heads),  # v5 (Phase 2)
         "ood_rng_state": ood_rng.getstate(),  # v6
         "dynamic_n_state": dynamic_n_state,  # Dynamic-N (macro-scale); None if not dynamic_n_mode
@@ -4300,7 +4301,9 @@ def run(
                     f"answer_pointer_supervision={bool(workspace_slot_readout and workspace_key_value_loss_weight > 0)} "
                     f"pointer_loss_scale={workspace_key_value_loss_weight if workspace_slot_readout else 0.0:g} "
                     f"query_binding_aux={bool(workspace_key_value_loss_weight > 0)} "
-                    f"binding_aux_scale={2.0 * workspace_key_value_loss_weight:g}"
+                    f"binding_aux_scale={2.0 * workspace_key_value_loss_weight:g} "
+                    f"context_copy_pointer={'on' if workspace_slot_readout and workspace_semantic_entity_count == 128 and workspace_key_value_loss_weight > 0 else 'off'} "
+                    f"copy_tracks=lang_logic,lang_induce,lang_act"
                 )
             if workspace_adaptive_v3_enabled:
                 print(
@@ -5320,6 +5323,13 @@ def run(
                 else:
                     curriculum.track_lessons = {k: int(curriculum.lesson) for k in curriculum.track_lessons}
                 dataset._curriculum_track_levels = curriculum.track_lessons
+            restored_promotion_history = ckpt.get("curriculum_promotion_history")
+            if isinstance(restored_promotion_history, dict):
+                curriculum.promotion_history = {
+                    str(k): [float(v) for v in values][-2:]
+                    for k, values in restored_promotion_history.items()
+                    if isinstance(values, (list, tuple))
+                }
         # Dynamic-N (macro-scale): restore the usage-EMA/cooldown/growth
         # history, so a resumed run doesn't silently reset the trigger's
         # sustained-saturation window back to 0 (which would just delay the
@@ -5919,7 +5929,9 @@ def run(
                     ss_logits = output_proj(ss_features)
                     if workspace_slot_readout:
                         ss_logits = rnn.apply_slot_readout(
-                            ss_logits, ss_features, ss_hidden, answer_mask
+                            ss_logits, ss_features, ss_hidden, answer_mask,
+                            copy_source_token_ids=(key_value_metadata or {}).get("workspace_copy_source_token_ids"),
+                            copy_source_mask=(key_value_metadata or {}).get("workspace_copy_source_mask"),
                         )
                     if workspace_key_value_loss_weight > 0:
                         ss_logits = dataset.apply_workspace_key_value_readout_logits(
@@ -6078,7 +6090,14 @@ def run(
             _slot_features = output
             output = output_proj(output)  # (B, T, 90)
             if workspace_slot_readout:
-                output = rnn.apply_slot_readout(output, _slot_features, hidden, answer_mask)
+                output = rnn.apply_slot_readout(
+                    output,
+                    _slot_features,
+                    hidden,
+                    answer_mask,
+                    copy_source_token_ids=(key_value_metadata or {}).get("workspace_copy_source_token_ids"),
+                    copy_source_mask=(key_value_metadata or {}).get("workspace_copy_source_mask"),
+                )
             key_value_predictions = []
             if workspace_key_value_loss_weight > 0:
                 workspace_module = getattr(rnn, "workspace", None)
@@ -6152,6 +6171,38 @@ def run(
                                     hidden[0].get("_initium_workspace_match_keys"),
                                 ).to(dtype=task_loss.dtype)
                             )
+                copy_source_mask = (key_value_metadata or {}).get(
+                    "workspace_copy_source_mask"
+                )
+                copy_source_token_ids = (key_value_metadata or {}).get(
+                    "workspace_copy_source_token_ids"
+                )
+                copy_target_token_ids = key_value_metadata.get(
+                    "workspace_copy_target_token_ids"
+                )
+                workspace_module = getattr(rnn, "workspace", None)
+                copy_adapter = getattr(getattr(rnn, "backbone", None), "in_adapter", None)
+                if (
+                    workspace_module is not None
+                    and copy_source_mask is not None
+                    and copy_source_token_ids is not None
+                    and copy_target_token_ids is not None
+                    and key_value_metadata.get("workspace_copy_has_targets", False)
+                    and workspace_module.context_copy_query is not None
+                    and isinstance(copy_adapter, nn.Linear)
+                ):
+                    copy_source_features = torch.nn.functional.embedding(
+                        copy_source_token_ids, copy_adapter.weight.T
+                    )
+                    workspace_key_value_loss = workspace_key_value_loss + (
+                        workspace_module.context_copy_loss(
+                            _slot_features,
+                            copy_source_features,
+                            copy_source_token_ids,
+                            copy_source_mask,
+                            copy_target_token_ids,
+                        ).to(dtype=task_loss.dtype)
+                    )
                 binding_aux_targets = key_value_metadata.get("workspace_binding_aux_targets")
                 if binding_aux_targets is not None:
                     binding_mask = binding_aux_targets.ge(0)
@@ -10258,12 +10309,15 @@ if __name__ == "__main__":
     parser.add_argument("--workspace-lang-identity", choices=("annotator", "truth"), default="truth",
                         help="Stage 5 key labels: annotator (no pronoun/coreference labels) or generator ground truth.")
     args = parser.parse_args()
-    _prod = args.dataset_type == "workspace-capability" and args.workspace_task_track.startswith(
+    _prod = args.dataset_type == "workspace-capability" and args.workspace_task_track.replace("-", "_").startswith(
         ("developmental_production", "lang_")
     )
     if (args.workspace_teacher_forced_answers or args.workspace_generation_eval
             or args.workspace_scheduled_sampling > 0) and not _prod:
-        parser.error("teacher forcing/generation/scheduled sampling require a developmental_production* track")
+        parser.error(
+            "teacher forcing/generation/scheduled sampling require a "
+            "developmental_production* or lang_* track"
+        )
     if not 0.0 <= args.workspace_scheduled_sampling <= 1.0:
         parser.error("--workspace-scheduled-sampling must be in [0, 1]")
     if args.workspace_scheduled_sampling > 0 and not (

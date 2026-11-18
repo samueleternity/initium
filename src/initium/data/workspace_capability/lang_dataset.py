@@ -124,8 +124,10 @@ class LanguageDataset(WorkspaceCapabilityDataset):
 
     def _make_episode(self, track, level, rng, *, ood=False, ood_axes=None, generalization_axis=None):
         track_level = level
-        if track == "lang_all":
+        if track in ("lang_all", lt.LANG_V5_SELECTOR):
             pool = self._tracks()
+            if not pool:
+                raise RuntimeError(f"{track}: no language tracks are available in this corpus")
             track = pool[min(int(rng.random() * len(pool)), len(pool) - 1)]
         if isinstance(level, dict):
             track_level = int(level.get(track, 0))
@@ -228,10 +230,22 @@ class LanguageDataset(WorkspaceCapabilityDataset):
         rr, ss, cc, kk, tt = [], [], [], [], []
         route_mask = torch.ones((batch, time), dtype=torch.bool)
         slot_target_ids = torch.full((batch, time), -1, dtype=torch.long)
+        copy_target_positions = torch.full((batch, time), -1, dtype=torch.long)
+        copy_source_size = max(
+            (len(e.metadata.get("workspace_copy_source_token_ids", ())) for e in examples),
+            default=0,
+        )
+        copy_source_token_ids = torch.zeros((batch, copy_source_size), dtype=torch.long)
+        copy_source_mask = torch.zeros((batch, copy_source_size), dtype=torch.bool)
         binding_aux_targets = torch.full((batch, time), -100, dtype=torch.long)
+        copy_target_token_ids = torch.full((batch, time), -100, dtype=torch.long)
         for row, episode in enumerate(examples):
             limit = min(time, len(episode.inputs))
             md = episode.metadata
+            source_ids = tuple(md.get("workspace_copy_source_token_ids", ()))
+            if episode.track in ("lang_logic", "lang_induce", "lang_act") and source_ids:
+                copy_source_token_ids[row, :len(source_ids)] = torch.tensor(source_ids)
+                copy_source_mask[row, :len(source_ids)] = True
             for step, target in md.get("workspace_binding_aux", ()):
                 step, target = int(step), int(target)
                 if 0 <= step < limit and 0 <= target < self.output_dim:
@@ -244,6 +258,18 @@ class LanguageDataset(WorkspaceCapabilityDataset):
                 rr.append(row), ss.append(step), cc.append(col), kk.append(key), tt.append(target)
             output_keys = tuple(md.get("workspace_output_keys", ()))
             output_kv_targets = md.get("workspace_output_kv_targets")
+            # Episode builders append EOS in their shared `done` method, while
+            # copy metadata is produced from the raw answer tokens. Zip against
+            # the canonical episode answer so any legacy/overlong metadata is
+            # safely truncated and EOS remains unsupervised by the copy head.
+            for offset, (target_token, source_position) in enumerate(
+                zip(episode.answer, md.get("workspace_copy_source_positions", ()))
+            ):
+                step = len(episode.inputs) + offset
+                source_position = int(source_position)
+                if 0 <= source_position < len(source_ids) and step < time:
+                    copy_target_positions[row, step] = source_position
+                    copy_target_token_ids[row, step] = int(target_token)
             for offset, key in enumerate(output_keys):
                 key = int(key)
                 step = len(episode.inputs) + offset
@@ -274,6 +300,15 @@ class LanguageDataset(WorkspaceCapabilityDataset):
             "key_value_mask": mask,
             "key_value_route_mask": route_mask,
             "workspace_slot_target_ids": slot_target_ids,
+            "workspace_copy_source_token_ids": copy_source_token_ids if copy_source_size else None,
+            "workspace_copy_source_mask": copy_source_mask if copy_source_size else None,
+            "workspace_copy_target_positions": copy_target_positions,
+            "workspace_copy_target_token_ids": copy_target_token_ids,
+            "workspace_copy_has_targets": any(
+                bool(e.metadata.get("workspace_copy_source_positions"))
+                and any(int(p) >= 0 for p in e.metadata["workspace_copy_source_positions"])
+                for e in examples
+            ),
             "workspace_binding_aux_targets": binding_aux_targets,
             "key_value_steps": tuple(sorted(set(ss))),
             "key_value_output_programs": (),
@@ -330,7 +365,7 @@ class LanguageDataset(WorkspaceCapabilityDataset):
             model._initium_carry = []
 
     def _ungrounded(self, episodes):
-        """Approximate ungrounded-token rate: content pieces in answers that never occur in the input."""
+        """Content-token support from the visible context plus labelled slot values."""
         tk = lt.tokenizer()
         func = {t for w in (*lg.FUNCTION, *lg.PUNCT, *_EXTRA_FUNC) for t in tk.word(w)}
         bad = tot = n = 0
@@ -338,16 +373,26 @@ class LanguageDataset(WorkspaceCapabilityDataset):
             p = self._last_eval_preds.get(id(e))
             if p is None or e.metadata.get("answer_kind", "text") not in ("text", "mr"):
                 continue
-            ins, n = set(e.inputs), n + 1
+            supported = set(e.inputs)
+            metadata = e.metadata
+            for field in ("workspace_event_writes", "workspace_query_reads", "workspace_binding_aux"):
+                for row in metadata.get(field, ()):
+                    value = int(row[-1])
+                    if value >= TEXT_BASE:
+                        supported.add(value)
+            n += 1
             for t in p:
                 if t >= TEXT_BASE and t not in func:
                     tot += 1
-                    bad += t not in ins
+                    bad += t not in supported
         return {"ungrounded_tokens": {"rate_pct": 100.0 * bad / max(tot, 1), "episodes": n}} if n else {}
     def _lang5_metrics(self, episodes):
         """Coreference-by-distance, derivation-by-depth and clarification P/R (also printed by the caller)."""
         preds, clar = self._last_eval_preds, [*ltr._toks(["who", "do", "you", "mean?"]), EOS]
         acc: dict[str, list[int]] = defaultdict(lambda: [0, 0])
+        induce_positions: dict[int, list[int]] = defaultdict(lambda: [0, 0])
+        induce_eos = [0, 0]
+        act_positions: dict[tuple[str, int], list[int]] = defaultdict(lambda: [0, 0])
         tp = pc = gc = 0
         for e in episodes:
             p = preds.get(id(e))
@@ -362,12 +407,45 @@ class LanguageDataset(WorkspaceCapabilityDataset):
                 a = acc[f"derivation_depth_{m.get('depth', 0)}"]
                 a[0] += ok
                 a[1] += 1
+            if e.track == "lang_induce":
+                for position, target in enumerate(e.answer):
+                    if target == EOS:
+                        induce_eos[0] += int(position < len(p) and p[position] == target)
+                        induce_eos[1] += 1
+                        continue
+                    counts = induce_positions[position]
+                    counts[0] += int(position < len(p) and p[position] == target)
+                    counts[1] += 1
             if e.track == "lang_act":
+                response_act = str(m.get("response_act", "unknown"))
+                for position, target in enumerate(e.answer):
+                    counts = act_positions[(response_act, position)]
+                    counts[0] += int(position < len(p) and p[position] == target)
+                    counts[1] += 1
                 g, c = m.get("response_act") == "clarify", p == clar
                 tp += g and c
                 pc += c
                 gc += g
         out = {k: {"exact_pct": 100.0 * a / n, "episodes": n} for k, (a, n) in sorted(acc.items())}
+        out.update({
+            f"induce_answer_position_{position}": {
+                "accuracy_pct": 100.0 * correct / max(count, 1),
+                "episodes": count,
+            }
+            for position, (correct, count) in sorted(induce_positions.items())
+        })
+        if induce_eos[1]:
+            out["induce_eos_accuracy"] = {
+                "accuracy_pct": 100.0 * induce_eos[0] / induce_eos[1],
+                "episodes": induce_eos[1],
+            }
+        out.update({
+            f"act_answer_position_{act}_{position}": {
+                "accuracy_pct": 100.0 * correct / max(count, 1),
+                "episodes": count,
+            }
+            for (act, position), (correct, count) in sorted(act_positions.items())
+        })
         if gc or pc:
             out["clarify"] = {"precision_pct": 100.0 * tp / max(pc, 1), "recall_pct": 100.0 * tp / max(gc, 1), "episodes": gc}
         return out
@@ -399,7 +477,8 @@ class LanguageDataset(WorkspaceCapabilityDataset):
 
     # ------------------------------------------------------------------ evaluation
     def evaluate_ood(self, model, device, num_episodes, rng, verbose_n=0, field_log=None):
-        # label / length / combo / combined splits; 'lang_all' resolves its track per paired seed
+        # label / length / combo / combined splits; language selectors resolve
+        # one concrete track per paired seed in _make_episode.
         return self.evaluate_dev_axes(model, device, num_episodes, rng, verbose_n, field_log)
 
     def _generation_metrics(self, model, device, episodes, cap=None):
@@ -523,7 +602,14 @@ class LanguageDataset(WorkspaceCapabilityDataset):
                     features = output.transpose(0, 1)
                     logits = self._output_proj(features)
                     if getattr(model, "workspace_slot_readout_enabled", False):
-                        logits = model.apply_slot_readout(logits, features, state, answer_mask.to(device))
+                        logits = model.apply_slot_readout(
+                            logits,
+                            features,
+                            state,
+                            answer_mask.to(device),
+                            copy_source_token_ids=(kv or {}).get("workspace_copy_source_token_ids"),
+                            copy_source_mask=(kv or {}).get("workspace_copy_source_mask"),
+                        )
                     tokens = logits.argmax(-1).cpu().tolist()
                     preds = [t[len(e.inputs) : len(e.inputs) + len(e.answer)] for e, t in zip(group, tokens)]
                     on_batch(group, preds, kv, workspace.pop_key_value_predictions() if want_kv else None)

@@ -953,7 +953,16 @@ class SplitGraphDNC(nn.Module):
         if self.device is not None and getattr(self.device, "type", None) == "cuda":
             self.to(self.device)
 
-    def apply_slot_readout(self, logits, features, state, answer_mask):
+    def apply_slot_readout(
+        self,
+        logits,
+        features,
+        state,
+        answer_mask,
+        *,
+        copy_source_token_ids=None,
+        copy_source_mask=None,
+    ):
         """Add slot-pointer word logits at answer positions; honours bypass/shuffle ablations."""
         ws = self.workspace
         chx = state[0] if isinstance(state, tuple) else None
@@ -966,6 +975,35 @@ class SplitGraphDNC(nn.Module):
             slots = slots.roll(1, 0)
         match_features = chx.get("_initium_workspace_match_keys")
         out = ws.slot_readout_logits(features, slots, match_features=match_features)
+        if (
+            not self.workspace_eval_bypass
+            and copy_source_token_ids is not None
+            and copy_source_mask is not None
+            and ws.context_copy_query is not None
+        ):
+            source_mask = copy_source_mask.to(device=features.device, dtype=torch.bool)
+            source_ids = copy_source_token_ids.to(device=features.device, dtype=torch.long).clamp(
+                0, logits.shape[-1] - 1
+            )
+            adapter = getattr(self.backbone, "in_adapter", None)
+            if not isinstance(adapter, nn.Linear) or adapter.weight.shape[0] != features.shape[-1]:
+                raise RuntimeError("context copy requires a token-ID input embedding adapter")
+            source_features = torch.nn.functional.embedding(source_ids, adapter.weight.T)
+            pointer = ws.context_copy_logits(features, source_features, source_mask).softmax(-1)
+            copy_vocab = torch.zeros_like(logits, dtype=torch.float32)
+            copy_vocab.scatter_add_(
+                -1,
+                source_ids.unsqueeze(1).expand(-1, pointer.shape[1], -1),
+                pointer.float(),
+            )
+            source_count = source_mask.sum(-1).clamp_min(1).to(pointer.dtype)
+            chance = source_count.reciprocal().unsqueeze(-1)
+            confidence = copy_vocab.amax(-1).to(pointer.dtype)
+            gate = ((confidence - chance) / (0.5 - chance).clamp_min(1e-6)).clamp(0.0, 1.0)
+            copy_delta = copy_vocab * 8.0 * gate.unsqueeze(-1)
+            logits = logits + copy_delta.to(dtype=logits.dtype) * answer_mask.to(
+                device=logits.device, dtype=logits.dtype
+            ).unsqueeze(-1)
         if ws.slot_text_cols is None:
             delta = out.to(logits.dtype)
             return logits + delta * answer_mask.to(device=logits.device, dtype=logits.dtype).unsqueeze(-1)

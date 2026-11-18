@@ -9,7 +9,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 
 from initium.data.workspace_capability.episode import (
-    MARK_O, MARK_R, SEP, SPK_SYS, SPK_USER, TASK_QA, TURN_END,
+    MARK_O, MARK_R, SEP, SPK_SYS, SPK_USER, TASK_QA, TEXT_BASE, TURN_END,
     entity_token, location_token, relation_token,
 )
 from initium.data.workspace_capability.tracks import _lang_grammar as lg
@@ -218,6 +218,25 @@ class Ep5(lg.Ep):
             meta.setdefault("workspace_binding_aux", tuple(self.binding_aux))
         if self.match_writes:
             meta.setdefault("workspace_match_writes", tuple(self.match_writes))
+        if track in ("lang_logic", "lang_induce", "lang_act"):
+            function_pieces = {
+                token
+                for word in (*lg.FUNCTION, *lg.PUNCT)
+                for token in self.tk.word(word)
+            }
+            source_by_token: dict[int, int] = {}
+            for position, token in enumerate(self.t):
+                source_by_token[int(token)] = position
+            meta.setdefault("workspace_copy_source_token_ids", tuple(self.t))
+            meta.setdefault(
+                "workspace_copy_source_positions",
+                tuple(
+                    source_by_token.get(int(token), -1)
+                    if int(token) < TEXT_BASE or int(token) not in function_pieces
+                    else -1
+                    for token in answer
+                ),
+            )
         return super().done(track, answer, qtype, group, kind, evictions=self.evict, closed_evictions=self.evc, **meta)
 
 
@@ -346,7 +365,10 @@ def _g_define(cfg, rng):
 def _g_induce(cfg, rng):
     grp, held = rng.choice(cfg["groups"]), bool(cfg["combos"])
     na, pa = cfg["rules"] >= 2 or held, cfg["rules"] >= 3 or held
-    c = rng.choice([c for c in range(12) if (c % 4 == 3) == held])  # held-out: neg-particle post AND plural post
+    order_count = max(1, min(3, int(cfg.get("orders", 3))))
+    c = rng.choice(
+        [c for c in range(12) if c // 4 < order_count and (c % 4 == 3) == held]
+    )  # held-out: neg-particle post AND plural post
     order, rem = divmod(c, 4)
     negpos, plupos = divmod(rem, 2)
     n = cfg["nouns"]
@@ -518,6 +540,10 @@ def _g_logic(cfg, rng):
         word: ep.ent.get(binding[0], -1)
         for word, binding in surf.items()
     }
+    # Verdict correctness and rationale fidelity are different capabilities.
+    # Abstention phrases and counting answers are complete verdicts; yes/no
+    # answers place the verdict in the first token and cite premises after it.
+    verdict_len = len(ans) if ans[0] not in ("yes,", "no,") else 1
     return ep.done(
         "lang_logic",
         _toks(ans),
@@ -525,6 +551,7 @@ def _g_logic(cfg, rng):
         grp,
         grammar_checked=False,
         depth=d,
+        verdict_len=verdict_len,
         workspace_output_keys=ep.output_keys(ans, key_by_word),
         workspace_output_kv_targets=tuple(_toks(ans)),
     )
@@ -735,8 +762,13 @@ def _g_act(cfg, rng):
     for o in w.O:
         w.put_o(o)
     segs = []
+    available_acts = tuple(act for act in cfg["groups"] if act in ACTS)
+    if not available_acts:
+        raise ValueError("lang_act curriculum has no known response acts")
     for k in range(T):
-        act = grp if k == T - 1 else rng.choice(ACTS)
+        # Earlier turns are context, but still must obey the active lesson.
+        # Sampling from every act leaked unintroduced operations into lesson 1.
+        act = grp if k == T - 1 else rng.choice(available_acts)
         ep.ctl(SPK_USER)
         ans, rd, resp = _act(w, act)
         ep.ctl(SPK_SYS)

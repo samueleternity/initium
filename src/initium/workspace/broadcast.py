@@ -273,6 +273,9 @@ class WorkspaceBroadcast(nn.Module):
         )
         self.slot_match_query = nn.Linear(d_model, d_model, bias=False) if slot_readout else None
         self.slot_match_key = nn.Linear(d_model, d_model, bias=False) if slot_readout else None
+        context_copy_enabled = slot_readout and self._SEMANTIC_ENTITY_COUNT == 128
+        self.context_copy_query = nn.Linear(d_model, d_model, bias=False) if context_copy_enabled else None
+        self.context_copy_key = nn.Linear(d_model, d_model, bias=False) if context_copy_enabled else None
         self.slot_readout_scale = nn.Parameter(torch.ones(())) if slot_readout else None
         self.slot_text_head = None
         self.register_buffer("slot_text_cols", None, persistent=False)
@@ -449,6 +452,41 @@ class WorkspaceBroadcast(nn.Module):
         if not valid.any():
             return logits.sum() * 0.0
         return F.cross_entropy(logits[valid], targets[valid])
+
+    def context_copy_logits(
+        self,
+        features: torch.Tensor,
+        source_features: torch.Tensor,
+        source_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Score answer positions against visible source-token positions."""
+        if self.context_copy_query is None or self.context_copy_key is None:
+            raise RuntimeError("context copy requires the slot-readout workspace")
+        query = self.context_copy_query(features.float())
+        key = self.context_copy_key(source_features.float())
+        logits = torch.einsum("btd,bsd->bts", query, key) / (self.d_model ** 0.5)
+        return logits.masked_fill(~source_mask.to(device=logits.device, dtype=torch.bool).unsqueeze(1), -1e4)
+
+    def context_copy_loss(
+        self,
+        features: torch.Tensor,
+        source_features: torch.Tensor,
+        source_token_ids: torch.Tensor,
+        source_mask: torch.Tensor,
+        target_token_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Supervise copied token mass, allowing any matching source occurrence."""
+        logits = self.context_copy_logits(features, source_features, source_mask)
+        targets = target_token_ids.to(device=logits.device, dtype=torch.long)
+        source_ids = source_token_ids.to(device=logits.device, dtype=torch.long)
+        mask = source_mask.to(device=logits.device, dtype=torch.bool)
+        matching = mask.unsqueeze(1) & source_ids.unsqueeze(1).eq(targets.unsqueeze(-1))
+        valid = targets.ge(0) & matching.any(-1)
+        if not valid.any():
+            return logits.sum() * 0.0
+        log_prob = F.log_softmax(logits, dim=-1)
+        target_log_prob = torch.logsumexp(log_prob.masked_fill(~matching, -1e4), dim=-1)
+        return -target_log_prob[valid].mean()
 
     def enable_slot_text(self, cols, *, tied_input_embedding=False):
         """Logit columns `cols` are produced only from slot content."""

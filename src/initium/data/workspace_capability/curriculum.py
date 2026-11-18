@@ -56,11 +56,12 @@ def _lang_config(track, level):
         c["groups"] = ("def_new", "def_prop", "def_redef", "def_unknown")[: (1, 2, 3, 4, 4, 4)[L]]
         c["pseudo"] = (1, 2, 2, 3, 3, 4)[L]
     elif track == "lang_induce":
-        # Reverse generation requires storing complete multi-piece words. The
-        # current slots keep only a first piece, so only score the supported
-        # surface-to-MR direction until that representation is implemented.
+        # Keep lesson 1 focused on lexical/role binding under one canonical
+        # order. Expand word-order induction only after the basic mapping is
+        # learnable; otherwise order inference and binding errors compound.
         c.update(groups=("ind_s2mr",), examples=(5, 6, 7, 8, 9, 10)[L],
-                 nouns=(3, 3, 4, 4, 5, 6)[L], rules=(1, 2, 2, 3, 3, 3)[L])
+                 nouns=(3, 3, 4, 4, 5, 6)[L], rules=(1, 2, 2, 3, 3, 3)[L],
+                 orders=(1, 1, 3, 3, 3, 3)[L])
     elif track == "lang_logic":
         c.update(groups=("l_chain", "l_neg", "l_unknown", "l_contra", "l_count", "l_some", "l_cond")[: (1, 3, 3, 4, 6, 7)[L]],
                  depth=(1, 1, 2, 2, 3, 4)[L])
@@ -382,9 +383,12 @@ class WorkspaceCapabilityCurriculum:
         self.lesson = 0
         self.track_lessons = (
             {track: 0 for track in dataset._tracks()}
-            if dataset.task_track in ("lang_all", _lang_text.LANG_V5_SELECTOR)
+            if dataset.task_track in _lang_text.LANG_TRACK_NAMES
             else None
         )
+        # Promotion decisions use the mean of the last two evaluations at the
+        # same track/lesson/stratum, avoiding one noisy check advancing a task.
+        self.promotion_history: dict[str, list[float]] = {}
         self.dataset._curriculum_track_levels = self.track_lessons
         # Split-graph sequence memories do not use DNC N, but retain this
         # interface for generic training/checkpoint code.
@@ -392,6 +396,14 @@ class WorkspaceCapabilityCurriculum:
 
     def level_for(self, track):
         return int(self.track_lessons.get(track, self.lesson)) if self.track_lessons is not None else self.lesson
+
+    def _smoothed_promotion_score(self, key: str, current: float) -> float | None:
+        history = self.promotion_history.setdefault(key, [])
+        history.append(float(current))
+        del history[:-2]
+        if len(history) < 2:
+            return None
+        return sum(history) / len(history)
 
     def maybe_advance(self, model, device, step=None, optimizer=None, *, allow_advance=True):
         field_log = {}
@@ -425,14 +437,59 @@ class WorkspaceCapabilityCurriculum:
                     continue
                 groups = self.dataset._curriculum_groups(track, level)
                 stats = progression_groups.get(track, {})
-                ready = all(
-                    group in stats
-                    and stats[group]["episodes"] >= self.dataset.curriculum_eval_episodes_per_group
-                    and stats[group]["exact_match"] / 100.0 >= self.dataset.advance_threshold
-                    for group in groups
-                )
-                overall = per_track.get(track, {}).get("exact_match", 0.0) / 100.0
-                ready = ready and overall >= self.dataset.advance_threshold
+                ready = True
+                score_notes = []
+                for group in groups:
+                    metrics = stats.get(group)
+                    if (
+                        metrics is None
+                        or metrics["episodes"] < self.dataset.curriculum_eval_episodes_per_group
+                    ):
+                        ready = False
+                        continue
+                    if track == "lang_logic" and "verdict_exact_match" in metrics:
+                        verdict = self._smoothed_promotion_score(
+                            f"{track}:{level}:{group}:verdict",
+                            metrics["verdict_exact_match"] / 100.0,
+                        )
+                        justification = self._smoothed_promotion_score(
+                            f"{track}:{level}:{group}:justification",
+                            metrics["justification_token_accuracy"] / 100.0,
+                        )
+                        group_ready = (
+                            verdict is not None
+                            and verdict >= self.dataset.advance_threshold
+                            and justification is not None
+                            and justification >= self.dataset.advance_threshold
+                        )
+                        score_notes.append(
+                            f"{group}:verdict={verdict if verdict is not None else float('nan'):.2f},"
+                            f"rationale={justification if justification is not None else float('nan'):.2f}"
+                        )
+                    else:
+                        smoothed = self._smoothed_promotion_score(
+                            f"{track}:{level}:{group}:exact",
+                            metrics["exact_match"] / 100.0,
+                        )
+                        group_ready = smoothed is not None and smoothed >= self.dataset.advance_threshold
+                        score_notes.append(
+                            f"{group}={smoothed if smoothed is not None else float('nan'):.2f}"
+                        )
+                    ready = ready and group_ready
+                if track == "lang_logic":
+                    overall_ready = True  # Group verdict+rationale scores are the logic gate.
+                else:
+                    current_overall = per_track.get(track, {}).get("exact_match", 0.0) / 100.0
+                    overall = self._smoothed_promotion_score(
+                        f"{track}:{level}:overall", current_overall
+                    )
+                    overall_ready = overall is not None and overall >= self.dataset.advance_threshold
+                    score_notes.append(
+                        f"overall={overall if overall is not None else float('nan'):.2f}"
+                    )
+                ready = ready and overall_ready
+                if score_notes:
+                    print(f"[workspace-curriculum-smoothing] {track} lesson={level + 1} " + "; ".join(score_notes))
                 if allow_advance and ready:
                     self.track_lessons[track] = level + 1
                     promoted.append(f"{track}:{level + 1}")

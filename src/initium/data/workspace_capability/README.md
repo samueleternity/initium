@@ -365,14 +365,31 @@ corpus is installed). Each selected track has its own curriculum lesson, so a
 weak track does not hold back promotion of the others. Existing `lang_all`
 behavior remains the full available language-track mixture.
 
+For a Stage-5-focused run that must retain Stage-4 capabilities, use
+`--workspace-task-track lang_all` and omit
+`--workspace-track-homogeneous-batches`. The weighted sampler adapts at both
+track and progression-group level: weak groups receive more examples, while
+solved tracks retain a replay floor. Language answer loss is averaged per
+episode, so long canonical answers do not gain extra weight solely from having
+more tokens.
+
+Language batches are grouped by segment-chain length. Each group keeps its
+examples mixed across tracks, avoids dummy rows for shorter chains, and
+accumulates segment gradients before one optimizer update. Consequently,
+`--total-steps`, evaluation cadence, and the learning-rate schedule count
+optimizer updates (completed sampled batches), not recurrent segment forwards.
+The vocabulary head is projected only at answer and binding-supervision
+positions for language batches. Logs report optimizer updates/s and segment
+forwards/s separately. Compare throughput using examples/s as well as update
+speed.
+
 Language promotion averages the last two evaluations at the current lesson.
 Logic promotion reports verdict and rationale-token accuracy separately, and
 requires both to meet the threshold. Induction lesson 1 fixes surface order to
 SVO to isolate lexical/role binding; later lessons introduce SOV and VSO.
 Induction reports each MR answer-token position separately and reports EOS
-accuracy apart from content-token accuracy. Its sampling ceiling matches the
-other tracks and evaluation output reports observed and next-interval sampling
-shares. Act-context turns are sampled only
+accuracy apart from content-token accuracy. Evaluation reports sampled episode
+and optimizer-update shares, along with the next track weights. Act-context turns are sampled only
 from response acts introduced by the active lesson. Act answer-token accuracy
 is reported by response act and answer position. Parse, define, logic,
 induction, and act train a context-token copy pointer for answer tokens present

@@ -1056,6 +1056,125 @@ class SplitGraphDNC(nn.Module):
                 device=result.device, dtype=result.dtype
             ).unsqueeze(-1)
         return result
+
+    def apply_slot_readout_sparse(
+        self,
+        logits,
+        features,
+        state,
+        batch_indices,
+        time_indices,
+        answer_positions,
+        *,
+        copy_source_token_ids=None,
+        copy_source_mask=None,
+    ):
+        """Apply the ordinary slot/copy readout to already-gathered positions."""
+        if logits.ndim != 2 or features.ndim != 2:
+            raise ValueError("sparse slot readout expects [positions,vocab] logits and [positions,hidden] features")
+        if logits.shape[0] == 0:
+            return logits
+        if self.workspace is None or self.workspace.slot_pointer is None:
+            return logits
+        chx = state[0] if isinstance(state, tuple) else None
+        if not isinstance(chx, dict) or "_initium_workspace_state" not in chx:
+            return logits
+        rows = batch_indices.to(device=features.device, dtype=torch.long)
+        batch_slots = chx["_initium_workspace_state"]
+        if self.workspace_eval_bypass:
+            batch_slots = torch.zeros_like(batch_slots)
+        elif self.workspace_eval_shuffle_readback and batch_slots.shape[0] > 1:
+            batch_slots = batch_slots.roll(1, 0)
+        slots = batch_slots.index_select(0, rows)
+        match_features = chx.get("_initium_workspace_match_keys")
+        sparse_match_features = (
+            match_features.index_select(0, rows)
+            if match_features is not None
+            else None
+        )
+        sparse_answer = answer_positions.to(device=logits.device, dtype=logits.dtype)
+        out = self.workspace.slot_readout_logits(
+            features.unsqueeze(1), slots, match_features=sparse_match_features
+        )
+        result = logits
+        if self.workspace.slot_text_cols is None:
+            result = logits + out[:, 0].to(logits.dtype) * sparse_answer.unsqueeze(-1)
+        else:
+            adapter = getattr(self.backbone, "in_adapter", None)
+            if isinstance(adapter, nn.Linear) and adapter.weight.shape[0] == out.shape[-1]:
+                slot_logits = (
+                    self.workspace.slot_readout_scale
+                    * (out[:, 0] @ adapter.weight[:, self.workspace.slot_text_cols])
+                ).to(logits.dtype)
+            else:
+                if self.workspace.slot_text_head is None:
+                    raise RuntimeError("slot-text copy requires a compatible token input embedding")
+                slot_logits = (
+                    self.workspace.slot_readout_scale * self.workspace.slot_text_head(out[:, 0])
+                ).to(logits.dtype)
+            address, _content = torch.split(
+                slots.float(), [self.workspace._address_dim, self.workspace.d_model], dim=-1
+            )
+            occupied = address.square().sum(-1) > 1e-12
+            slot_ids = address.argmax(-1)
+            present = torch.zeros(
+                address.shape[0], self.workspace._SEMANTIC_ENTITY_COUNT,
+                dtype=torch.int32, device=address.device,
+            ).scatter_add_(1, slot_ids, occupied.to(torch.int32)) > 0
+            pointer = self.workspace.slot_pointer_logits(
+                features.unsqueeze(1), sparse_match_features, present
+            ).softmax(-1)
+            pointer_on_occupied = pointer.gather(
+                -1, slot_ids.unsqueeze(1).expand(-1, pointer.shape[1], -1)
+            ) * occupied.unsqueeze(1).to(pointer.dtype)
+            confidence = pointer_on_occupied.amax(dim=-1)[:, 0]
+            chance = 1.0 / max(int(self.workspace.slot_pointer.out_features), 1)
+            slot_gate = ((confidence - chance) / max(0.75 - chance, 1e-6)).clamp(0.0, 1.0)
+            slot_gate = slot_gate.to(logits.dtype) * sparse_answer
+            cols = self.workspace.slot_text_cols
+            result = logits.clone()
+            result[:, cols] = logits[:, cols] + slot_gate.unsqueeze(-1) * (
+                slot_logits - logits[:, cols]
+            )
+
+        sparse_copy_ids = (
+            copy_source_token_ids.index_select(0, rows)
+            if copy_source_token_ids is not None
+            else None
+        )
+        sparse_copy_mask = (
+            copy_source_mask.index_select(0, rows)
+            if copy_source_mask is not None
+            else None
+        )
+        if (
+            not self.workspace_eval_bypass
+            and sparse_copy_ids is not None
+            and sparse_copy_mask is not None
+            and self.workspace.context_copy_query is not None
+        ):
+            source_ids = sparse_copy_ids.to(device=features.device, dtype=torch.long).clamp(
+                0, logits.shape[-1] - 1
+            )
+            source_mask = sparse_copy_mask.to(device=features.device, dtype=torch.bool)
+            adapter = getattr(self.backbone, "in_adapter", None)
+            if not isinstance(adapter, nn.Linear) or adapter.weight.shape[0] != features.shape[-1]:
+                raise RuntimeError("context copy requires a token-ID input embedding adapter")
+            source_features = torch.nn.functional.embedding(source_ids, adapter.weight.T)
+            copy_pointer = self.workspace.context_copy_logits(
+                features.unsqueeze(1), source_features, source_mask
+            ).softmax(-1)[:, 0]
+            copy_vocab = torch.zeros_like(result, dtype=torch.float32)
+            copy_vocab.scatter_add_(1, source_ids, copy_pointer.float())
+            source_count = source_mask.sum(-1).clamp_min(1).to(copy_pointer.dtype)
+            chance = source_count.reciprocal()
+            confidence = copy_vocab.amax(-1).to(copy_pointer.dtype)
+            copy_gate = ((confidence - chance) / (0.5 - chance).clamp_min(1e-6)).clamp(0.0, 1.0)
+            result = result + (
+                copy_vocab.to(result.dtype)
+                * (8.0 * copy_gate.to(result.dtype) * sparse_answer).unsqueeze(-1)
+            )
+        return result
     def _allocate(self, feats, state, ids, wm, valid):
         a = self.allocator
         out = a(feats.float(), state.float())

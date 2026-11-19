@@ -1594,12 +1594,10 @@ def run(
                     f"{len(selected_tracks)} steps; padding utilization is logged"
                 )
             else:
-                per_track_per_step = float(batch_size) / len(selected_tracks)
                 print(
-                    f"[workspace-capability] task exposure: {batch_size} episodes/batch "
-                    f"across {len(selected_tracks)} tracks = {per_track_per_step:.2f} "
-                    f"episodes/track/step on average; standalone batches provide "
-                    f"{len(selected_tracks)}x more examples per track"
+                    f"[workspace-capability] weighted mixed-track batches: up to {batch_size} "
+                    f"episodes sampled across {len(selected_tracks)} tracks; weak progression "
+                    f"groups receive higher sampling weight and solved tracks keep a replay floor"
                 )
         if not split_graph_enabled or split_graph_variant != "mamba1":
             raise ValueError("workspace-capability training requires split-graph Mamba-1")
@@ -5534,6 +5532,7 @@ def run(
     running_retrieval_query_found: Any = 0.0
     running_retrieval_query_slots: Any = 0.0
     running_log_steps = 0
+    running_micro_steps = 0
     running_eval_seconds = 0.0
     running_v3_candidate_tokens = 0
     running_v3_executed_tokens = 0
@@ -5602,9 +5601,12 @@ def run(
         print(f"[{run_id}] allocator routing disabled; generator-labeled addresses remain authoritative")
     if alloc_enabled:
         rnn.allocator_use_prob = alloc_p
-    while step < total_steps and not eval_only:
+    while (
+        (step < total_steps or bool(getattr(dataset, "has_pending_chain_segments", False)))
+        and not eval_only
+    ):
         adaptive_v3_teacher_weight_for_step = adaptive_v3_teacher_weight_current
-        moe_diagnostics_due = bool(moe_diagnostics_enabled and running_log_steps + 1 >= log_every)
+        moe_diagnostics_due = bool(moe_diagnostics_enabled and running_micro_steps + 1 >= log_every)
         for module in moe_diagnostic_modules:
             if module.diagnostics_enabled != moe_diagnostics_due:
                 module.set_diagnostics_enabled(moe_diagnostics_due)
@@ -5612,7 +5614,7 @@ def run(
             # Workspace health reductions are only consumed at the normal
             # logging cadence. Keep reconsideration/write-salience telemetry
             # continuous because it is accumulated per training step.
-            workspace_diag_due = running_log_steps + 1 >= log_every
+            workspace_diag_due = running_micro_steps + 1 >= log_every
             workspace_diagnostics_enabled = workspace_telemetry_enabled or workspace_diag_due
             if rnn.workspace.diagnostics_enabled != workspace_diagnostics_enabled:
                 rnn.workspace.set_diagnostics_enabled(workspace_diagnostics_enabled)
@@ -5639,7 +5641,7 @@ def run(
             or workspace_train_scope == "gate"
             or workspace_bistable_debug
             or anomaly_this_step
-            or running_log_steps + 1 >= log_every
+            or running_micro_steps + 1 >= log_every
         )
         segment_diagnostics.set_channel(
             "train" if segment_diagnostics_enabled and segment_sample_due else None
@@ -5656,6 +5658,23 @@ def run(
         if getattr(dataset, "name", None) == "workspace-capability":
             dataset.training_step = step
         batch = dataset.sample_batch(curriculum, batch_size)
+        chain_start = bool(getattr(dataset, "segment_chain_start", True))
+        chain_complete = bool(getattr(dataset, "segment_chain_complete", True))
+        chain_steps = max(1, int(getattr(dataset, "segment_chain_steps", 1)))
+        optimizer_update_due = chain_complete
+        language_sparse_projection = bool(
+            getattr(dataset, "_lang_ready", False)
+            and not workspace_permutation_transactional
+            and not workspace_attentional_cue_readout
+            and not workspace_nth_farthest_exact_readout
+            and not workspace_exact_value_comparison
+            and not workspace_exact_selection
+            and not workspace_no_report_confidence_readout
+            and not (
+                split_graph_forward_trace is not None
+                and split_graph_forward_trace.active
+            )
+        )
         if isinstance(rnn, SplitGraphDNC):
             rnn._initium_carry = (
                 [seg_carry] if getattr(dataset, "segment_continue", False) and seg_carry is not None else []
@@ -5671,6 +5690,20 @@ def run(
                 "dataset.sample_batch() must return (inputs, targets, mask) or "
                 "(inputs, targets, mask, timespans)"
             )
+
+        language_answer_positions_cpu = None
+        language_sparse_positions_cpu = None
+        if language_sparse_projection:
+            language_answer_positions_cpu = answer_mask.bool().nonzero(as_tuple=False)
+            sparse_mask_cpu = answer_mask.bool().clone()
+            output_dim = int(getattr(dataset, "output_dim", 0))
+            for row, episode in enumerate(dataset.last_batch_examples):
+                input_limit = min(input_seq.shape[1], len(episode.inputs))
+                for position, target_id in episode.metadata.get("workspace_binding_aux", ()):
+                    position, target_id = int(position), int(target_id)
+                    if 0 <= position < input_limit and 0 <= target_id < output_dim:
+                        sparse_mask_cpu[row, position] = True
+            language_sparse_positions_cpu = sparse_mask_cpu.nonzero(as_tuple=False)
 
         workspace_forward_kwargs = {}
         nth_metadata = None
@@ -5878,6 +5911,16 @@ def run(
         input_seq = input_seq.to(device, non_blocking=True)
         target_digits = target_digits.to(device, non_blocking=True)
         answer_mask = answer_mask.to(device, non_blocking=True)
+        language_answer_positions = (
+            language_answer_positions_cpu.to(device, non_blocking=True)
+            if language_answer_positions_cpu is not None
+            else None
+        )
+        language_sparse_positions = (
+            language_sparse_positions_cpu.to(device, non_blocking=True)
+            if language_sparse_positions_cpu is not None
+            else None
+        )
         if timespans is not None:
             timespans = timespans.to(device, non_blocking=True)
         activation_checkpointing_this_step = False
@@ -5918,7 +5961,8 @@ def run(
                     f"[{run_id}] non-finite training input at step {step}; stopping."
                 )
         hidden: Any = (None, None, None)
-        optimizer.zero_grad(set_to_none=True)
+        if chain_start:
+            optimizer.zero_grad(set_to_none=True)
         if workspace_scheduled_sampling > 0 and input_seq.ndim == 2:
             p_ss = workspace_scheduled_sampling * min(1.0, step / max(1, workspace_scheduled_sampling_steps))
             if p_ss > 0:
@@ -5935,23 +5979,55 @@ def run(
                     if isinstance(rnn, SplitGraphDNC):
                         rnn._initium_carry = list(scheduled_sampling_carry)
                     ss_features = ss_out.transpose(0, 1)
-                    ss_logits = output_proj(ss_features)
-                    if workspace_slot_readout:
-                        ss_logits = rnn.apply_slot_readout(
-                            ss_logits, ss_features, ss_hidden, answer_mask,
-                            copy_source_token_ids=(key_value_metadata or {}).get("workspace_copy_source_token_ids"),
-                            copy_source_mask=(key_value_metadata or {}).get("workspace_copy_source_mask"),
+                    if language_sparse_projection:
+                        ss_positions = language_answer_positions
+                        ss_rows, ss_times = ss_positions[:, 0], ss_positions[:, 1]
+                        ss_logits = output_proj(ss_features[ss_rows, ss_times])
+                        if workspace_slot_readout:
+                            ss_logits = rnn.apply_slot_readout_sparse(
+                                ss_logits,
+                                ss_features[ss_rows, ss_times],
+                                ss_hidden,
+                                ss_rows,
+                                ss_times,
+                                torch.ones_like(ss_rows, dtype=torch.bool),
+                                copy_source_token_ids=(key_value_metadata or {}).get("workspace_copy_source_token_ids"),
+                                copy_source_mask=(key_value_metadata or {}).get("workspace_copy_source_mask"),
+                            )
+                        if workspace_key_value_loss_weight > 0:
+                            ss_logits = dataset.apply_workspace_key_value_readout_sparse(
+                                ss_logits,
+                                ss_positions,
+                                rnn.workspace.pop_key_value_predictions(),
+                                key_value_metadata,
+                                answer_mask,
+                            )
+                        prev = torch.zeros(
+                            (input_seq.shape[0], max(0, input_seq.shape[1] - 1)),
+                            dtype=torch.long,
+                            device=input_seq.device,
                         )
-                    if workspace_key_value_loss_weight > 0:
-                        ss_logits = dataset.apply_workspace_key_value_readout_logits(
-                            ss_logits,
-                            rnn.workspace.pop_key_value_predictions(),
-                            key_value_metadata,
-                            answer_mask,
-                        )
+                        valid_next = ss_times.lt(prev.shape[1])
+                        if bool(valid_next.any()):
+                            prev[ss_rows[valid_next], ss_times[valid_next]] = ss_logits.argmax(-1)[valid_next]
+                    else:
+                        ss_logits = output_proj(ss_features)
+                        if workspace_slot_readout:
+                            ss_logits = rnn.apply_slot_readout(
+                                ss_logits, ss_features, ss_hidden, answer_mask,
+                                copy_source_token_ids=(key_value_metadata or {}).get("workspace_copy_source_token_ids"),
+                                copy_source_mask=(key_value_metadata or {}).get("workspace_copy_source_mask"),
+                            )
+                        if workspace_key_value_loss_weight > 0:
+                            ss_logits = dataset.apply_workspace_key_value_readout_logits(
+                                ss_logits,
+                                rnn.workspace.pop_key_value_predictions(),
+                                key_value_metadata,
+                                answer_mask,
+                            )
+                        prev = ss_logits.argmax(-1)[:, :-1]
                 for _layer in getattr(rnn, "moe_layers", ()):
                     _layer.pop_aux_loss()
-                prev = ss_logits.argmax(-1)[:, :-1]
                 ans = answer_mask.bool()
                 swap = ans[:, 1:] & ans[:, :-1] & (torch.rand(prev.shape, device=device) < p_ss)
                 input_seq = torch.cat((input_seq[:, :1], torch.where(swap, prev, input_seq[:, 1:])), 1)
@@ -6095,33 +6171,57 @@ def run(
                 # exact arg-sort is an inference/readout path and its hard
                 # selected logits carry no useful gradient. Clear its graph.
                 rnn.workspace.pop_nth_farthest_query_predictions()
-            output = output.transpose(0, 1)  # (B, T, 92); Linear accepts non-contiguous input.
+            output = output.transpose(0, 1)  # (B, T, hidden); Linear accepts non-contiguous input.
             _slot_features = output
-            output = output_proj(output)  # (B, T, 90)
-            if workspace_slot_readout:
-                output = rnn.apply_slot_readout(
-                    output,
-                    _slot_features,
-                    hidden,
-                    answer_mask,
-                    copy_source_token_ids=(key_value_metadata or {}).get("workspace_copy_source_token_ids"),
-                    copy_source_mask=(key_value_metadata or {}).get("workspace_copy_source_mask"),
-                )
+            sparse_positions = None
+            if language_sparse_projection:
+                sparse_positions = language_sparse_positions
+                sparse_rows, sparse_times = sparse_positions[:, 0], sparse_positions[:, 1]
+                sparse_features = _slot_features[sparse_rows, sparse_times]
+                output = output_proj(sparse_features)
+                if workspace_slot_readout:
+                    output = rnn.apply_slot_readout_sparse(
+                        output,
+                        sparse_features,
+                        hidden,
+                        sparse_rows,
+                        sparse_times,
+                        answer_mask[sparse_rows, sparse_times].bool(),
+                        copy_source_token_ids=(key_value_metadata or {}).get("workspace_copy_source_token_ids"),
+                        copy_source_mask=(key_value_metadata or {}).get("workspace_copy_source_mask"),
+                    )
+            else:
+                output = output_proj(_slot_features)  # (B, T, vocab)
+                if workspace_slot_readout:
+                    output = rnn.apply_slot_readout(
+                        output,
+                        _slot_features,
+                        hidden,
+                        answer_mask,
+                        copy_source_token_ids=(key_value_metadata or {}).get("workspace_copy_source_token_ids"),
+                        copy_source_mask=(key_value_metadata or {}).get("workspace_copy_source_mask"),
+                    )
             key_value_predictions = []
             if workspace_key_value_loss_weight > 0:
                 workspace_module = getattr(rnn, "workspace", None)
                 if workspace_module is None or key_value_metadata is None:
                     raise RuntimeError("workspace key-value supervision has no active readout")
                 key_value_predictions = workspace_module.pop_key_value_predictions()
-                output = dataset.apply_workspace_key_value_readout_logits(
-                    output,
-                    key_value_predictions,
-                    key_value_metadata,
-                    answer_mask,
-                    exact_value_comparison=workspace_exact_value_comparison,
-                    exact_selection=workspace_exact_selection,
-                    exact_no_report_readout=workspace_no_report_confidence_readout,
-                )
+                if sparse_positions is not None:
+                    output = dataset.apply_workspace_key_value_readout_sparse(
+                        output, sparse_positions, key_value_predictions,
+                        key_value_metadata, answer_mask,
+                    )
+                else:
+                    output = dataset.apply_workspace_key_value_readout_logits(
+                        output,
+                        key_value_predictions,
+                        key_value_metadata,
+                        answer_mask,
+                        exact_value_comparison=workspace_exact_value_comparison,
+                        exact_selection=workspace_exact_selection,
+                        exact_no_report_readout=workspace_no_report_confidence_readout,
+                    )
             if workspace_permutation_transactional:
                 workspace_module = getattr(rnn, "workspace", None)
                 if workspace_module is None:
@@ -6157,7 +6257,11 @@ def run(
                     f"[{run_id}] non-finite output logits at step {step}; "
                     "stopping before backward/optimizer update to protect the checkpoint."
                 )
-            task_loss = dataset.loss(output, target_digits, answer_mask)
+            task_loss = (
+                dataset.loss_sparse(output, target_digits, answer_mask, sparse_positions)
+                if sparse_positions is not None
+                else dataset.loss(output, target_digits, answer_mask)
+            )
             if workspace_key_value_loss_weight > 0:
                 workspace_key_value_loss = dataset.workspace_key_value_loss(
                     key_value_predictions,
@@ -6174,12 +6278,24 @@ def run(
                             # Train answer-time key selection directly. The target
                             # is auxiliary supervision only; inference still has
                             # to predict the key from the answer-prefix features.
-                            workspace_key_value_loss = workspace_key_value_loss + (
-                                workspace_module.slot_pointer_loss(
+                            if sparse_positions is not None:
+                                pointer_positions = slot_target_ids.ge(0).nonzero(as_tuple=False)
+                                pointer_rows, pointer_times = pointer_positions[:, 0], pointer_positions[:, 1]
+                                pointer_features = _slot_features[pointer_rows, pointer_times].unsqueeze(1)
+                                pointer_state = slot_state.index_select(0, pointer_rows)
+                                pointer_targets = slot_target_ids[pointer_rows, pointer_times].unsqueeze(1)
+                                match_keys = hidden[0].get("_initium_workspace_match_keys")
+                                if match_keys is not None:
+                                    match_keys = match_keys.index_select(0, pointer_rows)
+                                pointer_loss = workspace_module.slot_pointer_loss(
+                                    pointer_features, pointer_state, pointer_targets, match_keys,
+                                )
+                            else:
+                                pointer_loss = workspace_module.slot_pointer_loss(
                                     _slot_features, slot_state, slot_target_ids,
                                     hidden[0].get("_initium_workspace_match_keys"),
-                                ).to(dtype=task_loss.dtype)
-                            )
+                                )
+                            workspace_key_value_loss = workspace_key_value_loss + pointer_loss.to(dtype=task_loss.dtype)
                 copy_source_mask = (key_value_metadata or {}).get(
                     "workspace_copy_source_mask"
                 )
@@ -6203,15 +6319,26 @@ def run(
                     copy_source_features = torch.nn.functional.embedding(
                         copy_source_token_ids, copy_adapter.weight.T
                     )
-                    workspace_key_value_loss = workspace_key_value_loss + (
-                        workspace_module.context_copy_loss(
+                    if sparse_positions is not None:
+                        copy_positions = copy_target_token_ids.ge(0).nonzero(as_tuple=False)
+                        copy_rows, copy_times = copy_positions[:, 0], copy_positions[:, 1]
+                        copy_features = _slot_features[copy_rows, copy_times].unsqueeze(1)
+                        copy_loss = workspace_module.context_copy_loss(
+                            copy_features,
+                            copy_source_features.index_select(0, copy_rows),
+                            copy_source_token_ids.index_select(0, copy_rows),
+                            copy_source_mask.index_select(0, copy_rows),
+                            copy_target_token_ids[copy_rows, copy_times].unsqueeze(1),
+                        )
+                    else:
+                        copy_loss = workspace_module.context_copy_loss(
                             _slot_features,
                             copy_source_features,
                             copy_source_token_ids,
                             copy_source_mask,
                             copy_target_token_ids,
-                        ).to(dtype=task_loss.dtype)
-                    )
+                        )
+                    workspace_key_value_loss = workspace_key_value_loss + copy_loss.to(dtype=task_loss.dtype)
                 binding_aux_targets = key_value_metadata.get("workspace_binding_aux_targets")
                 if binding_aux_targets is not None:
                     binding_mask = binding_aux_targets.ge(0)
@@ -6221,8 +6348,19 @@ def run(
                         # query token before serializing the full answer.
                         # These labels are only attached to query positions,
                         # after the in-context examples have been observed.
+                        if sparse_positions is not None:
+                            binding_rows, binding_times = binding_mask.nonzero(as_tuple=True)
+                            sparse_index = torch.full(
+                                binding_mask.shape, -1, device=output.device, dtype=torch.long
+                            )
+                            sparse_index[sparse_positions[:, 0], sparse_positions[:, 1]] = torch.arange(
+                                sparse_positions.shape[0], device=output.device
+                            )
+                            binding_logits = output[sparse_index[binding_rows, binding_times]]
+                        else:
+                            binding_logits = output[binding_mask]
                         workspace_key_value_loss = workspace_key_value_loss + nn.functional.cross_entropy(
-                            output[binding_mask],
+                            binding_logits,
                             binding_aux_targets[binding_mask].to(dtype=torch.long),
                         ).to(dtype=task_loss.dtype) * 2.0
                 if workspace_attentional_cue_readout:
@@ -6469,7 +6607,7 @@ def run(
             pop_total_moe_aux_loss(
                 rnn.moe_layers,
                 include_diagnostics=(
-                    moe_diagnostics_enabled and running_log_steps + 1 >= log_every
+                    moe_diagnostics_enabled and running_micro_steps + 1 >= log_every
                 ),
             )
             if moe_enabled
@@ -6548,8 +6686,16 @@ def run(
             )
         if split_graph_forward_trace is not None:
             split_graph_forward_trace.end_step(step)
+        # A split language batch is one optimizer example made of several
+        # recurrent forwards. Keep answer CE at full scale (answers occur in
+        # the terminal segment), and average the per-segment auxiliary losses
+        # so context/workspace supervision does not grow with chain length.
+        segment_loss_weight = float(getattr(dataset, "segment_loss_weight", 1.0))
+        backward_loss = segment_loss_weight * (
+            task_loss + (loss - task_loss) / chain_steps
+        )
         try:
-            scaler.scale(loss).backward()
+            scaler.scale(backward_loss).backward()
         except RuntimeError:
             if anomaly_this_step:
                 # Anomaly detection raises as soon as one backward node emits
@@ -6564,202 +6710,208 @@ def run(
             segment_diagnostics.set_nonfinite_trace(False)
         if dnc_trace_this_step and isinstance(rnn, SplitGraphDNC):
             rnn.memories[0].set_backward_trace(False, step=step)
-        scaler.unscale_(optimizer)
-        bistable_debug_gradient_stats: dict[str, tuple[float, float, int]] = {}
-        bistable_debug_parameter_before: dict[str, torch.Tensor] = {}
-        if workspace_bistable_debug and isinstance(rnn, SplitGraphDNC):
-            assert rnn.workspace is not None and rnn.workspace.bistable_gate is not None
-            for name, parameter in rnn.workspace.bistable_gate.named_parameters():
-                bistable_debug_parameter_before[name] = parameter.detach().clone()
-                gradient = parameter.grad
-                if gradient is None:
-                    bistable_debug_gradient_stats[name] = (0.0, 0.0, 0)
-                    continue
-                finite_mask = torch.isfinite(gradient)
-                finite_gradient = torch.where(finite_mask, gradient, 0.0).detach().float()
-                finite_count = int(finite_mask.sum().item())
-                nonfinite_count = gradient.numel() - finite_count
-                norm = float(torch.linalg.vector_norm(finite_gradient.to(torch.float64)).cpu())
-                absmax = float(finite_gradient.abs().max().cpu())
-                bistable_debug_gradient_stats[name] = (
-                    norm,
-                    absmax,
-                    nonfinite_count,
-                )
-        independent_grad_norm = None
-        if bistable_grad_probe is not None:
-            step_parameter_norms = []
-            for name, parameter in trainable_named_parameters:
-                if parameter.grad is None:
-                    continue
-                parameter_norm = torch.linalg.vector_norm(
-                    parameter.grad.detach().to(dtype=torch.float64)
-                )
-                probe = bistable_grad_probe[name]
-                probe["sum_sq"].add_(parameter_norm.square())
-                probe["max_step"].copy_(
-                    torch.where(
-                        parameter_norm > probe["max"],
-                        torch.full_like(probe["max_step"], step),
-                        probe["max_step"],
+        if optimizer_update_due:
+            scaler.unscale_(optimizer)
+            bistable_debug_gradient_stats: dict[str, tuple[float, float, int]] = {}
+            bistable_debug_parameter_before: dict[str, torch.Tensor] = {}
+            if workspace_bistable_debug and isinstance(rnn, SplitGraphDNC):
+                assert rnn.workspace is not None and rnn.workspace.bistable_gate is not None
+                for name, parameter in rnn.workspace.bistable_gate.named_parameters():
+                    bistable_debug_parameter_before[name] = parameter.detach().clone()
+                    gradient = parameter.grad
+                    if gradient is None:
+                        bistable_debug_gradient_stats[name] = (0.0, 0.0, 0)
+                        continue
+                    finite_mask = torch.isfinite(gradient)
+                    finite_gradient = torch.where(finite_mask, gradient, 0.0).detach().float()
+                    finite_count = int(finite_mask.sum().item())
+                    nonfinite_count = gradient.numel() - finite_count
+                    norm = float(torch.linalg.vector_norm(finite_gradient.to(torch.float64)).cpu())
+                    absmax = float(finite_gradient.abs().max().cpu())
+                    bistable_debug_gradient_stats[name] = (
+                        norm,
+                        absmax,
+                        nonfinite_count,
                     )
-                )
-                probe["max"].copy_(torch.maximum(probe["max"], parameter_norm))
-                step_parameter_norms.append(parameter_norm)
-            if step_parameter_norms:
-                independent_grad_norm = torch.linalg.vector_norm(torch.stack(step_parameter_norms))
-                bistable_grad_probe_global_max_step.copy_(
-                    torch.where(
-                        independent_grad_norm > bistable_grad_probe_global_max,
-                        torch.full_like(bistable_grad_probe_global_max_step, step),
-                        bistable_grad_probe_global_max_step,
+            independent_grad_norm = None
+            if bistable_grad_probe is not None:
+                step_parameter_norms = []
+                for name, parameter in trainable_named_parameters:
+                    if parameter.grad is None:
+                        continue
+                    parameter_norm = torch.linalg.vector_norm(
+                        parameter.grad.detach().to(dtype=torch.float64)
                     )
-                )
-                bistable_grad_probe_global_max.copy_(
-                    torch.maximum(bistable_grad_probe_global_max, independent_grad_norm)
-                )
-                bistable_grad_probe_steps += 1
-        bistable_gate_grad_norm = 0.0
-        if workspace_gate_variant == "bistable":
-            assert isinstance(rnn, SplitGraphDNC) and rnn.workspace is not None
-            assert rnn.workspace.bistable_gate is not None
-            gate_gradient_items = [
-                (name, parameter.grad.detach())
-                for name, parameter in rnn.workspace.bistable_gate.named_parameters()
-                if parameter.grad is not None
-            ]
-            if not gate_gradient_items:
-                if workspace_bistable_debug:
-                    report_bistable_nonfinite(
-                        step,
-                        bistable_forward_debug,
-                        "no bistable gate parameter received a gradient",
+                    probe = bistable_grad_probe[name]
+                    probe["sum_sq"].add_(parameter_norm.square())
+                    probe["max_step"].copy_(
+                        torch.where(
+                            parameter_norm > probe["max"],
+                            torch.full_like(probe["max_step"], step),
+                            probe["max_step"],
+                        )
                     )
-                emit_failure_diagnostics("train", include_gradients=True)
-                raise FloatingPointError(
-                    f"[{run_id}] bistable write gate received no gradients at step {step}."
+                    probe["max"].copy_(torch.maximum(probe["max"], parameter_norm))
+                    step_parameter_norms.append(parameter_norm)
+                if step_parameter_norms:
+                    independent_grad_norm = torch.linalg.vector_norm(torch.stack(step_parameter_norms))
+                    bistable_grad_probe_global_max_step.copy_(
+                        torch.where(
+                            independent_grad_norm > bistable_grad_probe_global_max,
+                            torch.full_like(bistable_grad_probe_global_max_step, step),
+                            bistable_grad_probe_global_max_step,
+                        )
+                    )
+                    bistable_grad_probe_global_max.copy_(
+                        torch.maximum(bistable_grad_probe_global_max, independent_grad_norm)
+                    )
+                    bistable_grad_probe_steps += 1
+            bistable_gate_grad_norm = 0.0
+            if workspace_gate_variant == "bistable":
+                assert isinstance(rnn, SplitGraphDNC) and rnn.workspace is not None
+                assert rnn.workspace.bistable_gate is not None
+                gate_gradient_items = [
+                    (name, parameter.grad.detach())
+                    for name, parameter in rnn.workspace.bistable_gate.named_parameters()
+                    if parameter.grad is not None
+                ]
+                if not gate_gradient_items:
+                    if workspace_bistable_debug:
+                        report_bistable_nonfinite(
+                            step,
+                            bistable_forward_debug,
+                            "no bistable gate parameter received a gradient",
+                        )
+                    emit_failure_diagnostics("train", include_gradients=True)
+                    raise FloatingPointError(
+                        f"[{run_id}] bistable write gate received no gradients at step {step}."
+                    )
+                gate_gradients = [gradient for _, gradient in gate_gradient_items]
+                bistable_gate_grad_norm = float(
+                    torch.linalg.vector_norm(
+                        torch.cat(
+                            [gradient.to(torch.float64).reshape(-1) for gradient in gate_gradients]
+                        )
+                    ).cpu()
                 )
-            gate_gradients = [gradient for _, gradient in gate_gradient_items]
-            bistable_gate_grad_norm = float(
-                torch.linalg.vector_norm(
-                    torch.cat(
-                        [gradient.to(torch.float64).reshape(-1) for gradient in gate_gradients]
+                if not math.isfinite(bistable_gate_grad_norm) or bistable_gate_grad_norm == 0.0:
+                    gradient_debug_parts = []
+                    for name, gradient in gate_gradient_items:
+                        finite = torch.isfinite(gradient)
+                        finite_values = gradient[finite]
+                        finite_norm = (
+                            float(torch.linalg.vector_norm(finite_values.to(torch.float64)).cpu())
+                            if finite_values.numel()
+                            else 0.0
+                        )
+                        finite_absmax = (
+                            float(finite_values.abs().max().cpu()) if finite_values.numel() else 0.0
+                        )
+                        bad_count = gradient.numel() - finite_values.numel()
+                        gradient_debug_parts.append(
+                            f"{name}:finite_norm={finite_norm:.3g},"
+                            f"finite_absmax={finite_absmax:.3g},nonfinite={bad_count}"
+                        )
+                    gradient_debug = " ".join(gradient_debug_parts)
+                    if workspace_bistable_debug:
+                        report_bistable_nonfinite(step, bistable_forward_debug, gradient_debug)
+                    emit_failure_diagnostics("train", include_gradients=True)
+                    raise FloatingPointError(
+                        f"[{run_id}] bistable write gate gradient norm is "
+                        f"{bistable_gate_grad_norm} at step {step}; "
+                        f"parameter-gradient details: {gradient_debug}."
                     )
-                ).cpu()
-            )
-            if not math.isfinite(bistable_gate_grad_norm) or bistable_gate_grad_norm == 0.0:
-                gradient_debug_parts = []
-                for name, gradient in gate_gradient_items:
-                    finite = torch.isfinite(gradient)
-                    finite_values = gradient[finite]
-                    finite_norm = (
-                        float(torch.linalg.vector_norm(finite_values.to(torch.float64)).cpu())
-                        if finite_values.numel()
-                        else 0.0
-                    )
-                    finite_absmax = (
-                        float(finite_values.abs().max().cpu()) if finite_values.numel() else 0.0
-                    )
-                    bad_count = gradient.numel() - finite_values.numel()
-                    gradient_debug_parts.append(
-                        f"{name}:finite_norm={finite_norm:.3g},"
-                        f"finite_absmax={finite_absmax:.3g},nonfinite={bad_count}"
-                    )
-                gradient_debug = " ".join(gradient_debug_parts)
-                if workspace_bistable_debug:
-                    report_bistable_nonfinite(step, bistable_forward_debug, gradient_debug)
-                emit_failure_diagnostics("train", include_gradients=True)
-                raise FloatingPointError(
-                    f"[{run_id}] bistable write gate gradient norm is "
-                    f"{bistable_gate_grad_norm} at step {step}; "
-                    f"parameter-gradient details: {gradient_debug}."
-                )
-        # Log addition #2: capture the pre-clip gradient norm instead of
-        # discarding clip_grad_norm_'s return value. Gives a β=0 baseline
-        # gradient-scale trajectory to compare a future β>0 switch-in
-        # against, useful for telling a genuine instability apart from the
-        # expected one-off "shock" when sampling noise is switched on.
-        # Clip every parameter in this optimizer, including output_proj.
-        # Clipping only rnn.parameters() left the trainable prediction head
-        # unbounded while its gradients were still being applied by Adam.
-        if bistable_grad_probe is not None:
-            # Gate-only bistable runs have three scalar trainables. Their raw
-            # gradients can be large but finite; clipping_grad_norm_'s usual
-            # FP32 sum-of-squares can overflow before it gets a chance to
-            # rescale them. Compute the norm in FP64 and scale the original
-            # gradients directly so Adam never sees the unbounded values.
-            grad_norm = independent_grad_norm
-            if grad_norm is None:
-                grad_norm = torch.zeros((), device=device, dtype=torch.float64)
-            clip_coefficient = (max_grad_norm / grad_norm.clamp_min(1e-12)).clamp(max=1.0)
-            for parameter in trainable_parameters:
-                if parameter.grad is not None:
-                    parameter.grad.mul_(clip_coefficient.to(parameter.grad.dtype))
-            postclip_grad_norm = grad_norm * clip_coefficient
-        else:
-            try:
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    trainable_parameters, max_norm=max_grad_norm, error_if_nonfinite=True
-                )
-                # clip_grad_norm_ scales every gradient by this shared
-                # coefficient. Derive the resulting norm from its returned
-                # pre-clip norm instead of making another full pass over all
-                # model gradients on every training step.
-                clip_coefficient = (max_grad_norm / (grad_norm + 1e-6)).clamp(max=1.0)
+            # Log addition #2: capture the pre-clip gradient norm instead of
+            # discarding clip_grad_norm_'s return value. Gives a β=0 baseline
+            # gradient-scale trajectory to compare a future β>0 switch-in
+            # against, useful for telling a genuine instability apart from the
+            # expected one-off "shock" when sampling noise is switched on.
+            # Clip every parameter in this optimizer, including output_proj.
+            # Clipping only rnn.parameters() left the trainable prediction head
+            # unbounded while its gradients were still being applied by Adam.
+            if bistable_grad_probe is not None:
+                # Gate-only bistable runs have three scalar trainables. Their raw
+                # gradients can be large but finite; clipping_grad_norm_'s usual
+                # FP32 sum-of-squares can overflow before it gets a chance to
+                # rescale them. Compute the norm in FP64 and scale the original
+                # gradients directly so Adam never sees the unbounded values.
+                grad_norm = independent_grad_norm
+                if grad_norm is None:
+                    grad_norm = torch.zeros((), device=device, dtype=torch.float64)
+                clip_coefficient = (max_grad_norm / grad_norm.clamp_min(1e-12)).clamp(max=1.0)
+                for parameter in trainable_parameters:
+                    if parameter.grad is not None:
+                        parameter.grad.mul_(clip_coefficient.to(parameter.grad.dtype))
                 postclip_grad_norm = grad_norm * clip_coefficient
-            except RuntimeError as error:
-                if "non-finite" not in str(error):
-                    raise
-                # error_if_nonfinite raises before applying the clip coefficient,
-                # preserving the original bad gradients for the diagnostic below.
-                grad_norm = torch.tensor(float("nan"), device=device)
-                postclip_grad_norm = torch.tensor(float("nan"), device=device)
-        grad_norm_value = float(grad_norm)
-        postclip_grad_norm_value = float(postclip_grad_norm)
-        bistable_optimizer_updated = False
-        if independent_grad_norm is not None and math.isfinite(grad_norm_value):
-            relative_error = (
-                independent_grad_norm - grad_norm.detach().to(dtype=torch.float64)
-            ).abs() / independent_grad_norm.clamp_min(1e-12)
-            bistable_grad_probe_relative_error.copy_(
-                torch.maximum(bistable_grad_probe_relative_error, relative_error)
-            )
-        if not math.isfinite(grad_norm_value):
-            if workspace_bistable_debug:
-                gradient_debug = " ".join(
-                    f"{name}:norm={norm:.3g},absmax={absmax:.3g},nonfinite={bad}"
-                    for name, (norm, absmax, bad) in bistable_debug_gradient_stats.items()
+            else:
+                try:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        trainable_parameters, max_norm=max_grad_norm, error_if_nonfinite=True
+                    )
+                    # clip_grad_norm_ scales every gradient by this shared
+                    # coefficient. Derive the resulting norm from its returned
+                    # pre-clip norm instead of making another full pass over all
+                    # model gradients on every training step.
+                    clip_coefficient = (max_grad_norm / (grad_norm + 1e-6)).clamp(max=1.0)
+                    postclip_grad_norm = grad_norm * clip_coefficient
+                except RuntimeError as error:
+                    if "non-finite" not in str(error):
+                        raise
+                    # error_if_nonfinite raises before applying the clip coefficient,
+                    # preserving the original bad gradients for the diagnostic below.
+                    grad_norm = torch.tensor(float("nan"), device=device)
+                    postclip_grad_norm = torch.tensor(float("nan"), device=device)
+            grad_norm_value = float(grad_norm)
+            postclip_grad_norm_value = float(postclip_grad_norm)
+            bistable_optimizer_updated = False
+            if independent_grad_norm is not None and math.isfinite(grad_norm_value):
+                relative_error = (
+                    independent_grad_norm - grad_norm.detach().to(dtype=torch.float64)
+                ).abs() / independent_grad_norm.clamp_min(1e-12)
+                bistable_grad_probe_relative_error.copy_(
+                    torch.maximum(bistable_grad_probe_relative_error, relative_error)
                 )
-                report_bistable_nonfinite(step, bistable_forward_debug, gradient_debug)
-            grad_was_finite_since_eval = False
-            consecutive_nonfinite_grad_steps += 1
-            running_nonfinite_grad_steps += 1
-            _report_first_nonfinite_gradient(
-                [(f"rnn.{name}", parameter) for name, parameter in rnn.named_parameters()]
-                + [
-                    (f"output_proj.{name}", parameter)
-                    for name, parameter in output_proj.named_parameters()
-                ],
-                step,
-            )
-            emit_failure_diagnostics("train", include_gradients=True)
-            # Skip this optimizer update. GradScaler's found_inf scan happens
-            # during unscale_; the explicit finite-norm check also covers
-            # non-finite gradients that arise after that scan.
-            optimizer.zero_grad(set_to_none=True)
-            scaler.update()
-            if consecutive_nonfinite_grad_steps >= 8:
-                raise FloatingPointError(
-                    f"[{run_id}] {consecutive_nonfinite_grad_steps} consecutive optimizer "
-                    f"steps had non-finite gradients (AMP scale={scaler.get_scale():.4g}); "
-                    "stopping rather than silently training without parameter updates."
+            if not math.isfinite(grad_norm_value):
+                if workspace_bistable_debug:
+                    gradient_debug = " ".join(
+                        f"{name}:norm={norm:.3g},absmax={absmax:.3g},nonfinite={bad}"
+                        for name, (norm, absmax, bad) in bistable_debug_gradient_stats.items()
+                    )
+                    report_bistable_nonfinite(step, bistable_forward_debug, gradient_debug)
+                grad_was_finite_since_eval = False
+                consecutive_nonfinite_grad_steps += 1
+                running_nonfinite_grad_steps += 1
+                _report_first_nonfinite_gradient(
+                    [(f"rnn.{name}", parameter) for name, parameter in rnn.named_parameters()]
+                    + [
+                        (f"output_proj.{name}", parameter)
+                        for name, parameter in output_proj.named_parameters()
+                    ],
+                    step,
                 )
+                emit_failure_diagnostics("train", include_gradients=True)
+                # Skip this optimizer update. GradScaler's found_inf scan happens
+                # during unscale_; the explicit finite-norm check also covers
+                # non-finite gradients that arise after that scan.
+                optimizer.zero_grad(set_to_none=True)
+                scaler.update()
+                if consecutive_nonfinite_grad_steps >= 8:
+                    raise FloatingPointError(
+                        f"[{run_id}] {consecutive_nonfinite_grad_steps} consecutive optimizer "
+                        f"steps had non-finite gradients (AMP scale={scaler.get_scale():.4g}); "
+                        "stopping rather than silently training without parameter updates."
+                    )
+            else:
+                consecutive_nonfinite_grad_steps = 0
+                scaler.step(optimizer)
+                scaler.update()
+                bistable_optimizer_updated = True
         else:
-            consecutive_nonfinite_grad_steps = 0
-            scaler.step(optimizer)
-            scaler.update()
-            bistable_optimizer_updated = True
-        if workspace_bistable_debug and isinstance(rnn, SplitGraphDNC):
+            independent_grad_norm = None
+            grad_norm_value = 0.0
+            postclip_grad_norm_value = 0.0
+            bistable_optimizer_updated = False
+        if optimizer_update_due and workspace_bistable_debug and isinstance(rnn, SplitGraphDNC):
             assert rnn.workspace is not None and rnn.workspace.bistable_gate is not None
             clip_scale = (
                 min(1.0, max_grad_norm / max(grad_norm_value, 1e-12))
@@ -6813,7 +6965,7 @@ def run(
         # numerically fragile part of this pipeline, so a clean β=0 baseline
         # of scaler behavior is useful context once β>0 introduces that path.
         amp_scale = scaler.get_scale()
-        running_task_loss += task_loss.detach()
+        running_task_loss += task_loss.detach() * segment_loss_weight
         running_kl_loss += kl_loss.detach()
         if workspace_state_loss is not None:
             running_workspace_state_loss += workspace_state_loss.detach()
@@ -6835,8 +6987,13 @@ def run(
             running_retrieval_query_slots += retrieval_query_slots.detach()
         if prediction_loss is not None:
             running_sgr_prediction_loss += prediction_loss.detach()
-        running_div += dataset.diversity(output.detach(), target_digits, answer_mask)
-        if math.isfinite(grad_norm_value):
+        if sparse_positions is not None and hasattr(dataset, "diversity_sparse"):
+            running_div += dataset.diversity_sparse(
+                output.detach(), answer_mask, sparse_positions
+            )
+        else:
+            running_div += dataset.diversity(output.detach(), target_digits, answer_mask)
+        if optimizer_update_due and math.isfinite(grad_norm_value):
             running_grad_norm += grad_norm_value
             running_postclip_grad_norm += postclip_grad_norm_value
             running_finite_grad_steps += 1
@@ -6849,8 +7006,11 @@ def run(
                 value = step_workspace_diag.get(name)
                 if value is not None:
                     total.add_(value.detach())
-        step += 1
+        if optimizer_update_due:
+            step += 1
         if (
+            optimizer_update_due
+            and
             workspace_adaptive_v3_enabled
             and workspace_adaptive_v3_teacher_anneal_steps > 0
             and step % 100 == 0
@@ -6884,8 +7044,9 @@ def run(
                         adaptive_v3_teacher_weight_current + delta,
                     )
 
-        running_log_steps += 1
-        if alloc_enabled and not workspace_allocator_label_addresses_only and step % 100 == 0 and rnn.allocator_stats:
+        running_log_steps += int(optimizer_update_due)
+        running_micro_steps += 1
+        if optimizer_update_due and alloc_enabled and not workspace_allocator_label_addresses_only and step % 100 == 0 and rnn.allocator_stats:
             _d = 100.0 / max(1, workspace_allocator_anneal_steps)
             _acc = min(float(v) for v in rnn.allocator_stats.values())
             # Predicted addresses are not aligned with the gold KV/readout
@@ -6905,7 +7066,8 @@ def run(
                 + ",".join(f"{k}:{float(v):.3f}" for k, v in rnn.allocator_stats.items())
                 + f" predicted-key prob={alloc_p:.3f}"
             )
-        current_lr = set_lr(step)  # Phase 1 FIX: clamped manual LR, replaces scheduler.step()
+        if optimizer_update_due:
+            current_lr = set_lr(step)  # Phase 1 FIX: clamped manual LR, replaces scheduler.step()
 
         # Dynamic-N (usage-triggered), macro-scale: record this just-finished
         # episode's memory-usage saturation and, if the trigger has been
@@ -6923,7 +7085,7 @@ def run(
         # (micro-scale) variant reuse the same decision core fed from a
         # per-timestep usage reading instead, without redesigning the
         # EMA/cooldown logic.
-        if dynamic_n_ctrl is not None:
+        if optimizer_update_due and dynamic_n_ctrl is not None:
             with torch.no_grad():
                 # mem_hidden's shape differs by controller: MambaDNC's
                 # _init_hidden returns mhx as a bare dict for rnn_type!=
@@ -6967,7 +7129,8 @@ def run(
                 dynamic_n_log_file.flush()
 
         if running_log_steps >= log_every:
-            window_steps = running_log_steps
+            window_steps = max(running_micro_steps, 1)
+            window_optimizer_steps = running_log_steps
             # CUDA launches are asynchronous. Synchronize at the measurement
             # boundary, then report training throughput with periodic
             # evaluation time removed (evaluation remains reported separately).
@@ -6981,7 +7144,7 @@ def run(
                 running_task_loss.item()
                 if torch.is_tensor(running_task_loss)
                 else running_task_loss
-            ) / window_steps
+            ) / max(window_optimizer_steps, 1)
             avg_workspace_state_loss = (
                 (
                     running_workspace_state_loss.item()
@@ -7128,7 +7291,11 @@ def run(
             avg_kl = (
                 running_kl_loss.item() if torch.is_tensor(running_kl_loss) else running_kl_loss
             ) / window_steps
-            avg_div = running_div / window_steps
+            avg_div = (
+                float(running_div.item()) / window_steps
+                if torch.is_tensor(running_div)
+                else running_div / window_steps
+            )
             avg_grad_norm = running_grad_norm / max(running_finite_grad_steps, 1)
             avg_postclip_grad_norm = running_postclip_grad_norm / max(running_finite_grad_steps, 1)
             kl_contrib = (
@@ -7219,7 +7386,8 @@ def run(
                 ]
             parts += [
                 f"diversity {avg_div:.2f}",
-                f"{window_steps / elapsed:.2f} steps/s",
+                f"{window_optimizer_steps / elapsed:.2f} optimizer_steps/s "
+                f"{window_steps / elapsed:.2f} segment_steps/s",
                 f"eval_overhead {running_eval_seconds:.1f}s",
                 f"LR {current_lr:.6f}",
                 f"grad_norm {avg_grad_norm:.4g}",
@@ -7741,6 +7909,7 @@ def run(
             running_retrieval_query_found = 0.0
             running_retrieval_query_slots = 0.0
             running_log_steps = 0
+            running_micro_steps = 0
             running_eval_seconds = 0.0
             running_v3_candidate_tokens = 0
             running_v3_executed_tokens = 0
@@ -7820,8 +7989,8 @@ def run(
         per_value_loss = None
         prediction_logits = backbone_features = None
 
-        evaluation_started_at = time.time() if step % EVAL_EVERY == 0 else None
-        if step % EVAL_EVERY == 0:
+        evaluation_started_at = time.time() if optimizer_update_due and step % EVAL_EVERY == 0 else None
+        if optimizer_update_due and step % EVAL_EVERY == 0:
             pre_advance_lesson = curriculum.lesson  # capture before maybe_advance can bump it
             id_stage_memory = rnn.memories[0]
             id_usage_handles, id_usage_capture = _attach_memory_usage_hooks(rnn)
@@ -8396,7 +8565,7 @@ def run(
             t0 += evaluation_seconds
             running_eval_seconds += evaluation_seconds
 
-        if step % checkpoint_every == 0 or step == total_steps:
+        if optimizer_update_due and (step % checkpoint_every == 0 or step == total_steps):
             ckpt_path = os.path.join(CHECKPOINT_DIR, f"{run_id}_step{step}.pt")
             save_checkpoint(
                 ckpt_path,

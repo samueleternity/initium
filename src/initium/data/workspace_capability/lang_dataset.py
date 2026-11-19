@@ -79,6 +79,12 @@ class LanguageDataset(WorkspaceCapabilityDataset):
         self._track_optimizer_step_counts: dict[str, int] = defaultdict(int)
         self._track_sampled_episode_counts: dict[str, int] = defaultdict(int)
         self._track_sampled_batch_counts: dict[str, int] = defaultdict(int)
+        self._track_group_sampling_weights: dict[str, dict[str, float]] = {}
+        self._pending_chain_tracks: set[str] = set()
+        self.segment_chain_start = True
+        self.segment_chain_complete = True
+        self.segment_chain_steps = 1
+        self.segment_loss_weight = 1.0
 
     @staticmethod
     def slot_text_columns():
@@ -135,6 +141,9 @@ class LanguageDataset(WorkspaceCapabilityDataset):
         if isinstance(level, dict):
             track_level = int(level.get(track, 0))
         cfg = difficulty_for(track, track_level, ood=ood, ood_axes=ood_axes)
+        group_weights = self._track_group_sampling_weights.get(track)
+        if group_weights:
+            cfg["_group_sampling_weights"] = group_weights
         generate = _GEN[track]
         for _ in range(_RETRIES):
             try:
@@ -328,8 +337,6 @@ class LanguageDataset(WorkspaceCapabilityDataset):
     def _emit(self, group, cont):
         group = [g if g is not None else _DUMMY for g in group]
         self.last_batch_examples, self.segment_continue = group, cont
-        for track in {episode.track for episode in group if episode is not _DUMMY}:
-            self._track_optimizer_step_counts[track] += 1
         x, y, m = self._collate(group, token_ids_only=True, teacher_forced=self.teacher_forced_answers)
         m[torch.tensor([g is _DUMMY for g in group])] = 0.0
         for row, episode in enumerate(group):
@@ -339,7 +346,16 @@ class LanguageDataset(WorkspaceCapabilityDataset):
 
     def sample_batch(self, curriculum, batch_size):
         if self._seg_queue:
-            return self._emit(self._seg_queue.pop(0), True)
+            group, cont, steps, weight, chain_start, chain_complete = self._seg_queue.pop(0)
+            self.segment_chain_start = chain_start
+            self.segment_chain_complete = chain_complete and not self._seg_queue
+            self.segment_chain_steps = steps
+            self.segment_loss_weight = weight
+            if self.segment_chain_complete:
+                for track in self._pending_chain_tracks:
+                    self._track_optimizer_step_counts[track] += 1
+                self._pending_chain_tracks.clear()
+            return self._emit(group, cont)
         batch = super().sample_batch(curriculum, batch_size)
         sampled_tracks = [
             episode.track
@@ -352,14 +368,137 @@ class LanguageDataset(WorkspaceCapabilityDataset):
             self._track_sampled_batch_counts[track] += 1
         self.segment_continue = False
         chains = [tuple(e.metadata.get("prev", ())) + (e,) for e in self.last_batch_examples]
-        n = max(map(len, chains))
-        if n == 1:
-            for track in {episode.track for episode in self.last_batch_examples}:
+        self._pending_chain_tracks = {
+            episode.track for episode in self.last_batch_examples if episode is not _DUMMY
+        }
+        buckets: dict[int, list] = defaultdict(list)
+        for episode, chain in zip(self.last_batch_examples, chains):
+            buckets[len(chain)].append((episode, chain))
+        ordered = [sorted(buckets[n], key=lambda item: len(item[0].sequence)) for n in sorted(buckets)]
+        total_episodes = max(1, len(self.last_batch_examples))
+        segments = []
+        for bucket_index, bucket in enumerate(ordered):
+            n = len(bucket[0][1])
+            group_weight = len(bucket) / total_episodes
+            for segment_index in range(n):
+                group = [chain[segment_index] for _, chain in bucket]
+                segments.append(
+                    (
+                        group,
+                        segment_index > 0,
+                        n,
+                        group_weight,
+                        bucket_index == 0 and segment_index == 0,
+                        bucket_index == len(ordered) - 1 and segment_index == n - 1,
+                    )
+                )
+        self._seg_queue = segments[1:]
+        group, cont, steps, weight, chain_start, _complete = segments[0]
+        self.segment_chain_start = chain_start
+        self.segment_chain_complete = _complete and not self._seg_queue
+        self.segment_chain_steps = steps
+        self.segment_loss_weight = weight
+        if self.segment_chain_complete:
+            for track in self._pending_chain_tracks:
                 self._track_optimizer_step_counts[track] += 1
-            return batch
-        steps = [[c[i - (n - len(c))] if i >= n - len(c) else None for c in chains] for i in range(n)]
-        self._seg_queue = steps[1:]
-        return self._emit(steps[0], False)
+            self._pending_chain_tracks.clear()
+        return self._emit(group, cont)
+
+    @property
+    def has_pending_chain_segments(self):
+        return bool(self._seg_queue)
+
+    def loss(self, output, target, mask):
+        """Average answer loss per example so long rationales do not dominate mixed batches."""
+        if output.shape[:-1] != target.shape or target.shape != mask.shape:
+            raise ValueError("output, target, and mask batch/time dimensions must match")
+        valid = mask.bool()
+        locations = torch.nonzero(valid, as_tuple=False)
+        if locations.numel() == 0:
+            return output.new_zeros((), requires_grad=output.requires_grad)
+        token_loss = torch.nn.functional.cross_entropy(
+            output[valid].float(), target[valid], reduction="none"
+        )
+        counts = valid.sum(dim=1).to(token_loss.dtype)
+        active_rows = counts.gt(0)
+        per_example_sum = token_loss.new_zeros((target.shape[0],)).scatter_add(
+            0, locations[:, 0], token_loss
+        )
+        per_example = per_example_sum / counts.clamp_min(1)
+        return per_example[active_rows].mean()
+
+    @staticmethod
+    def loss_sparse(logits, target, mask, positions):
+        """Per-example answer CE for logits projected only at selected positions."""
+        if logits.ndim != 2 or positions.ndim != 2 or positions.shape[-1] != 2:
+            raise ValueError("sparse language loss expects [positions,vocab] logits and [N,2] coordinates")
+        if positions.shape[0] != logits.shape[0]:
+            raise ValueError("sparse language logits and coordinates differ in length")
+        if logits.shape[0] == 0:
+            return logits.new_zeros((), requires_grad=logits.requires_grad)
+        rows, times = positions[:, 0], positions[:, 1]
+        active = mask[rows, times].bool()
+        sparse_targets = target[rows, times].masked_fill(~active, -100)
+        token_loss = torch.nn.functional.cross_entropy(
+            logits.float(), sparse_targets, reduction="none", ignore_index=-100
+        )
+        valid_weight = active.to(token_loss.dtype)
+        counts = token_loss.new_zeros((target.shape[0],)).scatter_add(0, rows, valid_weight)
+        sums = token_loss.new_zeros((target.shape[0],)).scatter_add(0, rows, token_loss)
+        has_answer = counts.gt(0).to(token_loss.dtype)
+        per_example = sums / counts.clamp_min(1.0)
+        return (per_example * has_answer).sum() / has_answer.sum().clamp_min(1.0)
+
+    @staticmethod
+    def diversity_sparse(logits, mask, positions):
+        if logits.shape[0] == 0:
+            return logits.new_zeros(())
+        rows, times = positions[:, 0], positions[:, 1]
+        active = mask[rows, times].bool()
+        prediction = logits.argmax(dim=-1)
+        histogram = torch.bincount(
+            prediction,
+            weights=active.to(dtype=torch.float32),
+            minlength=logits.shape[-1],
+        )
+        # Keep this as a device scalar. The training loop transfers it only
+        # once when it emits the periodic log, rather than synchronizing each
+        # segment to convert a unique-count to Python float.
+        return histogram.ne(0).sum().to(dtype=logits.dtype)
+
+    @staticmethod
+    def apply_workspace_key_value_readout_sparse(logits, positions, predictions, metadata, answer_mask):
+        """Route language answer positions without materializing dense vocabulary logits."""
+        if not predictions:
+            return logits
+        if metadata.get("key_value_output_programs"):
+            raise ValueError("sparse language readout does not support structured KV output programs")
+        rows, times = positions[:, 0], positions[:, 1]
+        masks = metadata["key_value_mask"].to(device=logits.device)
+        route_mask = metadata.get("key_value_route_mask")
+        if route_mask is not None:
+            route_mask = route_mask.to(device=logits.device).bool()
+        answer_mask = answer_mask.to(device=logits.device).bool()
+        result = logits
+        for step, value_logits in predictions:
+            step = int(step)
+            if not 0 <= step < answer_mask.shape[1]:
+                continue
+            # Work over the already-gathered sparse answer rows. Avoid
+            # per-step CUDA nonzero()/Python truth checks, which synchronize
+            # the device for each workspace prediction time.
+            active = (
+                times.eq(step)
+                & masks[rows, times, 0]
+                & answer_mask[rows, times]
+            )
+            if route_mask is not None:
+                active &= route_mask[rows, times]
+            routed = value_logits[:, 0].index_select(0, rows).to(
+                device=logits.device, dtype=logits.dtype
+            )
+            result = torch.where(active.unsqueeze(-1), routed, result)
+        return result
 
     def _evaluate_episodes(self, model, device, episodes, **kw):
         if not any(e.metadata.get("prev") for e in episodes) or not hasattr(model, "_initium_carry"):
@@ -586,8 +725,21 @@ class LanguageDataset(WorkspaceCapabilityDataset):
                 and "exact_match" in group_values
             ]
             weight_basis_exact[track] = min(group_scores) if group_scores else float(values["exact_match"])
+        self._track_group_sampling_weights = {
+            track: {
+                group: max(
+                    0.05,
+                    0.05 + max(0.0, 0.9 - float(group_values.get("exact_match", 0.0)) / 100.0),
+                )
+                for group, group_values in progression_groups.get(track, {}).items()
+                if group_values.get("episodes", 0) > 0
+            }
+            for track in diagnostics.get("tracks", {})
+        }
         raw_weights = {
-            track: 0.02 if track == "lang_open" else 0.02 + max(
+            # Keep solved Stage-4 tracks in the replay mixture so they retain
+            # a meaningful minimum share while weak Stage-5 tracks are favored.
+            track: 0.05 if track == "lang_open" else 0.05 + max(
                 0.0, 0.9 - weight_basis_exact[track] / 100.0
             )
             for track in diagnostics.get("tracks", {})
@@ -610,7 +762,7 @@ class LanguageDataset(WorkspaceCapabilityDataset):
             # operation. Capping it below the ordinary ceiling caused its low
             # exact score to persist while it received less training.
             cap_scale = 3.0 if track == "lang_induce" else (1.5 if track in stalled else 3.0)
-            self._track_weights[track] = min(weight, max(0.02, cap_scale * median))
+            self._track_weights[track] = min(weight, max(0.05, cap_scale * median))
         sampled_steps = dict(self._track_optimizer_step_counts)
         sampled_episodes = dict(self._track_sampled_episode_counts)
         sampled_batches = dict(self._track_sampled_batch_counts)
@@ -633,6 +785,10 @@ class LanguageDataset(WorkspaceCapabilityDataset):
                 "next_sampling_share_pct": 100.0 * weight / max(weight_total, 1e-12),
             }
             for track, weight in sorted(self._track_weights.items())
+        }
+        diagnostics["group_sampling_weights"] = {
+            track: dict(sorted(weights.items()))
+            for track, weights in sorted(self._track_group_sampling_weights.items())
         }
         print(
             "  [track-sampling] "
@@ -726,10 +882,18 @@ class LanguageDataset(WorkspaceCapabilityDataset):
 
     def _slot_probe(self, model, device, episodes):
         """Slot-content decode accuracy at write time and at the final query (retention)."""
-        eps = [e for e in episodes if e.metadata.get("workspace_event_writes")][: self.diag_episodes]
+        eps, selected_per_track = [], defaultdict(int)
+        for episode in episodes:
+            if not episode.metadata.get("workspace_event_writes"):
+                continue
+            if selected_per_track[episode.track] >= self.diag_episodes:
+                continue
+            eps.append(episode)
+            selected_per_track[episode.track] += 1
         if not eps:
             return {}
         stats: dict[tuple[str, str], list[int]] = defaultdict(lambda: [0, 0])
+        track_stats: dict[tuple[str, str, str], list[int]] = defaultdict(lambda: [0, 0])
 
         def tally(group, _preds, kv, kv_preds):
             last = torch.tensor([len(e.inputs) - 1 for e in group]).unsqueeze(-1)
@@ -746,16 +910,33 @@ class LanguageDataset(WorkspaceCapabilityDataset):
                         sel = in_phase & kinds.eq(idx)
                         stats[(phase, name)][0] += int((hit & sel).sum())
                         stats[(phase, name)][1] += int(sel.sum())
+                        for row, episode in enumerate(group):
+                            row_sel = sel[row]
+                            track_stat = track_stats[(episode.track, phase, name)]
+                            track_stat[0] += int((hit[row] & row_sel).sum())
+                            track_stat[1] += int(row_sel.sum())
                     if not flag:
                         for i in range(8):
                             sel = in_phase & kinds.lt(3) & (keys % 8).eq(i)
                             stats[(phase, f"fact_{i}")][0] += int((hit & sel).sum())
                             stats[(phase, f"fact_{i}")][1] += int(sel.sum())
+                            for row, episode in enumerate(group):
+                                row_sel = sel[row]
+                                track_stat = track_stats[(episode.track, phase, f"fact_{i}")]
+                                track_stat[0] += int((hit[row] & row_sel).sum())
+                                track_stat[1] += int(row_sel.sum())
 
         self._probe_forward(model, device, eps, tally, want_kv=True)
         return {
             f"slot_probe_{phase}/{name}": {"accuracy": 100.0 * h / n, "episodes": n}
             for (phase, name), (h, n) in sorted(stats.items())
+            if n
+        } | {
+            f"slot_probe_track/{track}/{phase}/{name}": {
+                "accuracy": 100.0 * h / n,
+                "episodes": n,
+            }
+            for (track, phase, name), (h, n) in sorted(track_stats.items())
             if n
         }
 

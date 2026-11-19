@@ -162,7 +162,7 @@ def _render(cfg, w, rng):
 
 
 def _g_template(cfg, rng):
-    grp = rng.choice(cfg["groups"])
+    grp = lt.sample_group(cfg, rng)
     return _render(cfg, _world(cfg, rng, grp), rng)
 
 
@@ -183,7 +183,7 @@ def _ext_nlg(cfg, rng):
 
 
 def _g_nlg(cfg, rng):
-    grp = rng.choice(cfg["groups"])
+    grp = lt.sample_group(cfg, rng)
     if grp == "external":
         return _ext_nlg(cfg, rng)
     G = grammar()
@@ -232,7 +232,7 @@ def _obj_in(o, l):
 
 
 def _g_story(cfg, rng):
-    grp = rng.choice(cfg["groups"])
+    grp = lt.sample_group(cfg, rng)
     if grp == "external":
         return _ext_story(cfg, rng)
     ep = Ep(2)
@@ -343,7 +343,7 @@ def _turn(G, ctx, kind, prev, rng):
 
 def _g_dialogue(cfg, rng):
     G = grammar()
-    grp = rng.choice(cfg["groups"])
+    grp = lt.sample_group(cfg, rng)
     band = "B" if rng.random() < cfg["heldout"] else "A"
     hr = G.hr[band]
     heads = {}
@@ -442,7 +442,7 @@ def _corrupt(G, ws, kind, rng):
 
 def _g_probe(cfg, rng):
     G = grammar()
-    grp = rng.choice(cfg["groups"])
+    grp = lt.sample_group(cfg, rng)
     if grp == "external":
         rec = rng.choice(_rows("accept", _split(cfg)))
         ep = Ep(4, annotate=False)
@@ -476,7 +476,7 @@ _STOP = frozenset("that this with from have were been they their there which wou
 
 
 def _g_open(cfg, rng):
-    grp = rng.choice(cfg["groups"])
+    grp = lt.sample_group(cfg, rng)
     rec = rng.choice(_rows("open", _split(cfg)))
     words = rec["text"].split()[: cfg["words"]]
     ep = Ep(5)

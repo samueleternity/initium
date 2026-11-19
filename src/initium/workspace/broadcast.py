@@ -1376,7 +1376,13 @@ class WorkspaceBroadcast(nn.Module):
                 # backward pass. Use the options argument without a mode
                 # argument: current PyTorch rejects specifying both.
                 fullgraph=True,
-                dynamic=False,
+                # Language segment bucketing keeps an optimizer batch mixed
+                # while running each chain-length bucket at its natural row
+                # count. The recurrence's leading batch dimension therefore
+                # varies (for example, 1..8); let Dynamo generalize that
+                # dimension after its first shape change instead of forcing a
+                # separate static full graph for every bucket size.
+                dynamic=None,
                 # Respect the lightweight default path even if the Colab
                 # process has globally enabled max-autotune. This recurrence
                 # is a small per-token graph; exhaustive GEMM tuning adds
@@ -2461,9 +2467,10 @@ class WorkspaceBroadcast(nn.Module):
                     projected_read_queries = projected_read_queries.contiguous()
         compiled_step = None
         # The fused recurrence is a training optimization. Curriculum and
-        # periodic evaluations use variable/partial batch sizes, which would
-        # otherwise create new fullgraph specializations for each batch shape.
-        # Keep evaluation on the eager path; its state transition is identical.
+        # periodic evaluations also use different batch sizes, so keep those
+        # paths eager and reserve shape specialization for training. Within
+        # training, segment bucketing can still vary the leading row count;
+        # torch.compile uses automatic dynamic-shape generalization for it.
         if (
             self.compile_recurrence
             and self.training
@@ -2702,6 +2709,13 @@ class WorkspaceBroadcast(nn.Module):
                         "InductorError",
                         "SubprocException",
                         "TritonError",
+                        # Full-graph Dynamo raises these when a legal shape
+                        # variation exhausts specialization limits. This is a
+                        # compile-path failure, not a failed workspace update;
+                        # the pre-drawn random tape lets eager replay the same
+                        # mathematically equivalent transition.
+                        "FailOnRecompileLimitHit",
+                        "Unsupported",
                     }
                     cause: BaseException | None = exc
                     is_compile_error = False

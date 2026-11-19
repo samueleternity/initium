@@ -56,6 +56,15 @@ def available_tracks():
     )
 
 
+def sample_group(cfg, rng):
+    """Pick a curriculum group, honoring optional adaptive per-group weights."""
+    groups = tuple(cfg["groups"])
+    weights = cfg.get("_group_sampling_weights", {})
+    if weights:
+        return rng.choices(groups, [max(0.05, float(weights.get(group, 1.0))) for group in groups], k=1)[0]
+    return rng.choice(groups)
+
+
 class LangTokenizer:
     """SentencePiece unigram; text piece id p -> token TEXT_BASE + p. Words are encoded independently
     (pieces never cross whitespace; equivalence with sentence-level encoding is verified by the builder)."""

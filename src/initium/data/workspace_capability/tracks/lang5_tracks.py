@@ -270,7 +270,7 @@ def _pseudo_nouns(G, words):
 
 # ---------------------------------------------------------------- 5a parse
 def _g_parse(cfg, rng):
-    G, grp = lg.grammar(), rng.choice(cfg["groups"])
+    G, grp = lg.grammar(), lt.sample_group(cfg, rng)
     w = _world(cfg, rng, "qa_wh")
     items = []
     for f in w["ctx"][: max(1, cfg["facts"])]:
@@ -302,7 +302,7 @@ def _g_parse(cfg, rng):
 
 # ---------------------------------------------------------------- 5b define
 def _g_define(cfg, rng):
-    G, grp = lg.grammar(), rng.choice(cfg["groups"])
+    G, grp = lg.grammar(), lt.sample_group(cfg, rng)
     band = "B" if rng.random() < cfg["heldout"] else "A"
     pool = G.tails[band][0]
     # Definition learning is an in-context task: the episode states a fact
@@ -366,7 +366,7 @@ def _g_define(cfg, rng):
 
 # ---------------------------------------------------------------- 5c induce
 def _g_induce(cfg, rng):
-    grp, held = rng.choice(cfg["groups"]), bool(cfg["combos"])
+    grp, held = lt.sample_group(cfg, rng), bool(cfg["combos"])
     na, pa = cfg["rules"] >= 2 or held, cfg["rules"] >= 3 or held
     order_count = max(1, min(3, int(cfg.get("orders", 3))))
     c = rng.choice(
@@ -460,7 +460,7 @@ def _join(parts):
     out[-1] += "."
     return out
 def _g_logic(cfg, rng):
-    grp, d = rng.choice(cfg["groups"]), max(1, int(cfg["depth"]))
+    grp, d = lt.sample_group(cfg, rng), max(1, int(cfg["depth"]))
     C, pl, art = pseudo(rng, d + 3), lg.plural, lg.art
     x = rng.choice(lg.NAMES)
     surf = {n: (n, n) for n in lg.NAMES}
@@ -654,7 +654,7 @@ class _W:
 
 
 def _g_discourse(cfg, rng):
-    grp, T = rng.choice(cfg["groups"]), rng.randint(1, max(1, cfg["turns"]))
+    grp, T = lt.sample_group(cfg, rng), rng.randint(1, max(1, cfg["turns"]))
     ep = Ep5(10)
     w = _W(rng, ep)
     for p in w.P:
@@ -762,7 +762,7 @@ def _act(w, act):
 
 
 def _g_act(cfg, rng):
-    grp, T = rng.choice(cfg["groups"]), rng.randint(2, max(2, cfg["turns"]))
+    grp, T = lt.sample_group(cfg, rng), rng.randint(2, max(2, cfg["turns"]))
     ep = Ep5(11)
     w = _W(rng, ep, True)
     for p in w.P:
@@ -811,7 +811,7 @@ def _g_act(cfg, rng):
 # Normalised rows (to be emitted by the corpus builder): nlu_triples {split,text,triples:[[s,r,o]]},
 # nli {split,premise,hypothesis,label}, qa {split,context,question,answer}.
 def _g_nlu(cfg, rng):
-    grp = rng.choice(cfg["groups"])
+    grp = lt.sample_group(cfg, rng)
     rec = rng.choice(_rows({"triples": "nlu_triples", "nli": "nli", "qa": "qa"}[grp], _split(cfg)))
     ep = Ep5(12, annotate=False)
     ep.ctl(TASK_NLU)

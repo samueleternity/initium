@@ -1559,6 +1559,15 @@ def run(
         dataset.token_id_input = bool(workspace_token_id_input)
         dataset.v3_swap_operator = bool(workspace_adaptive_v3_enabled)
         dataset.v4_teacher = bool(workspace_adaptive_v4_enabled)
+        if workspace_adaptive_v4_enabled:
+            track_selector = getattr(dataset, "_tracks", None)
+            selected_tracks = tuple(track_selector()) if callable(track_selector) else ()
+            if selected_tracks and all(str(track).startswith("lang_") for track in selected_tracks):
+                print(
+                    "[adaptive-v4] enabled for a language run, but current language "
+                    "generators emit no V4 operation programs; candidate steps and V4 "
+                    "operator supervision will be empty."
+                )
         dataset.curriculum_eval_episodes_per_group = int(
             workspace_curriculum_eval_episodes_per_group
         )
@@ -4303,7 +4312,7 @@ def run(
                     f"query_binding_aux={bool(workspace_key_value_loss_weight > 0)} "
                     f"binding_aux_scale={2.0 * workspace_key_value_loss_weight:g} "
                     f"context_copy_pointer={'on' if workspace_slot_readout and workspace_semantic_entity_count == 128 and workspace_key_value_loss_weight > 0 else 'off'} "
-                    f"copy_tracks=lang_logic,lang_induce,lang_act"
+                    f"copy_tracks=lang_parse,lang_define,lang_logic,lang_induce,lang_act"
                 )
             if workspace_adaptive_v3_enabled:
                 print(

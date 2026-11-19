@@ -370,12 +370,24 @@ Logic promotion reports verdict and rationale-token accuracy separately, and
 requires both to meet the threshold. Induction lesson 1 fixes surface order to
 SVO to isolate lexical/role binding; later lessons introduce SOV and VSO.
 Induction reports each MR answer-token position separately and reports EOS
-accuracy apart from content-token accuracy. Act-context turns are sampled only
+accuracy apart from content-token accuracy. Its sampling ceiling matches the
+other tracks and evaluation output reports observed and next-interval sampling
+shares. Act-context turns are sampled only
 from response acts introduced by the active lesson. Act answer-token accuracy
-is reported by response act and answer position. Logic, induction, and act
-train a context-token copy pointer for answer tokens present in their visible
-context; this lets act answers copy mentioned entity names while the workspace
-readout supplies stored locations.
+is reported by response act and answer position. Parse, define, logic,
+induction, and act train a context-token copy pointer for answer tokens present
+in their visible context. The copy residual is applied after slot-text blending
+so the slot readout cannot erase a supported copy. Logic plural outputs are
+excluded from singular-key KV targets; context copy handles plural forms that
+occur in the premises.
+
+`--workspace-autoadaptive-v4` currently has no language operation programs to
+execute: Stage 5 generators provide token-copy and slot-readout labels, but do
+not emit the structured primitive-operation events expected by V4. The flag is
+accepted for language runs and prints a warning, but the V4 bank receives no
+candidate steps. A useful V4 language experiment needs task-specific typed
+operation programs; V4's current primitives do not implement relational joins
+for the chain/negation rationale tasks.
 OOD summaries are balanced by selected track and use that track's active
 lesson, with separate results for each held-out axis.
 

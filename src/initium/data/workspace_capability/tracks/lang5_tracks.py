@@ -192,7 +192,10 @@ class Ep5(lg.Ep):
             if k is None:
                 continue
             pos = self._pos(ws, sp, i)
-            if match_keys and not pron:
+            # A pronoun's generator-known referent is a legitimate intermediate
+            # target for the workspace key matcher: it teaches which entity to
+            # read, while the location/value still has to come from memory.
+            if match_keys:
                 self.match_writes.append((pos, int(k)))
             self.addr.append((pos, k, loc is not None))
             if loc is not None:
@@ -218,7 +221,7 @@ class Ep5(lg.Ep):
             meta.setdefault("workspace_binding_aux", tuple(self.binding_aux))
         if self.match_writes:
             meta.setdefault("workspace_match_writes", tuple(self.match_writes))
-        if track in ("lang_logic", "lang_induce", "lang_act"):
+        if track in ("lang_parse", "lang_define", "lang_logic", "lang_induce", "lang_act"):
             function_pieces = {
                 token
                 for word in (*lg.FUNCTION, *lg.PUNCT)
@@ -536,9 +539,11 @@ def _g_logic(cfg, rng):
     ep.manual(q, surf, ctx=False)
     for f in derived:  # derivation scaffold: placeholder tokens whose slots must hold the derived facts
         ep._commit(*f)
+    plural_forms = {pl(category) for category in C}
     key_by_word = {
         word: ep.ent.get(binding[0], -1)
         for word, binding in surf.items()
+        if word not in plural_forms
     }
     # Verdict correctness and rationale fidelity are different capabilities.
     # Abstention phrases and counting answers are complete verdicts; yes/no
@@ -683,7 +688,10 @@ def _g_discourse(cfg, rng):
             rd = [(("o", o), location_token(w.objloc(o)))]
         else:
             q, ments, ans = ["where", "is", lg.NAMES[p] + "?"], [(2, ("p", p), None, False)], w.where_p(p)
-        ep.story_ws(q, ments, match_keys=False)
+        # Supervise the query-to-entity match (including pronoun resolution).
+        # This does not expose the answer value; the slot read remains the
+        # source of the location that must be generated.
+        ep.story_ws(q, ments, match_keys=True)
         ep.ctl(SPK_SYS)
         for name, tgt in rd:
             ep.read_slot(name, tgt)
@@ -722,12 +730,12 @@ def _act(w, act):
         w.event()
         return ["ok."], [], "ack"
     if act == "a_ask":
-        ep.story_ws(["where", "is", lg.NAMES[p] + "?"], [(2, ("p", p), None, False)], match_keys=False)
+        ep.story_ws(["where", "is", lg.NAMES[p] + "?"], [(2, ("p", p), None, False)])
         return w.where_p(p), [(("p", p), location_token(w.pl[p]))], "answer"
     if act == "a_confirm":
         yes = r.random() < 0.5
         l = w.pl[p] if yes else r.choice([x for x in range(6) if x != w.pl[p]])
-        ep.story_ws(["is", lg.NAMES[p], "in", "the", lg.PLACES[l] + "?"], [(1, ("p", p), None, False)], match_keys=False)
+        ep.story_ws(["is", lg.NAMES[p], "in", "the", lg.PLACES[l] + "?"], [(1, ("p", p), None, False)])
         ans = (["yes,"] + w.where_p(p)) if yes else ["no,", lg.NAMES[p], "is", "not", "in", "the", lg.PLACES[l] + "."]
         return ans, [(("p", p), location_token(w.pl[p]))], "confirm" if yes else "deny"
     if act == "a_correct":

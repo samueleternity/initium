@@ -76,6 +76,9 @@ class LanguageDataset(WorkspaceCapabilityDataset):
         self._seg_queue: list = []
         self.segment_continue = False
         self._track_exact_history: dict[str, list[float]] = {}
+        self._track_optimizer_step_counts: dict[str, int] = defaultdict(int)
+        self._track_sampled_episode_counts: dict[str, int] = defaultdict(int)
+        self._track_sampled_batch_counts: dict[str, int] = defaultdict(int)
 
     @staticmethod
     def slot_text_columns():
@@ -243,7 +246,7 @@ class LanguageDataset(WorkspaceCapabilityDataset):
             limit = min(time, len(episode.inputs))
             md = episode.metadata
             source_ids = tuple(md.get("workspace_copy_source_token_ids", ()))
-            if episode.track in ("lang_logic", "lang_induce", "lang_act") and source_ids:
+            if episode.track in ("lang_parse", "lang_define", "lang_logic", "lang_induce", "lang_act") and source_ids:
                 copy_source_token_ids[row, :len(source_ids)] = torch.tensor(source_ids)
                 copy_source_mask[row, :len(source_ids)] = True
             for step, target in md.get("workspace_binding_aux", ()):
@@ -325,6 +328,8 @@ class LanguageDataset(WorkspaceCapabilityDataset):
     def _emit(self, group, cont):
         group = [g if g is not None else _DUMMY for g in group]
         self.last_batch_examples, self.segment_continue = group, cont
+        for track in {episode.track for episode in group if episode is not _DUMMY}:
+            self._track_optimizer_step_counts[track] += 1
         x, y, m = self._collate(group, token_ids_only=True, teacher_forced=self.teacher_forced_answers)
         m[torch.tensor([g is _DUMMY for g in group])] = 0.0
         for row, episode in enumerate(group):
@@ -336,10 +341,21 @@ class LanguageDataset(WorkspaceCapabilityDataset):
         if self._seg_queue:
             return self._emit(self._seg_queue.pop(0), True)
         batch = super().sample_batch(curriculum, batch_size)
+        sampled_tracks = [
+            episode.track
+            for episode in self.last_batch_examples
+            if episode is not _DUMMY
+        ]
+        for track in sampled_tracks:
+            self._track_sampled_episode_counts[track] += 1
+        for track in set(sampled_tracks):
+            self._track_sampled_batch_counts[track] += 1
         self.segment_continue = False
         chains = [tuple(e.metadata.get("prev", ())) + (e,) for e in self.last_batch_examples]
         n = max(map(len, chains))
         if n == 1:
+            for track in {episode.track for episode in self.last_batch_examples}:
+                self._track_optimizer_step_counts[track] += 1
             return batch
         steps = [[c[i - (n - len(c))] if i >= n - len(c) else None for c in chains] for i in range(n)]
         self._seg_queue = steps[1:]
@@ -393,6 +409,9 @@ class LanguageDataset(WorkspaceCapabilityDataset):
         induce_positions: dict[int, list[int]] = defaultdict(lambda: [0, 0])
         induce_eos = [0, 0]
         act_positions: dict[tuple[str, int], list[int]] = defaultdict(lambda: [0, 0])
+        act_eos: dict[str, list[int]] = defaultdict(lambda: [0, 0])
+        output_positions: dict[tuple[str, str, int], list[int]] = defaultdict(lambda: [0, 0])
+        output_eos: dict[tuple[str, str], list[int]] = defaultdict(lambda: [0, 0])
         tp = pc = gc = 0
         for e in episodes:
             p = preds.get(id(e))
@@ -416,9 +435,25 @@ class LanguageDataset(WorkspaceCapabilityDataset):
                     counts = induce_positions[position]
                     counts[0] += int(position < len(p) and p[position] == target)
                     counts[1] += 1
+            if e.track in ("lang_parse", "lang_define"):
+                group = str(m.get("progression_group", "all"))
+                for position, target in enumerate(e.answer):
+                    if target == EOS:
+                        eos = output_eos[(e.track, group)]
+                        eos[0] += int(position < len(p) and p[position] == target)
+                        eos[1] += 1
+                        continue
+                    counts = output_positions[(e.track, group, position)]
+                    counts[0] += int(position < len(p) and p[position] == target)
+                    counts[1] += 1
             if e.track == "lang_act":
                 response_act = str(m.get("response_act", "unknown"))
                 for position, target in enumerate(e.answer):
+                    if target == EOS:
+                        eos = act_eos[response_act]
+                        eos[0] += int(position < len(p) and p[position] == target)
+                        eos[1] += 1
+                        continue
                     counts = act_positions[(response_act, position)]
                     counts[0] += int(position < len(p) and p[position] == target)
                     counts[1] += 1
@@ -445,6 +480,27 @@ class LanguageDataset(WorkspaceCapabilityDataset):
                 "episodes": count,
             }
             for (act, position), (correct, count) in sorted(act_positions.items())
+        })
+        out.update({
+            f"act_eos_accuracy_{act}": {
+                "accuracy_pct": 100.0 * correct / max(count, 1),
+                "episodes": count,
+            }
+            for act, (correct, count) in sorted(act_eos.items())
+        })
+        out.update({
+            f"{track}_answer_position_{group}_{position}": {
+                "accuracy_pct": 100.0 * correct / max(count, 1),
+                "episodes": count,
+            }
+            for (track, group, position), (correct, count) in sorted(output_positions.items())
+        })
+        out.update({
+            f"{track}_eos_accuracy_{group}": {
+                "accuracy_pct": 100.0 * correct / max(count, 1),
+                "episodes": count,
+            }
+            for (track, group), (correct, count) in sorted(output_eos.items())
         })
         if gc or pc:
             out["clarify"] = {"precision_pct": 100.0 * tp / max(pc, 1), "recall_pct": 100.0 * tp / max(gc, 1), "episodes": gc}
@@ -517,9 +573,24 @@ class LanguageDataset(WorkspaceCapabilityDataset):
         result = super().evaluate_curriculum_id(model, device, lesson_idx, field_log=field_log)
         diagnostics = self.last_eval_diagnostics
         evaluation_track_lessons = diagnostics.get("evaluation_track_lessons", {})
+        progression_groups = diagnostics.get("progression_groups", {})
+        weight_basis_exact = {}
+        for track, values in diagnostics.get("tracks", {}).items():
+            # Track-level averages can hide the one group blocking promotion
+            # (for example, a_ask behind easy a_inform). Weight from the
+            # weakest observed group so solved strata do not starve weak ones.
+            group_scores = [
+                float(group_values["exact_match"])
+                for group_values in progression_groups.get(track, {}).values()
+                if group_values.get("episodes", 0) > 0
+                and "exact_match" in group_values
+            ]
+            weight_basis_exact[track] = min(group_scores) if group_scores else float(values["exact_match"])
         raw_weights = {
-            t: 0.02 if t == "lang_open" else 0.02 + max(0.0, 0.9 - v["exact_match"] / 100.0)
-            for t, v in self.last_eval_diagnostics.get("tracks", {}).items()
+            track: 0.02 if track == "lang_open" else 0.02 + max(
+                0.0, 0.9 - weight_basis_exact[track] / 100.0
+            )
+            for track in diagnostics.get("tracks", {})
         }
         stalled = set()
         for track, values in self.last_eval_diagnostics.get("tracks", {}).items():
@@ -535,11 +606,47 @@ class LanguageDataset(WorkspaceCapabilityDataset):
             if track == "lang_open":
                 self._track_weights[track] = weight
                 continue
-            # Induction receives an explicit binding target but remains far
-            # harder than the other tracks. Bound its share so a flat exact
-            # curve cannot consume the optimizer budget.
-            cap_scale = 0.5 if track == "lang_induce" else (1.5 if track in stalled else 3.0)
+            # The hardest track also needs enough updates to learn its binding
+            # operation. Capping it below the ordinary ceiling caused its low
+            # exact score to persist while it received less training.
+            cap_scale = 3.0 if track == "lang_induce" else (1.5 if track in stalled else 3.0)
             self._track_weights[track] = min(weight, max(0.02, cap_scale * median))
+        sampled_steps = dict(self._track_optimizer_step_counts)
+        sampled_episodes = dict(self._track_sampled_episode_counts)
+        sampled_batches = dict(self._track_sampled_batch_counts)
+        self._track_optimizer_step_counts.clear()
+        self._track_sampled_episode_counts.clear()
+        self._track_sampled_batch_counts.clear()
+        step_total = sum(sampled_steps.values())
+        episode_total = sum(sampled_episodes.values())
+        batch_total = sum(sampled_batches.values())
+        weight_total = sum(self._track_weights.values())
+        diagnostics["track_sampling"] = {
+            track: {
+                "sampled_episodes": int(sampled_episodes.get(track, 0)),
+                "sampled_episode_share_pct": 100.0 * sampled_episodes.get(track, 0) / max(episode_total, 1),
+                "sampled_batches": int(sampled_batches.get(track, 0)),
+                "sampled_batch_share_pct": 100.0 * sampled_batches.get(track, 0) / max(batch_total, 1),
+                "optimizer_steps": int(sampled_steps.get(track, 0)),
+                "observed_step_share_pct": 100.0 * sampled_steps.get(track, 0) / max(step_total, 1),
+                "weight_basis_exact_pct": float(weight_basis_exact.get(track, 0.0)),
+                "next_sampling_share_pct": 100.0 * weight / max(weight_total, 1e-12),
+            }
+            for track, weight in sorted(self._track_weights.items())
+        }
+        print(
+            "  [track-sampling] "
+            + " ".join(
+                f"{track}=episodes:{sampled_episodes.get(track, 0)} "
+                f"batches:{sampled_batches.get(track, 0)} "
+                f"steps:{sampled_steps.get(track, 0)} "
+                f"basis_exact:{weight_basis_exact.get(track, 0.0):.1f}% "
+                f"episode_share:{sampled_episodes.get(track, 0) / max(episode_total, 1):.1%} "
+                f"observed:{sampled_steps.get(track, 0) / max(step_total, 1):.1%} "
+                f"next:{weight / max(weight_total, 1e-12):.1%}"
+                for track, weight in sorted(self._track_weights.items())
+            )
+        )
         diagnostics, episodes, preds = self.last_eval_diagnostics, self._last_id_eval_episodes, self._last_eval_preds
         self._print_samples(episodes, "id")
         diagnostics["stage3_counterfactual"] = self._stage3_metrics(episodes)

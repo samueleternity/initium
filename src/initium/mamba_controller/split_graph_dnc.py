@@ -975,6 +975,7 @@ class SplitGraphDNC(nn.Module):
             slots = slots.roll(1, 0)
         match_features = chx.get("_initium_workspace_match_keys")
         out = ws.slot_readout_logits(features, slots, match_features=match_features)
+        copy_delta = None
         if (
             not self.workspace_eval_bypass
             and copy_source_token_ids is not None
@@ -1001,12 +1002,14 @@ class SplitGraphDNC(nn.Module):
             confidence = copy_vocab.amax(-1).to(pointer.dtype)
             gate = ((confidence - chance) / (0.5 - chance).clamp_min(1e-6)).clamp(0.0, 1.0)
             copy_delta = copy_vocab * 8.0 * gate.unsqueeze(-1)
-            logits = logits + copy_delta.to(dtype=logits.dtype) * answer_mask.to(
-                device=logits.device, dtype=logits.dtype
-            ).unsqueeze(-1)
         if ws.slot_text_cols is None:
             delta = out.to(logits.dtype)
-            return logits + delta * answer_mask.to(device=logits.device, dtype=logits.dtype).unsqueeze(-1)
+            result = logits + delta * answer_mask.to(device=logits.device, dtype=logits.dtype).unsqueeze(-1)
+            if copy_delta is not None:
+                result = result + copy_delta.to(dtype=result.dtype) * answer_mask.to(
+                    device=result.device, dtype=result.dtype
+                ).unsqueeze(-1)
+            return result
         sel = answer_mask.to(logits.device).bool()
         if not sel.any():
             return logits
@@ -1048,6 +1051,10 @@ class SplitGraphDNC(nn.Module):
         rows[:, cols] = base_logits + gate * (slot_logits - base_logits)
         result = logits.clone()
         result[sel] = rows
+        if copy_delta is not None:
+            result = result + copy_delta.to(dtype=result.dtype) * answer_mask.to(
+                device=result.device, dtype=result.dtype
+            ).unsqueeze(-1)
         return result
     def _allocate(self, feats, state, ids, wm, valid):
         a = self.allocator

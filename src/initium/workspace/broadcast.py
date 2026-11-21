@@ -15,6 +15,14 @@ import torch.nn.functional as F
 
 from initium.workspace.bistability import BistableWriteGate
 from initium.workspace.nth_farthest import select_nth_farthest
+from initium.workspace.adaptive_v3 import AdaptiveWorkspaceOperatorBank
+from initium.workspace.adaptive_v4 import AdaptiveWorkspaceOperatorBankV4
+
+_WORKSPACE_CAPABILITY_VOCAB_SIZE = 320
+_WORKSPACE_CAPABILITY_SCALAR_BASE = 136
+_WORKSPACE_CAPABILITY_SCALAR_COUNT = 16
+_WORKSPACE_CAPABILITY_SOURCE_BASE = 96
+_WORKSPACE_CAPABILITY_SOURCE_COUNT = 8
 
 
 def _normalize_address(value: torch.Tensor) -> torch.Tensor:
@@ -80,6 +88,7 @@ class WorkspaceBroadcast(nn.Module):
     _SEMANTIC_POSITION_COUNT = 16
     _SEMANTIC_CONTENT_RMS_LIMIT = 1.0
     _SEMANTIC_READBACK_MAX_RATIO = 1.0
+    _SPARSE_RECURRENCE_MAX_ACTIVE_FRACTION = 0.6
     # MoE residuals may be scaled to ~1e-5 before entering workspace. This
     # homogeneous scale improves address-projection gradient conditioning;
     # address normalization leaves forward similarities unchanged.
@@ -106,6 +115,29 @@ class WorkspaceBroadcast(nn.Module):
         permutation_transactional: bool = False,
         nth_farthest_exact_readout: bool = False,
         retrieval_exact_readout: bool = False,
+        key_value_readout: bool = False,
+        value_vocab_size: int = _WORKSPACE_CAPABILITY_VOCAB_SIZE,
+        operation_executor: bool = False,
+        operation_diagnostics: bool = False,
+        adaptive_v3_enabled: bool = False,
+        adaptive_v3_rank: int = 32,
+        adaptive_v3_usage_floor_weight: float = 0.0,
+        adaptive_v3_readback_consistency_weight: float = 0.0,
+        adaptive_v3_attention_temperature: float = 12.0,
+        adaptive_v3_temperature_enabled: bool = False,
+        adaptive_v3_straight_through_binding: bool = False,
+        adaptive_v3_entity_destinations: bool = False,
+        adaptive_v3_split_context_norm: bool = False,
+        adaptive_v3_use_backbone_context: bool = False,
+        adaptive_v3_teacher_forced_operator_outputs: bool = False,
+        adaptive_v3_class_balanced_operator_loss: bool = False,
+        adaptive_v3_compile_operators: bool = False,
+        adaptive_v4_enabled: bool = False,
+        sparse_recurrence: bool = False,
+        parallel_scan: bool = False,
+        attentional_cue_readout: bool = False,
+        slot_readout: bool = False,
+        semantic_entity_count: int = 64,
         key_match_threshold: float = 0.5,
         diagnostics_enabled: bool = True,
     ):
@@ -147,6 +179,7 @@ class WorkspaceBroadcast(nn.Module):
         self.compile_recurrence = bool(compile_recurrence)
         self.entity_keyed_writes = bool(entity_keyed_writes)
         self.semantic_entity_addressing = bool(semantic_entity_addressing)
+        self._SEMANTIC_ENTITY_COUNT = int(semantic_entity_count)
         # Semantic IDs are exact one-hot keys over the 64-entity vocabulary.
         # Keeping padded d_model-wide key vectors through every recurrent
         # state duplicates 448 guaranteed-zero features per slot and token.
@@ -158,10 +191,32 @@ class WorkspaceBroadcast(nn.Module):
         self.permutation_transactional = bool(permutation_transactional)
         self.nth_farthest_exact_readout = bool(nth_farthest_exact_readout)
         self.retrieval_exact_readout = bool(retrieval_exact_readout)
+        self.key_value_readout = bool(key_value_readout)
+        self.operation_executor = bool(operation_executor)
+        self.operation_diagnostics_enabled = bool(operation_diagnostics)
+        self.adaptive_v3_enabled = bool(adaptive_v3_enabled)
+        self.sparse_recurrence_enabled = bool(sparse_recurrence)
+        self.parallel_scan_enabled = bool(parallel_scan)
+        self._parallel_scan_fallback_warned = False
+        self.attentional_cue_readout_enabled = bool(attentional_cue_readout)
         if self.nth_farthest_exact_readout and not self.semantic_entity_addressing:
             raise ValueError("Nth-farthest exact readout requires semantic entity addressing")
         if self.retrieval_exact_readout and not self.semantic_entity_addressing:
             raise ValueError("retrieval exact readout requires semantic entity addressing")
+        if self.key_value_readout and not self.semantic_entity_addressing:
+            raise ValueError("key-value readout requires semantic entity addressing")
+        if self.attentional_cue_readout_enabled and not self.key_value_readout:
+            raise ValueError("attentional cue readout requires the semantic key-value decoder")
+        if self.operation_executor and not self.key_value_readout:
+            raise ValueError("operation executor requires key-value readout")
+        if self.operation_diagnostics_enabled and not self.operation_executor:
+            raise ValueError("operation diagnostics require the operation executor")
+        if self.adaptive_v3_enabled and not (
+            self.semantic_entity_addressing and self.key_value_readout
+        ):
+            raise ValueError(
+                "adaptive workspace V3 requires semantic entity addressing and key-value readout"
+            )
         if self.permutation_transactional and not self.semantic_entity_addressing:
             raise ValueError("permutation transactional mode requires semantic entity addressing")
         if self.semantic_entity_addressing and not self.entity_keyed_writes:
@@ -182,6 +237,90 @@ class WorkspaceBroadcast(nn.Module):
         self.semantic_retrieval_value_decoder = (
             nn.Linear(d_model, 16) if self.retrieval_exact_readout else None
         )
+        self.semantic_value_decoder = (
+            nn.Linear(d_model, int(value_vocab_size)) if self.key_value_readout else None
+        )
+        self.adaptive_v3 = (
+            AdaptiveWorkspaceOperatorBank(
+                d_model,
+                self._address_dim,
+                rank=adaptive_v3_rank,
+                usage_floor_weight=adaptive_v3_usage_floor_weight,
+                readback_consistency_weight=adaptive_v3_readback_consistency_weight,
+                attention_temperature=adaptive_v3_attention_temperature,
+                temperature_enabled=adaptive_v3_temperature_enabled,
+                straight_through_binding=adaptive_v3_straight_through_binding,
+                entity_destinations=adaptive_v3_entity_destinations,
+                split_context_norm=adaptive_v3_split_context_norm,
+                use_backbone_context=adaptive_v3_use_backbone_context,
+                teacher_forced_operator_outputs=adaptive_v3_teacher_forced_operator_outputs,
+                class_balanced_operator_loss=adaptive_v3_class_balanced_operator_loss,
+                compile_operators=adaptive_v3_compile_operators,
+            )
+            if self.adaptive_v3_enabled and not adaptive_v4_enabled
+            else None
+        )
+        self.adaptive_v3_eval_bypass = False
+        self.adaptive_v4 = (
+            AdaptiveWorkspaceOperatorBankV4(d_model, self._address_dim, compile_ops=adaptive_v3_compile_operators)
+            if adaptive_v4_enabled
+            else None
+        )
+        if self.adaptive_v4 is not None:
+            # Non-registered alias so the V3 call sites drive V4; checkpoint keys stay adaptive_v4.*
+            object.__setattr__(self, "adaptive_v3", self.adaptive_v4)
+        if slot_readout and not self.key_value_readout:
+            raise ValueError("slot readout requires key-value readout")
+        self.slot_pointer = (
+            nn.Linear(d_model, self._SEMANTIC_ENTITY_COUNT) if slot_readout else None
+        )
+        self.slot_match_query = nn.Linear(d_model, d_model, bias=False) if slot_readout else None
+        self.slot_match_key = nn.Linear(d_model, d_model, bias=False) if slot_readout else None
+        context_copy_enabled = slot_readout and self._SEMANTIC_ENTITY_COUNT == 128
+        self.context_copy_query = nn.Linear(d_model, d_model, bias=False) if context_copy_enabled else None
+        self.context_copy_key = nn.Linear(d_model, d_model, bias=False) if context_copy_enabled else None
+        self.slot_readout_scale = nn.Parameter(torch.ones(())) if slot_readout else None
+        self.slot_text_head = None
+        self.register_buffer("slot_text_cols", None, persistent=False)
+        self.semantic_attentional_color_decoder = (
+            nn.Linear(d_model, _WORKSPACE_CAPABILITY_SOURCE_COUNT)
+            if self.attentional_cue_readout_enabled
+            else None
+        )
+        self.semantic_attentional_shape_decoder = (
+            nn.Linear(d_model, _WORKSPACE_CAPABILITY_SOURCE_COUNT)
+            if self.attentional_cue_readout_enabled
+            else None
+        )
+        if self.operation_executor:
+            scalar_axis = torch.arange(_WORKSPACE_CAPABILITY_SCALAR_COUNT)
+            scalar_left = scalar_axis.view(-1, 1).expand(-1, _WORKSPACE_CAPABILITY_SCALAR_COUNT)
+            scalar_right = scalar_axis.view(1, -1).expand(_WORKSPACE_CAPABILITY_SCALAR_COUNT, -1)
+            self.register_buffer(
+                "_operation_add_indices",
+                ((scalar_left + scalar_right) % _WORKSPACE_CAPABILITY_SCALAR_COUNT).reshape(-1),
+                persistent=False,
+            )
+            self.register_buffer(
+                "_operation_low_indices",
+                torch.minimum(scalar_left, scalar_right).reshape(-1),
+                persistent=False,
+            )
+            self.register_buffer(
+                "_operation_high_indices",
+                torch.maximum(scalar_left, scalar_right).reshape(-1),
+                persistent=False,
+            )
+            self.register_buffer(
+                "_operation_compare_indices",
+                (scalar_left > scalar_right).long().reshape(-1),
+                persistent=False,
+            )
+            self.register_buffer(
+                "_operation_rank_indices",
+                (scalar_left < scalar_right).long().reshape(-1),
+                persistent=False,
+            )
         self._last_semantic_state_predictions: list[tuple[int, torch.Tensor]] = []
         self._last_semantic_query_predictions: list[
             tuple[int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
@@ -195,9 +334,29 @@ class WorkspaceBroadcast(nn.Module):
         self._last_retrieval_query_predictions: list[
             tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]
         ] = []
+        self._last_key_value_predictions: list[tuple[int, torch.Tensor]] = []
+        self._last_attentional_cue_predictions: list[
+            tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = []
+        self._last_attentional_frame_predictions: list[
+            tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = []
+        self._last_operation_diagnostics: list[
+            tuple[
+                int,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+            ]
+        ] = []
         self._compiled_recurrence_step = None
         self._compiled_recurrence_failed = False
         self._compiled_fallback_warned = False
+        self._sparse_recurrence_density_warned = False
         # Optional evaluation-only observer. Kept unset during training so it
         # adds no synchronization or work to the recurrence.
         self._initium_address_assignment_observer = None
@@ -238,6 +397,141 @@ class WorkspaceBroadcast(nn.Module):
         if self.prediction_error_to_write_gate is not None:
             nn.init.zeros_(self.prediction_error_to_write_gate.weight)
 
+    def slot_pointer_logits(self, features: torch.Tensor, match_features=None, slot_present=None) -> torch.Tensor:
+        if match_features is None:
+            return self.slot_pointer(features.float()).float()
+        query = self.slot_match_query(features.float())
+        keys = self.slot_match_key(match_features.float())
+        logits = torch.einsum("btd,bkd->btk", query, keys) / (self.d_model ** 0.5)
+        present = match_features.float().square().sum(-1) > 1e-12
+        if slot_present is not None:
+            present = present & slot_present.to(device=present.device, dtype=torch.bool)
+        logits = logits.masked_fill(~present.unsqueeze(1), -1e4)
+        fallback = self.slot_pointer(features.float()).float()
+        return torch.where(present.any(-1).view(-1, 1, 1), logits, fallback)
+
+    def slot_readout_logits(self, features: torch.Tensor, state: torch.Tensor, match_features=None) -> torch.Tensor:
+        """Learned concept pointer per position -> addressed slot content -> vocabulary logits."""
+        address, content = torch.split(state.float(), [self._address_dim, self.d_model], dim=-1)
+        occupied = (address.square().sum(-1) > 1e-12).float()
+        slot_ids = address.argmax(-1)
+        present = torch.zeros(address.shape[0], self._SEMANTIC_ENTITY_COUNT, dtype=torch.int32, device=address.device)
+        present.scatter_add_(1, slot_ids, occupied.to(torch.int32))
+        present = present > 0
+        pointer = self.slot_pointer_logits(features, match_features, present).softmax(-1)
+        weights = pointer.gather(-1, slot_ids.unsqueeze(1).expand(-1, pointer.shape[1], -1))
+        weights = weights * occupied.unsqueeze(1)
+        read = torch.einsum("bts,bsd->btd", weights, content)
+        if self.slot_text_cols is not None:
+            return read
+        return self.slot_readout_scale * self.semantic_value_decoder(read)
+
+    def slot_pointer_loss(
+        self,
+        features: torch.Tensor,
+        state: torch.Tensor,
+        target_keys: torch.Tensor,
+        match_features=None,
+    ) -> torch.Tensor:
+        """Supervise answer-time slot selection without routing gold keys at inference."""
+        if self.slot_pointer is None:
+            return features.new_zeros((), dtype=torch.float32)
+        address, _content = torch.split(
+            state.float(), [self._address_dim, self.d_model], dim=-1
+        )
+        occupied = address.square().sum(-1) > 1e-12
+        slot_keys = address.argmax(-1)
+        key_counts = torch.zeros(
+            address.shape[0],
+            self.slot_pointer.out_features,
+            dtype=torch.int32,
+            device=address.device,
+        ).scatter_add_(1, slot_keys, occupied.to(torch.int32))
+        key_present = key_counts > 0
+        logits = self.slot_pointer_logits(features, match_features, key_present)
+        targets = target_keys.to(device=logits.device, dtype=torch.long)
+        valid = targets.ge(0) & targets.lt(logits.shape[-1])
+        safe_targets = targets.clamp(0, logits.shape[-1] - 1)
+        valid &= key_present.gather(1, safe_targets)
+        if not valid.any():
+            return logits.sum() * 0.0
+        return F.cross_entropy(logits[valid], targets[valid])
+
+    def context_copy_logits(
+        self,
+        features: torch.Tensor,
+        source_features: torch.Tensor,
+        source_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Score answer positions against visible source-token positions."""
+        if self.context_copy_query is None or self.context_copy_key is None:
+            raise RuntimeError("context copy requires the slot-readout workspace")
+        query = self.context_copy_query(features.float())
+        key = self.context_copy_key(source_features.float())
+        logits = torch.einsum("btd,bsd->bts", query, key) / (self.d_model ** 0.5)
+        return logits.masked_fill(~source_mask.to(device=logits.device, dtype=torch.bool).unsqueeze(1), -1e4)
+
+    def context_copy_loss(
+        self,
+        features: torch.Tensor,
+        source_features: torch.Tensor,
+        source_token_ids: torch.Tensor,
+        source_mask: torch.Tensor,
+        target_token_ids: torch.Tensor,
+        target_positions: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Supervise the selected source occurrence, with token-mass fallback."""
+        logits = self.context_copy_logits(features, source_features, source_mask)
+        targets = target_token_ids.to(device=logits.device, dtype=torch.long)
+        source_ids = source_token_ids.to(device=logits.device, dtype=torch.long)
+        mask = source_mask.to(device=logits.device, dtype=torch.bool)
+        matching = mask.unsqueeze(1) & source_ids.unsqueeze(1).eq(targets.unsqueeze(-1))
+        token_valid = targets.ge(0) & matching.any(-1)
+        if target_positions is None:
+            valid = token_valid
+            if not valid.any():
+                return logits.sum() * 0.0
+            log_prob = F.log_softmax(logits, dim=-1)
+            target_log_prob = torch.logsumexp(log_prob.masked_fill(~matching, -1e4), dim=-1)
+            return -target_log_prob[valid].mean()
+
+        positions = target_positions.to(device=logits.device, dtype=torch.long)
+        in_range = positions.ge(0) & positions.lt(source_ids.shape[-1])
+        safe_positions = positions.clamp(min=0, max=max(source_ids.shape[-1] - 1, 0))
+        selected_ids = source_ids.unsqueeze(1).expand(-1, targets.shape[1], -1).gather(
+            -1, safe_positions.unsqueeze(-1)
+        ).squeeze(-1)
+        selected_mask = mask.unsqueeze(1).expand(-1, targets.shape[1], -1).gather(
+            -1, safe_positions.unsqueeze(-1)
+        ).squeeze(-1)
+        exact_valid = (
+            token_valid
+            & in_range
+            & selected_mask
+            & selected_ids.eq(targets)
+        )
+        fallback_valid = token_valid & ~exact_valid
+        if not exact_valid.any() and not fallback_valid.any():
+            return logits.sum() * 0.0
+        log_prob = F.log_softmax(logits, dim=-1)
+        # log_softmax may promote BF16 logits to FP32 under autocast. Keep
+        # the indexed-assignment buffer in the loss dtype to avoid a BF16 <-
+        # FP32 index_put mismatch, and preserve FP32 loss accumulation.
+        losses = log_prob.new_zeros(targets.shape)
+        if exact_valid.any():
+            losses[exact_valid] = -log_prob.gather(-1, safe_positions.unsqueeze(-1)).squeeze(-1)[exact_valid]
+        if fallback_valid.any():
+            target_log_prob = torch.logsumexp(log_prob.masked_fill(~matching, -1e4), dim=-1)
+            losses[fallback_valid] = -target_log_prob[fallback_valid]
+        return losses[exact_valid | fallback_valid].mean()
+
+    def enable_slot_text(self, cols, *, tied_input_embedding=False):
+        """Logit columns `cols` are produced only from slot content."""
+        if self.slot_pointer is None:
+            raise ValueError("slot text readout requires slot_readout")
+        self.slot_text_head = None if tied_input_embedding else nn.Linear(self.d_model, len(cols))
+        self.slot_text_cols = torch.as_tensor(list(cols), dtype=torch.long)
+    
     def pop_semantic_state_predictions(self) -> list[tuple[int, torch.Tensor]]:
         """Return and clear auxiliary predictions from the most recent call."""
         predictions = self._last_semantic_state_predictions
@@ -303,6 +597,159 @@ class WorkspaceBroadcast(nn.Module):
         predictions = self._last_retrieval_query_predictions
         self._last_retrieval_query_predictions = []
         return predictions
+
+    def pop_key_value_predictions(self) -> list[tuple[int, torch.Tensor]]:
+        predictions = self._last_key_value_predictions
+        self._last_key_value_predictions = []
+        return predictions
+
+    def pop_attentional_cue_predictions(
+        self,
+    ) -> list[tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]]:
+        predictions = self._last_attentional_cue_predictions
+        self._last_attentional_cue_predictions = []
+        return predictions
+
+    def pop_attentional_frame_predictions(
+        self,
+    ) -> list[tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]]:
+        predictions = self._last_attentional_frame_predictions
+        self._last_attentional_frame_predictions = []
+        return predictions
+
+    def _semantic_content_at_ids(
+        self, state: torch.Tensor, entity_ids: torch.Tensor, valid_mask: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Read content vectors from exact semantic entity addresses."""
+        address_state, content_state = torch.split(
+            state.float(), [self._address_dim, self.d_model], dim=-1
+        )
+        safe_ids = entity_ids.clamp(min=0, max=self._SEMANTIC_ENTITY_COUNT - 1)
+        queries = F.one_hot(safe_ids, num_classes=self._SEMANTIC_ENTITY_COUNT).to(
+            device=state.device, dtype=torch.float32
+        )
+        occupied = address_state.square().sum(dim=-1) > 1e-12
+        scores = torch.einsum("bqd,bsd->bqs", queries, _normalize_address(address_state))
+        scores = scores.masked_fill(~occupied.unsqueeze(1), -2.0)
+        best_scores, slot_indices = scores.max(dim=-1)
+        found = valid_mask.bool() & best_scores.ge(self.key_match_threshold)
+        read_values = content_state.gather(
+            1, slot_indices.unsqueeze(-1).expand(-1, -1, self.d_model)
+        )
+        read_values = read_values * found.unsqueeze(-1).to(read_values.dtype)
+        return read_values, found
+
+    def _attentional_cue_value_logits(
+        self,
+        state: torch.Tensor,
+        color_ids: torch.Tensor,
+        shape_ids: torch.Tensor,
+        query_rows: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Read the first two cue-matching temporal item records from slots."""
+        if self.semantic_value_decoder is None:
+            raise RuntimeError("attentional cue readout requires the semantic value decoder")
+        batch = state.shape[0]
+        if any(value.shape != (batch,) for value in (color_ids, shape_ids, query_rows)):
+            raise ValueError("attentional cue IDs and row mask must have shape (batch,)")
+        entity_count = min(self.num_slots, self._SEMANTIC_ENTITY_COUNT)
+        entity_ids = torch.arange(entity_count, device=state.device, dtype=torch.long)
+        address_state, _content_state = torch.split(
+            state.float(), [self._address_dim, self.d_model], dim=-1
+        )
+        address_ids = address_state[..., : self._SEMANTIC_ENTITY_COUNT].argmax(dim=-1)
+        occupied = address_state.detach().square().sum(dim=-1) > 1e-12
+        slot_valid = (
+            occupied.unsqueeze(-1)
+            & address_ids.unsqueeze(-1).eq(entity_ids.view(1, 1, -1))
+        ).any(dim=1)
+        read_ids = entity_ids.view(1, -1).expand(batch, -1)
+        read_values, _found = self._semantic_content_at_ids(state, read_ids, slot_valid)
+        if (
+            self.semantic_attentional_color_decoder is None
+            or self.semantic_attentional_shape_decoder is None
+            or self.semantic_value_decoder is None
+        ):
+            raise RuntimeError("attentional cue field decoders are not initialized")
+        color_logits = self.semantic_attentional_color_decoder(read_values)
+        shape_logits = self.semantic_attentional_shape_decoder(read_values)
+        color_probabilities = color_logits.float().softmax(dim=-1)
+        shape_probabilities = shape_logits.float().softmax(dim=-1)
+        safe_color_ids = (color_ids - _WORKSPACE_CAPABILITY_SOURCE_BASE).clamp(
+            min=0, max=_WORKSPACE_CAPABILITY_SOURCE_COUNT - 1
+        )
+        safe_shape_ids = (shape_ids - _WORKSPACE_CAPABILITY_SOURCE_BASE).clamp(
+            min=0, max=_WORKSPACE_CAPABILITY_SOURCE_COUNT - 1
+        )
+        color_probability = color_probabilities.gather(
+            -1, safe_color_ids[:, None, None].expand(-1, entity_count, 1)
+        ).squeeze(-1)
+        shape_probability = shape_probabilities.gather(
+            -1, safe_shape_ids[:, None, None].expand(-1, entity_count, 1)
+        ).squeeze(-1)
+        match_scores = (color_probability * shape_probability).masked_fill(~slot_valid, -1.0)
+        selected = match_scores.topk(k=2, dim=-1).indices.sort(dim=-1).values
+        item_logits = self.semantic_value_decoder(read_values)
+        scalar_logits = item_logits[
+            ..., _WORKSPACE_CAPABILITY_SCALAR_BASE : (
+                _WORKSPACE_CAPABILITY_SCALAR_BASE + _WORKSPACE_CAPABILITY_SCALAR_COUNT
+            )
+        ]
+        selected_logits = scalar_logits.gather(
+            1,
+            selected.unsqueeze(-1).expand(-1, -1, _WORKSPACE_CAPABILITY_SCALAR_COUNT),
+        )
+        first_logits = selected_logits[:, 0]
+        second_logits = selected_logits[:, 1]
+        active = query_rows & color_ids.ge(0) & shape_ids.ge(0)
+        return first_logits, second_logits, active
+
+    def _attentional_frame_field_logits(
+        self, state: torch.Tensor, entity_ids: torch.Tensor, valid_mask: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Decode the observed color and shape from one frame's stored slot."""
+        if (
+            self.semantic_attentional_color_decoder is None
+            or self.semantic_attentional_shape_decoder is None
+        ):
+            raise RuntimeError("attentional cue field decoders are not initialized")
+        read_values, found = self._semantic_content_at_ids(
+            state, entity_ids.unsqueeze(1), valid_mask.unsqueeze(1)
+        )
+        color_logits = self.semantic_attentional_color_decoder(read_values[:, 0])
+        shape_logits = self.semantic_attentional_shape_decoder(read_values[:, 0])
+        return color_logits, shape_logits, found[:, 0]
+
+    def pop_operation_diagnostics(self) -> list[
+        tuple[
+            int,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+        ]
+    ]:
+        diagnostics = self._last_operation_diagnostics
+        self._last_operation_diagnostics = []
+        return diagnostics
+
+    def pop_adaptive_v3_aux_loss(self) -> torch.Tensor | None:
+        if self.adaptive_v3 is None:
+            return None
+        return self.adaptive_v3.pop_aux_loss()
+
+    def adaptive_v3_route_steps(self) -> tuple[tuple[int, torch.Tensor], ...]:
+        if self.adaptive_v3 is None:
+            return ()
+        return self.adaptive_v3.last_route_steps()
+
+    def adaptive_v3_training_diagnostics(self) -> dict[str, torch.Tensor]:
+        if self.adaptive_v3 is None:
+            return {}
+        return self.adaptive_v3.last_diagnostics()
 
     def _semantic_retrieval_value_logits(
         self, state: torch.Tensor, entity_ids: torch.Tensor, valid_mask: torch.Tensor
@@ -466,6 +913,218 @@ class WorkspaceBroadcast(nn.Module):
         read_weights = read_weights * valid_mask.unsqueeze(-1).to(read_weights.dtype)
         read_values = torch.einsum("bqs,bsd->bqd", read_weights, content_state.float())
         return self.semantic_state_decoder(read_values)
+
+    def _semantic_value_logits(
+        self, state: torch.Tensor, entity_ids: torch.Tensor, valid_mask: torch.Tensor
+    ) -> torch.Tensor:
+        """Decode vocabulary values read from semantic entity-addressed slots."""
+        if self.semantic_value_decoder is None:
+            raise RuntimeError("key-value readout is not enabled")
+        address_state, content_state = torch.split(state, [self._address_dim, self.d_model], dim=-1)
+        safe_ids = entity_ids.clamp(min=0, max=self._SEMANTIC_ENTITY_COUNT - 1)
+        queries = F.one_hot(safe_ids, num_classes=self._SEMANTIC_ENTITY_COUNT).to(
+            device=state.device, dtype=torch.float32
+        )
+        address_state = address_state.float()
+        occupied = address_state.square().sum(dim=-1) > 1e-12
+        scores = torch.einsum("bqd,bsd->bqs", queries, _normalize_address(address_state))
+        scores = scores.masked_fill(~occupied.unsqueeze(1), -2.0)
+        best_scores, slot_indices = scores.max(dim=-1)
+        found = valid_mask.bool() & best_scores.ge(self.key_match_threshold)
+        read_values = content_state.float().gather(
+            1, slot_indices.unsqueeze(-1).expand(-1, -1, self.d_model)
+        )
+        read_values = read_values * found.unsqueeze(-1).to(read_values.dtype)
+        return self.semantic_value_decoder(read_values)
+
+    def _semantic_value_probabilities(
+        self, state: torch.Tensor, entity_ids: torch.Tensor, valid_mask: torch.Tensor
+    ) -> torch.Tensor:
+        logits = self._semantic_value_logits(state, entity_ids, valid_mask)
+        return logits.float().softmax(dim=-1)
+
+    def _operation_operand_probabilities(
+        self,
+        state: torch.Tensor,
+        operand_kind: torch.Tensor,
+        operand_value: torch.Tensor,
+    ) -> torch.Tensor:
+        """Read one key or materialize one input literal for every batch row."""
+        key_mask = operand_kind.eq(1)
+        literal_mask = operand_kind.eq(2)
+        key_probs = self._semantic_value_probabilities(
+            state,
+            operand_value.clamp(min=0, max=self._SEMANTIC_ENTITY_COUNT - 1).unsqueeze(1),
+            key_mask.unsqueeze(1),
+        )[:, 0]
+        literal_ids = operand_value.clamp(min=0, max=_WORKSPACE_CAPABILITY_VOCAB_SIZE - 1)
+        literal_probs = F.one_hot(
+            literal_ids, num_classes=_WORKSPACE_CAPABILITY_VOCAB_SIZE
+        ).to(key_probs.dtype)
+        return torch.where(
+            key_mask.unsqueeze(-1),
+            key_probs,
+            torch.where(literal_mask.unsqueeze(-1), literal_probs, torch.zeros_like(key_probs)),
+        )
+
+    def _execute_workspace_operation_step(
+        self,
+        state: torch.Tensor,
+        operation_metadata: torch.Tensor,
+        *,
+        step: int,
+        operand_state: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Read operands, execute one causal operation, and commit its output slot(s).
+
+        Metadata layout is [opcode, dest0, dest1, kind0, value0, kind1, value1].
+        Operand kind 1 is a semantic slot key; kind 2 is a token literal. Opcodes
+        are 1=lookup, 2=copy, 3=modular add, 4=two-output sort,
+        5=greater-than comparison, 6=maximum selection, and 7=two-item rank.
+        """
+        if self.semantic_value_decoder is None:
+            raise RuntimeError("workspace operation execution requires value decoding")
+        if operation_metadata.ndim != 2 or operation_metadata.shape[1] != 7:
+            raise ValueError("workspace operation metadata must have shape (batch, 7)")
+        operand_state = state if operand_state is None else operand_state
+        opcode = operation_metadata[:, 0]
+        active = opcode.gt(0)
+        first = self._operation_operand_probabilities(
+            operand_state, operation_metadata[:, 3], operation_metadata[:, 4]
+        )
+        second = self._operation_operand_probabilities(
+            operand_state, operation_metadata[:, 5], operation_metadata[:, 6]
+        )
+
+        # Arithmetic is over scalar token IDs modulo the scalar count. Inputs are
+        # normalized after restricting to that token range, so unsupported
+        # vocabulary classes cannot leak into the arithmetic operator.
+        first_scalar = first[
+            :,
+            _WORKSPACE_CAPABILITY_SCALAR_BASE : _WORKSPACE_CAPABILITY_SCALAR_BASE
+            + _WORKSPACE_CAPABILITY_SCALAR_COUNT,
+        ]
+        second_scalar = second[
+            :,
+            _WORKSPACE_CAPABILITY_SCALAR_BASE : _WORKSPACE_CAPABILITY_SCALAR_BASE
+            + _WORKSPACE_CAPABILITY_SCALAR_COUNT,
+        ]
+        first_scalar = first_scalar / first_scalar.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        second_scalar = second_scalar / second_scalar.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        joint = first_scalar.unsqueeze(2) * second_scalar.unsqueeze(1)
+        flat_joint = joint.reshape(joint.shape[0], -1)
+        batch = joint.shape[0]
+        add_probs = torch.zeros_like(first_scalar).scatter_add(
+            1, self._operation_add_indices.unsqueeze(0).expand(batch, -1), flat_joint
+        )
+        low_probs = torch.zeros_like(first_scalar).scatter_add(
+            1, self._operation_low_indices.unsqueeze(0).expand(batch, -1), flat_joint
+        )
+        high_probs = torch.zeros_like(first_scalar).scatter_add(
+            1, self._operation_high_indices.unsqueeze(0).expand(batch, -1), flat_joint
+        )
+        rank_probs = torch.zeros_like(first_scalar).scatter_add(
+            1, self._operation_rank_indices.unsqueeze(0).expand(batch, -1), flat_joint
+        )
+        compare_probs = torch.zeros_like(first_scalar).scatter_add(
+            1,
+            self._operation_compare_indices.unsqueeze(0).expand(batch, -1),
+            flat_joint,
+        )
+
+        scalar_padding = (
+            _WORKSPACE_CAPABILITY_SCALAR_BASE,
+            _WORKSPACE_CAPABILITY_VOCAB_SIZE
+            - _WORKSPACE_CAPABILITY_SCALAR_BASE
+            - _WORKSPACE_CAPABILITY_SCALAR_COUNT,
+        )
+        add_vocab = F.pad(add_probs, scalar_padding)
+        low_vocab = F.pad(low_probs, scalar_padding)
+        high_vocab = F.pad(high_probs, scalar_padding)
+        rank_vocab = F.pad(rank_probs, scalar_padding)
+        compare_vocab = F.pad(compare_probs, scalar_padding)
+        is_lookup_or_copy = opcode.eq(1) | opcode.eq(2)
+        is_add = opcode.eq(3)
+        is_sort = opcode.eq(4)
+        is_compare = opcode.eq(5)
+        is_select = opcode.eq(6)
+        is_rank = opcode.eq(7)
+        output0 = torch.where(
+            is_lookup_or_copy.unsqueeze(-1), first,
+            torch.where(is_add.unsqueeze(-1), add_vocab,
+                        torch.where(is_sort.unsqueeze(-1), low_vocab,
+                                    torch.where(is_compare.unsqueeze(-1), compare_vocab,
+                                                torch.where(is_select.unsqueeze(-1), high_vocab,
+                                                            torch.where(is_rank.unsqueeze(-1), rank_vocab,
+                                                                        torch.zeros_like(first)))))),
+        )
+        output1 = torch.where(is_sort.unsqueeze(-1), high_vocab, torch.zeros_like(first))
+
+        def commit_one(current_state: torch.Tensor, destination: torch.Tensor, probs: torch.Tensor,
+                       output_active: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            safe_ids = destination.clamp(min=0, max=self._SEMANTIC_ENTITY_COUNT - 1)
+            queries = F.one_hot(safe_ids, num_classes=self._SEMANTIC_ENTITY_COUNT).to(
+                device=current_state.device, dtype=torch.float32
+            )
+            address_state, content_state = torch.split(
+                current_state, [self._address_dim, self.d_model], dim=-1
+            )
+            occupied = address_state.float().square().sum(dim=-1) > 1e-12
+            scores = torch.einsum("bd,bsd->bs", queries, _normalize_address(address_state.float()))
+            matched = occupied & scores.ge(self.key_match_threshold)
+            matched = matched & output_active.unsqueeze(-1)
+            has_match = matched.any(dim=-1)
+            free = ~occupied
+            can_allocate = output_active & ~has_match & free.any(dim=-1)
+            free_slot = free.to(torch.int64).argmax(dim=-1)
+            allocation_mask = F.one_hot(free_slot, num_classes=self.num_slots).bool()
+            allocation_mask = allocation_mask & can_allocate.unsqueeze(-1)
+            destination_mask = matched | allocation_mask
+            hard_values = F.one_hot(
+                probs.argmax(dim=-1), num_classes=_WORKSPACE_CAPABILITY_VOCAB_SIZE
+            ).to(probs.dtype)
+            straight_through = hard_values + probs - probs.detach()
+            value_vectors = straight_through @ self.semantic_value_decoder.weight.float()
+            value_vectors = _cap_vector_rms(value_vectors, self._SEMANTIC_CONTENT_RMS_LIMIT)
+            address_state = torch.where(
+                allocation_mask.unsqueeze(-1), queries.unsqueeze(1), address_state.float()
+            )
+            updated_content = torch.where(
+                destination_mask.unsqueeze(-1), value_vectors.unsqueeze(1), content_state.float()
+            )
+            updated_state = torch.cat(
+                (address_state.float(), updated_content), dim=-1
+            ).to(current_state.dtype)
+            return updated_state, has_match | can_allocate
+
+        state, committed0 = commit_one(state, operation_metadata[:, 1], output0, active)
+        state, committed1 = commit_one(
+            state, operation_metadata[:, 2], output1, active & is_sort
+        )
+        if self.operation_diagnostics_enabled and not self.training:
+            value0 = self._semantic_value_logits(
+                state,
+                operation_metadata[:, 1].unsqueeze(1),
+                active.unsqueeze(1),
+            )[:, 0].argmax(dim=-1)
+            value1 = self._semantic_value_logits(
+                state,
+                operation_metadata[:, 2].unsqueeze(1),
+                (active & is_sort).unsqueeze(1),
+            )[:, 0].argmax(dim=-1)
+            self._last_operation_diagnostics.append(
+                (
+                    int(step),
+                    opcode.detach(),
+                    first.argmax(dim=-1).detach(),
+                    second.argmax(dim=-1).detach(),
+                    committed0.detach(),
+                    committed1.detach(),
+                    value0.detach(),
+                    value1.detach(),
+                )
+            )
+        return state
 
     def init_state(self, batch: int, *, device, dtype) -> torch.Tensor:
         state_width = self._address_dim + self.d_model if self.entity_keyed_writes else self.d_model
@@ -754,7 +1413,13 @@ class WorkspaceBroadcast(nn.Module):
                 # backward pass. Use the options argument without a mode
                 # argument: current PyTorch rejects specifying both.
                 fullgraph=True,
-                dynamic=False,
+                # Language segment bucketing keeps an optimizer batch mixed
+                # while running each chain-length bucket at its natural row
+                # count. The recurrence's leading batch dimension therefore
+                # varies (for example, 1..8); let Dynamo generalize that
+                # dimension after its first shape change instead of forcing a
+                # separate static full graph for every bucket size.
+                dynamic=None,
                 # Respect the lightweight default path even if the Colab
                 # process has globally enabled max-autotune. This recurrence
                 # is a small per-token graph; exhaustive GEMM tuning adds
@@ -768,6 +1433,231 @@ class WorkspaceBroadcast(nn.Module):
                 options={"max_autotune": False},
             )
         return self._compiled_recurrence_step
+
+    def _semantic_read_only_sequence(
+        self,
+        selected_deltas: torch.Tensor,
+        route_weights: torch.Tensor,
+        read_queries: torch.Tensor,
+        state: torch.Tensor,
+    ) -> torch.Tensor:
+        """Broadcast fixed semantic state over a span without recurrent writes."""
+        address_state, content_state = torch.split(
+            state.float(), [self._address_dim, self.d_model], dim=-1
+        )
+        occupied = address_state.detach().square().sum(dim=-1) > 1e-12
+        normalized_addresses = _normalize_address(address_state)
+        normalized_queries = _normalize_address(read_queries.float())[..., : self._address_dim]
+        scores = torch.einsum(
+            "lbka,bsa->lbks", normalized_queries, normalized_addresses
+        )
+        occupied_by_step = occupied[None, :, None, :]
+        scores = scores.masked_fill(~occupied_by_step, -1e4)
+        read_weights = scores.softmax(dim=-1)
+        read_weights = read_weights * occupied_by_step.to(read_weights.dtype)
+        read_weights = read_weights / read_weights.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        read_values = self.value(content_state)
+        broadcast = torch.einsum("lbks,bsd->lbkd", read_weights, read_values)
+        broadcast = _cap_readback_to_reference(
+            broadcast, selected_deltas, self._SEMANTIC_READBACK_MAX_RATIO
+        )
+        read_scale = torch.sigmoid(self.read_gate).to(selected_deltas.dtype)
+        return (
+            (selected_deltas + read_scale * broadcast) * route_weights.unsqueeze(-1)
+        ).sum(dim=2)
+
+    def _parallel_semantic_scan(
+        self,
+        selected_deltas: torch.Tensor,
+        route_weights: torch.Tensor,
+        read_queries: torch.Tensor,
+        write_values: torch.Tensor,
+        entity_ids: torch.Tensor,
+        entity_write_mask: torch.Tensor,
+        state: torch.Tensor,
+        key_value_entity_ids: torch.Tensor | None,
+        key_value_mask: torch.Tensor | None,
+        key_value_steps: set[int],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run proposal-only semantic writes with an associative event scan.
+
+        Write events are assigned deterministic entity slots first, then each
+        slot's gated proposal recurrence is scanned in parallel. Readback is
+        still evaluated against the exact state visible at each timestep.
+        """
+        ids = entity_ids.to(torch.long).transpose(0, 1).contiguous()
+        write_mask = entity_write_mask.transpose(0, 1).contiguous()
+        routes = route_weights.transpose(0, 1).contiguous()
+        values = write_values.transpose(0, 1).contiguous()
+        batch, steps = ids.shape
+        if (
+            write_mask.shape != (batch, steps)
+            or routes.shape[:2] != (batch, steps)
+            or values.shape[:2] != (batch, steps)
+        ):
+            raise ValueError("parallel semantic scan inputs disagree on batch/time axes")
+        slots = self.num_slots
+        count = self._SEMANTIC_ENTITY_COUNT
+        address_dim = self._address_dim
+        address_state, content_state = torch.split(
+            state.float(), [address_dim, self.d_model], dim=-1
+        )
+        occupied = address_state.detach().square().sum(dim=-1) > 1e-12
+        slot_axis = torch.arange(slots, device=state.device).expand(batch, -1)
+        stored_ids = address_state.detach().argmax(dim=-1)
+        slot_values = torch.where(occupied, slot_axis, slots)
+        existing_slot = torch.full(
+            (batch, count), slots, device=state.device, dtype=torch.long
+        )
+        existing_slot.scatter_reduce_(1, stored_ids, slot_values, reduce="amin", include_self=True)
+
+        if bool(((ids >= count) & write_mask).any()):
+            raise ValueError("parallel semantic scan received an out-of-range entity ID")
+        safe_ids = ids.clamp(0, count - 1)
+        active = write_mask & ids.ge(0) & routes[..., 0].gt(0)
+        identity = F.one_hot(safe_ids, num_classes=count).to(torch.bool)
+        first_occurrence = torch.where(
+            identity & active.unsqueeze(-1),
+            torch.arange(steps, device=state.device).view(1, steps, 1),
+            steps,
+        ).amin(dim=1)
+        is_existing = existing_slot.lt(slots)
+        novel_first = torch.where(
+            (~is_existing) & first_occurrence.lt(steps), first_occurrence, steps
+        )
+        order = torch.argsort(novel_first, dim=1, stable=True)
+        ranks = torch.empty_like(order).scatter(
+            1, order, torch.arange(count, device=state.device).expand(batch, -1)
+        )
+        free_slots = torch.where(occupied, slots, slot_axis).sort(dim=1).values
+        free_count = (~occupied).sum(dim=1, keepdim=True)
+        allocated = free_slots.gather(1, ranks.clamp(max=slots - 1))
+        slot_by_id = torch.where(
+            is_existing,
+            existing_slot,
+            torch.where(
+                novel_first.lt(steps) & ranks.lt(free_count), allocated, slots
+            ),
+        )
+        event_slots = slot_by_id.gather(1, safe_ids)
+        active = active & event_slots.lt(slots)
+        event_batch, event_time = active.nonzero(as_tuple=True)
+        if event_time.numel():
+            event_slot = event_slots[event_batch, event_time]
+            proposal = _cap_vector_rms(
+                values[event_batch, event_time, 0].float(),
+                self._SEMANTIC_CONTENT_RMS_LIMIT,
+            )
+            gate_weight = self.write_gate.weight[:, self.d_model :]
+            update = torch.sigmoid(F.linear(proposal, gate_weight, self.write_gate.bias))
+            a = 1.0 - update
+            b = update * proposal
+            groups = event_batch * slots + event_slot
+            sort_order = torch.argsort(groups * (steps + 1) + event_time, stable=True)
+            event_batch = event_batch[sort_order]
+            event_time = event_time[sort_order]
+            event_slot = event_slot[sort_order]
+            groups = groups[sort_order]
+            a = a[sort_order]
+            b = b[sort_order]
+
+            initial = content_state[event_batch, event_slot]
+            first = torch.ones_like(groups, dtype=torch.bool)
+            first[1:] = groups[1:] != groups[:-1]
+            b = b + a * initial * first.unsqueeze(-1)
+            # Inclusive associative scan over affine transforms (a,b):
+            # c_out = a*c_in+b. Group boundaries keep independent slots apart.
+            scan_a, scan_b = a, b
+            offset = 1
+            while offset < scan_a.shape[0]:
+                same = groups[offset:] == groups[:-offset]
+                tail_a = torch.where(same.unsqueeze(-1), scan_a[offset:] * scan_a[:-offset], scan_a[offset:])
+                tail_b = torch.where(
+                    same.unsqueeze(-1),
+                    scan_a[offset:] * scan_b[:-offset] + scan_b[offset:],
+                    scan_b[offset:],
+                )
+                scan_a = torch.cat((scan_a[:offset], tail_a), dim=0)
+                scan_b = torch.cat((scan_b[:offset], tail_b), dim=0)
+                offset *= 2
+            scanned_content = _cap_vector_rms(scan_b, self._SEMANTIC_CONTENT_RMS_LIMIT)
+            event_steps = event_time.unique(sorted=True).tolist()
+        else:
+            event_batch = event_time = event_slot = None
+            scanned_content = None
+            event_steps = []
+
+        timeline = sorted(set(event_steps) | key_value_steps)
+        outputs: list[torch.Tensor] = []
+        predictions: list[tuple[int, torch.Tensor]] = []
+        cursor = 0
+        for step in timeline:
+            if cursor < step:
+                outputs.append(
+                    self._semantic_read_only_sequence(
+                        selected_deltas[cursor:step].float(),
+                        route_weights[cursor:step].float(),
+                        read_queries[cursor:step].float(),
+                        state.float(),
+                    )
+                )
+            if step in event_steps:
+                event_mask = event_time.eq(step)
+                row = event_batch[event_mask]
+                target_slot = event_slot[event_mask]
+                content = scanned_content[event_mask]
+                addr, current_content = torch.split(
+                    state.float(), [address_dim, self.d_model], dim=-1
+                )
+                new_address = F.one_hot(
+                    ids[row, step].clamp(0, count - 1),
+                    num_classes=count,
+                ).to(addr.dtype)
+                updated_addr = addr[row].scatter(
+                    1,
+                    target_slot[:, None, None].expand(-1, 1, address_dim),
+                    new_address[:, None, :],
+                )
+                updated_content = current_content[row].scatter(
+                    1,
+                    target_slot[:, None, None].expand(-1, 1, self.d_model),
+                    content[:, None, :],
+                )
+                merged = torch.cat((updated_addr, updated_content), dim=-1)
+                state = state.index_copy(0, row, merged)
+            outputs.append(
+                self._semantic_read_only_sequence(
+                    selected_deltas[step : step + 1].float(),
+                    route_weights[step : step + 1].float(),
+                    read_queries[step : step + 1].float(),
+                    state.float(),
+                )
+            )
+            if step in key_value_steps:
+                assert key_value_entity_ids is not None and key_value_mask is not None
+                predictions.append(
+                    (
+                        step,
+                        self._semantic_value_logits(
+                            state,
+                            key_value_entity_ids[step],
+                            key_value_mask[step],
+                        ),
+                    )
+                )
+            cursor = step + 1
+        if cursor < steps:
+            outputs.append(
+                self._semantic_read_only_sequence(
+                    selected_deltas[cursor:].float(),
+                    route_weights[cursor:].float(),
+                    read_queries[cursor:].float(),
+                    state.float(),
+                )
+            )
+        self._last_key_value_predictions = predictions
+        self._last_diag = {}
+        return torch.cat(outputs, dim=0).transpose(0, 1), state
 
     def forward_step(
         self,
@@ -1285,6 +2175,7 @@ class WorkspaceBroadcast(nn.Module):
         bistable_selection_scale: float | None = None,
         deterministic_gate: bool = False,
         prediction_error: torch.Tensor | None = None,
+        backbone_context: torch.Tensor | None = None,
         selected_specialists_only: bool = False,
         entity_ids: torch.Tensor | None = None,
         entity_write_mask: torch.Tensor | None = None,
@@ -1312,6 +2203,27 @@ class WorkspaceBroadcast(nn.Module):
         retrieval_query_mask: torch.Tensor | None = None,
         retrieval_query_operation: torch.Tensor | None = None,
         retrieval_query_steps: tuple[int, ...] | None = None,
+        key_value_entity_ids: torch.Tensor | None = None,
+        key_value_mask: torch.Tensor | None = None,
+        key_value_steps: tuple[int, ...] | None = None,
+        attentional_cue_color_ids: torch.Tensor | None = None,
+        attentional_cue_shape_ids: torch.Tensor | None = None,
+        attentional_cue_query_step_ids: torch.Tensor | None = None,
+        attentional_cue_readout_steps: tuple[int, ...] | None = None,
+        attentional_frame_entity_ids: torch.Tensor | None = None,
+        attentional_frame_mask: torch.Tensor | None = None,
+        attentional_frame_steps: tuple[int, ...] | None = None,
+        operation_metadata: torch.Tensor | None = None,
+        operation_steps: tuple[int, ...] | None = None,
+        adaptive_operator_teacher_targets: torch.Tensor | None = None,
+        adaptive_operator_candidate_mask: torch.Tensor | None = None,
+        adaptive_operator_execution_mask: torch.Tensor | None = None,
+        adaptive_operator_steps: tuple[int, ...] | None = None,
+        adaptive_operator_teacher_steps: tuple[int, ...] | None = None,
+        workspace_sparse_active_steps: tuple[int, ...] | None = None,
+        parallel_scan_allowed: bool = True,
+        adaptive_operator_teacher_weight: float = 0.0,
+        event_token_window: torch.Tensor | None = None,
         collect_kv_records: bool = False,
     ):
         """Process time-major specialists ``(B,T,E,D)`` sequentially."""
@@ -1325,6 +2237,14 @@ class WorkspaceBroadcast(nn.Module):
         self._last_nth_farthest_query_predictions = []
         self._last_retrieval_value_predictions = []
         self._last_retrieval_query_predictions = []
+        self._last_key_value_predictions = []
+        self._last_attentional_cue_predictions = []
+        self._last_attentional_frame_predictions = []
+        self._last_operation_diagnostics = []
+        self._last_adaptive_v3_route_steps: list[tuple[int, torch.Tensor]] = []
+        if self.adaptive_v3 is not None:
+            self.adaptive_v3.begin_sequence()
+            self.adaptive_v3.eval_bypass = bool(self.adaptive_v3_eval_bypass)
         step_diags: list[dict[str, torch.Tensor]] | None = [] if self.diagnostics_enabled else None
         state_observer = getattr(self, "_initium_recurrent_state_observer", None)
         smoothed_prediction_error = None
@@ -1334,6 +2254,7 @@ class WorkspaceBroadcast(nn.Module):
         time_major_deltas = None
         time_major_route_indices = None
         time_major_route_weights = None
+        time_major_selected_deltas = None
         time_major_entity_write_mask = None
         if self.semantic_entity_addressing:
             if entity_ids is None or entity_write_mask is None:
@@ -1353,6 +2274,156 @@ class WorkspaceBroadcast(nn.Module):
             raise ValueError(
                 "entity metadata is only accepted when semantic entity addressing is enabled"
             )
+        if self.adaptive_v3 is not None and self.adaptive_v3.use_backbone_context:
+            if backbone_context is None or backbone_context.shape != (
+                specialist_deltas.shape[0], specialist_deltas.shape[1], self.d_model
+            ):
+                raise ValueError(
+                    "adaptive V3 backbone context must have shape (batch, time, d_model)"
+                )
+            time_major_backbone_context = backbone_context.transpose(0, 1).contiguous()
+        else:
+            time_major_backbone_context = None
+        time_major_event_tokens = (
+            event_token_window.transpose(0, 1).contiguous()
+            if event_token_window is not None
+            else None
+        )
+        if key_value_entity_ids is not None or key_value_mask is not None:
+            expected_value_prefix = specialist_deltas.shape[:2]
+            if (
+                not self.key_value_readout
+                or key_value_entity_ids is None
+                or key_value_mask is None
+                or key_value_entity_ids.ndim != 3
+                or key_value_entity_ids.shape[:2] != expected_value_prefix
+                or key_value_entity_ids.shape[-1] < 4
+                or key_value_mask.shape != key_value_entity_ids.shape
+            ):
+                raise ValueError(
+                    "key-value read metadata requires the enabled readout and shape "
+                    "(batch, time, operands)"
+                )
+            if key_value_entity_ids.dtype not in (torch.int32, torch.int64):
+                raise TypeError("key-value entity IDs must be integer tensors")
+            if key_value_mask.dtype != torch.bool:
+                raise TypeError("key-value read mask must be torch.bool")
+            key_value_steps = tuple(sorted(set(key_value_steps or ())))
+            if any(step < 0 or step >= specialist_deltas.shape[1] for step in key_value_steps):
+                raise ValueError("key-value read step is outside the recurrent sequence")
+        elif key_value_steps:
+            raise ValueError("key-value read steps require key-value read metadata")
+        cue_values = (
+            attentional_cue_color_ids,
+            attentional_cue_shape_ids,
+            attentional_cue_query_step_ids,
+        )
+        if self.attentional_cue_readout_enabled:
+            if any(value is None or value.shape != (specialist_deltas.shape[0],) for value in cue_values):
+                raise ValueError("attentional cue metadata must contain three (batch,) tensors")
+            if any(value.dtype not in (torch.int32, torch.int64) for value in cue_values):
+                raise TypeError("attentional cue metadata must use integer tensors")
+            attentional_cue_readout_steps = tuple(
+                sorted(set(attentional_cue_readout_steps or ()))
+            )
+            if any(
+                step < 0 or step >= specialist_deltas.shape[1]
+                for step in attentional_cue_readout_steps
+            ):
+                raise ValueError("attentional cue read step is outside the recurrent sequence")
+        elif any(value is not None for value in cue_values) or attentional_cue_readout_steps:
+            raise ValueError("attentional cue metadata requires attentional cue readout mode")
+        frame_values = (attentional_frame_entity_ids, attentional_frame_mask)
+        if self.attentional_cue_readout_enabled:
+            expected_frame_shape = specialist_deltas.shape[:2]
+            if any(
+                value is None or value.shape != expected_frame_shape
+                for value in frame_values
+            ):
+                raise ValueError(
+                    "attentional frame metadata must contain (batch,time) IDs and mask"
+                )
+            assert attentional_frame_entity_ids is not None
+            assert attentional_frame_mask is not None
+            if attentional_frame_entity_ids.dtype not in (torch.int32, torch.int64):
+                raise TypeError("attentional frame entity IDs must be integer tensors")
+            if attentional_frame_mask.dtype != torch.bool:
+                raise TypeError("attentional frame mask must use torch.bool")
+            attentional_frame_steps = tuple(sorted(set(attentional_frame_steps or ())))
+            if any(
+                step < 0 or step >= specialist_deltas.shape[1]
+                for step in attentional_frame_steps
+            ):
+                raise ValueError("attentional frame step is outside the recurrent sequence")
+        elif any(value is not None for value in frame_values) or attentional_frame_steps:
+            raise ValueError("attentional frame metadata requires attentional cue readout mode")
+        if operation_metadata is not None or operation_steps:
+            if (
+                not self.operation_executor
+                or operation_metadata is None
+                or operation_metadata.shape != (*specialist_deltas.shape[:2], 7)
+                or operation_metadata.dtype not in (torch.int32, torch.int64)
+            ):
+                raise ValueError(
+                    "operation execution requires enabled mode and integer metadata "
+                    "with shape (batch,time,7)"
+                )
+            operation_steps = tuple(sorted(set(operation_steps or ())))
+            if any(step < 0 or step >= specialist_deltas.shape[1] for step in operation_steps):
+                raise ValueError("operation step is outside the recurrent sequence")
+        elif self.operation_executor:
+            raise ValueError("enabled workspace operation executor requires operation metadata")
+        operation_steps = tuple(operation_steps or ())
+        operation_step_set = set(operation_steps)
+        key_value_step_set = set(key_value_steps or ())
+        pair_swap_step_set = set(pair_swap_steps or ())
+        permutation_query_step_set = set(permutation_query_steps or ())
+        state_supervision_step_set = set(state_supervision_steps or ())
+        nth_farthest_vector_step_set = set(nth_farthest_vector_steps or ())
+        nth_farthest_query_step_set = set(nth_farthest_query_steps or ())
+        retrieval_value_step_set = set(retrieval_value_steps or ())
+        retrieval_query_step_set = set(retrieval_query_steps or ())
+        attentional_cue_readout_step_set = set(attentional_cue_readout_steps or ())
+        attentional_frame_step_set = set(attentional_frame_steps or ())
+        adaptive_operator_step_set: set[int] = set()
+        adaptive_operator_teacher_step_set: set[int] = set()
+        if self.adaptive_v3 is not None:
+            expected_adaptive_shape = specialist_deltas.shape[:2]
+            if (
+                adaptive_operator_candidate_mask is None
+                or adaptive_operator_execution_mask is None
+                or adaptive_operator_candidate_mask.shape != expected_adaptive_shape
+                or adaptive_operator_execution_mask.shape != expected_adaptive_shape
+                or adaptive_operator_candidate_mask.dtype != torch.bool
+                or adaptive_operator_execution_mask.dtype != torch.bool
+                or (adaptive_operator_teacher_targets is not None
+                    and adaptive_operator_teacher_targets.shape != (*expected_adaptive_shape, getattr(self.adaptive_v3, "teacher_width", 12)))
+            ):
+                raise ValueError(
+                    "adaptive V3 requires candidate/execution masks and optional (B,T,11) teacher targets"
+                )
+            adaptive_operator_steps = tuple(sorted(set(adaptive_operator_steps or ())))
+            adaptive_operator_step_set = set(adaptive_operator_steps)
+            if any(step < 0 or step >= specialist_deltas.shape[1] for step in adaptive_operator_steps):
+                raise ValueError("adaptive V3 candidate step is outside the recurrent sequence")
+            adaptive_operator_teacher_steps = tuple(
+                sorted(set(adaptive_operator_teacher_steps or ()))
+            )
+            if any(
+                step < 0 or step >= specialist_deltas.shape[1]
+                for step in adaptive_operator_teacher_steps
+            ):
+                raise ValueError("adaptive V3 teacher step is outside the recurrent sequence")
+            adaptive_operator_teacher_step_set = set(adaptive_operator_teacher_steps)
+        elif any(
+            value is not None
+            for value in (
+                adaptive_operator_teacher_targets,
+                adaptive_operator_candidate_mask,
+                adaptive_operator_execution_mask,
+            )
+        ) or adaptive_operator_steps:
+            raise ValueError("adaptive V3 metadata requires the V3 operator bank")
         if self.permutation_transactional:
             expected_pair_shape = (*specialist_deltas.shape[:2], 2)
             expected_metadata_shape = specialist_deltas.shape[:2]
@@ -1558,6 +2629,7 @@ class WorkspaceBroadcast(nn.Module):
                     time_major_route_indices.unsqueeze(-1).expand(-1, -1, -1, self.d_model),
                 )
             )
+            time_major_selected_deltas = selected_deltas
             write_candidates = time_major_deltas if no_selection else selected_deltas
             projection_context = (
                 torch.autocast(device_type="cuda", enabled=False)
@@ -1626,9 +2698,10 @@ class WorkspaceBroadcast(nn.Module):
                     projected_read_queries = projected_read_queries.contiguous()
         compiled_step = None
         # The fused recurrence is a training optimization. Curriculum and
-        # periodic evaluations use variable/partial batch sizes, which would
-        # otherwise create new fullgraph specializations for each batch shape.
-        # Keep evaluation on the eager path; its state transition is identical.
+        # periodic evaluations also use different batch sizes, so keep those
+        # paths eager and reserve shape specialization for training. Within
+        # training, segment bucketing can still vary the leading row count;
+        # torch.compile uses automatic dynamic-shape generalization for it.
         if (
             self.compile_recurrence
             and self.training
@@ -1673,7 +2746,193 @@ class WorkspaceBroadcast(nn.Module):
             compiled_zero_reconsideration_scores = state.new_zeros(
                 state.shape[:2], dtype=torch.float32
             )
+        v4_parse = {}
+        if (
+            self.adaptive_v4 is not None
+            and adaptive_operator_step_set
+            and time_major_event_tokens is not None
+        ):
+            _ps = sorted(adaptive_operator_step_set)
+            _pre = self.adaptive_v4.parse_steps(time_major_event_tokens[_ps])
+            v4_parse = {s: self.adaptive_v4.pick_parse(_pre, i) for i, s in enumerate(_ps)}
+        parallel_ineligible = []
+        if self.parallel_scan_enabled:
+            if not parallel_scan_allowed:
+                parallel_ineligible.append(
+                    "allocator routing or workspace-to-KV bridge is active"
+                )
+            if not (self.semantic_entity_addressing and self.entity_keyed_writes):
+                parallel_ineligible.append("semantic entity-keyed addressing is disabled")
+            if no_selection or not selected_specialists_only:
+                parallel_ineligible.append("routed top-k writes are unavailable")
+            if reset_each_step or bypass_broadcast or shuffle_readback_across_batch:
+                parallel_ineligible.append("reset, bypass, or shuffled readback is active")
+            if self.bistable_gate is not None or self.reconsideration_enabled:
+                parallel_ineligible.append("bistable gating or reconsideration is active")
+            if self.prediction_error_to_write_gate is not None or prediction_error is not None:
+                parallel_ineligible.append("prediction-error write control is active")
+            if self.bptt_horizon or self.adaptive_v3 is not None or self.adaptive_v4 is not None:
+                parallel_ineligible.append("truncated BPTT or adaptive V3/V4 is active")
+            if self.operation_executor or self.permutation_transactional:
+                parallel_ineligible.append("operation execution or pair-swap transactions are active")
+            if collect_kv_records or self.diagnostics_enabled or state_observer is not None:
+                parallel_ineligible.append("KV collection, diagnostics, or state observation is active")
+            if any((
+                operation_step_set,
+                pair_swap_step_set,
+                permutation_query_step_set,
+                state_supervision_step_set,
+                nth_farthest_vector_step_set,
+                nth_farthest_query_step_set,
+                retrieval_value_step_set,
+                retrieval_query_step_set,
+                attentional_cue_readout_step_set,
+                attentional_frame_step_set,
+                adaptive_operator_step_set,
+            )):
+                parallel_ineligible.append("a non-key-value auxiliary workspace read is active")
+            if (
+                route_indices.shape[-1] != 1
+                or projected_write_values is None
+                or projected_read_queries is None
+                or time_major_selected_deltas is None
+                or time_major_route_weights is None
+                or time_major_entity_write_mask is None
+            ):
+                parallel_ineligible.append("the fast-path projections are unavailable or top-k is not 1")
+            if self.write_gate_closed:
+                parallel_ineligible.append("the workspace write gate is closed")
+            if not parallel_ineligible:
+                with (
+                    torch.autocast(device_type="cuda", enabled=False)
+                    if specialist_deltas.is_cuda
+                    else torch.autocast(device_type="cpu", enabled=False)
+                ):
+                    parallel_outputs, parallel_state = self._parallel_semantic_scan(
+                        time_major_selected_deltas,
+                        time_major_route_weights,
+                        projected_read_queries,
+                        projected_write_values,
+                        entity_ids.transpose(0, 1).contiguous(),
+                        time_major_entity_write_mask,
+                        state.float(),
+                        key_value_entity_ids.transpose(0, 1).contiguous()
+                        if key_value_entity_ids is not None
+                        else None,
+                        key_value_mask.transpose(0, 1).contiguous()
+                        if key_value_mask is not None
+                        else None,
+                        key_value_step_set,
+                    )
+                return parallel_outputs, parallel_state
+            if self.training and not self._parallel_scan_fallback_warned:
+                warnings.warn(
+                    "workspace parallel semantic scan is enabled but this forward "
+                    "uses the sequential recurrence: " + "; ".join(parallel_ineligible),
+                    stacklevel=2,
+                )
+                self._parallel_scan_fallback_warned = True
+
+        sparse_active_steps: set[int] = set()
+        sparse_recurrence = bool(
+            self.sparse_recurrence_enabled
+            and self.semantic_entity_addressing
+            and self.entity_keyed_writes
+            and selected_specialists_only
+            and not no_selection
+            and not reset_each_step
+            and not bypass_broadcast
+            and not shuffle_readback_across_batch
+            and not self.reconsideration_enabled
+            and self.prediction_error_to_write_gate is None
+            and prediction_error is None
+            and self.bistable_gate is None
+            and not self.bptt_horizon
+            and not collect_kv_records
+            and not self.diagnostics_enabled
+            and state_observer is None
+            and time_major_entity_write_mask is not None
+            and projected_read_queries is not None
+            and time_major_selected_deltas is not None
+        )
+        if sparse_recurrence:
+            # A single device-to-host sync builds the sparse event index. The
+            # loop then runs the full recurrent transition only where an input
+            # event can change state or a side-channel read must be emitted.
+            # Dense batches do not amortize the sync/index overhead and get no
+            # useful work reduction, so leave those on the regular path.
+            if workspace_sparse_active_steps is not None:
+                sparse_active_steps.update(int(index) for index in workspace_sparse_active_steps)
+            else:
+                sparse_active_steps.update(
+                    int(index)
+                    for index in time_major_entity_write_mask.any(dim=1).nonzero().flatten().tolist()
+                )
+            for steps in (
+                operation_steps,
+                pair_swap_steps,
+                key_value_steps,
+                permutation_query_steps,
+                state_supervision_steps,
+                nth_farthest_vector_steps,
+                nth_farthest_query_steps,
+                retrieval_value_steps,
+                retrieval_query_steps,
+                attentional_frame_steps,
+                attentional_cue_readout_steps,
+                adaptive_operator_steps if self.adaptive_v3 is not None else (),
+            ):
+                sparse_active_steps.update(int(index) for index in (steps or ()))
+            sequence_length = specialist_deltas.shape[1]
+            max_sparse_steps = int(
+                sequence_length * self._SPARSE_RECURRENCE_MAX_ACTIVE_FRACTION
+            )
+            if len(sparse_active_steps) > max_sparse_steps:
+                if self.training and not self._sparse_recurrence_density_warned:
+                    active_fraction = len(sparse_active_steps) / max(sequence_length, 1)
+                    warnings.warn(
+                        "workspace sparse recurrence fell back to the ordinary "
+                        f"loop: {len(sparse_active_steps)}/{sequence_length} sequence "
+                        f"positions are state-changing ({active_fraction:.1%}; "
+                        f"limit {self._SPARSE_RECURRENCE_MAX_ACTIVE_FRACTION:.0%}).",
+                        stacklevel=2,
+                    )
+                    self._sparse_recurrence_density_warned = True
+                sparse_recurrence = False
+                sparse_active_steps.clear()
+        if sparse_recurrence:
+            next_active_step = [sequence_length] * sequence_length
+            following = sequence_length
+            for index in range(sequence_length - 1, -1, -1):
+                next_active_step[index] = following
+                if index in sparse_active_steps:
+                    following = index
+        else:
+            next_active_step = []
+        sparse_skip_until = 0
         for step in range(specialist_deltas.shape[1]):
+            if sparse_recurrence and step < sparse_skip_until:
+                continue
+            if sparse_recurrence and step not in sparse_active_steps:
+                end_step = next_active_step[step]
+                if end_step > step:
+                    assert time_major_selected_deltas is not None
+                    assert time_major_route_weights is not None
+                    assert projected_read_queries is not None
+                    with (
+                        torch.autocast(device_type="cuda", enabled=False)
+                        if specialist_deltas.is_cuda
+                        else torch.autocast(device_type="cpu", enabled=False)
+                    ):
+                        read_only_output = self._semantic_read_only_sequence(
+                            time_major_selected_deltas[step:end_step].float(),
+                            time_major_route_weights[step:end_step].float(),
+                            projected_read_queries[step:end_step].float(),
+                            state.float(),
+                        )
+                    outputs.extend(read_only_output.unbind(0))
+                    sparse_skip_until = end_step
+                    continue
             # Truncate only the gradient carried by persistent slots. Detach
             # preserves the exact forward state and therefore the full write /
             # read trajectory; zero keeps the historical full-sequence BPTT.
@@ -1770,6 +3029,13 @@ class WorkspaceBroadcast(nn.Module):
                         "InductorError",
                         "SubprocException",
                         "TritonError",
+                        # Full-graph Dynamo raises these when a legal shape
+                        # variation exhausts specialization limits. This is a
+                        # compile-path failure, not a failed workspace update;
+                        # the pre-drawn random tape lets eager replay the same
+                        # mathematically equivalent transition.
+                        "FailOnRecompileLimitHit",
+                        "Unsupported",
                     }
                     cause: BaseException | None = exc
                     is_compile_error = False
@@ -1960,7 +3226,74 @@ class WorkspaceBroadcast(nn.Module):
                         )
                 else:
                     self._last_step_diag = {}
-            if self.permutation_transactional and pair_swap_steps and step in pair_swap_steps:
+            if (
+                self.adaptive_v3 is not None
+                and step in adaptive_operator_step_set
+                and not bypass_broadcast
+            ):
+                assert adaptive_operator_candidate_mask is not None
+                assert adaptive_operator_execution_mask is not None
+                assert time_major_selected_deltas is not None
+                assert time_major_route_weights is not None
+                assert self.semantic_value_decoder is not None
+                routed_context = (
+                    time_major_selected_deltas[step].float()
+                    * time_major_route_weights[step].float().unsqueeze(-1)
+                ).sum(dim=1)
+                state_content = (
+                    torch.split(state.float(), [self._address_dim, self.d_model], dim=-1)[1]
+                    if self.entity_keyed_writes
+                    else state.float()
+                )
+                adaptive_context = torch.cat(
+                    (routed_context, state_content.mean(dim=1)), dim=-1
+                )
+                adaptive_backbone_context = (
+                    time_major_backbone_context[step].float()
+                    if time_major_backbone_context is not None
+                    else None
+                )
+                state = self.adaptive_v3.step(
+                    state=state.float(),
+                    context=adaptive_context,
+                    backbone_context=adaptive_backbone_context,
+                    event_tokens=time_major_event_tokens[step],
+                    semantic_value_decoder=self.semantic_value_decoder,
+                    active_mask=adaptive_operator_candidate_mask[:, step],
+                    execution_mask=adaptive_operator_execution_mask[:, step],
+                    teacher_targets=(
+                        adaptive_operator_teacher_targets[:, step]
+                        if adaptive_operator_teacher_targets is not None
+                        and step in adaptive_operator_teacher_step_set
+                        else None
+                    ),
+                    teacher_weight=(
+                        adaptive_operator_teacher_weight
+                        if step in adaptive_operator_teacher_step_set
+                        else 0.0
+                    ),
+                    step_index=step,
+                    **({"parsed": v4_parse[step]} if v4_parse else {}),
+                )
+            if operation_step_set and step in operation_step_set:
+                assert operation_metadata is not None
+                operand_state = state
+                if bypass_broadcast:
+                    # A bypass must remove the executor's access to stored
+                    # operands as well as the specialists' broadcast input.
+                    continue_operations = False
+                else:
+                    continue_operations = True
+                    if shuffle_readback_across_batch and state.shape[0] > 1:
+                        operand_state = state.roll(1, dims=0)
+                if continue_operations:
+                    state = self._execute_workspace_operation_step(
+                        state,
+                        operation_metadata[:, step],
+                        step=step,
+                        operand_state=operand_state,
+                    )
+            if self.permutation_transactional and step in pair_swap_step_set:
                 assert pair_swap_entity_ids is not None and pair_swap_mask is not None
                 state, committed = self._apply_semantic_pair_swap(
                     state,
@@ -2008,10 +3341,27 @@ class WorkspaceBroadcast(nn.Module):
                 kv_commit_masks.append(top_weights > 1e-6)
             if state_observer is not None:
                 state_observer(state, call_index=step)
+            if step in key_value_step_set:
+                assert key_value_entity_ids is not None and key_value_mask is not None
+                value_state = state
+                if bypass_broadcast:
+                    value_state = torch.zeros_like(state)
+                elif shuffle_readback_across_batch and state.shape[0] > 1:
+                    value_state = state.roll(1, dims=0)
+                self._last_key_value_predictions.append(
+                    (
+                        step,
+                        self._semantic_value_logits(
+                            value_state,
+                            key_value_entity_ids[:, step],
+                            key_value_mask[:, step],
+                        ),
+                    )
+                )
             if (
                 self.permutation_transactional
                 and permutation_query_steps
-                and step in permutation_query_steps
+                and step in permutation_query_step_set
             ):
                 assert permutation_query_kind is not None and permutation_query_ids is not None
                 position_logits, entity_logits = self._semantic_query_class_logits(
@@ -2030,7 +3380,7 @@ class WorkspaceBroadcast(nn.Module):
                 )
             if (
                 state_supervision_steps
-                and step in state_supervision_steps
+                and step in state_supervision_step_set
                 and state_supervision_entity_ids is not None
                 and state_supervision_mask is not None
             ):
@@ -2046,7 +3396,7 @@ class WorkspaceBroadcast(nn.Module):
                 )
             if (
                 nth_farthest_vector_steps
-                and step in nth_farthest_vector_steps
+                and step in nth_farthest_vector_step_set
                 and nth_farthest_vector_entity_ids is not None
                 and nth_farthest_vector_mask is not None
             ):
@@ -2060,7 +3410,7 @@ class WorkspaceBroadcast(nn.Module):
                         ),
                     )
                 )
-            if nth_farthest_query_steps and step in nth_farthest_query_steps:
+            if step in nth_farthest_query_step_set:
                 assert nth_farthest_query_candidate_ids is not None
                 assert nth_farthest_query_candidate_mask is not None
                 assert nth_farthest_query_vectors is not None
@@ -2077,7 +3427,7 @@ class WorkspaceBroadcast(nn.Module):
                 self._last_nth_farthest_query_predictions.append(
                     (step, query_logits, selected_entities, active_queries)
                 )
-            if retrieval_value_steps and step in retrieval_value_steps:
+            if step in retrieval_value_step_set:
                 assert retrieval_value_entity_ids is not None and retrieval_value_mask is not None
                 value_logits, found = self._semantic_retrieval_value_logits(
                     state,
@@ -2087,7 +3437,7 @@ class WorkspaceBroadcast(nn.Module):
                 self._last_retrieval_value_predictions.append(
                     (step, value_logits.squeeze(1), found.squeeze(1))
                 )
-            if retrieval_query_steps and step in retrieval_query_steps:
+            if step in retrieval_query_step_set:
                 assert retrieval_query_entity_ids is not None
                 assert retrieval_query_mask is not None
                 query_logits, found = self._semantic_retrieval_value_logits(
@@ -2102,6 +3452,35 @@ class WorkspaceBroadcast(nn.Module):
                         found.detach(),
                         retrieval_query_mask[:, step].detach(),
                     )
+                )
+            if step in attentional_cue_readout_step_set:
+                assert attentional_cue_color_ids is not None
+                assert attentional_cue_shape_ids is not None
+                assert attentional_cue_query_step_ids is not None
+                cue_state = state
+                if bypass_broadcast:
+                    cue_state = torch.zeros_like(state)
+                elif shuffle_readback_across_batch and state.shape[0] > 1:
+                    cue_state = state.roll(1, dims=0)
+                first_logits, second_logits, active_rows = self._attentional_cue_value_logits(
+                    cue_state,
+                    attentional_cue_color_ids,
+                    attentional_cue_shape_ids,
+                    attentional_cue_query_step_ids.eq(step),
+                )
+                self._last_attentional_cue_predictions.append(
+                    (step, first_logits, second_logits, active_rows)
+                )
+            if step in attentional_frame_step_set:
+                assert attentional_frame_entity_ids is not None
+                assert attentional_frame_mask is not None
+                color_logits, shape_logits, found = self._attentional_frame_field_logits(
+                    state,
+                    attentional_frame_entity_ids[:, step],
+                    attentional_frame_mask[:, step],
+                )
+                self._last_attentional_frame_predictions.append(
+                    (step, color_logits, shape_logits, found)
                 )
             outputs.append(out)
             if step_diags is not None:

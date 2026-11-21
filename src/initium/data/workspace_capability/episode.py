@@ -7,13 +7,32 @@ from itertools import chain
 from typing import Any
 
 VOCAB_SIZE = 320
+VOCAB_LIMIT = 1 << 15  # Stage-4 text vocabulary ceiling (legacy typed vocabulary stays 320)
 PAD = 0
 BOS = 1
 EOS = 2
 SEP = 3
 QUERY = 4
 ANSWER = 5
+# Keep all eleven existing track marker IDs stable for old checkpoints. Later
+# tracks use an existing marker as a sentinel plus a compact source-token code,
+# avoiding a vocabulary-size change that would invalidate model projections.
 TRACK_BASE = 24
+TRACK_TOKEN_IDS = (24, 25, 26, 27, 28, 29, 30, 31, 6, 7, 189)
+
+
+def track_token(index: int) -> int:
+    if not 0 <= int(index) < len(TRACK_TOKEN_IDS):
+        raise ValueError(f"track index must be in [0,{len(TRACK_TOKEN_IDS)}), got {index}")
+    return TRACK_TOKEN_IDS[int(index)]
+
+
+def track_index(token: int) -> int | None:
+    try:
+        return TRACK_TOKEN_IDS.index(int(token))
+    except ValueError:
+        return None
+
 
 # Event tokens occupy a dedicated range; fields use disjoint typed ranges.
 EV_INIT = 8
@@ -44,6 +63,31 @@ BOOL_FALSE, BOOL_TRUE = 184, 185
 NONE_TOKEN = 186
 SOURCE_PRIORITY_POLICY = 187
 FACT_BASE, FACT_COUNT = 192, 128
+# Stage 4 control tokens (320-383) and text base
+LANG_TRACK_BASE, LANG_TRACK_COUNT = 320, 16
+MARK_S, MARK_R, MARK_O = 336, 337, 338
+SPK_USER, SPK_SYS, TURN_END = 339, 340, 341
+TASK_QA, TASK_RETELL, TASK_PARA, TASK_D2T, TASK_T2D, TASK_ACCEPT, TASK_CLOZE, TASK_FIRST = range(342, 350)
+MASK_TOKEN = 350
+TEXT_BASE = 384
+
+
+def track_marker_info(tokens: tuple[int, ...] | list[int]) -> tuple[int | None, int]:
+    """Decode a track prefix and return ``(track_id, prefix_length)``.
+
+    The original single-token prefix remains unchanged. Later tracks use a
+    compact two-token extension after the stable marker so old vocabulary and
+    checkpoint projection shapes remain compatible.
+    """
+    if len(tokens) < 3:
+        return None, 0
+    if int(tokens[2]) == TRACK_TOKEN_IDS[-1] and len(tokens) >= 5:
+        extension = int(tokens[3])
+        if SOURCE_BASE <= extension < SOURCE_BASE + 8 and int(tokens[4]) == SEP:
+            return len(TRACK_TOKEN_IDS) + extension - SOURCE_BASE, 5
+        return None, 0
+    index = track_index(int(tokens[1]))
+    return (index, 3) if index is not None and int(tokens[2]) == SEP else (None, 0)
 
 
 def entity_token(index: int) -> int:
@@ -104,7 +148,7 @@ class TaskEpisode:
             raise ValueError("episode input must begin with BOS")
         if not self.answer or self.answer[-1] != EOS:
             raise ValueError("episode answer must end with EOS")
-        if any(token < 0 or token >= VOCAB_SIZE for token in chain(self.inputs, self.answer)):
+        if any(token < 0 or token >= VOCAB_LIMIT for token in chain(self.inputs, self.answer)):
             raise ValueError("episode contains a token outside the configured vocabulary")
         if not self.metadata.get("query_type"):
             raise ValueError("episode metadata must include query_type")

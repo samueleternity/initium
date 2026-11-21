@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 import warnings
+from typing import Any, cast
 
 import torch
 import torch.nn as nn
@@ -93,6 +94,12 @@ class WorkspaceBroadcast(nn.Module):
     # homogeneous scale improves address-projection gradient conditioning;
     # address normalization leaves forward similarities unchanged.
     _ADDRESS_PROJECTION_INPUT_SCALE = 10_000.0
+
+    _operation_add_indices: torch.Tensor
+    _operation_low_indices: torch.Tensor
+    _operation_high_indices: torch.Tensor
+    _operation_compare_indices: torch.Tensor
+    _operation_rank_indices: torch.Tensor
 
     def __init__(
         self,
@@ -1034,19 +1041,19 @@ class WorkspaceBroadcast(nn.Module):
         joint = first_scalar.unsqueeze(2) * second_scalar.unsqueeze(1)
         flat_joint = joint.reshape(joint.shape[0], -1)
         batch = joint.shape[0]
-        add_probs = torch.zeros_like(first_scalar).scatter_add_(
+        add_probs = cast(Any, torch.zeros_like(first_scalar)).scatter_add(
             1, self._operation_add_indices.unsqueeze(0).expand(batch, -1), flat_joint
         )
-        low_probs = torch.zeros_like(first_scalar).scatter_add_(
+        low_probs = cast(Any, torch.zeros_like(first_scalar)).scatter_add(
             1, self._operation_low_indices.unsqueeze(0).expand(batch, -1), flat_joint
         )
-        high_probs = torch.zeros_like(first_scalar).scatter_add_(
+        high_probs = cast(Any, torch.zeros_like(first_scalar)).scatter_add(
             1, self._operation_high_indices.unsqueeze(0).expand(batch, -1), flat_joint
         )
-        rank_probs = torch.zeros_like(first_scalar).scatter_add_(
+        rank_probs = cast(Any, torch.zeros_like(first_scalar)).scatter_add(
             1, self._operation_rank_indices.unsqueeze(0).expand(batch, -1), flat_joint
         )
-        compare_probs = torch.zeros_like(first_scalar).scatter_add_(
+        compare_probs = cast(Any, torch.zeros_like(first_scalar)).scatter_add(
             1,
             self._operation_compare_indices.unsqueeze(0).expand(batch, -1),
             flat_joint,

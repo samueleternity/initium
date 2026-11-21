@@ -17,7 +17,6 @@ from initium.data.workspace_capability.episode import (
     EV_INIT,
     EV_KV,
     EV_MOVE,
-    EV_NOISE,
     EV_UPDATE,
     EV_VECTOR,
     LOCATION_BASE,

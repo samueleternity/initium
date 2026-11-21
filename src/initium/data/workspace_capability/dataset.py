@@ -3131,6 +3131,9 @@ class WorkspaceCapabilityDataset(BaseDataset):
     ):
         if self._output_proj is None:
             raise RuntimeError("dataset output projection was not set by the training pipeline")
+        eval_teacher_forced = (
+            self.teacher_forced_answers if teacher_forced is None else bool(teacher_forced)
+        )
         was_training = model.training
         prior_workspace_bypass = getattr(model, "workspace_eval_bypass", None)
         prior_workspace_shuffle = getattr(model, "workspace_eval_shuffle_readback", None)
@@ -3304,7 +3307,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 ):
                     x, _targets, _mask = self._collate(
                         group,
-                        teacher_forced=self.teacher_forced_answers if teacher_forced is None else teacher_forced,
+                        teacher_forced=eval_teacher_forced,
                         token_ids_only=bool(getattr(model, "workspace_token_id_input", False)),
                     )
                     sequence_valid_mask = None

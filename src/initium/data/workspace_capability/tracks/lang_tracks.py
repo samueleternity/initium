@@ -8,7 +8,7 @@ import random as _random
 
 from initium.data.workspace_capability.episode import (
     BOOL_FALSE, BOOL_TRUE, FACT_BASE, MASK_TOKEN, SPK_SYS, SPK_USER, TASK_ACCEPT, TASK_CLOZE, TASK_D2T,
-    TASK_FIRST, TASK_PARA, TASK_QA, TASK_RETELL, TASK_T2D, TURN_END, relation_token,
+    TASK_FIRST, TASK_PARA, TASK_QA, TASK_RETELL, TASK_T2D, TURN_END, location_token, relation_token,
 )
 from initium.data.workspace_capability.tracks import _lang_text as lt
 from initium.data.workspace_capability.tracks._lang_grammar import (
@@ -307,6 +307,12 @@ def _g_story(cfg, rng):
         a = [NAMES[p], "is", "carrying", "the", OBJS[hs[0]] + "."] if hs else [NAMES[p], "is", "carrying", "nothing."]
     ep.ctl(TASK_QA)
     ep.story(q, ctx=False)
+    if grp == "yes_no" and ep.ann:
+        # The utterance names both a person and a candidate place. Give the
+        # workspace an explicit causal read target for the person's current
+        # location, so the model can learn the comparison before verbalizing
+        # the yes/no plus rationale. This does not put the answer in the input.
+        ep.rd.append((len(ep.t) - 1, p, location_token(pl[p])))
     return ep.done("lang_story_qa", _toks(a), f"{grp}_ev{cfg['events']}", grp, grammar_checked=False)
 
 

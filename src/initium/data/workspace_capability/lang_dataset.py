@@ -573,14 +573,30 @@ class LanguageDataset(WorkspaceCapabilityDataset):
     def _evaluate_episodes(self, model, device, episodes, **kw):
         if not any(e.metadata.get("prev") for e in episodes) or not hasattr(model, "_initium_carry"):
             return super()._evaluate_episodes(model, device, episodes, **kw)
+        context_teacher_forced = bool(kw.get("teacher_forced", self.teacher_forced_answers))
         hint, carries = min(self.batch_size_hint, max(1, len(episodes))), []
+        prior_segment_count = sum(len(tuple(e.metadata.get("prev", ()))) for e in episodes)
+        if prior_segment_count:
+            print(
+                f"  [lang-eval-context] replaying {prior_segment_count} prior segments "
+                f"| teacher_forced={'on' if context_teacher_forced else 'off'} "
+                f"| workspace_kv={'on' if getattr(model, 'workspace_key_value_readout_enabled', False) else 'off'}"
+            )
         for off in range(0, len(episodes), hint):
             chains = [tuple(e.metadata.get("prev", ())) for e in episodes[off : off + hint]]
             n, carry = max(map(len, chains)), None
             for i in range(n):
                 group = [c[i - (n - len(c))] if i >= n - len(c) else _DUMMY for c in chains]
                 model._initium_carry = [carry]
-                self._probe_forward(model, device, group, lambda *a: None)
+                self._probe_forward(
+                    model,
+                    device,
+                    group,
+                    lambda *a: None,
+                    want_kv=bool(getattr(model, "workspace_key_value_readout_enabled", False)),
+                    teacher_forced=context_teacher_forced,
+                    state_only=True,
+                )
                 carry = model._carry_out
             carries.append(carry)
         model._initium_carry = carries
@@ -913,7 +929,17 @@ class LanguageDataset(WorkspaceCapabilityDataset):
         return result
 
     # ------------------------------------------------------------------ section-8 diagnostics
-    def _probe_forward(self, model, device, episodes, on_batch, make_observer=None, want_kv=False):
+    def _probe_forward(
+        self,
+        model,
+        device,
+        episodes,
+        on_batch,
+        make_observer=None,
+        want_kv=False,
+        teacher_forced=False,
+        state_only=False,
+    ):
         """Microbatched eval forward; calls on_batch(group, answer_preds, kv_meta, kv_preds)."""
         workspace = model.workspace
         prior, was_training = getattr(workspace, "_initium_recurrent_state_observer", None), model.training
@@ -922,7 +948,11 @@ class LanguageDataset(WorkspaceCapabilityDataset):
             with torch.no_grad():
                 for off in range(0, len(episodes), self.batch_size_hint):
                     group = episodes[off : off + self.batch_size_hint]
-                    x, _targets, answer_mask = self._collate(group, token_ids_only=True)
+                    x, _targets, answer_mask = self._collate(
+                        group,
+                        token_ids_only=True,
+                        teacher_forced=teacher_forced,
+                    )
                     kwargs = {
                         k: v.to(device) for k, v in self.workspace_entity_address_metadata(x, episodes=group).items()
                     }
@@ -935,6 +965,10 @@ class LanguageDataset(WorkspaceCapabilityDataset):
                         )
                     workspace._initium_recurrent_state_observer = make_observer(group) if make_observer else None
                     output, state = model(x.to(device), (None, None, None), reset_experience=True, **kwargs)
+                    if state_only:
+                        if want_kv:
+                            workspace.pop_key_value_predictions()
+                        continue
                     features = output.transpose(0, 1)
                     logits = self._output_proj(features)
                     if getattr(model, "workspace_slot_readout_enabled", False):

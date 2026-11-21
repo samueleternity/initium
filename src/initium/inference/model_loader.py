@@ -225,6 +225,10 @@ def _build_split_graph(c: _Cfg, input_dim, hidden, nr_cells, cell_size, read_hea
         ),
         workspace_enabled=c.get("workspace_enabled", cc.WORKSPACE_ENABLED),
         workspace_num_slots=c.get("workspace_num_slots", cc.WORKSPACE_NUM_SLOTS),
+        workspace_token_id_input=c.get("workspace_token_id_input", False),
+        workspace_slot_readout=c.get("workspace_slot_readout", False),
+        workspace_semantic_entity_count=c.get("workspace_semantic_entity_count", 64),
+        workspace_allocator=c.get("workspace_allocator", False),
         workspace_adaptive_enabled=c.get("workspace_adaptive_enabled", False),
         workspace_adaptive_v2_enabled=c.get("workspace_adaptive_v2_enabled", False),
         workspace_adaptive_v2_num_skills=c.get("workspace_adaptive_v2_num_skills", 8),
@@ -325,6 +329,41 @@ def load_model(ckpt: dict, device: torch.device, deterministic_write: bool = Fal
     link_mode = raw.get("link_matrix_mode", "dense")
     if link_mode != "dense":
         patch_link_matrix(rnn, mode=link_mode, topk=raw.get("link_matrix_topk"))
+
+    # The language slot-text decoder is partly tied to the input token
+    # embedding. Its column manifest must be installed before loading weights,
+    # otherwise the workspace state is incomplete and cannot reproduce the
+    # training-time readout.
+    if raw.get("workspace_slot_readout") and isinstance(rnn, SplitGraphDNC):
+        from initium.data.workspace_capability.lang_dataset import LanguageDataset
+        from initium.data.workspace_capability.tracks import _lang_text
+
+        stage5 = int(raw.get("workspace_semantic_entity_count", 64)) == 128
+        _lang_text.configure(stage5=stage5)
+        if not raw.get("workspace_lang_manifest_sha256"):
+            raise ValueError("language slot-readout checkpoint is missing its tokenizer manifest hash")
+        actual_manifest = _lang_text.manifest_sha256()
+        if actual_manifest != raw["workspace_lang_manifest_sha256"]:
+            raise ValueError(
+                "language checkpoint tokenizer manifest mismatch: "
+                f"checkpoint={raw['workspace_lang_manifest_sha256']} local={actual_manifest}"
+            )
+        columns = LanguageDataset.slot_text_columns()
+        import hashlib
+
+        column_hash = hashlib.sha256(",".join(str(int(token)) for token in columns).encode("ascii")).hexdigest()
+        expected_hash = raw.get("workspace_slot_text_columns_sha256")
+        if expected_hash and column_hash != expected_hash:
+            raise ValueError(
+                "language slot-text columns differ from the checkpoint manifest; "
+                "use the Stage 5 tokenizer/code revision used for training"
+            )
+        expected_count = raw.get("workspace_slot_text_columns_count")
+        if expected_count is not None and len(columns) != int(expected_count):
+            raise ValueError(
+                f"language slot-text column count mismatch: checkpoint={expected_count}, local={len(columns)}"
+            )
+        rnn.workspace.enable_slot_text(columns, tied_input_embedding=True)
 
     w = ckpt["output_proj_state_dict"]["weight"]
     output_proj = nn.Linear(w.shape[1], w.shape[0]).to(device)

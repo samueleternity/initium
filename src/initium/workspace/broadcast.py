@@ -514,7 +514,10 @@ class WorkspaceBroadcast(nn.Module):
         if not exact_valid.any() and not fallback_valid.any():
             return logits.sum() * 0.0
         log_prob = F.log_softmax(logits, dim=-1)
-        losses = logits.new_zeros(targets.shape, dtype=logits.dtype)
+        # log_softmax may promote BF16 logits to FP32 under autocast. Keep
+        # the indexed-assignment buffer in the loss dtype to avoid a BF16 <-
+        # FP32 index_put mismatch, and preserve FP32 loss accumulation.
+        losses = log_prob.new_zeros(targets.shape)
         if exact_valid.any():
             losses[exact_valid] = -log_prob.gather(-1, safe_positions.unsqueeze(-1)).squeeze(-1)[exact_valid]
         if fallback_valid.any():
@@ -1482,7 +1485,17 @@ class WorkspaceBroadcast(nn.Module):
         slot's gated proposal recurrence is scanned in parallel. Readback is
         still evaluated against the exact state visible at each timestep.
         """
-        steps, batch = entity_ids.shape
+        ids = entity_ids.to(torch.long).transpose(0, 1).contiguous()
+        write_mask = entity_write_mask.transpose(0, 1).contiguous()
+        routes = route_weights.transpose(0, 1).contiguous()
+        values = write_values.transpose(0, 1).contiguous()
+        batch, steps = ids.shape
+        if (
+            write_mask.shape != (batch, steps)
+            or routes.shape[:2] != (batch, steps)
+            or values.shape[:2] != (batch, steps)
+        ):
+            raise ValueError("parallel semantic scan inputs disagree on batch/time axes")
         slots = self.num_slots
         count = self._SEMANTIC_ENTITY_COUNT
         address_dim = self._address_dim
@@ -1498,17 +1511,16 @@ class WorkspaceBroadcast(nn.Module):
         )
         existing_slot.scatter_reduce_(1, stored_ids, slot_values, reduce="amin", include_self=True)
 
-        ids = entity_ids.to(torch.long)
-        if bool(((ids >= count) & entity_write_mask).any()):
+        if bool(((ids >= count) & write_mask).any()):
             raise ValueError("parallel semantic scan received an out-of-range entity ID")
         safe_ids = ids.clamp(0, count - 1)
-        active = entity_write_mask & ids.ge(0) & route_weights[..., 0].gt(0)
+        active = write_mask & ids.ge(0) & routes[..., 0].gt(0)
         identity = F.one_hot(safe_ids, num_classes=count).to(torch.bool)
         first_occurrence = torch.where(
             identity & active.unsqueeze(-1),
-            torch.arange(steps, device=state.device).view(steps, 1, 1),
+            torch.arange(steps, device=state.device).view(1, steps, 1),
             steps,
-        ).amin(dim=0)
+        ).amin(dim=1)
         is_existing = existing_slot.lt(slots)
         novel_first = torch.where(
             (~is_existing) & first_occurrence.lt(steps), first_occurrence, steps
@@ -1527,13 +1539,13 @@ class WorkspaceBroadcast(nn.Module):
                 novel_first.lt(steps) & ranks.lt(free_count), allocated, slots
             ),
         )
-        event_slots = slot_by_id.gather(1, safe_ids.transpose(0, 1)).transpose(0, 1)
+        event_slots = slot_by_id.gather(1, safe_ids)
         active = active & event_slots.lt(slots)
-        event_batch, event_time = active.transpose(0, 1).nonzero(as_tuple=True)
+        event_batch, event_time = active.nonzero(as_tuple=True)
         if event_time.numel():
             event_slot = event_slots[event_batch, event_time]
             proposal = _cap_vector_rms(
-                write_values[event_time, event_batch, 0].float(),
+                values[event_batch, event_time, 0].float(),
                 self._SEMANTIC_CONTENT_RMS_LIMIT,
             )
             gate_weight = self.write_gate.weight[:, self.d_model :]
@@ -1598,7 +1610,7 @@ class WorkspaceBroadcast(nn.Module):
                     state.float(), [address_dim, self.d_model], dim=-1
                 )
                 new_address = F.one_hot(
-                    entity_ids[step, row].long().clamp(0, count - 1),
+                    ids[row, step].clamp(0, count - 1),
                     num_classes=count,
                 ).to(addr.dtype)
                 updated_addr = addr[row].scatter(
@@ -2746,7 +2758,9 @@ class WorkspaceBroadcast(nn.Module):
         parallel_ineligible = []
         if self.parallel_scan_enabled:
             if not parallel_scan_allowed:
-                parallel_ineligible.append("allocator or workspace-to-KV bridge is active")
+                parallel_ineligible.append(
+                    "allocator routing or workspace-to-KV bridge is active"
+                )
             if not (self.semantic_entity_addressing and self.entity_keyed_writes):
                 parallel_ineligible.append("semantic entity-keyed addressing is disabled")
             if no_selection or not selected_specialists_only:

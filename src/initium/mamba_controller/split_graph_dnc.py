@@ -1944,7 +1944,8 @@ class SplitGraphDNC(nn.Module):
                 ),
                 collect_kv_records=self.workspace_kv_memory is not None,
                 parallel_scan_allowed=(
-                    self.allocator is None and self.workspace_kv_memory is None
+                    (self.allocator is None or self.allocator_use_prob <= 0.0)
+                    and self.workspace_kv_memory is None
                 ),
             )
             if self.workspace_kv_memory is not None:

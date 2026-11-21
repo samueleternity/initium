@@ -45,6 +45,7 @@ from initium.data.workspace_capability.episode import (
     SCALAR_BASE,
     SEP,
     SOURCE_BASE,
+    VOCAB_LIMIT,
     VOCAB_SIZE,
     TaskEpisode,
     validate_episode,
@@ -399,25 +400,53 @@ def test_all_track_curriculum_has_separate_schedules_and_requires_each_track(mon
     dataset = capability_dataset.WorkspaceCapabilityDataset("all")
     curriculum = WorkspaceCapabilityCurriculum(dataset)
     assert len(curriculum.table) == 6
-    assert set(curriculum.table[0]) == set(GENERATORS)
+    assert set(curriculum.table[0]) == set(dataset._tracks())
 
     def mocked_evaluate(*args, **kwargs):
         dataset.last_eval_diagnostics = {
-            "tracks": {track: {"accuracy": 90.0} for track in GENERATORS}
+            "tracks": {
+                track: {"accuracy": 90.0, "exact_match": 90.0, "episodes": 64}
+                for track in dataset._tracks()
+            },
+            "progression_groups": {
+                track: {
+                    group: {"accuracy": 90.0, "exact_match": 90.0, "episodes": 64}
+                    for group in dataset._curriculum_groups(track, curriculum.lesson)
+                }
+                for track in dataset._tracks()
+            },
         }
-        dataset.last_eval_diagnostics["tracks"]["nth_farthest"]["accuracy"] = 40.0
+        dataset.last_eval_diagnostics["tracks"]["entity_state"]["accuracy"] = 40.0
+        dataset.last_eval_diagnostics["tracks"]["entity_state"]["exact_match"] = 40.0
+        for g in (
+            dataset.last_eval_diagnostics["progression_groups"].get("entity_state", {}).values()
+        ):
+            g["accuracy"] = 40.0
+            g["exact_match"] = 40.0
         return 88.0, 88.0, {}
 
+    monkeypatch.setattr(dataset, "evaluate_curriculum_id", mocked_evaluate)
     monkeypatch.setattr(dataset, "evaluate_id", mocked_evaluate)
     curriculum.maybe_advance(None, torch.device("cpu"), step=10)
     assert curriculum.lesson == 0
 
     def all_ready(*args, **kwargs):
         dataset.last_eval_diagnostics = {
-            "tracks": {track: {"accuracy": 90.0} for track in GENERATORS}
+            "tracks": {
+                track: {"accuracy": 90.0, "exact_match": 90.0, "episodes": 64}
+                for track in dataset._tracks()
+            },
+            "progression_groups": {
+                track: {
+                    group: {"accuracy": 90.0, "exact_match": 90.0, "episodes": 64}
+                    for group in dataset._curriculum_groups(track, curriculum.lesson)
+                }
+                for track in dataset._tracks()
+            },
         }
         return 90.0, 88.0, {}
 
+    monkeypatch.setattr(dataset, "evaluate_curriculum_id", all_ready)
     monkeypatch.setattr(dataset, "evaluate_id", all_ready)
     curriculum.maybe_advance(None, torch.device("cpu"), step=20)
     assert curriculum.lesson == 1
@@ -474,7 +503,7 @@ def test_task_field_log_rows_match_dataset_owned_header():
 
 def test_episode_rejects_tokens_outside_typed_vocabulary():
     with pytest.raises(ValueError, match="outside"):
-        TaskEpisode("bad", (BOS, VOCAB_SIZE), (EOS,), {"query_type": "invalid"})
+        TaskEpisode("bad", (BOS, VOCAB_LIMIT), (EOS,), {"query_type": "invalid"})
 
 
 def test_transactional_metadata_defers_swap_pair_and_marks_boundary():

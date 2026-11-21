@@ -138,8 +138,24 @@ from initium.mamba_controller.mamba3_controller import Mamba3ControllerWrapper
 from initium.mamba_controller.mamba_controller import MambaControllerWrapper
 from initium.memory_manipulation.dnc_mechanisms import build_memory
 from initium.memory_manipulation.sequence_memories import CausalKVMemory, GatedDeltaMemory
+from initium.workspace.adaptive import AdaptiveWorkspaceSkills
+from initium.workspace.adaptive_v2 import AdaptiveWorkspaceSkillsV2
+from initium.workspace.allocator import KeyAllocator
 from initium.workspace.broadcast import WorkspaceBroadcast
 from initium.workspace.kv_bridge import WorkspaceKVBridge, WorkspaceKVState
+
+
+def _detach_state_tree(value):
+    if isinstance(value, torch.Tensor):
+        return value.detach()
+    if isinstance(value, dict):
+        return {key: _detach_state_tree(child) for key, child in value.items()}
+    if isinstance(value, list):
+        return [_detach_state_tree(child) for child in value]
+    if isinstance(value, tuple):
+        children = tuple(_detach_state_tree(child) for child in value)
+        return type(value)(*children) if hasattr(value, "_fields") else children
+    return value
 
 
 class _ModelCapacityMetadata:
@@ -247,12 +263,42 @@ class SplitGraphDNC(nn.Module):
         dnc_implementation: str = "base",
         workspace_enabled: bool = False,
         workspace_num_slots: int = 5,
+        workspace_adaptive_enabled: bool = False,
+        workspace_adaptive_v2_enabled: bool = False,
+        workspace_adaptive_v2_num_skills: int = 8,
+        workspace_adaptive_v2_mi_weight: float = 0.01,
+        workspace_adaptive_v3_enabled: bool = False,
+        workspace_adaptive_v3_rank: int = 32,
+        workspace_adaptive_v3_usage_floor_weight: float = 0.0,
+        workspace_adaptive_v3_readback_consistency_weight: float = 0.0,
+        workspace_adaptive_v3_attention_temperature: float = 12.0,
+        workspace_adaptive_v3_temperature_enabled: bool = False,
+        workspace_adaptive_v3_straight_through_binding: bool = False,
+        workspace_adaptive_v3_entity_destinations: bool = False,
+        workspace_adaptive_v3_split_context_norm: bool = False,
+        workspace_adaptive_v3_use_backbone_context: bool = False,
+        workspace_adaptive_v3_teacher_forced_operator_outputs: bool = False,
+        workspace_adaptive_v3_class_balanced_operator_loss: bool = False,
+        workspace_adaptive_v3_compile_operators: bool = False,
+        workspace_adaptive_v4_enabled: bool = False,
         workspace_compile_recurrence: bool = False,
+        workspace_sparse_recurrence: bool = False,
+        workspace_parallel_scan: bool = False,
         workspace_entity_keyed_writes: bool = False,
         workspace_semantic_entity_addressing: bool = False,
         workspace_permutation_transactional: bool = False,
         workspace_nth_farthest_exact_readout: bool = False,
         workspace_retrieval_exact_readout: bool = False,
+        workspace_key_value_readout: bool = False,
+        workspace_operation_executor: bool = False,
+        workspace_operation_diagnostics: bool = False,
+        workspace_exact_value_comparison: bool = False,
+        workspace_exact_selection: bool = False,
+        workspace_attentional_item_memory: bool = False,
+        workspace_attentional_cue_readout: bool = False,
+        workspace_rule_feedback_update: bool = False,
+        workspace_no_report_confidence_readout: bool = False,
+        workspace_masked_prime_trace: bool = False,
         workspace_key_match_threshold: float = 0.5,
         workspace_no_selection: bool = False,
         workspace_reset_each_step: bool = False,
@@ -268,6 +314,10 @@ class SplitGraphDNC(nn.Module):
         workspace_write_to_kv: bool = False,
         workspace_kv_read_scale: float = 0.1,
         workspace_token_id_input: bool = False,
+        workspace_slot_readout: bool = False,
+        workspace_semantic_entity_count: int = 64,
+        workspace_allocator: bool = False,
+        activation_checkpointing: bool = False,
         sgr_write_salience_enabled: bool = False,
         sgr_workspace_salience_enabled: bool = False,
     ):
@@ -415,7 +465,8 @@ class SplitGraphDNC(nn.Module):
             )
         self.workspace_enabled = workspace_enabled
         self.workspace_token_id_input = bool(workspace_token_id_input)
-        if self.workspace_token_id_input and not (mamba_variant == "mamba1" and input_size == 320):
+        self.workspace_slot_readout_enabled = bool(workspace_slot_readout)
+        if self.workspace_token_id_input and not (mamba_variant == "mamba1" and input_size >= 320):
             raise ValueError(
                 "token-ID input is currently supported only for the 320-token "
                 "workspace-capability vocabulary with Mamba-1"
@@ -426,6 +477,66 @@ class SplitGraphDNC(nn.Module):
         self.workspace_permutation_transactional = bool(workspace_permutation_transactional)
         self.workspace_nth_farthest_exact_readout = bool(workspace_nth_farthest_exact_readout)
         self.workspace_retrieval_exact_readout = bool(workspace_retrieval_exact_readout)
+        self.workspace_key_value_readout_enabled = bool(workspace_key_value_readout)
+        self.workspace_operation_executor_enabled = bool(workspace_operation_executor)
+        self.workspace_adaptive_v3_enabled = bool(workspace_adaptive_v3_enabled)
+        self.workspace_adaptive_v3_logit_diagnostics_enabled: bool = False
+        self.workspace_adaptive_v3_eval_episodes_per_track: int = 0
+        self.workspace_adaptive_v3_feature_off_tracks: tuple[str, ...] = ()
+        self.workspace_adaptive_v3_holdout_tracks: tuple[str, ...] = ()
+        self.workspace_operation_diagnostics_enabled = bool(workspace_operation_diagnostics)
+        self.workspace_exact_value_comparison_enabled = bool(workspace_exact_value_comparison)
+        self.workspace_exact_selection_enabled = bool(workspace_exact_selection)
+        self.workspace_attentional_item_memory_enabled = bool(
+            workspace_attentional_item_memory or workspace_attentional_cue_readout
+        )
+        self.workspace_attentional_cue_readout_enabled = bool(workspace_attentional_cue_readout)
+        self.workspace_rule_feedback_update_enabled = bool(workspace_rule_feedback_update)
+        self.workspace_no_report_confidence_readout_enabled = bool(
+            workspace_no_report_confidence_readout
+        )
+        self.workspace_masked_prime_trace_enabled = bool(workspace_masked_prime_trace)
+        if (
+            self.workspace_no_report_confidence_readout_enabled
+            or self.workspace_masked_prime_trace_enabled
+        ) and not (
+            workspace_enabled
+            and workspace_entity_keyed_writes
+            and workspace_semantic_entity_addressing
+            and workspace_key_value_readout
+        ):
+            raise ValueError(
+                "GNW-specific workspace readouts require entity-keyed semantic "
+                "workspace addressing and key-value readout"
+            )
+        self.workspace_sparse_recurrence_enabled = bool(workspace_sparse_recurrence)
+        if self.workspace_sparse_recurrence_enabled and not (
+            self.workspace_entity_keyed_writes and self.workspace_semantic_entity_addressing
+        ):
+            raise ValueError(
+                "workspace sparse recurrence requires entity-keyed semantic addressing"
+            )
+        self.workspace_parallel_scan_enabled = bool(workspace_parallel_scan)
+        if self.workspace_parallel_scan_enabled and not (
+            workspace_enabled
+            and workspace_entity_keyed_writes
+            and workspace_semantic_entity_addressing
+            and workspace_key_value_readout
+        ):
+            raise ValueError(
+                "workspace parallel scan requires entity-keyed semantic addressing "
+                "and key-value readout"
+            )
+        if (
+            self.workspace_operation_executor_enabled
+            and not self.workspace_key_value_readout_enabled
+        ):
+            raise ValueError("workspace operation executor requires key-value readout")
+        if (
+            self.workspace_operation_diagnostics_enabled
+            and not self.workspace_operation_executor_enabled
+        ):
+            raise ValueError("workspace operation diagnostics require the operation executor")
         self.workspace_key_match_threshold = float(workspace_key_match_threshold)
         self.workspace_no_selection = workspace_no_selection
         self.workspace_reset_each_step = workspace_reset_each_step
@@ -476,6 +587,7 @@ class SplitGraphDNC(nn.Module):
             moe_load_balance_alpha=moe_load_balance_alpha,
             moe_residual_scale=moe_backbone_residual_scale,
             moe_block_isolation=moe_backbone_block_isolation,
+            activation_checkpointing=activation_checkpointing,
             device=device,
         )
 
@@ -713,6 +825,16 @@ class SplitGraphDNC(nn.Module):
             self.output = None
         if workspace_num_slots < 0:
             raise ValueError("workspace_num_slots must be >= 0")
+        if workspace_adaptive_enabled and workspace_adaptive_v2_enabled:
+            raise ValueError("choose either workspace adaptive v1 or v2, not both")
+        if workspace_adaptive_enabled and not (workspace_enabled and workspace_num_slots > 0):
+            raise ValueError(
+                "adaptive workspace skills require an active workspace with at least one slot"
+            )
+        if workspace_adaptive_v2_enabled and not (workspace_enabled and workspace_num_slots > 0):
+            raise ValueError(
+                "adaptive workspace v2 requires an active workspace with at least one slot"
+            )
         if workspace_compile_recurrence and (not workspace_enabled or workspace_num_slots < 1):
             raise ValueError(
                 "compiled workspace recurrence requires workspace_enabled=True "
@@ -752,6 +874,35 @@ class SplitGraphDNC(nn.Module):
                 permutation_transactional=workspace_permutation_transactional,
                 nth_farthest_exact_readout=workspace_nth_farthest_exact_readout,
                 retrieval_exact_readout=workspace_retrieval_exact_readout,
+                key_value_readout=workspace_key_value_readout,
+                value_vocab_size=input_size,
+                operation_executor=workspace_operation_executor,
+                operation_diagnostics=workspace_operation_diagnostics,
+                adaptive_v3_enabled=workspace_adaptive_v3_enabled,
+                adaptive_v3_rank=workspace_adaptive_v3_rank,
+                adaptive_v3_usage_floor_weight=workspace_adaptive_v3_usage_floor_weight,
+                adaptive_v3_readback_consistency_weight=(
+                    workspace_adaptive_v3_readback_consistency_weight
+                ),
+                adaptive_v3_attention_temperature=workspace_adaptive_v3_attention_temperature,
+                adaptive_v3_temperature_enabled=workspace_adaptive_v3_temperature_enabled,
+                adaptive_v3_straight_through_binding=workspace_adaptive_v3_straight_through_binding,
+                adaptive_v3_entity_destinations=workspace_adaptive_v3_entity_destinations,
+                adaptive_v3_split_context_norm=workspace_adaptive_v3_split_context_norm,
+                adaptive_v3_use_backbone_context=workspace_adaptive_v3_use_backbone_context,
+                adaptive_v3_teacher_forced_operator_outputs=(
+                    workspace_adaptive_v3_teacher_forced_operator_outputs
+                ),
+                adaptive_v3_class_balanced_operator_loss=(
+                    workspace_adaptive_v3_class_balanced_operator_loss
+                ),
+                adaptive_v3_compile_operators=workspace_adaptive_v3_compile_operators,
+                adaptive_v4_enabled=workspace_adaptive_v4_enabled,
+                sparse_recurrence=workspace_sparse_recurrence,
+                parallel_scan=workspace_parallel_scan,
+                slot_readout=workspace_slot_readout,
+                semantic_entity_count=workspace_semantic_entity_count,
+                attentional_cue_readout=workspace_attentional_cue_readout,
                 key_match_threshold=workspace_key_match_threshold,
             )
             if workspace_enabled and workspace_num_slots > 0
@@ -759,6 +910,39 @@ class SplitGraphDNC(nn.Module):
         )
         if workspace_rng_state is not None:
             torch.random.set_rng_state(workspace_rng_state)
+        self.workspace_adaptive: AdaptiveWorkspaceSkills | AdaptiveWorkspaceSkillsV2 | None = None
+        if workspace_adaptive_enabled or workspace_adaptive_v2_enabled:
+            adaptive_rng_state = torch.random.get_rng_state()
+            if workspace_adaptive_v2_enabled:
+                self.workspace_adaptive = AdaptiveWorkspaceSkillsV2(
+                    hidden_size,
+                    moe_num_experts,
+                    num_skills=workspace_adaptive_v2_num_skills,
+                    mutual_information_loss_weight=workspace_adaptive_v2_mi_weight,
+                )
+            else:
+                self.workspace_adaptive = AdaptiveWorkspaceSkills(hidden_size, moe_num_experts)
+            torch.random.set_rng_state(adaptive_rng_state)
+        self.workspace_adaptive_eval_bypass = False
+        self._initium_carry: list = []
+        self._carry_out = None
+        self.allocator_use_prob = 0.0
+        self.allocator_stats: dict = {}
+        self._alloc_loss = None
+        self.allocator = None
+        if workspace_allocator:
+            if (
+                self.workspace is None
+                or not (self.workspace_token_id_input and workspace_semantic_entity_addressing)
+                or num_backbone_blocks < 2
+            ):
+                raise ValueError(
+                    "allocator requires workspace + semantic addressing + token-ID input + >=2 backbone blocks"
+                )
+            _rs = torch.random.get_rng_state()
+            self.allocator = KeyAllocator(hidden_size, self.workspace._address_dim)
+            torch.random.set_rng_state(_rs)
+        self.workspace_adaptive_v3_eval_bypass = False
         if self.workspace_write_to_kv:
             # Keep this optional sidecar from changing the random stream used
             # by existing modules or matched-seed controls.
@@ -794,6 +978,262 @@ class SplitGraphDNC(nn.Module):
         if self.device is not None and getattr(self.device, "type", None) == "cuda":
             self.to(self.device)
 
+    def apply_slot_readout(
+        self,
+        logits,
+        features,
+        state,
+        answer_mask,
+        *,
+        copy_source_token_ids=None,
+        copy_source_mask=None,
+    ):
+        """Add slot-pointer word logits at answer positions; honours bypass/shuffle ablations."""
+        ws = self.workspace
+        chx = state[0] if isinstance(state, tuple) else None
+        if ws is None or ws.slot_pointer is None or not isinstance(chx, dict):
+            return logits
+        slots = chx["_initium_workspace_state"]
+        if self.workspace_eval_bypass:
+            slots = torch.zeros_like(slots)
+        elif self.workspace_eval_shuffle_readback and slots.shape[0] > 1:
+            slots = slots.roll(1, 0)
+        match_features = chx.get("_initium_workspace_match_keys")
+        out = ws.slot_readout_logits(features, slots, match_features=match_features)
+        copy_delta = None
+        if (
+            not self.workspace_eval_bypass
+            and copy_source_token_ids is not None
+            and copy_source_mask is not None
+            and ws.context_copy_query is not None
+        ):
+            source_mask = copy_source_mask.to(device=features.device, dtype=torch.bool)
+            source_ids = copy_source_token_ids.to(device=features.device, dtype=torch.long).clamp(
+                0, logits.shape[-1] - 1
+            )
+            adapter = getattr(self.backbone, "in_adapter", None)
+            if not isinstance(adapter, nn.Linear) or adapter.weight.shape[0] != features.shape[-1]:
+                raise RuntimeError("context copy requires a token-ID input embedding adapter")
+            source_features = torch.nn.functional.embedding(source_ids, adapter.weight.T)
+            pointer = ws.context_copy_logits(features, source_features, source_mask).softmax(-1)
+            copy_vocab = torch.zeros_like(logits, dtype=torch.float32)
+            copy_vocab.scatter_add_(
+                -1,
+                source_ids.unsqueeze(1).expand(-1, pointer.shape[1], -1),
+                pointer.float(),
+            )
+            source_count = source_mask.sum(-1).clamp_min(1).to(pointer.dtype)
+            chance = source_count.reciprocal().unsqueeze(-1)
+            confidence = copy_vocab.amax(-1).to(pointer.dtype)
+            gate = ((confidence - chance) / (0.5 - chance).clamp_min(1e-6)).clamp(0.0, 1.0)
+            copy_delta = copy_vocab * 8.0 * gate.unsqueeze(-1)
+        if ws.slot_text_cols is None:
+            delta = out.to(logits.dtype)
+            result = logits + delta * answer_mask.to(
+                device=logits.device, dtype=logits.dtype
+            ).unsqueeze(-1)
+            if copy_delta is not None:
+                result = result + copy_delta.to(dtype=result.dtype) * answer_mask.to(
+                    device=result.device, dtype=result.dtype
+                ).unsqueeze(-1)
+            return result
+        sel = answer_mask.to(logits.device).bool()
+        if not sel.any():
+            return logits
+        rows = logits[sel]
+        adapter = getattr(self.backbone, "in_adapter", None)
+        if isinstance(adapter, nn.Linear) and adapter.weight.shape[0] == out.shape[-1]:
+            # Copy logits share the input token embeddings. A token unseen as a
+            # slot-head target can still be emitted when its input embedding
+            # has been learned.
+            slot_logits = (
+                ws.slot_readout_scale * (out[sel] @ adapter.weight[:, ws.slot_text_cols])
+            ).to(rows.dtype)
+        else:
+            if ws.slot_text_head is None:
+                raise RuntimeError("slot-text copy requires a compatible token input embedding")
+            slot_logits = (ws.slot_readout_scale * ws.slot_text_head(out[sel])).to(rows.dtype)
+
+        # Let the backbone handle words that are absent from memory or whose
+        # pointer is still uncertain. Slot values are useful as a grounded
+        # residual once the pointer has confidence, but overwriting these logits
+        # makes early training depend entirely on randomly initialized slots.
+        address, _content = torch.split(slots.float(), [ws._address_dim, ws.d_model], dim=-1)
+        occupied = address.square().sum(-1) > 1e-12
+        slot_ids = address.argmax(-1)
+        present = torch.zeros(
+            address.shape[0], ws._SEMANTIC_ENTITY_COUNT, dtype=torch.int32, device=address.device
+        )
+        present.scatter_add_(1, slot_ids, occupied.to(torch.int32))
+        present = present > 0
+        pointer = ws.slot_pointer_logits(features, match_features, present).softmax(-1)
+        pointer_on_occupied = pointer.gather(
+            -1, slot_ids.unsqueeze(1).expand(-1, pointer.shape[1], -1)
+        ) * occupied.unsqueeze(1).to(pointer.dtype)
+        confidence = pointer_on_occupied.amax(dim=-1)[sel]
+        chance = 1.0 / max(int(ws.slot_pointer.out_features), 1)
+        # Confidence ramps from chance-level to full slot influence. This keeps
+        # the backbone path available while answer-time pointer supervision is
+        # still learning.
+        slot_gate = ((confidence - chance) / max(0.75 - chance, 1e-6)).clamp(0.0, 1.0)
+        cols = ws.slot_text_cols
+        base_logits = rows[:, cols]
+        gate = slot_gate.to(rows.dtype).unsqueeze(-1)
+        rows[:, cols] = base_logits + gate * (slot_logits - base_logits)
+        result = logits.clone()
+        result[sel] = rows
+        if copy_delta is not None:
+            result = result + copy_delta.to(dtype=result.dtype) * answer_mask.to(
+                device=result.device, dtype=result.dtype
+            ).unsqueeze(-1)
+        return result
+
+    def apply_slot_readout_sparse(
+        self,
+        logits,
+        features,
+        state,
+        batch_indices,
+        time_indices,
+        answer_positions,
+        *,
+        copy_source_token_ids=None,
+        copy_source_mask=None,
+    ):
+        """Apply the ordinary slot/copy readout to already-gathered positions."""
+        if logits.ndim != 2 or features.ndim != 2:
+            raise ValueError(
+                "sparse slot readout expects [positions,vocab] logits and [positions,hidden] features"
+            )
+        if logits.shape[0] == 0:
+            return logits
+        if self.workspace is None or self.workspace.slot_pointer is None:
+            return logits
+        chx = state[0] if isinstance(state, tuple) else None
+        if not isinstance(chx, dict) or "_initium_workspace_state" not in chx:
+            return logits
+        rows = batch_indices.to(device=features.device, dtype=torch.long)
+        batch_slots = chx["_initium_workspace_state"]
+        if self.workspace_eval_bypass:
+            batch_slots = torch.zeros_like(batch_slots)
+        elif self.workspace_eval_shuffle_readback and batch_slots.shape[0] > 1:
+            batch_slots = batch_slots.roll(1, 0)
+        slots = batch_slots.index_select(0, rows)
+        match_features = chx.get("_initium_workspace_match_keys")
+        sparse_match_features = (
+            match_features.index_select(0, rows) if match_features is not None else None
+        )
+        sparse_answer = answer_positions.to(device=logits.device, dtype=logits.dtype)
+        out = self.workspace.slot_readout_logits(
+            features.unsqueeze(1), slots, match_features=sparse_match_features
+        )
+        result = logits
+        if self.workspace.slot_text_cols is None:
+            result = logits + out[:, 0].to(logits.dtype) * sparse_answer.unsqueeze(-1)
+        else:
+            adapter = getattr(self.backbone, "in_adapter", None)
+            if isinstance(adapter, nn.Linear) and adapter.weight.shape[0] == out.shape[-1]:
+                slot_logits = (
+                    self.workspace.slot_readout_scale
+                    * (out[:, 0] @ adapter.weight[:, self.workspace.slot_text_cols])
+                ).to(logits.dtype)
+            else:
+                if self.workspace.slot_text_head is None:
+                    raise RuntimeError("slot-text copy requires a compatible token input embedding")
+                slot_logits = (
+                    self.workspace.slot_readout_scale * self.workspace.slot_text_head(out[:, 0])
+                ).to(logits.dtype)
+            address, _content = torch.split(
+                slots.float(), [self.workspace._address_dim, self.workspace.d_model], dim=-1
+            )
+            occupied = address.square().sum(-1) > 1e-12
+            slot_ids = address.argmax(-1)
+            present = (
+                torch.zeros(
+                    address.shape[0],
+                    self.workspace._SEMANTIC_ENTITY_COUNT,
+                    dtype=torch.int32,
+                    device=address.device,
+                ).scatter_add_(1, slot_ids, occupied.to(torch.int32))
+                > 0
+            )
+            pointer = self.workspace.slot_pointer_logits(
+                features.unsqueeze(1), sparse_match_features, present
+            ).softmax(-1)
+            pointer_on_occupied = pointer.gather(
+                -1, slot_ids.unsqueeze(1).expand(-1, pointer.shape[1], -1)
+            ) * occupied.unsqueeze(1).to(pointer.dtype)
+            confidence = pointer_on_occupied.amax(dim=-1)[:, 0]
+            chance = 1.0 / max(int(self.workspace.slot_pointer.out_features), 1)
+            slot_gate = ((confidence - chance) / max(0.75 - chance, 1e-6)).clamp(0.0, 1.0)
+            slot_gate = slot_gate.to(logits.dtype) * sparse_answer
+            cols = self.workspace.slot_text_cols
+            result = logits.clone()
+            result[:, cols] = logits[:, cols] + slot_gate.unsqueeze(-1) * (
+                slot_logits - logits[:, cols]
+            )
+
+        sparse_copy_ids = (
+            copy_source_token_ids.index_select(0, rows)
+            if copy_source_token_ids is not None
+            else None
+        )
+        sparse_copy_mask = (
+            copy_source_mask.index_select(0, rows) if copy_source_mask is not None else None
+        )
+        if (
+            not self.workspace_eval_bypass
+            and sparse_copy_ids is not None
+            and sparse_copy_mask is not None
+            and self.workspace.context_copy_query is not None
+        ):
+            source_ids = sparse_copy_ids.to(device=features.device, dtype=torch.long).clamp(
+                0, logits.shape[-1] - 1
+            )
+            source_mask = sparse_copy_mask.to(device=features.device, dtype=torch.bool)
+            adapter = getattr(self.backbone, "in_adapter", None)
+            if not isinstance(adapter, nn.Linear) or adapter.weight.shape[0] != features.shape[-1]:
+                raise RuntimeError("context copy requires a token-ID input embedding adapter")
+            source_features = torch.nn.functional.embedding(source_ids, adapter.weight.T)
+            copy_pointer = self.workspace.context_copy_logits(
+                features.unsqueeze(1), source_features, source_mask
+            ).softmax(-1)[:, 0]
+            copy_vocab = torch.zeros_like(result, dtype=torch.float32)
+            copy_vocab.scatter_add_(1, source_ids, copy_pointer.float())
+            source_count = source_mask.sum(-1).clamp_min(1).to(copy_pointer.dtype)
+            chance = source_count.reciprocal()
+            confidence = copy_vocab.amax(-1).to(copy_pointer.dtype)
+            copy_gate = ((confidence - chance) / (0.5 - chance).clamp_min(1e-6)).clamp(0.0, 1.0)
+            result = result + (
+                copy_vocab.to(result.dtype)
+                * (8.0 * copy_gate.to(result.dtype) * sparse_answer).unsqueeze(-1)
+            )
+        return result
+
+    def _allocate(self, feats, state, ids, wm, valid):
+        a = self.allocator
+        out = a(feats.float(), state.float())
+        if self.training:
+            loss, st = a.loss(out, ids, wm, valid)
+            self._alloc_loss = loss
+            e = self.allocator_stats
+            self.allocator_stats = (
+                st if not e else {k: 0.99 * e[k] + 0.01 * v for k, v in st.items()}
+            )
+        if self.allocator_use_prob > 0.0:
+            pid, pw, confidence = a.predict(out)
+            use = (
+                (torch.rand(ids.shape, device=ids.device) < self.allocator_use_prob)
+                & confidence.ge(0.2)
+                & ids.ge(0)
+            )
+            ids, wm = torch.where(use, pid, ids), torch.where(use, pw, wm)
+        return ids, wm
+
+    def pop_allocator_loss(self):
+        loss, self._alloc_loss = self._alloc_loss, None
+        return loss
+
     def set_sgr_prediction_decoder(self, decoder: nn.Module | None, signal_mode: str) -> None:
         object.__setattr__(
             self,
@@ -814,6 +1254,8 @@ class SplitGraphDNC(nn.Module):
         prediction_valid_mask: torch.Tensor | None = None,
         entity_ids: torch.Tensor | None = None,
         entity_write_mask: torch.Tensor | None = None,
+        workspace_match_entity_ids: torch.Tensor | None = None,
+        workspace_match_write_mask: torch.Tensor | None = None,
         pair_swap_entity_ids: torch.Tensor | None = None,
         pair_swap_mask: torch.Tensor | None = None,
         pair_swap_steps: tuple[int, ...] | None = None,
@@ -823,6 +1265,25 @@ class SplitGraphDNC(nn.Module):
         state_supervision_entity_ids: torch.Tensor | None = None,
         state_supervision_mask: torch.Tensor | None = None,
         state_supervision_steps: tuple[int, ...] | None = None,
+        key_value_entity_ids: torch.Tensor | None = None,
+        key_value_mask: torch.Tensor | None = None,
+        key_value_steps: tuple[int, ...] | None = None,
+        attentional_cue_color_ids: torch.Tensor | None = None,
+        attentional_cue_shape_ids: torch.Tensor | None = None,
+        attentional_cue_query_step_ids: torch.Tensor | None = None,
+        attentional_cue_readout_steps: tuple[int, ...] | None = None,
+        attentional_frame_entity_ids: torch.Tensor | None = None,
+        attentional_frame_mask: torch.Tensor | None = None,
+        attentional_frame_steps: tuple[int, ...] | None = None,
+        operation_metadata: torch.Tensor | None = None,
+        operation_steps: tuple[int, ...] | None = None,
+        adaptive_operator_teacher_targets: torch.Tensor | None = None,
+        adaptive_operator_candidate_mask: torch.Tensor | None = None,
+        adaptive_operator_execution_mask: torch.Tensor | None = None,
+        adaptive_operator_steps: tuple[int, ...] | None = None,
+        adaptive_operator_teacher_steps: tuple[int, ...] | None = None,
+        workspace_sparse_active_steps: tuple[int, ...] | None = None,
+        adaptive_operator_teacher_weight: float = 0.0,
         nth_farthest_vector_entity_ids: torch.Tensor | None = None,
         nth_farthest_vector_mask: torch.Tensor | None = None,
         nth_farthest_vector_steps: tuple[int, ...] | None = None,
@@ -875,6 +1336,18 @@ class SplitGraphDNC(nn.Module):
         """
         original_hx = hx
         chx, mhx, last_read = hx
+        if (
+            self._initium_carry
+        ):  # segment-carry: recurrent stores survive after old tokens are dropped
+            _c = self._initium_carry.pop(0)
+            if _c is not None:
+                if "chx" in _c:
+                    chx = _c["chx"]
+                    mhx = _c.get("mhx", mhx)
+                    last_read = _c.get("last_read", last_read)
+                else:  # compatibility with workspace-only carry payloads
+                    chx = _c
+                reset_experience = False
         if self.workspace_token_id_input:
             if input.ndim != 2 or input.dtype not in (torch.int32, torch.int64):
                 raise ValueError(
@@ -948,6 +1421,16 @@ class SplitGraphDNC(nn.Module):
             if workspace_state is None or reset_experience:
                 workspace_state = self.workspace.init_state(
                     B, device=input.device, dtype=recurrent_state_dtype
+                )
+        workspace_match_keys = None
+        if self.workspace is not None and self.workspace.slot_pointer is not None:
+            if isinstance(chx, dict) and not reset_experience:
+                workspace_match_keys = chx.get("_initium_workspace_match_keys")
+            if workspace_match_keys is None or reset_experience:
+                workspace_match_keys = torch.zeros(
+                    (B, self.workspace._SEMANTIC_ENTITY_COUNT, self.workspace.d_model),
+                    device=input.device,
+                    dtype=recurrent_state_dtype,
                 )
         if start_step:
             if not (0 < start_step < T):
@@ -1180,6 +1663,39 @@ class SplitGraphDNC(nn.Module):
             base, specialists, route_indices, route_weights = forward_with_specialists(
                 stage_input, **specialist_kwargs
             )
+            if (
+                workspace_match_keys is not None
+                and workspace_match_entity_ids is not None
+                and workspace_match_write_mask is not None
+            ):
+                match_ids = workspace_match_entity_ids[:, start_step:]
+                match_mask = workspace_match_write_mask[:, start_step:] & match_ids.ge(0)
+                positions = torch.arange(match_ids.shape[1], device=input.device).expand_as(
+                    match_ids
+                )
+                src = torch.where(match_mask, positions, torch.full_like(positions, -1))
+                latest = torch.full_like(workspace_match_keys[:, :, 0], -1, dtype=torch.long)
+                latest.scatter_reduce_(
+                    1,
+                    match_ids.clamp(0, self.workspace._SEMANTIC_ENTITY_COUNT - 1),
+                    src,
+                    reduce="amax",
+                    include_self=True,
+                )
+                observed = base[:, start_step:]
+                gathered = observed.gather(
+                    1, latest.clamp_min(0).unsqueeze(-1).expand(-1, -1, observed.shape[-1])
+                )
+                workspace_match_keys = torch.where(
+                    latest.ge(0).unsqueeze(-1), gathered, workspace_match_keys
+                )
+            if self.allocator is not None and entity_ids is not None:
+                # Use the final contextual backbone representation. The old
+                # block-0 side pass added a full extra backbone execution and
+                # gave the allocator less context for coreference decisions.
+                entity_ids, entity_write_mask = self._allocate(
+                    base.detach(), workspace_state, entity_ids, entity_write_mask, input_valid_mask
+                )
             if inter_layer_memory_enabled:
                 inter_layer_memory_read_done = True
             # Workspace mode bypasses MoEBlock's ordinary residual add, so
@@ -1189,6 +1705,13 @@ class SplitGraphDNC(nn.Module):
             # state exposed to unscaled expert outputs and defeats this
             # stability control on the write path.
             specialists = specialists[:, start_step:] * self.moe_backbone_residual_scale
+            event_window = None
+            if self.workspace_adaptive_v3_enabled:
+                _ids = input_token_ids if input_token_ids is not None else input.argmax(dim=-1)
+                event_window = torch.nn.functional.pad(_ids, (11, 0)).unfold(1, 12, 1)[
+                    :, start_step:
+                ]
+            self.workspace.adaptive_v3_eval_bypass = bool(self.workspace_adaptive_v3_eval_bypass)
             workspace_result = self.workspace(
                 specialists,
                 route_indices[:, start_step:],
@@ -1205,6 +1728,9 @@ class SplitGraphDNC(nn.Module):
                     prediction_error[:, start_step:]
                     if prediction_error is not None and workspace_error_consumer
                     else None
+                ),
+                backbone_context=(
+                    base[:, start_step:] if self.workspace_adaptive_v3_enabled else None
                 ),
                 selected_specialists_only=selected_specialists_only,
                 entity_ids=(entity_ids[:, start_step:] if entity_ids is not None else None),
@@ -1264,6 +1790,114 @@ class SplitGraphDNC(nn.Module):
                     if state_supervision_entity_ids is not None
                     else None
                 ),
+                key_value_entity_ids=(
+                    key_value_entity_ids[:, start_step:]
+                    if key_value_entity_ids is not None
+                    else None
+                ),
+                key_value_mask=(
+                    key_value_mask[:, start_step:] if key_value_mask is not None else None
+                ),
+                key_value_steps=(
+                    tuple(
+                        step - start_step for step in (key_value_steps or ()) if step >= start_step
+                    )
+                    if key_value_entity_ids is not None
+                    else None
+                ),
+                attentional_cue_color_ids=attentional_cue_color_ids,
+                attentional_cue_shape_ids=attentional_cue_shape_ids,
+                attentional_cue_query_step_ids=(
+                    torch.where(
+                        attentional_cue_query_step_ids >= start_step,
+                        attentional_cue_query_step_ids - start_step,
+                        torch.full_like(attentional_cue_query_step_ids, -1),
+                    )
+                    if attentional_cue_query_step_ids is not None
+                    else None
+                ),
+                attentional_cue_readout_steps=(
+                    tuple(
+                        step - start_step
+                        for step in (attentional_cue_readout_steps or ())
+                        if step >= start_step
+                    )
+                    if attentional_cue_query_step_ids is not None
+                    else None
+                ),
+                attentional_frame_entity_ids=(
+                    attentional_frame_entity_ids[:, start_step:]
+                    if attentional_frame_entity_ids is not None
+                    else None
+                ),
+                attentional_frame_mask=(
+                    attentional_frame_mask[:, start_step:]
+                    if attentional_frame_mask is not None
+                    else None
+                ),
+                attentional_frame_steps=(
+                    tuple(
+                        step - start_step
+                        for step in (attentional_frame_steps or ())
+                        if step >= start_step
+                    )
+                    if attentional_frame_entity_ids is not None
+                    else None
+                ),
+                operation_metadata=(
+                    operation_metadata[:, start_step:] if operation_metadata is not None else None
+                ),
+                operation_steps=(
+                    tuple(
+                        step - start_step for step in (operation_steps or ()) if step >= start_step
+                    )
+                    if operation_metadata is not None
+                    else None
+                ),
+                adaptive_operator_teacher_targets=(
+                    adaptive_operator_teacher_targets[:, start_step:]
+                    if adaptive_operator_teacher_targets is not None
+                    else None
+                ),
+                adaptive_operator_candidate_mask=(
+                    adaptive_operator_candidate_mask[:, start_step:]
+                    if adaptive_operator_candidate_mask is not None
+                    else None
+                ),
+                adaptive_operator_execution_mask=(
+                    adaptive_operator_execution_mask[:, start_step:]
+                    if adaptive_operator_execution_mask is not None
+                    else None
+                ),
+                adaptive_operator_steps=(
+                    tuple(
+                        step - start_step
+                        for step in (adaptive_operator_steps or ())
+                        if step >= start_step
+                    )
+                    if adaptive_operator_candidate_mask is not None
+                    else None
+                ),
+                adaptive_operator_teacher_steps=(
+                    tuple(
+                        step - start_step
+                        for step in (adaptive_operator_teacher_steps or ())
+                        if step >= start_step
+                    )
+                    if adaptive_operator_candidate_mask is not None
+                    else None
+                ),
+                workspace_sparse_active_steps=(
+                    tuple(
+                        step - start_step
+                        for step in (workspace_sparse_active_steps or ())
+                        if step >= start_step
+                    )
+                    if entity_write_mask is not None
+                    else None
+                ),
+                adaptive_operator_teacher_weight=adaptive_operator_teacher_weight,
+                event_token_window=event_window,
                 nth_farthest_vector_entity_ids=(
                     nth_farthest_vector_entity_ids[:, start_step:]
                     if nth_farthest_vector_entity_ids is not None
@@ -1356,6 +1990,10 @@ class SplitGraphDNC(nn.Module):
                     else None
                 ),
                 collect_kv_records=self.workspace_kv_memory is not None,
+                parallel_scan_allowed=(
+                    (self.allocator is None or self.allocator_use_prob <= 0.0)
+                    and self.workspace_kv_memory is None
+                ),
             )
             if self.workspace_kv_memory is not None:
                 (
@@ -1374,7 +2012,24 @@ class SplitGraphDNC(nn.Module):
             # The workspace returns a selected, broadcast-enriched MoE delta
             # whose candidate inputs have already been residual-scaled, just
             # like the ordinary final MoE block's routed delta.
-            H[:, start_step:] = base[:, start_step:] + broadcast_delta
+            if self.workspace_adaptive is not None:
+                self.workspace_adaptive.eval_bypass = self.workspace_adaptive_eval_bypass
+                adaptive_delta = self.workspace_adaptive(
+                    base[:, start_step:],
+                    specialists,
+                    route_indices[:, start_step:],
+                    route_weights[:, start_step:],
+                    broadcast_delta,
+                    valid_mask=(
+                        sequence_valid_mask[:, start_step:]
+                        if sequence_valid_mask is not None
+                        else None
+                    ),
+                    selected_specialists_only=selected_specialists_only,
+                )
+                H[:, start_step:] = base[:, start_step:] + broadcast_delta + adaptive_delta
+            else:
+                H[:, start_step:] = base[:, start_step:] + broadcast_delta
             normalize_backbone_output = getattr(final_stage, "normalize_output", None)
             if callable(normalize_backbone_output):
                 # forward_with_specialists exposes the pre-normalized final
@@ -1494,6 +2149,8 @@ class SplitGraphDNC(nn.Module):
                         prediction_valid_mask=prediction_valid_mask,
                         entity_ids=entity_ids,
                         entity_write_mask=entity_write_mask,
+                        workspace_match_entity_ids=workspace_match_entity_ids,
+                        workspace_match_write_mask=workspace_match_write_mask,
                         pair_swap_entity_ids=pair_swap_entity_ids,
                         pair_swap_mask=pair_swap_mask,
                         pair_swap_steps=pair_swap_steps,
@@ -1552,9 +2209,14 @@ class SplitGraphDNC(nn.Module):
                 }
             if self.workspace is not None:
                 chx = {"_initium_workspace_state": workspace_state}
+                if workspace_match_keys is not None:
+                    chx["_initium_workspace_match_keys"] = workspace_match_keys
                 if self.workspace_kv_memory is not None:
                     chx["_initium_workspace_kv_state"] = workspace_kv_state
             state = (chx, memory_states, last_read)
+            self._carry_out = _detach_state_tree(
+                {"chx": chx, "mhx": memory_states, "last_read": last_read}
+            )
             if return_backbone_features:
                 assert backbone_features is not None
                 if return_prediction_logits:
@@ -1569,12 +2231,24 @@ class SplitGraphDNC(nn.Module):
             # backbone (and optional MoE/workspace path above) is the model.
             # There is no memory reset, combiner, read/write loop, or DNC
             # output projection on this path.
-            output = H[:, start_step:].transpose(0, 1)
+            if not self.sequence_memory_enabled:
+                output = H[:, start_step:].transpose(0, 1)
             if self.workspace is not None:
                 chx = {"_initium_workspace_state": workspace_state}
+                if workspace_match_keys is not None:
+                    chx["_initium_workspace_match_keys"] = workspace_match_keys
+                if self.workspace_kv_memory is not None:
+                    chx["_initium_workspace_kv_state"] = workspace_kv_state
             else:
                 chx = None
-            state = (chx, None, None)
+            state = (
+                chx,
+                memory_states if self.sequence_memory_enabled else None,
+                last_read if self.sequence_memory_enabled else None,
+            )
+            self._carry_out = _detach_state_tree(
+                {"chx": chx, "mhx": state[1], "last_read": last_read}
+            )
             if return_backbone_features:
                 assert backbone_features is not None
                 if return_prediction_logits:
@@ -1706,6 +2380,8 @@ class SplitGraphDNC(nn.Module):
                     combiner_hx if self.combiner_mode == "controller" else combiner_hx_in
                 ),
             }
+            if workspace_match_keys is not None:
+                chx["_initium_workspace_match_keys"] = workspace_match_keys
 
         mhx = [mem_state]
         output = torch.stack(outputs, dim=0)  # (T, B, input_size)

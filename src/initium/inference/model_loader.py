@@ -165,6 +165,7 @@ def _build_split_graph(c: _Cfg, input_dim, hidden, nr_cells, cell_size, read_hea
         read_heads=read_heads,
         num_backbone_blocks=c.get("split_graph_num_blocks", cc.SPLIT_GRAPH_NUM_BLOCKS),
         mamba_variant=variant,
+        activation_checkpointing=c.get("split_graph_activation_checkpointing", False),
         mamba_d_state=hp["d_state"],
         mamba_d_conv=hp["d_conv"],
         mamba_expand=hp["expand"],
@@ -224,9 +225,55 @@ def _build_split_graph(c: _Cfg, input_dim, hidden, nr_cells, cell_size, read_hea
         ),
         workspace_enabled=c.get("workspace_enabled", cc.WORKSPACE_ENABLED),
         workspace_num_slots=c.get("workspace_num_slots", cc.WORKSPACE_NUM_SLOTS),
+        workspace_token_id_input=c.get("workspace_token_id_input", False),
+        workspace_slot_readout=c.get("workspace_slot_readout", False),
+        workspace_semantic_entity_count=c.get("workspace_semantic_entity_count", 64),
+        workspace_allocator=c.get("workspace_allocator", False),
+        workspace_adaptive_enabled=c.get("workspace_adaptive_enabled", False),
+        workspace_adaptive_v2_enabled=c.get("workspace_adaptive_v2_enabled", False),
+        workspace_adaptive_v2_num_skills=c.get("workspace_adaptive_v2_num_skills", 8),
+        workspace_adaptive_v2_mi_weight=c.get("workspace_adaptive_v2_mi_weight", 0.01),
+        workspace_adaptive_v3_enabled=c.get("workspace_adaptive_v3_enabled", False),
+        workspace_adaptive_v3_rank=c.get("workspace_adaptive_v3_rank", 32),
+        workspace_adaptive_v3_usage_floor_weight=c.get(
+            "workspace_adaptive_v3_usage_floor_weight", 0.0
+        ),
+        workspace_adaptive_v3_readback_consistency_weight=c.get(
+            "workspace_adaptive_v3_readback_consistency_weight", 0.0
+        ),
+        workspace_adaptive_v3_attention_temperature=c.get(
+            "workspace_adaptive_v3_attention_temperature", 12.0
+        ),
+        workspace_adaptive_v3_temperature_enabled=c.get(
+            "workspace_adaptive_v3_temperature_enabled", False
+        ),
+        workspace_adaptive_v3_straight_through_binding=c.get(
+            "workspace_adaptive_v3_straight_through_binding", False
+        ),
+        workspace_adaptive_v3_entity_destinations=c.get(
+            "workspace_adaptive_v3_entity_destinations", False
+        ),
+        workspace_adaptive_v3_split_context_norm=c.get(
+            "workspace_adaptive_v3_split_context_norm", False
+        ),
+        workspace_adaptive_v3_use_backbone_context=c.get(
+            "workspace_adaptive_v3_use_backbone_context", False
+        ),
+        workspace_adaptive_v3_teacher_forced_operator_outputs=c.get(
+            "workspace_adaptive_v3_teacher_forced_operator_outputs", False
+        ),
+        workspace_adaptive_v3_class_balanced_operator_loss=c.get(
+            "workspace_adaptive_v3_class_balanced_operator_loss", False
+        ),
         workspace_compile_recurrence=c.get("workspace_compile_recurrence", False),
         workspace_entity_keyed_writes=c.get("workspace_entity_keyed_writes", False),
         workspace_semantic_entity_addressing=c.get("workspace_semantic_entity_addressing", False),
+        workspace_parallel_scan=c.get("workspace_parallel_scan", False),
+        workspace_key_value_readout=bool(c.get("workspace_key_value_loss_weight", 0.0) > 0),
+        workspace_no_report_confidence_readout=c.get(
+            "workspace_no_report_confidence_readout", False
+        ),
+        workspace_masked_prime_trace=c.get("workspace_masked_prime_trace", False),
         workspace_key_match_threshold=c.get("workspace_key_match_threshold", 0.5),
         workspace_no_selection=c.get("workspace_no_selection", cc.WORKSPACE_NO_SELECTION),
         workspace_reset_each_step=c.get("workspace_reset_each_step", cc.WORKSPACE_RESET_EACH_STEP),
@@ -249,7 +296,13 @@ def _build_split_graph(c: _Cfg, input_dim, hidden, nr_cells, cell_size, read_hea
     return model
 
 
-def load_model(ckpt: dict, device: torch.device, deterministic_write: bool = False) -> LoadedModel:
+def load_model(
+    ckpt: dict,
+    device: torch.device,
+    deterministic_write: bool = False,
+    *,
+    allow_legacy_tokenizer_manifest_mismatch: bool = False,
+) -> LoadedModel:
     raw = ckpt["model_config"]
     c = _Cfg(raw)
     controller = raw.get("controller_type", "lstm")
@@ -282,6 +335,90 @@ def load_model(ckpt: dict, device: torch.device, deterministic_write: bool = Fal
     link_mode = raw.get("link_matrix_mode", "dense")
     if link_mode != "dense":
         patch_link_matrix(rnn, mode=link_mode, topk=raw.get("link_matrix_topk"))
+
+    # The language slot-text decoder is partly tied to the input token
+    # embedding. Its column manifest must be installed before loading weights,
+    # otherwise the workspace state is incomplete and cannot reproduce the
+    # training-time readout.
+    if raw.get("workspace_slot_readout") and isinstance(rnn, SplitGraphDNC):
+        from initium.data.workspace_capability.episode import TEXT_BASE
+        from initium.data.workspace_capability.lang_dataset import LanguageDataset
+        from initium.data.workspace_capability.tracks import _lang_text
+
+        stage5 = int(raw.get("workspace_semantic_entity_count", 64)) == 128
+        _lang_text.configure(stage5=stage5)
+        expected_tokenizer_hash = raw.get("workspace_lang_tokenizer_sha256")
+        if expected_tokenizer_hash:
+            actual_tokenizer_hash = _lang_text.tokenizer_sha256()
+            if actual_tokenizer_hash != expected_tokenizer_hash:
+                raise ValueError(
+                    "language checkpoint SentencePiece model mismatch: "
+                    f"checkpoint={expected_tokenizer_hash} local={actual_tokenizer_hash}"
+                )
+            expected_vocab_size = raw.get("workspace_lang_tokenizer_vocab_size")
+            if (
+                expected_vocab_size is not None
+                and int(expected_vocab_size) != _lang_text.tokenizer_vocab_size()
+            ):
+                raise ValueError(
+                    "language checkpoint tokenizer vocabulary size mismatch: "
+                    f"checkpoint={expected_vocab_size} local={_lang_text.tokenizer_vocab_size()}"
+                )
+        else:
+            # Older checkpoints saved the hash of the whole generated corpus
+            # manifest, which can drift when non-tokenizer corpus assets change.
+            # Preserve strict behavior unless a caller explicitly opts in.
+            expected_manifest = raw.get("workspace_lang_manifest_sha256")
+            actual_manifest = _lang_text.manifest_sha256()
+            if not expected_manifest:
+                raise ValueError(
+                    "language slot-readout checkpoint has neither a tokenizer hash "
+                    "nor a legacy corpus-manifest hash"
+                )
+            if (
+                actual_manifest != expected_manifest
+                and not allow_legacy_tokenizer_manifest_mismatch
+            ):
+                raise ValueError(
+                    "legacy language checkpoint corpus-manifest mismatch: "
+                    f"checkpoint={expected_manifest} local={actual_manifest}. "
+                    "The legacy checkpoint does not record its SentencePiece hash; "
+                    "restore the training tokenizer assets or explicitly pass "
+                    "allow_legacy_tokenizer_manifest_mismatch=True after confirming "
+                    "the tokenizer is the same."
+                )
+            if actual_manifest != expected_manifest:
+                local_vocab_size = _lang_text.tokenizer_vocab_size()
+                output_vocab_size = int(ckpt["output_proj_state_dict"]["weight"].shape[0])
+                if local_vocab_size + TEXT_BASE != output_vocab_size:
+                    raise ValueError(
+                        "legacy tokenizer override rejected: local text vocabulary plus "
+                        f"TEXT_BASE is {local_vocab_size + TEXT_BASE}, checkpoint output vocabulary "
+                        f"is {output_vocab_size}"
+                    )
+                print(
+                    "[inference] WARNING: accepting a legacy corpus-manifest mismatch "
+                    "after vocabulary-size validation; tokenizer identity is not proven"
+                )
+        columns = LanguageDataset.slot_text_columns()
+        import hashlib
+
+        column_hash = hashlib.sha256(
+            ",".join(str(int(token)) for token in columns).encode("ascii")
+        ).hexdigest()
+        expected_hash = raw.get("workspace_slot_text_columns_sha256")
+        if expected_hash and column_hash != expected_hash:
+            raise ValueError(
+                "language slot-text columns differ from the checkpoint manifest; "
+                "use the Stage 5 tokenizer/code revision used for training"
+            )
+        expected_count = raw.get("workspace_slot_text_columns_count")
+        if expected_count is not None and len(columns) != int(expected_count):
+            raise ValueError(
+                f"language slot-text column count mismatch: checkpoint={expected_count}, local={len(columns)}"
+            )
+        assert rnn.workspace is not None
+        rnn.workspace.enable_slot_text(columns, tied_input_embedding=True)
 
     w = ckpt["output_proj_state_dict"]["weight"]
     output_proj = nn.Linear(w.shape[1], w.shape[0]).to(device)

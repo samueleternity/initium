@@ -299,6 +299,7 @@ def build_parallel_backbone(
     moe_load_balance_alpha: float = 0.01,
     moe_residual_scale: float = 1.0,
     moe_block_isolation: int | None = None,
+    activation_checkpointing: bool = False,
     device=None,
     dtype=None,
 ):
@@ -352,6 +353,7 @@ def build_parallel_backbone(
                     moe_load_balance_alpha=moe_load_balance_alpha,
                     moe_residual_scale=moe_residual_scale,
                     moe_block_isolation=moe_block_isolation,
+                    activation_checkpointing=activation_checkpointing,
                 )
             )
         cur = d_model

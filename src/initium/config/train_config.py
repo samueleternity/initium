@@ -12,7 +12,7 @@ import math
 BATCH_SIZE = 16  # bucketed, so padding waste stays low even >1
 TOTAL_STEPS = 120000
 LOG_EVERY = 100
-EVAL_EVERY = 500  # curriculum-advance eval cadence
+EVAL_EVERY = 3000  # curriculum-advance eval cadence
 LR = 3e-4
 LR_MIN = 3e-5
 LR_DECAY_STEPS = TOTAL_STEPS  # cosine anneal length. Derived from TOTAL_STEPS here on
@@ -26,7 +26,7 @@ AMP_INIT_SCALE = 128.0  # GradScaler start scale (default 65536 wasted ~14k step
 
 # ---- Model size -------------------------------------------------------------
 MODEL_HIDDEN_SIZE = 512
-MODEL_NR_CELLS = 256  # link matrix is O(N^2) in memory, so left unchanged
+MODEL_NR_CELLS = 256
 MODEL_CELL_SIZE = 192
 MODEL_READ_HEADS = 8
 

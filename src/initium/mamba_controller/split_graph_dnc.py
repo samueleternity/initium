@@ -480,6 +480,10 @@ class SplitGraphDNC(nn.Module):
         self.workspace_key_value_readout_enabled = bool(workspace_key_value_readout)
         self.workspace_operation_executor_enabled = bool(workspace_operation_executor)
         self.workspace_adaptive_v3_enabled = bool(workspace_adaptive_v3_enabled)
+        self.workspace_adaptive_v3_logit_diagnostics_enabled: bool = False
+        self.workspace_adaptive_v3_eval_episodes_per_track: int = 0
+        self.workspace_adaptive_v3_feature_off_tracks: tuple[str, ...] = ()
+        self.workspace_adaptive_v3_holdout_tracks: tuple[str, ...] = ()
         self.workspace_operation_diagnostics_enabled = bool(workspace_operation_diagnostics)
         self.workspace_exact_value_comparison_enabled = bool(workspace_exact_value_comparison)
         self.workspace_exact_selection_enabled = bool(workspace_exact_selection)
@@ -906,7 +910,7 @@ class SplitGraphDNC(nn.Module):
         )
         if workspace_rng_state is not None:
             torch.random.set_rng_state(workspace_rng_state)
-        self.workspace_adaptive = None
+        self.workspace_adaptive: AdaptiveWorkspaceSkills | AdaptiveWorkspaceSkillsV2 | None = None
         if workspace_adaptive_enabled or workspace_adaptive_v2_enabled:
             adaptive_rng_state = torch.random.get_rng_state()
             if workspace_adaptive_v2_enabled:

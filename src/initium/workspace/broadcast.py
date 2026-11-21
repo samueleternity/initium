@@ -406,8 +406,10 @@ class WorkspaceBroadcast(nn.Module):
     def slot_pointer_logits(
         self, features: torch.Tensor, match_features=None, slot_present=None
     ) -> torch.Tensor:
+        assert self.slot_pointer is not None
         if match_features is None:
             return self.slot_pointer(features.float()).float()
+        assert self.slot_match_query is not None and self.slot_match_key is not None
         query = self.slot_match_query(features.float())
         keys = self.slot_match_key(match_features.float())
         logits = torch.einsum("btd,bkd->btk", query, keys) / (self.d_model**0.5)
@@ -436,6 +438,7 @@ class WorkspaceBroadcast(nn.Module):
         read = torch.einsum("bts,bsd->btd", weights, content)
         if self.slot_text_cols is not None:
             return read
+        assert self.semantic_value_decoder is not None
         return self.slot_readout_scale * self.semantic_value_decoder(read)
 
     def slot_pointer_loss(
@@ -1031,19 +1034,19 @@ class WorkspaceBroadcast(nn.Module):
         joint = first_scalar.unsqueeze(2) * second_scalar.unsqueeze(1)
         flat_joint = joint.reshape(joint.shape[0], -1)
         batch = joint.shape[0]
-        add_probs = torch.zeros_like(first_scalar).scatter_add(
+        add_probs = torch.zeros_like(first_scalar).scatter_add_(
             1, self._operation_add_indices.unsqueeze(0).expand(batch, -1), flat_joint
         )
-        low_probs = torch.zeros_like(first_scalar).scatter_add(
+        low_probs = torch.zeros_like(first_scalar).scatter_add_(
             1, self._operation_low_indices.unsqueeze(0).expand(batch, -1), flat_joint
         )
-        high_probs = torch.zeros_like(first_scalar).scatter_add(
+        high_probs = torch.zeros_like(first_scalar).scatter_add_(
             1, self._operation_high_indices.unsqueeze(0).expand(batch, -1), flat_joint
         )
-        rank_probs = torch.zeros_like(first_scalar).scatter_add(
+        rank_probs = torch.zeros_like(first_scalar).scatter_add_(
             1, self._operation_rank_indices.unsqueeze(0).expand(batch, -1), flat_joint
         )
-        compare_probs = torch.zeros_like(first_scalar).scatter_add(
+        compare_probs = torch.zeros_like(first_scalar).scatter_add_(
             1,
             self._operation_compare_indices.unsqueeze(0).expand(batch, -1),
             flat_joint,
@@ -1117,6 +1120,7 @@ class WorkspaceBroadcast(nn.Module):
                 probs.argmax(dim=-1), num_classes=_WORKSPACE_CAPABILITY_VOCAB_SIZE
             ).to(probs.dtype)
             straight_through = hard_values + probs - probs.detach()
+            assert self.semantic_value_decoder is not None
             value_vectors = straight_through @ self.semantic_value_decoder.weight.float()
             value_vectors = _cap_vector_rms(value_vectors, self._SEMANTIC_CONTENT_RMS_LIMIT)
             address_state = torch.where(
@@ -1565,6 +1569,8 @@ class WorkspaceBroadcast(nn.Module):
         event_slots = slot_by_id.gather(1, safe_ids)
         active = active & event_slots.lt(slots)
         event_batch, event_time = active.nonzero(as_tuple=True)
+        event_slot: torch.Tensor | None = None
+        scanned_content: torch.Tensor | None = None
         if event_time.numel():
             event_slot = event_slots[event_batch, event_time]
             proposal = _cap_vector_rms(
@@ -1608,8 +1614,6 @@ class WorkspaceBroadcast(nn.Module):
             scanned_content = _cap_vector_rms(scan_b, self._SEMANTIC_CONTENT_RMS_LIMIT)
             event_steps = event_time.unique(sorted=True).tolist()
         else:
-            event_batch = event_time = event_slot = None
-            scanned_content = None
             event_steps = []
 
         timeline = sorted(set(event_steps) | key_value_steps)
@@ -1627,6 +1631,7 @@ class WorkspaceBroadcast(nn.Module):
                     )
                 )
             if step in event_steps:
+                assert event_slot is not None and scanned_content is not None
                 event_mask = event_time.eq(step)
                 row = event_batch[event_mask]
                 target_slot = event_slot[event_mask]
@@ -2351,7 +2356,10 @@ class WorkspaceBroadcast(nn.Module):
                 for value in cue_values
             ):
                 raise ValueError("attentional cue metadata must contain three (batch,) tensors")
-            if any(value.dtype not in (torch.int32, torch.int64) for value in cue_values):
+            if any(
+                value is not None and value.dtype not in (torch.int32, torch.int64)
+                for value in cue_values
+            ):
                 raise TypeError("attentional cue metadata must use integer tensors")
             attentional_cue_readout_steps = tuple(sorted(set(attentional_cue_readout_steps or ())))
             if any(
@@ -2841,6 +2849,14 @@ class WorkspaceBroadcast(nn.Module):
             if self.write_gate_closed:
                 parallel_ineligible.append("the workspace write gate is closed")
             if not parallel_ineligible:
+                assert (
+                    time_major_selected_deltas is not None
+                    and time_major_route_weights is not None
+                    and projected_read_queries is not None
+                    and projected_write_values is not None
+                    and entity_ids is not None
+                    and time_major_entity_write_mask is not None
+                )
                 with (
                     torch.autocast(device_type="cuda", enabled=False)
                     if specialist_deltas.is_cuda
@@ -2894,6 +2910,7 @@ class WorkspaceBroadcast(nn.Module):
             and time_major_selected_deltas is not None
         )
         if sparse_recurrence:
+            assert time_major_entity_write_mask is not None
             # A single device-to-host sync builds the sparse event index. The
             # loop then runs the full recurrent transition only where an input
             # event can change state or a side-channel read must be emitted.
@@ -3275,6 +3292,7 @@ class WorkspaceBroadcast(nn.Module):
                 assert time_major_selected_deltas is not None
                 assert time_major_route_weights is not None
                 assert self.semantic_value_decoder is not None
+                assert time_major_event_tokens is not None
                 routed_context = (
                     time_major_selected_deltas[step].float()
                     * time_major_route_weights[step].float().unsqueeze(-1)

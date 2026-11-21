@@ -48,37 +48,40 @@ def generate(difficulty: dict, rng: random.Random, *, ood: bool = False) -> Task
         for index in range(1, operation_count)
     ]
     for index, (stage_id, skill) in enumerate(zip(stage_ids, skills)):
-        previous = outputs[index - 1][0] if index else None
-        previous_stage = stage_ids[index - 1] if index else None
+        result: tuple[int, ...]
+        args: tuple[int, ...]
         if skill == "lookup":
             # The initial lookup seeds the chain. Later lookup stages are not
             # used so every downstream stage can depend on a prior result.
             key = rng.randrange(keys)
             result = (table[key],)
             args = (entity_token(key),)
-        elif skill == "arithmetic":
-            right = rng.randrange(SCALAR_COUNT)
-            result = ((int(previous) + right) % SCALAR_COUNT,)
-            args = (entity_token(int(previous_stage)), scalar_token(right))
-        elif skill == "copy":
-            result = (int(previous),)
-            args = (entity_token(int(previous_stage)),)
-        elif skill == "sort":
-            right = rng.randrange(SCALAR_COUNT)
-            result = tuple(sorted((int(previous), right)))
-            args = (entity_token(int(previous_stage)), scalar_token(right))
-        elif skill == "compare":
-            right = rng.randrange(SCALAR_COUNT)
-            result = (int(int(previous) > right),)
-            args = (entity_token(int(previous_stage)), scalar_token(right))
-        elif skill == "select":
-            right = rng.randrange(SCALAR_COUNT)
-            result = (max(int(previous), right),)
-            args = (entity_token(int(previous_stage)), scalar_token(right))
-        else:  # rank: zero is the higher-ranked operand; one is the lower.
-            right = rng.randrange(SCALAR_COUNT)
-            result = (0 if int(previous) >= right else 1,)
-            args = (entity_token(int(previous_stage)), scalar_token(right))
+        else:
+            prev = int(outputs[index - 1][0])
+            prev_stage = int(stage_ids[index - 1])
+            if skill == "arithmetic":
+                right = rng.randrange(SCALAR_COUNT)
+                result = ((prev + right) % SCALAR_COUNT,)
+                args = (entity_token(prev_stage), scalar_token(right))
+            elif skill == "copy":
+                result = (prev,)
+                args = (entity_token(prev_stage),)
+            elif skill == "sort":
+                right = rng.randrange(SCALAR_COUNT)
+                result = tuple(sorted((prev, right)))
+                args = (entity_token(prev_stage), scalar_token(right))
+            elif skill == "compare":
+                right = rng.randrange(SCALAR_COUNT)
+                result = (int(prev > right),)
+                args = (entity_token(prev_stage), scalar_token(right))
+            elif skill == "select":
+                right = rng.randrange(SCALAR_COUNT)
+                result = (max(prev, right),)
+                args = (entity_token(prev_stage), scalar_token(right))
+            else:  # rank: zero is the higher-ranked operand; one is the lower.
+                right = rng.randrange(SCALAR_COUNT)
+                result = (0 if prev >= right else 1,)
+                args = (entity_token(prev_stage), scalar_token(right))
         stream.extend(
             (EV_VECTOR, entity_token(stage_id), source_token(_SKILL_IDS[skill]), *args, SEP)
         )

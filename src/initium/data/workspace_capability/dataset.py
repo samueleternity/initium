@@ -1552,7 +1552,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
     def _add_mixed_skill_address_writes(row, tokens, entity_ids, write_mask) -> None:
         """Store initial table values and each operation result by stage ID."""
         active_event = None
-        event_entities = []
+        event_entities: list[int] = []
         has_scalar = False
         has_source = False
         for position, token_value in enumerate(tokens):
@@ -1713,7 +1713,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
                     frame_entity_ids[row, position] = frame_index
                     frame_mask[row, position] = True
                     frame_steps.add(position)
-            cue = []
+            cue: list[int] = []
             _track_id, prefix_length = track_marker_info(tokens)
             cue_tokens = tokens[prefix_length:] if prefix_length else tokens
             for token_value in cue_tokens:
@@ -1937,7 +1937,18 @@ class WorkspaceCapabilityDataset(BaseDataset):
         if episode.track not in ("mixed_skill", "variable_binding", "permutation"):
             return ()
         current_values: dict[int, int] = {}
-        records = []
+        records: list[
+            tuple[
+                int,
+                str,
+                int,
+                int,
+                tuple[int, int],
+                tuple[int, int],
+                tuple[int, ...],
+                tuple[int, ...],
+            ]
+        ] = []
         index = 0
         while index < len(episode.inputs):
             event = int(tokens[index])
@@ -1995,6 +2006,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
                     destination = entity_fields[0]
                     operands = entity_fields[1:]
                     literal = scalar_fields[0] if scalar_fields else -1
+                    outputs: tuple[int, ...]
                     if skill == 0 and operands:
                         operation = "lookup"
                         operand0 = (_WORKSPACE_OPERAND_KEY, operands[0])
@@ -2091,9 +2103,9 @@ class WorkspaceCapabilityDataset(BaseDataset):
                     ]
                     name = EXT_OP_NAMES[codes[0] * 4 + codes[1]]
                     destination, left = entity_fields[:2]
-                    right = entity_fields[2] if len(entity_fields) > 2 else None
+                    right_entity = entity_fields[2] if len(entity_fields) > 2 else None
                     a = current_values[left] - SCALAR_BASE
-                    b = current_values[right] - SCALAR_BASE if right is not None else 0
+                    b = current_values[right_entity] - SCALAR_BASE if right_entity is not None else 0
                     result = SCALAR_BASE + ext_op_result(name, a, b)
                     records.append(
                         (
@@ -2102,7 +2114,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
                             destination,
                             -1,
                             (_WORKSPACE_OPERAND_KEY, left),
-                            (_WORKSPACE_OPERAND_KEY, right) if right is not None else (0, -1),
+                            (_WORKSPACE_OPERAND_KEY, right_entity) if right_entity is not None else (0, -1),
                             (result,),
                             (current_values[left], -100),
                         )
@@ -2313,7 +2325,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
         operation_steps: set[int] = set()
         read_steps: set[int] = set()
         output_program_specs: list[tuple[int, int, str, int]] = []
-        argmatch_locations: dict[tuple[int, int], int] = {}
+        argmatch_locations: dict[tuple[int, int], Any] = {}
 
         for row, (episode, tokens, event_keys, event_writes) in enumerate(
             zip(examples, token_rows, entity_rows, write_rows)
@@ -5288,7 +5300,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
         episodes: list[TaskEpisode] = []
 
         def collect(track: str, cells, key_fn):
-            selected = {cell: [] for cell in cells}
+            selected: dict[Any, list[TaskEpisode]] = {cell: [] for cell in cells}
             attempts = 0
             max_attempts = max(10_000, len(cells) * episodes_per_cell * 200)
             while any(len(values) < episodes_per_cell for values in selected.values()):

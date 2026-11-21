@@ -417,6 +417,7 @@ def load_model(
             raise ValueError(
                 f"language slot-text column count mismatch: checkpoint={expected_count}, local={len(columns)}"
             )
+        assert rnn.workspace is not None
         rnn.workspace.enable_slot_text(columns, tied_input_embedding=True)
 
     w = ckpt["output_proj_state_dict"]["weight"]

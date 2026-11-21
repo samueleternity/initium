@@ -41,7 +41,7 @@ def generate(difficulty: dict, rng: random.Random, *, ood: bool = False) -> Task
     # The behavioral answer is the action supported by the available evidence.
     # Keep the latent state only for diagnostic scoring: finite noisy samples
     # do not reveal it deterministically.
-    answer = (BOOL_TRUE if action else BOOL_FALSE,)
+    answer: tuple[int, ...] = (BOOL_TRUE if action else BOOL_FALSE,)
     if report_condition:
         answer += (scalar_token(confidence),)
     answer += (EOS,)

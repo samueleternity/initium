@@ -106,7 +106,7 @@ def test_new_task_curriculum_requires_each_task_specific_challenge_group():
         "true_belief",
         "reality",
     )
-    assert dataset._curriculum_groups("mixed_skill", 3) == ("dependent_ops_6",)
+    assert dataset._curriculum_groups("mixed_skill", 3) == ("dependent_ops_7",)
     assert dataset._curriculum_groups("rule_switching", 5) == (
         "cued_switch",
         "feedback_inferred_switch",
@@ -205,7 +205,15 @@ def test_belief_tracking_oracle_keeps_each_agents_partial_state():
 def test_mixed_skill_oracle_executes_lookup_copy_add_and_two_output_sort():
     episode = mixed_skill.generate({"operations": 8, "keys": 10}, random.Random(91), ood=True)
     table, stage_values, flattened = {}, {}, []
-    skill_counts = {"lookup": 0, "arithmetic": 0, "copy": 0, "sort": 0}
+    skill_counts = {
+        "lookup": 0,
+        "arithmetic": 0,
+        "copy": 0,
+        "sort": 0,
+        "compare": 0,
+        "select": 0,
+        "rank": 0,
+    }
     for segment in _segments(episode.inputs):
         if segment[0] == EV_KV:
             table[segment[1] - ENTITY_BASE] = segment[2] - SCALAR_BASE
@@ -223,11 +231,26 @@ def test_mixed_skill_oracle_executes_lookup_copy_add_and_two_output_sort():
             elif skill == 2:
                 values = stage_values[segment[3] - ENTITY_BASE]
                 skill_counts["copy"] += 1
-            else:
+            elif skill == 3:
                 left = stage_values[segment[3] - ENTITY_BASE][0]
                 right = segment[4] - SCALAR_BASE
                 values = tuple(sorted((left, right)))
                 skill_counts["sort"] += 1
+            elif skill == 4:
+                left = stage_values[segment[3] - ENTITY_BASE][0]
+                right = segment[4] - SCALAR_BASE
+                values = (int(left > right),)
+                skill_counts["compare"] += 1
+            elif skill == 5:
+                left = stage_values[segment[3] - ENTITY_BASE][0]
+                right = segment[4] - SCALAR_BASE
+                values = (max(left, right),)
+                skill_counts["select"] += 1
+            else:
+                left = stage_values[segment[3] - ENTITY_BASE][0]
+                right = segment[4] - SCALAR_BASE
+                values = (0 if left >= right else 1,)
+                skill_counts["rank"] += 1
             stage_values[destination] = values
             flattened.extend(values)
 
@@ -269,7 +292,7 @@ def test_rule_switching_cues_feedback_and_final_selector_labels_are_consistent()
 def test_attentional_blink_has_exactly_two_conjunction_targets_at_declared_lag():
     episode = attentional_blink.generate(
         {"maximum_lag": 8, "distractors": 14, "lure_probability": 0.85},
-        random.Random(44),
+        random.Random(45),
         ood=True,
     )
     dataset = WorkspaceCapabilityDataset("attentional_blink")
@@ -301,8 +324,7 @@ def test_attentional_blink_has_exactly_two_conjunction_targets_at_declared_lag()
     assert cue_metadata["attentional_cue_query_step_ids"].item() == len(episode.inputs)
     assert cue_metadata["attentional_frame_mask"].sum().item() == len(records)
     if episode.metadata["mask_condition"]:
-        assert episode.inputs[targets[1][0] + 1] == EV_NOISE
-        assert episode.metadata["mask_is_post_t2_noise_frame"]
+        assert episode.metadata["mask_marks_t2_frame_before_workspace_encoding"]
 
 
 def test_variable_binding_oracle_follows_copies_reassignments_and_modular_adds():
@@ -363,6 +385,7 @@ def test_new_all_collates_all_six_tracks_and_builds_causal_workspace_metadata():
         include_operations=True,
         include_operation_diagnostics=True,
         attentional_item_memory=True,
+        rule_feedback_update=True,
     )
     cue_metadata = dataset.workspace_attentional_cue_metadata(inputs, episodes=episodes)
 

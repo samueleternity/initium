@@ -26,7 +26,7 @@ from initium.data.workspace_capability.tracks._shared import common_metadata
 def _card(rng: random.Random) -> tuple[int, int, int]:
     # All dimensions share one value vocabulary; feature position, not token
     # family, defines the candidate rules.
-    return tuple(rng.randrange(SCALAR_COUNT) for _ in range(3))
+    return (rng.randrange(SCALAR_COUNT), rng.randrange(SCALAR_COUNT), rng.randrange(SCALAR_COUNT))
 
 
 def generate(difficulty: dict, rng: random.Random, *, ood: bool = False) -> TaskEpisode:

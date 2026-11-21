@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import random
 from collections.abc import Iterable
+from typing import Any
 
 from initium.data.workspace_capability.tracks import _dev_lexicon, _lang_text
 
@@ -149,7 +150,7 @@ def difficulty_for(
     *,
     ood: bool = False,
     ood_axes: Iterable[str] | None = None,
-) -> dict[str, int | float | str | bool | tuple[str, ...]]:
+) -> dict[str, Any]:
     """Return a fresh serializable configuration for a track/lesson."""
     level = max(0, min(int(level), _LEVELS - 1))
     if ood_axes is None:
@@ -168,7 +169,7 @@ def difficulty_for(
             raise ValueError(f"unknown OOD axes for {track!r}: {sorted(unknown_axes)}")
         if track != "permutation" and track not in _DEV and track not in _LANG:
             raise ValueError("explicit OOD axes are currently supported only for permutation")
-    config: dict[str, int | float | str | bool | tuple[str, ...]]
+    config: dict[str, Any]
     if track == "permutation":
         config = {
             "entities": (4, 6, 8, 10, 12, 16)[level],

@@ -9,6 +9,7 @@ train words are FACT indices [0,64), held-out words [64,128) (OOD only).
 from __future__ import annotations
 
 import random
+from typing import Any
 
 from initium.data.workspace_capability.episode import (
     BOS,
@@ -220,6 +221,7 @@ def generate(difficulty: dict, rng: random.Random, *, ood: bool = False) -> Task
         else _teach(rng, stream, mode, W, noise)
     )
 
+    extra: dict[str, Any] = {}
     if family == "d6_compose":
         pairs = [(s, r) for s in objs for r in rels]
         ok = [p for p in pairs if _pair_ok(*p, difficulty.get("combos", 0))]
@@ -231,10 +233,9 @@ def generate(difficulty: dict, rng: random.Random, *, ood: bool = False) -> Task
             stream += [EV_FACT, entity_token(s), entity_token(r), entity_token(facts[(s, r)]), SEP]
         s, r = rng.choice(picks)
         stream += [QUERY, fact_token(W[s]), fact_token(W[r]), SEP]
-        answer, direction, extra, baseline = (
+        answer, direction, baseline = (
             (entity_token(facts[(s, r)]), EOS),
             "compose",
-            {},
             100.0 / len(objs),
         )
     else:

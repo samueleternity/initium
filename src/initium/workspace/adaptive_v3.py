@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from typing import Any
 
 import torch
 from torch import nn
@@ -17,6 +18,10 @@ class AdaptiveWorkspaceOperatorBank(nn.Module):
     they are never concatenated into the controller input or used to select an
     operation, operand, or destination at inference time.
     """
+
+    semantic_slot_prototypes: torch.Tensor
+    _compiled_operator_forward: Any
+    _route_sum: torch.Tensor | None
 
     _OPERATOR_COUNT = 8
     _COPY = 1
@@ -264,6 +269,7 @@ class AdaptiveWorkspaceOperatorBank(nn.Module):
                 options={"max_autotune": False},
             )
         try:
+            assert self._compiled_operator_forward is not None
             return self._compiled_operator_forward(operator_input)
         except Exception as exc:
             compile_error_names = {
@@ -934,8 +940,9 @@ class AdaptiveWorkspaceOperatorBank(nn.Module):
         )
         output1_logits = semantic_value_decoder(output1) if teacher_active else None
         teacher_loss = None
-        teacher_diagnostics = {}
+        teacher_diagnostics: dict[str, torch.Tensor] = {}
         if teacher_active:
+            assert teacher_targets is not None
             assert output0_logits is not None and output1_logits is not None
             teacher_forced_output0_logits = None
             if self.teacher_forced_operator_outputs:
@@ -1020,6 +1027,7 @@ class AdaptiveWorkspaceOperatorBank(nn.Module):
             _s = (operation_probabilities.detach() * _w).sum(0)
             self._route_sum = _s if self._route_sum is None else self._route_sum + _s
             self._route_n += float(active_mask.sum())
+            assert self._route_sum is not None
             current = self._route_sum / max(self._route_n, 1.0)
             previous = None
             self._last_training_diagnostics["operation_probability"] = (

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from typing import Any
 
 import torch
 from torch import nn
@@ -131,7 +132,9 @@ class AdaptiveWorkspaceOperatorBankV4(nn.Module):
     def __init__(self, d_model: int, address_dim: int, compile_ops: bool = False) -> None:
         super().__init__()
         self.d_model, self.address_dim, self.scale = int(d_model), int(address_dim), 12.0
-        self.compile_ops, self._compiled, self._failed = bool(compile_ops), {}, set()
+        self.compile_ops = bool(compile_ops)
+        self._compiled: dict[str, Any] = {}
+        self._failed: set[str] = set()
         K, A, C, w = self.max_ops, self.address_dim, len(_NAMES), 3 * d_model
         self.event_embedding = nn.Embedding(320, d_model)
         self.event_proj = nn.Linear(8 * d_model, d_model)
@@ -163,9 +166,9 @@ class AdaptiveWorkspaceOperatorBankV4(nn.Module):
             self.register_buffer(f"C{n}", t.cos().float(), persistent=False)
             self.register_buffer(f"S{n}", t.sin().float(), persistent=False)
         self._last_aux_loss = None
-        self._last_training_diagnostics = {}
-        self._last_training_diagnostic_counts = {}
-        self._last_route_steps = []
+        self._last_training_diagnostics: dict[str, torch.Tensor] = {}
+        self._last_training_diagnostic_counts: dict[str, torch.Tensor] = {}
+        self._last_route_steps: list[tuple[int, torch.Tensor]] = []
         self._route_sum = None
         self._route_n = 0.0
 

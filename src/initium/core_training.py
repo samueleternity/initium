@@ -5035,7 +5035,9 @@ def run(
                 + ", ".join(unexpected_trainable)
             )
     fused_optimizer_enabled = device.type == "cuda"
-    optimizer_kwargs = {"lr": LR, "fused": True} if fused_optimizer_enabled else {"lr": LR}
+    optimizer_kwargs: dict[str, Any] = (
+        {"lr": LR, "fused": True} if fused_optimizer_enabled else {"lr": LR}
+    )
     if workspace_adaptive_v3_enabled:
         v3_parameters = [
             parameter
@@ -6130,6 +6132,7 @@ def run(
                     ss_features = ss_out.transpose(0, 1)
                     if language_sparse_projection:
                         ss_positions = language_answer_positions
+                        assert ss_positions is not None
                         ss_rows, ss_times = ss_positions[:, 0], ss_positions[:, 1]
                         ss_logits = output_proj(ss_features[ss_rows, ss_times])
                         if workspace_slot_readout:
@@ -6340,6 +6343,7 @@ def run(
             sparse_positions = None
             if language_sparse_projection:
                 sparse_positions = language_sparse_positions
+                assert sparse_positions is not None
                 sparse_rows, sparse_times = sparse_positions[:, 0], sparse_positions[:, 1]
                 sparse_features = _slot_features[sparse_rows, sparse_times]
                 output = output_proj(sparse_features)
@@ -6438,6 +6442,7 @@ def run(
                 else dataset.loss(output, target_digits, answer_mask)
             )
             if workspace_key_value_loss_weight > 0:
+                assert key_value_metadata is not None
                 workspace_key_value_loss = dataset.workspace_key_value_loss(
                     key_value_predictions,
                     key_value_metadata,
@@ -6823,6 +6828,7 @@ def run(
             adaptive_skill_loss = rnn.workspace_adaptive.pop_aux_loss()
         adaptive_v3_loss = None
         if workspace_adaptive_v3_enabled and isinstance(rnn, SplitGraphDNC):
+            assert rnn.workspace is not None
             adaptive_v3_loss = rnn.workspace.pop_adaptive_v3_aux_loss()
         if check_finite_this_step and not _first_nonfinite_report(
             moe_aux_loss, "moe_aux_loss", step
@@ -7208,9 +7214,9 @@ def run(
             assert isinstance(rnn, SplitGraphDNC) and rnn.workspace is not None
             step_workspace_diag = rnn.workspace.last_diagnostics()
             for name, total in workspace_reconsideration_window.items():
-                value = step_workspace_diag.get(name)
-                if value is not None:
-                    total.add_(value.detach())
+                diag_val = step_workspace_diag.get(name)
+                if diag_val is not None:
+                    total.add_(diag_val.detach())
         if optimizer_update_due:
             step += 1
         if (
@@ -7220,17 +7226,18 @@ def run(
             and step % 100 == 0
             and isinstance(rnn, SplitGraphDNC)
         ):
+            assert rnn.workspace is not None
             teacher_diagnostics = rnn.workspace.adaptive_v3_training_diagnostics()
             measured = []
-            for name, value in teacher_diagnostics.items():
+            for name, teacher_val in teacher_diagnostics.items():
                 if not name.startswith("teacher_feature_off_") or not name.endswith("_accuracy"):
                     continue
                 count_value = teacher_diagnostics.get(f"{name}_count")
                 if count_value is None or float(count_value.item()) <= 0:
                     continue
-                measured.append(float(value.item()))
+                measured.append(float(teacher_val.item()))
             if measured:
-                delta = (
+                anneal_delta = (
                     (
                         workspace_adaptive_v3_teacher_weight
                         - workspace_adaptive_v3_teacher_min_weight
@@ -7241,12 +7248,12 @@ def run(
                 if min(measured) >= workspace_adaptive_v3_teacher_accuracy_threshold:
                     adaptive_v3_teacher_weight_current = max(
                         workspace_adaptive_v3_teacher_min_weight,
-                        adaptive_v3_teacher_weight_current - delta,
+                        adaptive_v3_teacher_weight_current - anneal_delta,
                     )
                 else:
                     adaptive_v3_teacher_weight_current = min(
                         workspace_adaptive_v3_teacher_weight,
-                        adaptive_v3_teacher_weight_current + delta,
+                        adaptive_v3_teacher_weight_current + anneal_delta,
                     )
 
         running_log_steps += int(optimizer_update_due)
@@ -8685,9 +8692,9 @@ def run(
                                     )
                             finally:
                                 curriculum.lesson = saved_lesson
-                                for name, value in saved_writers.items():
-                                    if hasattr(curriculum, name):
-                                        setattr(curriculum, name, value)
+                                for writer_name, writer_value in saved_writers.items():
+                                    if hasattr(curriculum, writer_name):
+                                        setattr(curriculum, writer_name, writer_value)
                             segment_diagnostics.emit("eval-id-memory-shuffled")
                     finally:
                         _restore_rng_state(rng_state_after_other_evaluations)

@@ -62,12 +62,13 @@ def generate(difficulty: dict, rng: random.Random, *, ood: bool = False) -> Task
             allowed += ["and", "or", "xor"]
         prev = chosen[-1] if chosen else None
         if ood:
-            forced = _HELD_OUT.get(prev)
+            forced = _HELD_OUT.get(prev) if prev is not None else None
             op = forced if forced and rng.random() < 0.4 else rng.choice(allowed)
         else:
             op = rng.choice([a for a in allowed if (prev, a) not in _HELD_OUT_PAIRS])
         pool = list(values)
         dest = 32 + i
+        args: tuple[int, ...]
         if op in ("sub", "mul", "eq"):
             a = rng.choice(pool)
             va = values[a]

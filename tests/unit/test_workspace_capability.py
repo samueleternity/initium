@@ -418,7 +418,9 @@ def test_all_track_curriculum_has_separate_schedules_and_requires_each_track(mon
         }
         dataset.last_eval_diagnostics["tracks"]["entity_state"]["accuracy"] = 40.0
         dataset.last_eval_diagnostics["tracks"]["entity_state"]["exact_match"] = 40.0
-        for g in dataset.last_eval_diagnostics["progression_groups"].get("entity_state", {}).values():
+        for g in (
+            dataset.last_eval_diagnostics["progression_groups"].get("entity_state", {}).values()
+        ):
             g["accuracy"] = 40.0
             g["exact_match"] = 40.0
         return 88.0, 88.0, {}

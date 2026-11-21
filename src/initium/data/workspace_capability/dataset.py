@@ -2105,7 +2105,11 @@ class WorkspaceCapabilityDataset(BaseDataset):
                     destination, left = entity_fields[:2]
                     right_entity = entity_fields[2] if len(entity_fields) > 2 else None
                     a = current_values[left] - SCALAR_BASE
-                    b = current_values[right_entity] - SCALAR_BASE if right_entity is not None else 0
+                    b = (
+                        current_values[right_entity] - SCALAR_BASE
+                        if right_entity is not None
+                        else 0
+                    )
                     result = SCALAR_BASE + ext_op_result(name, a, b)
                     records.append(
                         (
@@ -2114,7 +2118,9 @@ class WorkspaceCapabilityDataset(BaseDataset):
                             destination,
                             -1,
                             (_WORKSPACE_OPERAND_KEY, left),
-                            (_WORKSPACE_OPERAND_KEY, right_entity) if right_entity is not None else (0, -1),
+                            (_WORKSPACE_OPERAND_KEY, right_entity)
+                            if right_entity is not None
+                            else (0, -1),
                             (result,),
                             (current_values[left], -100),
                         )

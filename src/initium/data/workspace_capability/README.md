@@ -393,10 +393,13 @@ and optimizer-update shares, along with the next track weights. Act-context turn
 from response acts introduced by the active lesson. Act answer-token accuracy
 is reported by response act and answer position. Parse, define, logic,
 induction, and act train a context-token copy pointer for answer tokens present
-in their visible context. The copy residual is applied after slot-text blending
-so the slot readout cannot erase a supported copy. Logic plural outputs are
-excluded from singular-key KV targets; context copy handles plural forms that
-occur in the premises.
+in their visible context. When metadata identifies a source occurrence, the
+copy loss now supervises that position directly; it falls back to token-mass
+supervision when no valid position is available. This gives answer mentions
+such as the queried person in `a_ask` a precise copy target. The copy residual
+is applied after slot-text blending so the slot readout cannot erase a
+supported copy. Logic plural outputs are excluded from singular-key KV targets;
+context copy handles plural forms that occur in the premises.
 
 `--workspace-autoadaptive-v4` currently has no language operation programs to
 execute: Stage 5 generators provide token-copy and slot-readout labels, but do

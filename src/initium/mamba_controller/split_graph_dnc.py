@@ -283,6 +283,7 @@ class SplitGraphDNC(nn.Module):
         workspace_adaptive_v4_enabled: bool = False,
         workspace_compile_recurrence: bool = False,
         workspace_sparse_recurrence: bool = False,
+        workspace_parallel_scan: bool = False,
         workspace_entity_keyed_writes: bool = False,
         workspace_semantic_entity_addressing: bool = False,
         workspace_permutation_transactional: bool = False,
@@ -512,6 +513,17 @@ class SplitGraphDNC(nn.Module):
         ):
             raise ValueError(
                 "workspace sparse recurrence requires entity-keyed semantic addressing"
+            )
+        self.workspace_parallel_scan_enabled = bool(workspace_parallel_scan)
+        if self.workspace_parallel_scan_enabled and not (
+            workspace_enabled
+            and workspace_entity_keyed_writes
+            and workspace_semantic_entity_addressing
+            and workspace_key_value_readout
+        ):
+            raise ValueError(
+                "workspace parallel scan requires entity-keyed semantic addressing "
+                "and key-value readout"
             )
         if self.workspace_operation_executor_enabled and not self.workspace_key_value_readout_enabled:
             raise ValueError("workspace operation executor requires key-value readout")
@@ -875,6 +887,7 @@ class SplitGraphDNC(nn.Module):
                 adaptive_v3_compile_operators=workspace_adaptive_v3_compile_operators,
                 adaptive_v4_enabled=workspace_adaptive_v4_enabled,
                 sparse_recurrence=workspace_sparse_recurrence,
+                parallel_scan=workspace_parallel_scan,
                 slot_readout=workspace_slot_readout,
                 semantic_entity_count=workspace_semantic_entity_count,
                 attentional_cue_readout=workspace_attentional_cue_readout,
@@ -1930,6 +1943,9 @@ class SplitGraphDNC(nn.Module):
                     else None
                 ),
                 collect_kv_records=self.workspace_kv_memory is not None,
+                parallel_scan_allowed=(
+                    self.allocator is None and self.workspace_kv_memory is None
+                ),
             )
             if self.workspace_kv_memory is not None:
                 (

@@ -264,6 +264,7 @@ def _build_split_graph(c: _Cfg, input_dim, hidden, nr_cells, cell_size, read_hea
         workspace_compile_recurrence=c.get("workspace_compile_recurrence", False),
         workspace_entity_keyed_writes=c.get("workspace_entity_keyed_writes", False),
         workspace_semantic_entity_addressing=c.get("workspace_semantic_entity_addressing", False),
+        workspace_parallel_scan=c.get("workspace_parallel_scan", False),
         workspace_key_value_readout=bool(c.get("workspace_key_value_loss_weight", 0.0) > 0),
         workspace_no_report_confidence_readout=c.get(
             "workspace_no_report_confidence_readout", False

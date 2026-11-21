@@ -439,7 +439,11 @@ def _g_induce(cfg, rng):
     ws, mr = build(*q)
     if grp == "ind_s2mr":
         ep.ctl(TASK_S2MR)
-        ep.bind_surface(ws, surface_to_semantic, write=False, aux=True, match_key=False)
+        # Train the workspace matcher at answer time as well as the token
+        # binding auxiliary. The pseudo-words are episode-local, so the model
+        # must resolve each surface form from the in-context demonstrations;
+        # supervising its semantic slot key gives the read path that target.
+        ep.bind_surface(ws, surface_to_semantic, write=False, aux=True, match_key=True)
         ans, kind = mr, "mr"
         output_keys = tuple(semantic_output_key.get(int(t), -1) for t in mr) + (-1,)
     else:

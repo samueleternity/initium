@@ -878,6 +878,7 @@ def load_frozen_workspace_warm_start(
         "workspace_exact_value_comparison",  # parameter-free answer readout
         "workspace_exact_selection",  # parameter-free answer readout
         "workspace_sparse_recurrence",  # execution optimization
+        "workspace_parallel_scan",  # execution optimization; same parameter shapes
         "workspace_attentional_item_memory",  # workspace-only data addressing
         "workspace_attentional_cue_readout",  # task-specific typed decoders/readout
         "workspace_rule_feedback_update",  # training-target policy; no model state
@@ -915,6 +916,8 @@ def load_frozen_workspace_warm_start(
         "dnc_link_sharpness",  # parameter-free read-addressing experiment
         "dnc_allocation_topk",  # parameter-free allocation experiment
         "batch_size",  # training hyperparameter, not model architecture
+        "bf16",  # training precision; state-dict-compatible
+        "workspace_length_bucket_microbatches",  # batching policy
     }
     missing_config = sorted(
         key
@@ -1150,6 +1153,7 @@ def run(
     activation_offload_to_cpu: bool = False,
     activation_offload_cpu_budget_mb: int = 2048,
     fp32: bool = False,
+    bf16: bool = False,
     split_graph_moe_placement: str = "all",
     split_graph_moe_backbone_block_isolation: int | None = None,
     split_graph_moe_backbone_residual_scale: float = 1.0,
@@ -1277,6 +1281,8 @@ def run(
     workspace_exact_selection: bool = False,
     workspace_rule_feedback_update: bool = False,
     workspace_sparse_recurrence: bool = False,
+    workspace_parallel_scan: bool = False,
+    workspace_length_bucket_microbatches: int = 1,
     workspace_attentional_item_memory: bool = False,
     workspace_attentional_cue_readout: bool = False,
     workspace_no_report_confidence_readout: bool = False,
@@ -1295,6 +1301,7 @@ def run(
     sgr_workspace_write_salience: bool = False,
     workspace_teacher_forced_answers: bool = False,
     workspace_generation_eval: bool = False,
+    workspace_progression_eval_only: bool = False,
     workspace_eval_samples_per_group: int = 2,
     workspace_scheduled_sampling: float = 0.0,
     workspace_scheduled_sampling_steps: int = 20_000,
@@ -1309,6 +1316,7 @@ def run(
     workspace_allocator_label_addresses_only: bool = False,
 ):
     original_run_id = run_id
+    progression_eval_only = bool(workspace_progression_eval_only)
     run_id = _filesystem_safe_run_id(run_id)
     if run_id != original_run_id:
         print(
@@ -1319,8 +1327,22 @@ def run(
         )
     if log_every <= 0:
         raise ValueError("log_every must be positive")
+    if bf16 and fp32:
+        raise ValueError("--bf16 and --fp32 are mutually exclusive")
+    if bf16 and (device.type != "cuda" or not torch.cuda.is_bf16_supported()):
+        raise ValueError("--bf16 requires a CUDA GPU with native bfloat16 support")
+    if workspace_length_bucket_microbatches < 1:
+        raise ValueError("workspace_length_bucket_microbatches must be >= 1")
     if finite_check_interval < 1:
         raise ValueError("finite_check_interval must be positive")
+    if workspace_progression_eval_only and not (
+        dataset_type == "workspace-capability"
+        and str(workspace_task_track).replace("-", "_").startswith("lang_")
+    ):
+        raise ValueError(
+            "workspace progression-only evaluation is limited to "
+            "workspace-capability lang_* tracks"
+        )
     if split_graph_activation_checkpointing_min_seq_len < 0:
         raise ValueError("activation-checkpoint minimum sequence length must be non-negative")
     if int(workspace_gnw_balanced_eval_episodes_per_cell) < 0:
@@ -1341,10 +1363,15 @@ def run(
             raise ValueError("language tracks forbid next-token prediction loss (Stage 5 hard rule 1)")
         if workspace_task_track == "lang_open" and not eval_only:
             raise ValueError("lang_open is retired from training (eval-only probe)")
-    if workspace_allocator and (workspace_sparse_recurrence or not workspace_token_id_input):
+    if workspace_allocator and (
+        not workspace_token_id_input
+        or (workspace_sparse_recurrence and not workspace_allocator_label_addresses_only)
+    ):
         raise ValueError(
-            "--workspace-allocator requires --workspace-token-id-input and excludes "
-            "--workspace-sparse-recurrence (predicted writes need every step)"
+            "--workspace-allocator requires --workspace-token-id-input; sparse "
+            "recurrence is incompatible with predicted allocator routing because "
+            "predicted writes need every step (it is supported with "
+            "--workspace-allocator-label-addresses-only)"
         )
     if workspace_attentional_cue_readout:
         # Cue readout depends on structured per-frame storage; the single flag
@@ -1439,6 +1466,17 @@ def run(
         raise ValueError(
             "workspace sparse recurrence requires workspace, entity-keyed writes, "
             "and semantic entity addressing"
+        )
+    if workspace_parallel_scan and not (
+        workspace_key_value_loss_weight > 0
+        and workspace_enabled
+        and workspace_entity_keyed_writes
+        and workspace_semantic_entity_addressing
+        and moe_top_k == 1
+    ):
+        raise ValueError(
+            "workspace parallel scan requires workspace, key-value readout, "
+            "entity-keyed writes, semantic entity addressing, and moe_top_k=1"
         )
     if workspace_exact_selection and not (
         workspace_key_value_loss_weight > 0
@@ -1556,6 +1594,16 @@ def run(
         batch_size_hint=batch_size,
     )
     if getattr(dataset, "name", None) == "workspace-capability":
+        if hasattr(dataset, "length_bucket_microbatches"):
+            dataset.length_bucket_microbatches = int(workspace_length_bucket_microbatches)
+        elif workspace_length_bucket_microbatches != 1:
+            raise ValueError(
+                "workspace length-bucket microbatches are only supported by lang_* tracks"
+            )
+        if workspace_length_bucket_microbatches > 1 and not str(
+            getattr(dataset, "task_track", "")
+        ).replace("-", "_").startswith("lang_"):
+            raise ValueError("workspace length-bucket microbatches require a lang_* track")
         dataset.token_id_input = bool(workspace_token_id_input)
         dataset.v3_swap_operator = bool(workspace_adaptive_v3_enabled)
         dataset.v4_teacher = bool(workspace_adaptive_v4_enabled)
@@ -1573,8 +1621,17 @@ def run(
         )
         dataset.track_homogeneous_batches = bool(workspace_track_homogeneous_batches)
         dataset.teacher_forced_answers = bool(workspace_teacher_forced_answers)
-        dataset.generation_eval = bool(workspace_generation_eval)
+        progression_eval_only = bool(workspace_progression_eval_only)
+        dataset.progression_eval_only = progression_eval_only
+        dataset.generation_eval = bool(workspace_generation_eval) and not progression_eval_only
         dataset.sample_print_per_group = max(0, int(workspace_eval_samples_per_group))
+        if progression_eval_only:
+            dataset.sample_print_per_group = 0
+            print(
+                "[workspace-capability] progression-only evaluation enabled: "
+                "per-track ID curriculum checks and workspace dependency checks stay on; "
+                "OOD, generation and language probes are skipped"
+            )
         _dev_lexicon.configure(
             lexicon_mode=workspace_lexicon_mode,
             family=workspace_lexical_family,
@@ -3151,6 +3208,8 @@ def run(
             )
         for _key in ("production", "production_generation", "production_gap", "axis_generalization", "stage3_counterfactual", "stage3_ood"):            
             for _label, _metrics in sorted((diagnostics.get(_key) or {}).items()):
+                if not isinstance(_metrics, dict):
+                    continue
                 for _metric, _value in sorted(_metrics.items()):
                     if _metric != "episodes":
                         workspace_task_writer.writerow(
@@ -3991,6 +4050,7 @@ def run(
             workspace_compile_recurrence=workspace_compile_recurrence,
             workspace_adaptive_v4_enabled=workspace_adaptive_v4_enabled,
             workspace_sparse_recurrence=workspace_sparse_recurrence,
+            workspace_parallel_scan=workspace_parallel_scan,
             workspace_attentional_item_memory=workspace_attentional_item_memory,
             workspace_attentional_cue_readout=workspace_attentional_cue_readout,
             workspace_rule_feedback_update=workspace_rule_feedback_update,
@@ -4165,7 +4225,7 @@ def run(
         if trace is None or not trace.activate_on_error(step, failure):
             return
         try:
-            with torch.amp.autocast("cuda", enabled=amp_enabled):
+            with torch.amp.autocast("cuda", enabled=amp_enabled, dtype=amp_dtype):
                 replay_result = rnn(
                     input_seq,
                     (None, None, None),
@@ -4287,6 +4347,7 @@ def run(
                 f"exact_value_comparison={'on' if workspace_exact_value_comparison else 'off'} | "
                 f"exact_selection={'on' if workspace_exact_selection else 'off'} | "
                 f"sparse_recurrence={'on' if workspace_sparse_recurrence else 'off'} | "
+                f"parallel_scan={'on' if workspace_parallel_scan else 'off'} | "
                 f"attentional_item_memory={'on' if workspace_attentional_item_memory else 'off'} | "
                 f"attentional_cue_readout={'on' if workspace_attentional_cue_readout else 'off'} | "
                 f"rule_feedback_update={'on' if workspace_rule_feedback_update else 'off'} | "
@@ -4310,7 +4371,7 @@ def run(
                     f"query_binding_aux={bool(workspace_key_value_loss_weight > 0)} "
                     f"binding_aux_scale={2.0 * workspace_key_value_loss_weight:g} "
                     f"context_copy_pointer={'on' if workspace_slot_readout and workspace_semantic_entity_count == 128 and workspace_key_value_loss_weight > 0 else 'off'} "
-                    f"copy_tracks=lang_parse,lang_define,lang_logic,lang_induce,lang_act"
+                    f"copy_tracks=lang_parse,lang_define,lang_logic,lang_induce,lang_act,lang_discourse,lang_nlg/retell_all"
                 )
             if workspace_adaptive_v3_enabled:
                 print(
@@ -4348,12 +4409,17 @@ def run(
         "dataset_type": dataset_type,
         "dataset_name": dataset.name,
         "workspace_task_track": getattr(dataset, "task_track", None),
+        "bf16": bool(bf16),
+        "workspace_length_bucket_microbatches": int(
+            workspace_length_bucket_microbatches
+        ),
         "workspace_track_homogeneous_batches": bool(
             getattr(dataset, "track_homogeneous_batches", False)
         ),
         "workspace_gnw_task_design_version": getattr(
             dataset, "gnw_task_design_version", None
         ),
+        "workspace_parallel_scan": bool(workspace_parallel_scan),
         "supported_dataset_types": [dataset_type],  # use ["*"] for a future multi-modal model
         "input_dim": INPUT_DIM,
         "output_dim": TRIPLE_DIM,
@@ -4416,10 +4482,13 @@ def run(
         "dnc_compute_precision": "fp32",
         "dnc_backward_trace": dnc_backward_trace,
         "batch_size": batch_size,
+        "workspace_length_bucket_microbatches": workspace_length_bucket_microbatches,
+        "bf16": bool(bf16),
         "activation_offload_to_cpu": activation_offload_to_cpu,
         "activation_offload_cpu_budget_mb": activation_offload_cpu_budget_mb,
         "workspace_enabled": workspace_enabled,
         "workspace_num_slots": workspace_num_slots,
+        "workspace_parallel_scan": workspace_parallel_scan,
         "workspace_adaptive_v3_enabled": workspace_adaptive_v3_enabled,
         "workspace_adaptive_v4_enabled": workspace_adaptive_v4_enabled,
         "workspace_adaptive_v3_rank": workspace_adaptive_v3_rank,
@@ -4971,17 +5040,20 @@ def run(
     # diagnosing FP16 instability. Workspace internals already promote several
     # operations to FP32, which does not protect the backbone's recurrent path.
     amp_enabled = USE_AMP and device.type == "cuda" and not fp32
-    workspace_amp_stability = bool(amp_enabled and workspace_enabled)
+    amp_dtype = torch.bfloat16 if bf16 else torch.float16
+    workspace_amp_stability = bool(amp_enabled and workspace_enabled and not bf16)
     workspace_amp_init_scale = 16.0 if workspace_amp_stability else AMP_INIT_SCALE
     workspace_amp_growth_interval = 100_000 if workspace_amp_stability else 2_000
     kl_on = bool(stochastic_heads) and stochastic_heads[0].sample
     print(
         f"[{run_id}] params {param_count} | kl_terms={'on' if kl_on else 'off'} | "
-        f"amp={'on' if amp_enabled else 'off'} | "
+        f"amp={'bf16' if amp_enabled and bf16 else 'fp16' if amp_enabled else 'off'} | "
         f"optimizer=Adam{'-fused' if fused_optimizer_enabled else ''}"
     )
     if fp32:
         print(f"[{run_id}] full FP32 mode: CUDA autocast and GradScaler disabled")
+    if bf16:
+        print(f"[{run_id}] BF16 autocast enabled; workspace math remains FP32 and GradScaler is disabled")
     if finite_check_interval > 1:
         print(
             f"[{run_id}] NaN/Inf tensor scans every {finite_check_interval} steps; "
@@ -5033,7 +5105,7 @@ def run(
         )
     scaler = torch.amp.GradScaler(
         "cuda",
-        enabled=amp_enabled,
+        enabled=amp_enabled and not bf16,
         init_scale=workspace_amp_init_scale,
         growth_interval=workspace_amp_growth_interval,
     )
@@ -5096,6 +5168,17 @@ def run(
     # absolute step, this stays resume-safe for the same reason the original
     # fix was -- a resume past WARMUP_STEPS just lands in the cosine part,
     # no separate warmup state to save/restore.
+    effective_training_batch_size = int(batch_size) * int(
+        workspace_length_bucket_microbatches
+    )
+    lr_batch_scale = math.sqrt(effective_training_batch_size / max(1, int(BATCH_SIZE)))
+    if lr_batch_scale != 1.0:
+        print(
+            f"[{run_id}] batch-scaled LR: effective batch "
+            f"{effective_training_batch_size} vs reference {BATCH_SIZE}; "
+            f"sqrt scale={lr_batch_scale:.3f}"
+        )
+
     def lr_at_step(s):
         if s < WARMUP_STEPS:
             return LR * (s + 1) / WARMUP_STEPS
@@ -5105,7 +5188,7 @@ def run(
         return LR_MIN + 0.5 * (LR - LR_MIN) * (1 + math.cos(math.pi * progress))
 
     def set_lr(step_now):
-        lr_now = lr_at_step(step_now)
+        lr_now = lr_at_step(step_now) * lr_batch_scale
         for g in optimizer.param_groups:
             g["lr"] = lr_now * float(g.get("lr_multiplier", 1.0))
         return lr_now
@@ -5533,6 +5616,8 @@ def run(
     running_retrieval_query_slots: Any = 0.0
     running_log_steps = 0
     running_micro_steps = 0
+    running_batch_prepare_seconds = 0.0
+    running_forward_backward_seconds = 0.0
     running_eval_seconds = 0.0
     running_v3_candidate_tokens = 0
     running_v3_executed_tokens = 0
@@ -5655,6 +5740,7 @@ def run(
             # Anomaly detection must be enabled before this step's forward so
             # PyTorch can retain the originating stack for backward failures.
             torch.autograd.set_detect_anomaly(True, check_nan=True)
+        batch_prepare_started = time.perf_counter()
         if getattr(dataset, "name", None) == "workspace-capability":
             dataset.training_step = step
         batch = dataset.sample_batch(curriculum, batch_size)
@@ -5908,6 +5994,7 @@ def run(
             retrieval_query_targets = retrieval_metadata["retrieval_query_targets"].to(
                 device, non_blocking=True
             )
+        running_batch_prepare_seconds += time.perf_counter() - batch_prepare_started
         input_seq = input_seq.to(device, non_blocking=True)
         target_digits = target_digits.to(device, non_blocking=True)
         answer_mask = answer_mask.to(device, non_blocking=True)
@@ -5963,10 +6050,13 @@ def run(
         hidden: Any = (None, None, None)
         if chain_start:
             optimizer.zero_grad(set_to_none=True)
+        forward_backward_started = time.perf_counter()
         if workspace_scheduled_sampling > 0 and input_seq.ndim == 2:
             p_ss = workspace_scheduled_sampling * min(1.0, step / max(1, workspace_scheduled_sampling_steps))
             if p_ss > 0:
-                with torch.no_grad(), torch.amp.autocast("cuda", enabled=amp_enabled):
+                with torch.no_grad(), torch.amp.autocast(
+                    "cuda", enabled=amp_enabled, dtype=amp_dtype
+                ):
                     ss_out, ss_hidden = rnn(
                         input_seq,
                         (None, None, None),
@@ -6054,7 +6144,7 @@ def run(
         )
         with (
             saved_tensor_context as activation_offload_stats,
-            torch.amp.autocast("cuda", enabled=amp_enabled),
+            torch.amp.autocast("cuda", enabled=amp_enabled, dtype=amp_dtype),
         ):
             if isinstance(rnn, SurpriseRecallBackboneOnly):
                 oracle_flags = None
@@ -6305,6 +6395,9 @@ def run(
                 copy_target_token_ids = key_value_metadata.get(
                     "workspace_copy_target_token_ids"
                 )
+                copy_target_positions = key_value_metadata.get(
+                    "workspace_copy_target_positions"
+                )
                 workspace_module = getattr(rnn, "workspace", None)
                 copy_adapter = getattr(getattr(rnn, "backbone", None), "in_adapter", None)
                 if (
@@ -6329,6 +6422,10 @@ def run(
                             copy_source_token_ids.index_select(0, copy_rows),
                             copy_source_mask.index_select(0, copy_rows),
                             copy_target_token_ids[copy_rows, copy_times].unsqueeze(1),
+                            (
+                                copy_target_positions[copy_rows, copy_times].unsqueeze(1)
+                                if copy_target_positions is not None else None
+                            ),
                         )
                     else:
                         copy_loss = workspace_module.context_copy_loss(
@@ -6337,6 +6434,7 @@ def run(
                             copy_source_token_ids,
                             copy_source_mask,
                             copy_target_token_ids,
+                            copy_target_positions,
                         )
                     workspace_key_value_loss = workspace_key_value_loss + copy_loss.to(dtype=task_loss.dtype)
                 binding_aux_targets = key_value_metadata.get("workspace_binding_aux_targets")
@@ -6705,6 +6803,7 @@ def run(
                 emit_failure_diagnostics("train", include_gradients=True)
                 segment_diagnostics.set_nonfinite_trace(False)
             raise
+        running_forward_backward_seconds += time.perf_counter() - forward_backward_started
         if anomaly_this_step:
             torch.autograd.set_detect_anomaly(False)
             segment_diagnostics.set_nonfinite_trace(False)
@@ -7139,6 +7238,14 @@ def run(
             # t0 is advanced by each evaluation duration below, so evaluation
             # time is already excluded from this training-only window.
             elapsed = max(time.time() - t0, 1e-9)
+            measured_prep_total = (
+                running_batch_prepare_seconds + running_forward_backward_seconds
+            )
+            batch_prepare_share = (
+                running_batch_prepare_seconds / measured_prep_total
+                if measured_prep_total > 0
+                else 0.0
+            )
             total_elapsed = time.time() - t_run_start  # log addition #5
             avg_task = (
                 running_task_loss.item()
@@ -7389,6 +7496,9 @@ def run(
                 f"{window_optimizer_steps / elapsed:.2f} optimizer_steps/s "
                 f"{window_steps / elapsed:.2f} segment_steps/s",
                 f"eval_overhead {running_eval_seconds:.1f}s",
+                f"data_prep {running_batch_prepare_seconds:.2f}s "
+                f"({batch_prepare_share:.1%} of prep+forward/backward) "
+                f"fwd_bwd {running_forward_backward_seconds:.2f}s",
                 f"LR {current_lr:.6f}",
                 f"grad_norm {avg_grad_norm:.4g}",
                 f"postclip_grad_norm {avg_postclip_grad_norm:.4g}",
@@ -7910,6 +8020,8 @@ def run(
             running_retrieval_query_slots = 0.0
             running_log_steps = 0
             running_micro_steps = 0
+            running_batch_prepare_seconds = 0.0
+            running_forward_backward_seconds = 0.0
             running_eval_seconds = 0.0
             running_v3_candidate_tokens = 0
             running_v3_executed_tokens = 0
@@ -8007,7 +8119,7 @@ def run(
                 surprise_recall_logger.write_evaluation(
                     step, pre_advance_lesson + 1, "id", dataset.last_eval_diagnostics
                 )
-            if isinstance(sgr_prediction_decoder, SurprisePredictionHead):
+            if not progression_eval_only and isinstance(sgr_prediction_decoder, SurprisePredictionHead):
                 sgr_phase1_eval = evaluate_prediction_signals(
                     rnn.backbone,
                     sgr_prediction_decoder,
@@ -8106,74 +8218,57 @@ def run(
                 scale_at_last_eval = scaler.get_scale()
                 grad_was_finite_since_eval = True
 
-            ood_field_log: dict[tuple[int, int], list[int]] = {}
-            ood_rng_state = ood_rng.getstate()
-            ood_torch_rng = _capture_torch_rng()
-            ood_stage_memory = rnn.memories[0]
-            ood_usage_handles, ood_usage_capture = _attach_memory_usage_hooks(rnn)
-            if hasattr(ood_stage_memory, "begin_stage_diagnostics"):
-                ood_stage_memory.begin_stage_diagnostics()
-            segment_diagnostics.set_channel("eval-ood")
-            ood_triple_acc, ood_perfect_frac, ood_hop_breakdown = dataset.evaluate_ood(
-                rnn,
-                device,
-                num_episodes=periodic_ood_episodes,
-                rng=ood_rng,
-                field_log=ood_field_log,
-            )
-            write_workspace_task_metrics(
-                step, curriculum.lesson + 1, "ood", getattr(dataset, "last_eval_diagnostics", None)
-            )
-            if surprise_recall_logger is not None:
-                surprise_recall_logger.write_evaluation(
-                    step, curriculum.lesson + 1, "ood", dataset.last_eval_diagnostics
+            if not progression_eval_only:
+                ood_field_log: dict[tuple[int, int], list[int]] = {}
+                ood_rng_state = ood_rng.getstate()
+                ood_torch_rng = _capture_torch_rng()
+                ood_stage_memory = rnn.memories[0]
+                ood_usage_handles, ood_usage_capture = _attach_memory_usage_hooks(rnn)
+                if hasattr(ood_stage_memory, "begin_stage_diagnostics"):
+                    ood_stage_memory.begin_stage_diagnostics()
+                segment_diagnostics.set_channel("eval-ood")
+                ood_triple_acc, ood_perfect_frac, ood_hop_breakdown = dataset.evaluate_ood(
+                    rnn,
+                    device,
+                    num_episodes=periodic_ood_episodes,
+                    rng=ood_rng,
+                    field_log=ood_field_log,
                 )
-            segment_diagnostics.emit("eval-ood")
-            ood_stage_diagnostics = (
-                ood_stage_memory.finish_stage_diagnostics()
-                if hasattr(ood_stage_memory, "finish_stage_diagnostics")
-                else {}
-            )
-            ood_stage_diagnostics.update(
-                _finish_memory_usage_hooks(ood_usage_handles, ood_usage_capture)
-            )
-            write_memory_usage(step, curriculum.lesson + 1, "ood", ood_stage_diagnostics)
-            ood_ablated_acc = None
-            if has_memory and hasattr(dataset, "evaluate_ood_ablated"):
-                ood_ablated_rng = random.Random()
-                ood_ablated_rng.setstate(ood_rng_state)
-                segment_diagnostics.set_channel("eval-ood-memory-off")
-                with _replay_torch_rng(ood_torch_rng):
-                    ood_ablated_acc, _ood_ablated_perfect = dataset.evaluate_ood_ablated(
-                        rnn, device, periodic_ood_episodes, ood_ablated_rng
-                    )
-                segment_diagnostics.emit("eval-ood-memory-off")
-
-            if callable(getattr(dataset, "evaluate_permutation_generalization", None)) and getattr(
-                dataset, "task_track", None
-            ) in {"all", "permutation"}:
-                permutation_eval_seed = int(seed) * 1_000_003 + int(step) + 0x5045524D
-                permutation_episodes_per_split = max(8, periodic_ood_episodes // 4)
-                permutation_torch_rng = _capture_torch_rng()
-                segment_diagnostics.set_channel("eval-permutation-generalization")
-                with _replay_torch_rng(permutation_torch_rng):
-                    dataset.evaluate_permutation_generalization(
-                        rnn,
-                        device,
-                        curriculum.lesson,
-                        episodes_per_split=permutation_episodes_per_split,
-                        rng=random.Random(permutation_eval_seed),
-                    )
-                permutation_diagnostics = dataset.last_eval_diagnostics
                 write_workspace_task_metrics(
-                    step,
-                    curriculum.lesson + 1,
-                    "permutation-generalization",
-                    permutation_diagnostics,
+                    step, curriculum.lesson + 1, "ood", getattr(dataset, "last_eval_diagnostics", None)
                 )
-                segment_diagnostics.emit("eval-permutation-generalization")
-                if has_memory:
-                    segment_diagnostics.set_channel("eval-permutation-generalization-memory-off")
+                if surprise_recall_logger is not None:
+                    surprise_recall_logger.write_evaluation(
+                        step, curriculum.lesson + 1, "ood", dataset.last_eval_diagnostics
+                    )
+                segment_diagnostics.emit("eval-ood")
+                ood_stage_diagnostics = (
+                    ood_stage_memory.finish_stage_diagnostics()
+                    if hasattr(ood_stage_memory, "finish_stage_diagnostics")
+                    else {}
+                )
+                ood_stage_diagnostics.update(
+                    _finish_memory_usage_hooks(ood_usage_handles, ood_usage_capture)
+                )
+                write_memory_usage(step, curriculum.lesson + 1, "ood", ood_stage_diagnostics)
+                ood_ablated_acc = None
+                if has_memory and hasattr(dataset, "evaluate_ood_ablated"):
+                    ood_ablated_rng = random.Random()
+                    ood_ablated_rng.setstate(ood_rng_state)
+                    segment_diagnostics.set_channel("eval-ood-memory-off")
+                    with _replay_torch_rng(ood_torch_rng):
+                        ood_ablated_acc, _ood_ablated_perfect = dataset.evaluate_ood_ablated(
+                            rnn, device, periodic_ood_episodes, ood_ablated_rng
+                        )
+                    segment_diagnostics.emit("eval-ood-memory-off")
+
+                if callable(getattr(dataset, "evaluate_permutation_generalization", None)) and getattr(
+                    dataset, "task_track", None
+                ) in {"all", "permutation"}:
+                    permutation_eval_seed = int(seed) * 1_000_003 + int(step) + 0x5045524D
+                    permutation_episodes_per_split = max(8, periodic_ood_episodes // 4)
+                    permutation_torch_rng = _capture_torch_rng()
+                    segment_diagnostics.set_channel("eval-permutation-generalization")
                     with _replay_torch_rng(permutation_torch_rng):
                         dataset.evaluate_permutation_generalization(
                             rnn,
@@ -8181,380 +8276,411 @@ def run(
                             curriculum.lesson,
                             episodes_per_split=permutation_episodes_per_split,
                             rng=random.Random(permutation_eval_seed),
-                            ablate_memory=True,
                         )
+                    permutation_diagnostics = dataset.last_eval_diagnostics
                     write_workspace_task_metrics(
                         step,
                         curriculum.lesson + 1,
-                        "permutation-generalization-memory-off",
-                        dataset.last_eval_diagnostics,
+                        "permutation-generalization",
+                        permutation_diagnostics,
                     )
-                    segment_diagnostics.emit("eval-permutation-generalization-memory-off")
-
-            ood_log_writer.writerow(
-                [
-                    step,
-                    curriculum.lesson + 1,
-                    id_triple_acc,
-                    id_perfect_frac,
-                    ood_triple_acc,
-                    ood_perfect_frac,
-                    id_triple_acc - ood_triple_acc,
-                    id_perfect_frac - ood_perfect_frac,
-                ]
-            )
-            ood_log_file.flush()
-            if (
-                has_dnc
-                and track_a_writer is not None
-                and track_a_file is not None
-                and relational_probe_cases is not None
-            ):
-                rho_key = "ordinary_read_score_cosine_correlation_mean"
-                rho = id_stage_diagnostics.get(
-                    rho_key,
-                    1.0 if dnc_read_variant == "cosine" else None,
-                )
-                rho_count = id_stage_diagnostics.get("diagnostic_steps", 0.0)
-                stress_metrics = score_probe_cases(rnn.memories[0], relational_probe_cases)
-                track_a_writer.writerow(
-                    [
-                        step,
-                        pre_advance_lesson + 1,
-                        dnc_read_variant,
-                        id_triple_acc,
-                        ood_triple_acc,
-                        id_triple_acc - ood_triple_acc,
-                        cosine_top1_accuracy(relational_probe_cases),
-                        stress_metrics["accuracy"],
-                        stress_metrics["held_out_accuracy"],
-                        rho,
-                        rho_count,
-                        id_stage_diagnostics.get("read_content_entropy_mean"),
-                        id_stage_diagnostics.get("read_content_max_weight_mean"),
-                        id_stage_diagnostics.get("relational_read_residual_rms_mean"),
-                        id_stage_diagnostics.get("relational_read_residual_to_cosine_rms_mean"),
-                    ]
-                )
-                track_a_file.flush()
-                print(
-                    f"[{run_id}] [Track A] read={dnc_read_variant} | "
-                    f"ID/OOD/offset={id_triple_acc:.2f}/{ood_triple_acc:.2f}/"
-                    f"{id_triple_acc - ood_triple_acc:.2f} | "
-                    f"stress cosine/read/held-out="
-                    f"{cosine_top1_accuracy(relational_probe_cases):.3f}/"
-                    f"{stress_metrics['accuracy']:.3f}/"
-                    f"{stress_metrics['held_out_accuracy']:.3f} | "
-                    f"ordinary MLP-cosine rho="
-                    f"{rho if rho is not None else float('nan'):.4f} | "
-                    f"read entropy/max="
-                    f"{id_stage_diagnostics.get('read_content_entropy_mean', float('nan')):.3f}/"
-                    f"{id_stage_diagnostics.get('read_content_max_weight_mean', float('nan')):.3f} | "
-                    f"residual/cosine rms="
-                    f"{id_stage_diagnostics.get('relational_read_residual_to_cosine_rms_mean', float('nan')):.3f}"
-                )
-            if track_b_writer is not None and track_b_file is not None:
-                id_write_values = [
-                    id_stage_diagnostics.get("posterior_variance_mean"),
-                    id_stage_diagnostics.get("posterior_variance_min"),
-                    id_stage_diagnostics.get("posterior_variance_max"),
-                    id_stage_diagnostics.get("posterior_variance_reduction_mean"),
-                    id_stage_diagnostics.get("posterior_mean_update_abs_mean"),
-                    id_stage_diagnostics.get("active_write_cell_fraction_mean"),
-                    id_stage_diagnostics.get("write_weight_mass_mean"),
-                    id_stage_diagnostics.get("diagnostic_steps"),
-                ]
-                ood_write_values = [
-                    ood_stage_diagnostics.get("posterior_variance_mean"),
-                    ood_stage_diagnostics.get("posterior_variance_min"),
-                    ood_stage_diagnostics.get("posterior_variance_max"),
-                    ood_stage_diagnostics.get("posterior_variance_reduction_mean"),
-                    ood_stage_diagnostics.get("posterior_mean_update_abs_mean"),
-                    ood_stage_diagnostics.get("active_write_cell_fraction_mean"),
-                    ood_stage_diagnostics.get("write_weight_mass_mean"),
-                    ood_stage_diagnostics.get("diagnostic_steps"),
-                ]
-                track_b_writer.writerow(
-                    [
-                        "evaluation",
-                        step,
-                        pre_advance_lesson + 1,
-                        dnc_write_variant,
-                        id_triple_acc,
-                        ood_triple_acc,
-                        id_triple_acc - ood_triple_acc,
-                        *([None] * 12),
-                        *id_write_values,
-                        *ood_write_values,
-                        *([None] * 6),
-                    ]
-                )
-                track_b_file.flush()
-                if dnc_write_variant == "kanerva-closed-form":
-                    print(
-                        f"[{run_id}] [Track B] write={dnc_write_variant} | "
-                        f"posterior variance ID/OOD="
-                        f"{id_stage_diagnostics.get('posterior_variance_mean', float('nan')):.5f}/"
-                        f"{ood_stage_diagnostics.get('posterior_variance_mean', float('nan')):.5f} | "
-                        f"mean update ID/OOD="
-                        f"{id_stage_diagnostics.get('posterior_mean_update_abs_mean', float('nan')):.6g}/"
-                        f"{ood_stage_diagnostics.get('posterior_mean_update_abs_mean', float('nan')):.6g} | "
-                        f"active cells ID/OOD="
-                        f"{id_stage_diagnostics.get('active_write_cell_fraction_mean', float('nan')):.4f}/"
-                        f"{ood_stage_diagnostics.get('active_write_cell_fraction_mean', float('nan')):.4f}"
-                    )
-            _write_ogs_row(
-                ogs_log_writer,
-                step,
-                pre_advance_lesson + 1,
-                id_triple_acc,
-                ood_triple_acc,
-                ood_perfect_frac,
-                ood_ablated_acc,
-                ogs_weights,
-            )
-            ogs_log_file.flush()
-            _print_ood_analysis(
-                run_id,
-                "periodic",
-                step,
-                pre_advance_lesson + 1,
-                id_triple_acc,
-                ood_triple_acc,
-                ood_perfect_frac,
-                ood_ablated_acc,
-                ogs_weights,
-                beta_eff,
-                avg_kl,
-                kl_diag,
-            )
-            dataset.write_field_log(
-                field_log_writer, field_log_file, step, curriculum.lesson + 1, "ood", ood_field_log
-            )
-            print(
-                f"[{run_id}] Step {step} periodic OOD check: "
-                f"ID {id_triple_acc:.2f}% | OOD {ood_triple_acc:.2f}% | "
-                f"offset {id_triple_acc - ood_triple_acc:.2f}"
-            )
-            for hops, (acc, pf, n) in sorted(ood_hop_breakdown.items()):
-                hop_log_writer.writerow([step, curriculum.lesson + 1, "ood", hops, acc, pf, n])
-            hop_log_file.flush()
-
-            # Functional-usage check: same lesson distribution the ID eval
-            # above just used (pre_advance_lesson, not curriculum.lesson --
-            # this call may have just advanced it).
-            # Replay the exact ID evaluation episodes with memory bypassed.
-            # Comparing two independently sampled episode sets made this
-            # purported causal dependency metric too noisy to diagnose
-            # whether the model actually used memory. Restore the post-ID
-            # stream afterward so the paired evaluation consumes no extra
-            # randomness from the run.
-            if not has_memory:
-                print(
-                    f"[{run_id}] Step {step} memory-dependency check: n/a "
-                    "(this model has no active memory module)."
-                )
-            else:
-                rng_state_after_other_evaluations = _capture_rng_state()
-                ablated_triple_acc = ablated_perfect_frac = None
-                shuffled_triple_acc = shuffled_perfect_frac = None
-                try:
-                    _restore_rng_state(id_eval_rng_state)
-                    segment_diagnostics.set_channel("eval-id-memory-off")
-                    ablated_triple_acc, ablated_perfect_frac = dataset.evaluate_id_ablated(
-                        rnn, device, curriculum, pre_advance_lesson
-                    )
-                    if surprise_recall_logger is not None:
-                        surprise_recall_logger.write_evaluation(
+                    segment_diagnostics.emit("eval-permutation-generalization")
+                    if has_memory:
+                        segment_diagnostics.set_channel("eval-permutation-generalization-memory-off")
+                        with _replay_torch_rng(permutation_torch_rng):
+                            dataset.evaluate_permutation_generalization(
+                                rnn,
+                                device,
+                                curriculum.lesson,
+                                episodes_per_split=permutation_episodes_per_split,
+                                rng=random.Random(permutation_eval_seed),
+                                ablate_memory=True,
+                            )
+                        write_workspace_task_metrics(
                             step,
-                            pre_advance_lesson + 1,
-                            "id-memory-off",
+                            curriculum.lesson + 1,
+                            "permutation-generalization-memory-off",
                             dataset.last_eval_diagnostics,
                         )
-                    segment_diagnostics.emit("eval-id-memory-off")
+                        segment_diagnostics.emit("eval-permutation-generalization-memory-off")
 
-                    _restore_rng_state(id_eval_rng_state)
-                    if paired_graph_memory_diagnostics:
-                        # Graph traversal evaluates one episode per forward,
-                        # so the old batch-row hook could only return the
-                        # unmodified read. A real shuffle is logged below by
-                        # the fixed-episode batched diagnostic.
-                        shuffled_triple_acc = shuffled_perfect_frac = None
-                    else:
-                        segment_diagnostics.set_channel("eval-id-memory-shuffled")
-                        saved_lesson = curriculum.lesson
-                        saved_writers = {
-                            name: getattr(curriculum, name, None)
-                            for name in ("hop_log_writer", "field_log_writer")
-                        }
-                        try:
-                            curriculum.lesson = pre_advance_lesson
-                            for name in saved_writers:
-                                if hasattr(curriculum, name):
-                                    setattr(curriculum, name, None)
-                            with _shuffle_memory_reads_across_batch(rnn):
-                                _, shuffled_triple_acc, shuffled_perfect_frac = (
-                                    curriculum.maybe_advance(
-                                        rnn,
-                                        device,
-                                        step=step,
-                                        optimizer=optimizer,
-                                        allow_advance=False,
-                                    )
-                                )
-                            if surprise_recall_logger is not None:
-                                surprise_recall_logger.write_evaluation(
-                                    step,
-                                    pre_advance_lesson + 1,
-                                    "id-memory-shuffled",
-                                    dataset.last_eval_diagnostics,
-                                )
-                        finally:
-                            curriculum.lesson = saved_lesson
-                            for name, value in saved_writers.items():
-                                if hasattr(curriculum, name):
-                                    setattr(curriculum, name, value)
-                        segment_diagnostics.emit("eval-id-memory-shuffled")
-                finally:
-                    _restore_rng_state(rng_state_after_other_evaluations)
-
-                assert mem_check_writer is not None and mem_check_file is not None
-                mem_check_writer.writerow(
+                ood_log_writer.writerow(
                     [
                         step,
-                        pre_advance_lesson + 1,
-                        memory_type,
+                        curriculum.lesson + 1,
                         id_triple_acc,
                         id_perfect_frac,
-                        ablated_triple_acc,
-                        ablated_perfect_frac,
-                        id_triple_acc - ablated_triple_acc,
-                        id_perfect_frac - ablated_perfect_frac,
-                        shuffled_triple_acc,
-                        shuffled_perfect_frac,
-                        (
-                            id_triple_acc - shuffled_triple_acc
-                            if shuffled_triple_acc is not None
-                            else None
-                        ),
-                        (
-                            id_perfect_frac - shuffled_perfect_frac
-                            if shuffled_perfect_frac is not None
-                            else None
-                        ),
+                        ood_triple_acc,
+                        ood_perfect_frac,
+                        id_triple_acc - ood_triple_acc,
+                        id_perfect_frac - ood_perfect_frac,
                     ]
                 )
-                mem_check_file.flush()
-                shuffle_summary = (
-                    "shuffled pending paired batch diagnostic"
-                    if shuffled_triple_acc is None
-                    else f"shuffled {shuffled_triple_acc:.2f}% "
-                    f"(drop {id_triple_acc - shuffled_triple_acc:.2f})"
-                )
-                print(
-                    f"[{run_id}] Step {step} memory-dependency check ({memory_type}): "
-                    f"on {id_triple_acc:.2f}% | off {ablated_triple_acc:.2f}% "
-                    f"(drop {id_triple_acc - ablated_triple_acc:.2f}) | "
-                    f"{shuffle_summary}"
-                )
-
-            if workspace_check_writer is not None:
-                write_workspace_dependency(
+                ood_log_file.flush()
+                if (
+                    has_dnc
+                    and track_a_writer is not None
+                    and track_a_file is not None
+                    and relational_probe_cases is not None
+                ):
+                    rho_key = "ordinary_read_score_cosine_correlation_mean"
+                    rho = id_stage_diagnostics.get(
+                        rho_key,
+                        1.0 if dnc_read_variant == "cosine" else None,
+                    )
+                    rho_count = id_stage_diagnostics.get("diagnostic_steps", 0.0)
+                    stress_metrics = score_probe_cases(rnn.memories[0], relational_probe_cases)
+                    track_a_writer.writerow(
+                        [
+                            step,
+                            pre_advance_lesson + 1,
+                            dnc_read_variant,
+                            id_triple_acc,
+                            ood_triple_acc,
+                            id_triple_acc - ood_triple_acc,
+                            cosine_top1_accuracy(relational_probe_cases),
+                            stress_metrics["accuracy"],
+                            stress_metrics["held_out_accuracy"],
+                            rho,
+                            rho_count,
+                            id_stage_diagnostics.get("read_content_entropy_mean"),
+                            id_stage_diagnostics.get("read_content_max_weight_mean"),
+                            id_stage_diagnostics.get("relational_read_residual_rms_mean"),
+                            id_stage_diagnostics.get("relational_read_residual_to_cosine_rms_mean"),
+                        ]
+                    )
+                    track_a_file.flush()
+                    print(
+                        f"[{run_id}] [Track A] read={dnc_read_variant} | "
+                        f"ID/OOD/offset={id_triple_acc:.2f}/{ood_triple_acc:.2f}/"
+                        f"{id_triple_acc - ood_triple_acc:.2f} | "
+                        f"stress cosine/read/held-out="
+                        f"{cosine_top1_accuracy(relational_probe_cases):.3f}/"
+                        f"{stress_metrics['accuracy']:.3f}/"
+                        f"{stress_metrics['held_out_accuracy']:.3f} | "
+                        f"ordinary MLP-cosine rho="
+                        f"{rho if rho is not None else float('nan'):.4f} | "
+                        f"read entropy/max="
+                        f"{id_stage_diagnostics.get('read_content_entropy_mean', float('nan')):.3f}/"
+                        f"{id_stage_diagnostics.get('read_content_max_weight_mean', float('nan')):.3f} | "
+                        f"residual/cosine rms="
+                        f"{id_stage_diagnostics.get('relational_read_residual_to_cosine_rms_mean', float('nan')):.3f}"
+                    )
+                if track_b_writer is not None and track_b_file is not None:
+                    id_write_values = [
+                        id_stage_diagnostics.get("posterior_variance_mean"),
+                        id_stage_diagnostics.get("posterior_variance_min"),
+                        id_stage_diagnostics.get("posterior_variance_max"),
+                        id_stage_diagnostics.get("posterior_variance_reduction_mean"),
+                        id_stage_diagnostics.get("posterior_mean_update_abs_mean"),
+                        id_stage_diagnostics.get("active_write_cell_fraction_mean"),
+                        id_stage_diagnostics.get("write_weight_mass_mean"),
+                        id_stage_diagnostics.get("diagnostic_steps"),
+                    ]
+                    ood_write_values = [
+                        ood_stage_diagnostics.get("posterior_variance_mean"),
+                        ood_stage_diagnostics.get("posterior_variance_min"),
+                        ood_stage_diagnostics.get("posterior_variance_max"),
+                        ood_stage_diagnostics.get("posterior_variance_reduction_mean"),
+                        ood_stage_diagnostics.get("posterior_mean_update_abs_mean"),
+                        ood_stage_diagnostics.get("active_write_cell_fraction_mean"),
+                        ood_stage_diagnostics.get("write_weight_mass_mean"),
+                        ood_stage_diagnostics.get("diagnostic_steps"),
+                    ]
+                    track_b_writer.writerow(
+                        [
+                            "evaluation",
+                            step,
+                            pre_advance_lesson + 1,
+                            dnc_write_variant,
+                            id_triple_acc,
+                            ood_triple_acc,
+                            id_triple_acc - ood_triple_acc,
+                            *([None] * 12),
+                            *id_write_values,
+                            *ood_write_values,
+                            *([None] * 6),
+                        ]
+                    )
+                    track_b_file.flush()
+                    if dnc_write_variant == "kanerva-closed-form":
+                        print(
+                            f"[{run_id}] [Track B] write={dnc_write_variant} | "
+                            f"posterior variance ID/OOD="
+                            f"{id_stage_diagnostics.get('posterior_variance_mean', float('nan')):.5f}/"
+                            f"{ood_stage_diagnostics.get('posterior_variance_mean', float('nan')):.5f} | "
+                            f"mean update ID/OOD="
+                            f"{id_stage_diagnostics.get('posterior_mean_update_abs_mean', float('nan')):.6g}/"
+                            f"{ood_stage_diagnostics.get('posterior_mean_update_abs_mean', float('nan')):.6g} | "
+                            f"active cells ID/OOD="
+                            f"{id_stage_diagnostics.get('active_write_cell_fraction_mean', float('nan')):.4f}/"
+                            f"{ood_stage_diagnostics.get('active_write_cell_fraction_mean', float('nan')):.4f}"
+                        )
+                _write_ogs_row(
+                    ogs_log_writer,
                     step,
                     pre_advance_lesson + 1,
                     id_triple_acc,
-                    id_perfect_frac,
-                    id_task_diagnostics,
+                    ood_triple_acc,
+                    ood_perfect_frac,
+                    ood_ablated_acc,
+                    ogs_weights,
                 )
-
-            if workspace_semantic_state_diagnostics:
-                state_rng = random.Random(int(seed) * 1_000_003 + int(step) + 0x53544154)
-                state_torch_rng = _capture_torch_rng()
-                segment_diagnostics.set_channel("eval-permutation-state-diagnostics")
-                with _replay_torch_rng(state_torch_rng):
-                    state_probe = dataset.evaluate_permutation_state_diagnostics(
-                        rnn,
-                        device,
-                        pre_advance_lesson,
-                        num_episodes=1,
-                        max_events_per_episode=workspace_state_diagnostic_max_events,
-                        rng=state_rng,
-                    )
-                write_workspace_task_metrics(
+                ogs_log_file.flush()
+                _print_ood_analysis(
+                    run_id,
+                    "periodic",
                     step,
                     pre_advance_lesson + 1,
-                    "permutation-state-diagnostics",
-                    {"permutation_state_diagnostics": state_probe},
+                    id_triple_acc,
+                    ood_triple_acc,
+                    ood_perfect_frac,
+                    ood_ablated_acc,
+                    ogs_weights,
+                    beta_eff,
+                    avg_kl,
+                    kl_diag,
                 )
-                segment_diagnostics.emit("eval-permutation-state-diagnostics")
+                dataset.write_field_log(
+                    field_log_writer, field_log_file, step, curriculum.lesson + 1, "ood", ood_field_log
+                )
+                print(
+                    f"[{run_id}] Step {step} periodic OOD check: "
+                    f"ID {id_triple_acc:.2f}% | OOD {ood_triple_acc:.2f}% | "
+                    f"offset {id_triple_acc - ood_triple_acc:.2f}"
+                )
+                for hops, (acc, pf, n) in sorted(ood_hop_breakdown.items()):
+                    hop_log_writer.writerow([step, curriculum.lesson + 1, "ood", hops, acc, pf, n])
+                hop_log_file.flush()
 
-            if (
-                paired_graph_memory_diagnostics
-                and memory_path_writer is not None
-                and step % max(EVAL_EVERY * 10, 1) == 0
-            ):
-                write_paired_graph_memory_diagnostics(step, pre_advance_lesson)
-
-            if combiner_stage_kinds is not None:
-                # Same pattern as the memory-dependency check above, but
-                # ablating one combiner stage (e.g. the CfC block in a
-                # "mamba+cfc" combiner) at a time, so each stage's actual
-                # contribution to accuracy is measured directly instead of
-                # inferred from loss curves / plateau shape.
-                for stage_idx, stage_kind in enumerate(combiner_stage_kinds):
-                    segment_diagnostics.set_channel(f"eval-combiner-{stage_idx}")
-                    stage_triple_acc, stage_perfect_frac = (
-                        dataset.evaluate_id_combiner_stage_ablated(
-                            rnn, device, curriculum, pre_advance_lesson, skip_stages={stage_idx}
+                # Functional-usage check: same lesson distribution the ID eval
+                # above just used (pre_advance_lesson, not curriculum.lesson --
+                # this call may have just advanced it).
+                # Replay the exact ID evaluation episodes with memory bypassed.
+                # Comparing two independently sampled episode sets made this
+                # purported causal dependency metric too noisy to diagnose
+                # whether the model actually used memory. Restore the post-ID
+                # stream afterward so the paired evaluation consumes no extra
+                # randomness from the run.
+                if not has_memory:
+                    print(
+                        f"[{run_id}] Step {step} memory-dependency check: n/a "
+                        "(this model has no active memory module)."
+                    )
+                else:
+                    rng_state_after_other_evaluations = _capture_rng_state()
+                    ablated_triple_acc = ablated_perfect_frac = None
+                    shuffled_triple_acc = shuffled_perfect_frac = None
+                    try:
+                        _restore_rng_state(id_eval_rng_state)
+                        segment_diagnostics.set_channel("eval-id-memory-off")
+                        ablated_triple_acc, ablated_perfect_frac = dataset.evaluate_id_ablated(
+                            rnn, device, curriculum, pre_advance_lesson
                         )
-                    )
-                    segment_diagnostics.emit(f"eval-combiner-{stage_idx}")
-                    combiner_stage_log_writer.writerow(
+                        if surprise_recall_logger is not None:
+                            surprise_recall_logger.write_evaluation(
+                                step,
+                                pre_advance_lesson + 1,
+                                "id-memory-off",
+                                dataset.last_eval_diagnostics,
+                            )
+                        segment_diagnostics.emit("eval-id-memory-off")
+
+                        _restore_rng_state(id_eval_rng_state)
+                        if paired_graph_memory_diagnostics:
+                            # Graph traversal evaluates one episode per forward,
+                            # so the old batch-row hook could only return the
+                            # unmodified read. A real shuffle is logged below by
+                            # the fixed-episode batched diagnostic.
+                            shuffled_triple_acc = shuffled_perfect_frac = None
+                        else:
+                            segment_diagnostics.set_channel("eval-id-memory-shuffled")
+                            saved_lesson = curriculum.lesson
+                            saved_writers = {
+                                name: getattr(curriculum, name, None)
+                                for name in ("hop_log_writer", "field_log_writer")
+                            }
+                            try:
+                                curriculum.lesson = pre_advance_lesson
+                                for name in saved_writers:
+                                    if hasattr(curriculum, name):
+                                        setattr(curriculum, name, None)
+                                with _shuffle_memory_reads_across_batch(rnn):
+                                    _, shuffled_triple_acc, shuffled_perfect_frac = (
+                                        curriculum.maybe_advance(
+                                            rnn,
+                                            device,
+                                            step=step,
+                                            optimizer=optimizer,
+                                            allow_advance=False,
+                                        )
+                                    )
+                                if surprise_recall_logger is not None:
+                                    surprise_recall_logger.write_evaluation(
+                                        step,
+                                        pre_advance_lesson + 1,
+                                        "id-memory-shuffled",
+                                        dataset.last_eval_diagnostics,
+                                    )
+                            finally:
+                                curriculum.lesson = saved_lesson
+                                for name, value in saved_writers.items():
+                                    if hasattr(curriculum, name):
+                                        setattr(curriculum, name, value)
+                            segment_diagnostics.emit("eval-id-memory-shuffled")
+                    finally:
+                        _restore_rng_state(rng_state_after_other_evaluations)
+
+                    assert mem_check_writer is not None and mem_check_file is not None
+                    mem_check_writer.writerow(
                         [
                             step,
                             pre_advance_lesson + 1,
-                            stage_idx,
-                            stage_kind,
+                            memory_type,
                             id_triple_acc,
                             id_perfect_frac,
-                            stage_triple_acc,
-                            stage_perfect_frac,
-                            id_triple_acc - stage_triple_acc,
-                            id_perfect_frac - stage_perfect_frac,
+                            ablated_triple_acc,
+                            ablated_perfect_frac,
+                            id_triple_acc - ablated_triple_acc,
+                            id_perfect_frac - ablated_perfect_frac,
+                            shuffled_triple_acc,
+                            shuffled_perfect_frac,
+                            (
+                                id_triple_acc - shuffled_triple_acc
+                                if shuffled_triple_acc is not None
+                                else None
+                            ),
+                            (
+                                id_perfect_frac - shuffled_perfect_frac
+                                if shuffled_perfect_frac is not None
+                                else None
+                            ),
                         ]
                     )
-                    combiner_stage_log_file.flush()
+                    mem_check_file.flush()
+                    shuffle_summary = (
+                        "shuffled pending paired batch diagnostic"
+                        if shuffled_triple_acc is None
+                        else f"shuffled {shuffled_triple_acc:.2f}% "
+                        f"(drop {id_triple_acc - shuffled_triple_acc:.2f})"
+                    )
                     print(
-                        f"[{run_id}] Step {step} combiner-stage-dependency check "
-                        f"[{stage_idx}:{stage_kind}]: ID (full) {id_triple_acc:.2f}% | "
-                        f"ablated ({stage_kind} off) {stage_triple_acc:.2f}% | "
-                        f"dependency {id_triple_acc - stage_triple_acc:.2f}"
+                        f"[{run_id}] Step {step} memory-dependency check ({memory_type}): "
+                        f"on {id_triple_acc:.2f}% | off {ablated_triple_acc:.2f}% "
+                        f"(drop {id_triple_acc - ablated_triple_acc:.2f}) | "
+                        f"{shuffle_summary}"
                     )
 
-            if getattr(dataset, "modalities", None):
-                for modality in dataset.modalities:
-                    m_acc, m_pf = dataset.evaluate_modality_ablated(
-                        rnn, device, curriculum, pre_advance_lesson, modality
+                if workspace_check_writer is not None:
+                    write_workspace_dependency(
+                        step,
+                        pre_advance_lesson + 1,
+                        id_triple_acc,
+                        id_perfect_frac,
+                        id_task_diagnostics,
                     )
-                    modality_log_writer.writerow(
-                        [
-                            step,
-                            pre_advance_lesson + 1,
-                            modality,
-                            id_triple_acc,
-                            id_perfect_frac,
-                            m_acc,
-                            m_pf,
-                            id_triple_acc - m_acc,
-                            id_perfect_frac - m_pf,
-                        ]
+
+                if workspace_semantic_state_diagnostics:
+                    state_rng = random.Random(int(seed) * 1_000_003 + int(step) + 0x53544154)
+                    state_torch_rng = _capture_torch_rng()
+                    segment_diagnostics.set_channel("eval-permutation-state-diagnostics")
+                    with _replay_torch_rng(state_torch_rng):
+                        state_probe = dataset.evaluate_permutation_state_diagnostics(
+                            rnn,
+                            device,
+                            pre_advance_lesson,
+                            num_episodes=1,
+                            max_events_per_episode=workspace_state_diagnostic_max_events,
+                            rng=state_rng,
+                        )
+                    write_workspace_task_metrics(
+                        step,
+                        pre_advance_lesson + 1,
+                        "permutation-state-diagnostics",
+                        {"permutation_state_diagnostics": state_probe},
                     )
-                    modality_log_file.flush()
-                    print(
-                        f"[{run_id}] Step {step} modality-dependency check "
-                        f"[{modality}]: full {id_triple_acc:.2f}% | ablated ({modality} off) "
-                        f"{m_acc:.2f}% | dependency {id_triple_acc - m_acc:.2f}"
-                    )
+                    segment_diagnostics.emit("eval-permutation-state-diagnostics")
+
+                if (
+                    paired_graph_memory_diagnostics
+                    and memory_path_writer is not None
+                    and step % max(EVAL_EVERY * 10, 1) == 0
+                ):
+                    write_paired_graph_memory_diagnostics(step, pre_advance_lesson)
+
+                if combiner_stage_kinds is not None:
+                    # Same pattern as the memory-dependency check above, but
+                    # ablating one combiner stage (e.g. the CfC block in a
+                    # "mamba+cfc" combiner) at a time, so each stage's actual
+                    # contribution to accuracy is measured directly instead of
+                    # inferred from loss curves / plateau shape.
+                    for stage_idx, stage_kind in enumerate(combiner_stage_kinds):
+                        segment_diagnostics.set_channel(f"eval-combiner-{stage_idx}")
+                        stage_triple_acc, stage_perfect_frac = (
+                            dataset.evaluate_id_combiner_stage_ablated(
+                                rnn, device, curriculum, pre_advance_lesson, skip_stages={stage_idx}
+                            )
+                        )
+                        segment_diagnostics.emit(f"eval-combiner-{stage_idx}")
+                        combiner_stage_log_writer.writerow(
+                            [
+                                step,
+                                pre_advance_lesson + 1,
+                                stage_idx,
+                                stage_kind,
+                                id_triple_acc,
+                                id_perfect_frac,
+                                stage_triple_acc,
+                                stage_perfect_frac,
+                                id_triple_acc - stage_triple_acc,
+                                id_perfect_frac - stage_perfect_frac,
+                            ]
+                        )
+                        combiner_stage_log_file.flush()
+                        print(
+                            f"[{run_id}] Step {step} combiner-stage-dependency check "
+                            f"[{stage_idx}:{stage_kind}]: ID (full) {id_triple_acc:.2f}% | "
+                            f"ablated ({stage_kind} off) {stage_triple_acc:.2f}% | "
+                            f"dependency {id_triple_acc - stage_triple_acc:.2f}"
+                        )
+
+                if getattr(dataset, "modalities", None):
+                    for modality in dataset.modalities:
+                        m_acc, m_pf = dataset.evaluate_modality_ablated(
+                            rnn, device, curriculum, pre_advance_lesson, modality
+                        )
+                        modality_log_writer.writerow(
+                            [
+                                step,
+                                pre_advance_lesson + 1,
+                                modality,
+                                id_triple_acc,
+                                id_perfect_frac,
+                                m_acc,
+                                m_pf,
+                                id_triple_acc - m_acc,
+                                id_perfect_frac - m_pf,
+                            ]
+                        )
+                        modality_log_file.flush()
+                        print(
+                            f"[{run_id}] Step {step} modality-dependency check "
+                            f"[{modality}]: full {id_triple_acc:.2f}% | ablated ({modality} off) "
+                            f"{m_acc:.2f}% | dependency {id_triple_acc - m_acc:.2f}"
+                        )
+
+        if (
+            progression_eval_only
+            and workspace_check_writer is not None
+            and evaluation_started_at is not None
+        ):
+            write_workspace_dependency(
+                step,
+                pre_advance_lesson + 1,
+                id_triple_acc,
+                id_perfect_frac,
+                id_task_diagnostics,
+            )
 
         if evaluation_started_at is not None:
             evaluation_seconds = time.time() - evaluation_started_at
@@ -8627,7 +8753,7 @@ def run(
             step, curriculum.lesson + 1, "final-id", dataset.last_eval_diagnostics
         )
     final_sgr_phase1_eval = None
-    if isinstance(sgr_prediction_decoder, SurprisePredictionHead):
+    if not progression_eval_only and isinstance(sgr_prediction_decoder, SurprisePredictionHead):
         final_sgr_phase1_eval = evaluate_prediction_signals(
             rnn.backbone,
             sgr_prediction_decoder,
@@ -8677,194 +8803,182 @@ def run(
         )
         relational_probe_file.flush()
 
-    print(f"\n[{run_id}] Generalization test:")
-
-    final_ood_rng_state = ood_rng.getstate()
-    final_ood_torch_rng = _capture_torch_rng()
-    final_ood_field_log: dict[tuple[int, int], list[int]] = {}
-    final_ood_stage_memory = rnn.memories[0]
-    final_ood_usage_handles, final_ood_usage_capture = _attach_memory_usage_hooks(rnn)
-    if isinstance(rnn, SplitGraphDNC) and rnn.workspace is not None:
-        rnn.workspace.reset_bistable_diagnostics()
-    if hasattr(final_ood_stage_memory, "begin_stage_diagnostics"):
-        final_ood_stage_memory.begin_stage_diagnostics()
-    segment_diagnostics.set_channel("eval-final-ood")
-    ood_triple_acc, ood_perfect_frac, ood_hop_breakdown = dataset.evaluate_ood(
-        rnn,
-        device,
-        num_episodes=final_ood_episodes,
-        rng=ood_rng,
-        verbose_n=10,
-        field_log=final_ood_field_log,
-    )
-    write_workspace_task_metrics(
-        step, curriculum.lesson + 1, "final-ood", getattr(dataset, "last_eval_diagnostics", None)
-    )
-    if surprise_recall_logger is not None:
-        surprise_recall_logger.write_evaluation(
-            step, curriculum.lesson + 1, "final-ood", dataset.last_eval_diagnostics
-        )
-    segment_diagnostics.emit("eval-final-ood")
-    report_bistable_evaluation("OOD")
-    final_ood_stage_diagnostics = (
-        final_ood_stage_memory.finish_stage_diagnostics()
-        if hasattr(final_ood_stage_memory, "finish_stage_diagnostics")
-        else {}
-    )
-    final_ood_stage_diagnostics.update(
-        _finish_memory_usage_hooks(final_ood_usage_handles, final_ood_usage_capture)
-    )
-    write_memory_usage(step, curriculum.lesson + 1, "final-ood", final_ood_stage_diagnostics)
-
-    ood_offset_triple = id_triple_acc - ood_triple_acc
-    ood_offset_perfect = id_perfect_frac - ood_perfect_frac
-
-    if (
-        paired_graph_memory_diagnostics
-        and memory_path_writer is not None
-        and int(step) not in memory_path_probe_steps
-    ):
-        write_paired_graph_memory_diagnostics(step, curriculum.lesson)
-
-    if (
-        has_dnc
-        and track_a_writer is not None
-        and track_a_file is not None
-        and relational_probe_cases is not None
-    ):
-        final_stress_metrics = score_probe_cases(rnn.memories[0], relational_probe_cases)
-        rho = final_id_stage_diagnostics.get(
-            "ordinary_read_score_cosine_correlation_mean",
-            1.0 if dnc_read_variant == "cosine" else None,
-        )
-        track_a_writer.writerow(
-            [
-                step,
-                curriculum.lesson + 1,
-                dnc_read_variant,
-                id_triple_acc,
-                ood_triple_acc,
-                ood_offset_triple,
-                cosine_top1_accuracy(relational_probe_cases),
-                final_stress_metrics["accuracy"],
-                final_stress_metrics["held_out_accuracy"],
-                rho,
-                final_id_stage_diagnostics.get("diagnostic_steps", 0.0),
-                final_id_stage_diagnostics.get("read_content_entropy_mean"),
-                final_id_stage_diagnostics.get("read_content_max_weight_mean"),
-                final_id_stage_diagnostics.get("relational_read_residual_rms_mean"),
-                final_id_stage_diagnostics.get("relational_read_residual_to_cosine_rms_mean"),
-            ]
-        )
-        track_a_file.flush()
-        residual_ratio = final_id_stage_diagnostics.get(
-            "relational_read_residual_to_cosine_rms_mean"
-        )
-        residual_ratio_text = (
-            f"{residual_ratio:.3f}"
-            if residual_ratio is not None
-            else f"n/a (not defined for {dnc_read_variant} read)"
-        )
-        print(
-            f"[{run_id}] [Track A / final] stress cosine/read/held-out="
-            f"{cosine_top1_accuracy(relational_probe_cases):.3f}/"
-            f"{final_stress_metrics['accuracy']:.3f}/"
-            f"{final_stress_metrics['held_out_accuracy']:.3f} | "
-            f"ordinary MLP-cosine rho="
-            f"{rho if rho is not None else float('nan'):.4f} | "
-            f"read entropy/max="
-            f"{final_id_stage_diagnostics.get('read_content_entropy_mean', float('nan')):.3f}/"
-            f"{final_id_stage_diagnostics.get('read_content_max_weight_mean', float('nan')):.3f} | "
-            f"residual/cosine rms={residual_ratio_text}"
-        )
-    if track_b_writer is not None and track_b_file is not None:
-
-        def _write_diagnostic_values(diagnostics):
-            return [
-                diagnostics.get("posterior_variance_mean"),
-                diagnostics.get("posterior_variance_min"),
-                diagnostics.get("posterior_variance_max"),
-                diagnostics.get("posterior_variance_reduction_mean"),
-                diagnostics.get("posterior_mean_update_abs_mean"),
-                diagnostics.get("active_write_cell_fraction_mean"),
-                diagnostics.get("write_weight_mass_mean"),
-                diagnostics.get("diagnostic_steps"),
-            ]
-
-        track_b_writer.writerow(
-            [
-                "final_evaluation",
-                step,
-                curriculum.lesson + 1,
-                dnc_write_variant,
-                id_triple_acc,
-                ood_triple_acc,
-                ood_offset_triple,
-                *([None] * 12),
-                *_write_diagnostic_values(final_id_stage_diagnostics),
-                *_write_diagnostic_values(final_ood_stage_diagnostics),
-                *([None] * 6),
-            ]
-        )
-        track_b_file.flush()
-        if dnc_write_variant == "kanerva-closed-form":
-            print(
-                f"[{run_id}] [Track B / final] posterior variance ID/OOD="
-                f"{final_id_stage_diagnostics.get('posterior_variance_mean', float('nan')):.5f}/"
-                f"{final_ood_stage_diagnostics.get('posterior_variance_mean', float('nan')):.5f} | "
-                f"mean update ID/OOD="
-                f"{final_id_stage_diagnostics.get('posterior_mean_update_abs_mean', float('nan')):.6g}/"
-                f"{final_ood_stage_diagnostics.get('posterior_mean_update_abs_mean', float('nan')):.6g}"
-            )
-
-    ood_log_writer.writerow(
-        [
-            step,
-            curriculum.lesson + 1,
-            id_triple_acc,
-            id_perfect_frac,
-            ood_triple_acc,
-            ood_perfect_frac,
-            ood_offset_triple,
-            ood_offset_perfect,
-        ]
-    )
-    ood_log_file.flush()
+    ood_triple_acc = ood_perfect_frac = None
+    ood_offset_triple = ood_offset_perfect = None
+    ood_hop_breakdown = {}
     final_ood_ablated_acc = None
-    if has_memory and hasattr(dataset, "evaluate_ood_ablated"):
-        final_ood_ablated_rng = random.Random()
-        final_ood_ablated_rng.setstate(final_ood_rng_state)
-        segment_diagnostics.set_channel("eval-final-ood-memory-off")
-        with _replay_torch_rng(final_ood_torch_rng):
-            final_ood_ablated_acc, _final_ood_ablated_perfect = dataset.evaluate_ood_ablated(
-                rnn, device, final_ood_episodes, final_ood_ablated_rng
-            )
-        segment_diagnostics.emit("eval-final-ood-memory-off")
+    if not progression_eval_only:
+        print(f"\n[{run_id}] Generalization test:")
 
-    if callable(getattr(dataset, "evaluate_permutation_generalization", None)) and getattr(
-        dataset, "task_track", None
-    ) in {"all", "permutation"}:
-        permutation_eval_seed = int(seed) * 1_000_003 + int(step) + 0x5045524D
-        permutation_episodes_per_split = max(8, final_ood_episodes // 4)
-        permutation_torch_rng = _capture_torch_rng()
-        segment_diagnostics.set_channel("eval-final-permutation-generalization")
-        with _replay_torch_rng(permutation_torch_rng):
-            dataset.evaluate_permutation_generalization(
-                rnn,
-                device,
-                curriculum.lesson,
-                episodes_per_split=permutation_episodes_per_split,
-                rng=random.Random(permutation_eval_seed),
-            )
-        write_workspace_task_metrics(
-            step,
-            curriculum.lesson + 1,
-            "final-permutation-generalization",
-            dataset.last_eval_diagnostics,
+        final_ood_rng_state = ood_rng.getstate()
+        final_ood_torch_rng = _capture_torch_rng()
+        final_ood_field_log: dict[tuple[int, int], list[int]] = {}
+        final_ood_stage_memory = rnn.memories[0]
+        final_ood_usage_handles, final_ood_usage_capture = _attach_memory_usage_hooks(rnn)
+        if isinstance(rnn, SplitGraphDNC) and rnn.workspace is not None:
+            rnn.workspace.reset_bistable_diagnostics()
+        if hasattr(final_ood_stage_memory, "begin_stage_diagnostics"):
+            final_ood_stage_memory.begin_stage_diagnostics()
+        segment_diagnostics.set_channel("eval-final-ood")
+        ood_triple_acc, ood_perfect_frac, ood_hop_breakdown = dataset.evaluate_ood(
+            rnn,
+            device,
+            num_episodes=final_ood_episodes,
+            rng=ood_rng,
+            verbose_n=10,
+            field_log=final_ood_field_log,
         )
-        segment_diagnostics.emit("eval-final-permutation-generalization")
-        if has_memory:
-            segment_diagnostics.set_channel("eval-final-permutation-generalization-memory-off")
+        write_workspace_task_metrics(
+            step, curriculum.lesson + 1, "final-ood", getattr(dataset, "last_eval_diagnostics", None)
+        )
+        if surprise_recall_logger is not None:
+            surprise_recall_logger.write_evaluation(
+                step, curriculum.lesson + 1, "final-ood", dataset.last_eval_diagnostics
+            )
+        segment_diagnostics.emit("eval-final-ood")
+        report_bistable_evaluation("OOD")
+        final_ood_stage_diagnostics = (
+            final_ood_stage_memory.finish_stage_diagnostics()
+            if hasattr(final_ood_stage_memory, "finish_stage_diagnostics")
+            else {}
+        )
+        final_ood_stage_diagnostics.update(
+            _finish_memory_usage_hooks(final_ood_usage_handles, final_ood_usage_capture)
+        )
+        write_memory_usage(step, curriculum.lesson + 1, "final-ood", final_ood_stage_diagnostics)
+
+        ood_offset_triple = id_triple_acc - ood_triple_acc
+        ood_offset_perfect = id_perfect_frac - ood_perfect_frac
+
+        if (
+            paired_graph_memory_diagnostics
+            and memory_path_writer is not None
+            and int(step) not in memory_path_probe_steps
+        ):
+            write_paired_graph_memory_diagnostics(step, curriculum.lesson)
+
+        if (
+            has_dnc
+            and track_a_writer is not None
+            and track_a_file is not None
+            and relational_probe_cases is not None
+        ):
+            final_stress_metrics = score_probe_cases(rnn.memories[0], relational_probe_cases)
+            rho = final_id_stage_diagnostics.get(
+                "ordinary_read_score_cosine_correlation_mean",
+                1.0 if dnc_read_variant == "cosine" else None,
+            )
+            track_a_writer.writerow(
+                [
+                    step,
+                    curriculum.lesson + 1,
+                    dnc_read_variant,
+                    id_triple_acc,
+                    ood_triple_acc,
+                    ood_offset_triple,
+                    cosine_top1_accuracy(relational_probe_cases),
+                    final_stress_metrics["accuracy"],
+                    final_stress_metrics["held_out_accuracy"],
+                    rho,
+                    final_id_stage_diagnostics.get("diagnostic_steps", 0.0),
+                    final_id_stage_diagnostics.get("read_content_entropy_mean"),
+                    final_id_stage_diagnostics.get("read_content_max_weight_mean"),
+                    final_id_stage_diagnostics.get("relational_read_residual_rms_mean"),
+                    final_id_stage_diagnostics.get("relational_read_residual_to_cosine_rms_mean"),
+                ]
+            )
+            track_a_file.flush()
+            residual_ratio = final_id_stage_diagnostics.get(
+                "relational_read_residual_to_cosine_rms_mean"
+            )
+            residual_ratio_text = (
+                f"{residual_ratio:.3f}"
+                if residual_ratio is not None
+                else f"n/a (not defined for {dnc_read_variant} read)"
+            )
+            print(
+                f"[{run_id}] [Track A / final] stress cosine/read/held-out="
+                f"{cosine_top1_accuracy(relational_probe_cases):.3f}/"
+                f"{final_stress_metrics['accuracy']:.3f}/"
+                f"{final_stress_metrics['held_out_accuracy']:.3f} | "
+                f"ordinary MLP-cosine rho="
+                f"{rho if rho is not None else float('nan'):.4f} | "
+                f"read entropy/max="
+                f"{final_id_stage_diagnostics.get('read_content_entropy_mean', float('nan')):.3f}/"
+                f"{final_id_stage_diagnostics.get('read_content_max_weight_mean', float('nan')):.3f} | "
+                f"residual/cosine rms={residual_ratio_text}"
+            )
+        if track_b_writer is not None and track_b_file is not None:
+
+            def _write_diagnostic_values(diagnostics):
+                return [
+                    diagnostics.get("posterior_variance_mean"),
+                    diagnostics.get("posterior_variance_min"),
+                    diagnostics.get("posterior_variance_max"),
+                    diagnostics.get("posterior_variance_reduction_mean"),
+                    diagnostics.get("posterior_mean_update_abs_mean"),
+                    diagnostics.get("active_write_cell_fraction_mean"),
+                    diagnostics.get("write_weight_mass_mean"),
+                    diagnostics.get("diagnostic_steps"),
+                ]
+
+            track_b_writer.writerow(
+                [
+                    "final_evaluation",
+                    step,
+                    curriculum.lesson + 1,
+                    dnc_write_variant,
+                    id_triple_acc,
+                    ood_triple_acc,
+                    ood_offset_triple,
+                    *([None] * 12),
+                    *_write_diagnostic_values(final_id_stage_diagnostics),
+                    *_write_diagnostic_values(final_ood_stage_diagnostics),
+                    *([None] * 6),
+                ]
+            )
+            track_b_file.flush()
+            if dnc_write_variant == "kanerva-closed-form":
+                print(
+                    f"[{run_id}] [Track B / final] posterior variance ID/OOD="
+                    f"{final_id_stage_diagnostics.get('posterior_variance_mean', float('nan')):.5f}/"
+                    f"{final_ood_stage_diagnostics.get('posterior_variance_mean', float('nan')):.5f} | "
+                    f"mean update ID/OOD="
+                    f"{final_id_stage_diagnostics.get('posterior_mean_update_abs_mean', float('nan')):.6g}/"
+                    f"{final_ood_stage_diagnostics.get('posterior_mean_update_abs_mean', float('nan')):.6g}"
+                )
+
+        ood_log_writer.writerow(
+            [
+                step,
+                curriculum.lesson + 1,
+                id_triple_acc,
+                id_perfect_frac,
+                ood_triple_acc,
+                ood_perfect_frac,
+                ood_offset_triple,
+                ood_offset_perfect,
+            ]
+        )
+        ood_log_file.flush()
+        final_ood_ablated_acc = None
+        if has_memory and hasattr(dataset, "evaluate_ood_ablated"):
+            final_ood_ablated_rng = random.Random()
+            final_ood_ablated_rng.setstate(final_ood_rng_state)
+            segment_diagnostics.set_channel("eval-final-ood-memory-off")
+            with _replay_torch_rng(final_ood_torch_rng):
+                final_ood_ablated_acc, _final_ood_ablated_perfect = dataset.evaluate_ood_ablated(
+                    rnn, device, final_ood_episodes, final_ood_ablated_rng
+                )
+            segment_diagnostics.emit("eval-final-ood-memory-off")
+
+        if callable(getattr(dataset, "evaluate_permutation_generalization", None)) and getattr(
+            dataset, "task_track", None
+        ) in {"all", "permutation"}:
+            permutation_eval_seed = int(seed) * 1_000_003 + int(step) + 0x5045524D
+            permutation_episodes_per_split = max(8, final_ood_episodes // 4)
+            permutation_torch_rng = _capture_torch_rng()
+            segment_diagnostics.set_channel("eval-final-permutation-generalization")
             with _replay_torch_rng(permutation_torch_rng):
                 dataset.evaluate_permutation_generalization(
                     rnn,
@@ -8872,39 +8986,60 @@ def run(
                     curriculum.lesson,
                     episodes_per_split=permutation_episodes_per_split,
                     rng=random.Random(permutation_eval_seed),
-                    ablate_memory=True,
                 )
             write_workspace_task_metrics(
                 step,
                 curriculum.lesson + 1,
-                "final-permutation-generalization-memory-off",
+                "final-permutation-generalization",
                 dataset.last_eval_diagnostics,
             )
-            segment_diagnostics.emit("eval-final-permutation-generalization-memory-off")
+            segment_diagnostics.emit("eval-final-permutation-generalization")
+            if has_memory:
+                segment_diagnostics.set_channel("eval-final-permutation-generalization-memory-off")
+                with _replay_torch_rng(permutation_torch_rng):
+                    dataset.evaluate_permutation_generalization(
+                        rnn,
+                        device,
+                        curriculum.lesson,
+                        episodes_per_split=permutation_episodes_per_split,
+                        rng=random.Random(permutation_eval_seed),
+                        ablate_memory=True,
+                    )
+                write_workspace_task_metrics(
+                    step,
+                    curriculum.lesson + 1,
+                    "final-permutation-generalization-memory-off",
+                    dataset.last_eval_diagnostics,
+                )
+                segment_diagnostics.emit("eval-final-permutation-generalization-memory-off")
 
-    if workspace_semantic_state_diagnostics:
-        state_rng = random.Random(int(seed) * 1_000_003 + int(step) + 0x53544154)
-        state_torch_rng = _capture_torch_rng()
-        segment_diagnostics.set_channel("eval-final-permutation-state-diagnostics")
-        with _replay_torch_rng(state_torch_rng):
-            state_probe = dataset.evaluate_permutation_state_diagnostics(
-                rnn,
-                device,
-                curriculum.lesson,
-                num_episodes=1,
-                max_events_per_episode=workspace_state_diagnostic_max_events,
-                rng=state_rng,
+        if workspace_semantic_state_diagnostics:
+            state_rng = random.Random(int(seed) * 1_000_003 + int(step) + 0x53544154)
+            state_torch_rng = _capture_torch_rng()
+            segment_diagnostics.set_channel("eval-final-permutation-state-diagnostics")
+            with _replay_torch_rng(state_torch_rng):
+                state_probe = dataset.evaluate_permutation_state_diagnostics(
+                    rnn,
+                    device,
+                    curriculum.lesson,
+                    num_episodes=1,
+                    max_events_per_episode=workspace_state_diagnostic_max_events,
+                    rng=state_rng,
+                )
+            write_workspace_task_metrics(
+                step,
+                curriculum.lesson + 1,
+                "final-permutation-state-diagnostics",
+                {"permutation_state_diagnostics": state_probe},
             )
-        write_workspace_task_metrics(
-            step,
-            curriculum.lesson + 1,
-            "final-permutation-state-diagnostics",
-            {"permutation_state_diagnostics": state_probe},
-        )
-        segment_diagnostics.emit("eval-final-permutation-state-diagnostics")
+            segment_diagnostics.emit("eval-final-permutation-state-diagnostics")
 
     q99_metrics = None
-    if split_graph_enabled and dnc_write_variant == "kanerva-closed-form":
+    if (
+        not progression_eval_only
+        and split_graph_enabled
+        and dnc_write_variant == "kanerva-closed-form"
+    ):
         q99_inputs, q99_targets, q99_answer_mask = build_q99_probe_batch()
         q99_metrics = evaluate_q99_order_sensitivity(
             rnn,
@@ -8954,34 +9089,35 @@ def run(
                 ]
             )
             track_b_file.flush()
-    _write_ogs_row(
-        ogs_log_writer,
-        step,
-        curriculum.lesson + 1,
-        id_triple_acc,
-        ood_triple_acc,
-        ood_perfect_frac,
-        final_ood_ablated_acc,
-        ogs_weights,
-    )
-    ogs_log_file.flush()
-    _print_ood_analysis(
-        run_id,
-        "final",
-        step,
-        curriculum.lesson + 1,
-        id_triple_acc,
-        ood_triple_acc,
-        ood_perfect_frac,
-        final_ood_ablated_acc,
-        ogs_weights,
-        beta_eff,
-        avg_kl,
-        kl_diag,
-    )
+    if not progression_eval_only:
+        _write_ogs_row(
+            ogs_log_writer,
+            step,
+            curriculum.lesson + 1,
+            id_triple_acc,
+            ood_triple_acc,
+            ood_perfect_frac,
+            final_ood_ablated_acc,
+            ogs_weights,
+        )
+        ogs_log_file.flush()
+        _print_ood_analysis(
+            run_id,
+            "final",
+            step,
+            curriculum.lesson + 1,
+            id_triple_acc,
+            ood_triple_acc,
+            ood_perfect_frac,
+            final_ood_ablated_acc,
+            ogs_weights,
+            beta_eff,
+            avg_kl,
+            kl_diag,
+        )
 
     gnw_balanced_probe_result = None
-    if workspace_gnw_balanced_eval_episodes_per_cell:
+    if workspace_gnw_balanced_eval_episodes_per_cell and not progression_eval_only:
         balanced_probe_seed = int(seed) * 1_000_003 + int(step) + 0x474E57
         segment_diagnostics.set_channel("eval-final-gnw-balanced-probe")
         gnw_balanced_probe_result = dataset.evaluate_gnw_balanced_probe(
@@ -9005,6 +9141,7 @@ def run(
 
     summary = {
         "run_id": run_id,
+        "progression_eval_only": progression_eval_only,
         "beta_target": beta_target,
         "id_triple_acc": id_triple_acc,
         "id_perfect_frac": id_perfect_frac,
@@ -9341,6 +9478,15 @@ if __name__ == "__main__":
         help=(
             "Disable CUDA autocast and GradScaler; train the full model, including "
             "Mamba, in FP32. Uses more VRAM and may run slower."
+        ),
+    )
+    parser.add_argument(
+        "--bf16",
+        action="store_true",
+        help=(
+            "Use CUDA BF16 autocast for the backbone and output head. Workspace "
+            "recurrence stays FP32 and GradScaler is disabled. Requires native "
+            "BF16 GPU support; mutually exclusive with --fp32."
         ),
     )
     parser.add_argument(
@@ -9726,8 +9872,20 @@ if __name__ == "__main__":
             "write or state-side operation. State-changing events remain causal and "
             "use the normal recurrent transition. Requires entity-keyed semantic "
             "addressing; training telemetry and unsupported modes fall back to the "
-            "standard per-token recurrence. The existing --workspace-sparse-recurrence "
-            "name is an equivalent alias."
+            "standard per-token recurrence. Compatible with the allocator when "
+            "--workspace-allocator-label-addresses-only disables predicted routing."
+        ),
+    )
+    parser.add_argument(
+        "--workspace-parallel-scan",
+        action="store_true",
+        dest="workspace_parallel_scan",
+        help=(
+            "Use an associative proposal-only scan for semantic entity-keyed slot writes. "
+            "Requires key-value readout and top-k=1. Unsupported stateful features, "
+            "allocator routing, workspace-to-KV writes, and diagnostics fall back to "
+            "the sequential recurrence. This changes the write-gate function; it is "
+            "opt-in and can be toggled when resuming the same checkpoint."
         ),
     )
     parser.add_argument(
@@ -10286,9 +10444,21 @@ if __name__ == "__main__":
         "--batch-size",
         type=int,
         default=BATCH_SIZE,
-        help=f"Training episodes per optimizer step (default: {BATCH_SIZE}); "
+        help=f"Training episodes per microbatch (default: {BATCH_SIZE}); "
         "larger values may improve device utilization at higher memory use and "
         "change the effective gradient batch.",
+    )
+    parser.add_argument(
+        "--workspace-length-bucket-microbatches",
+        type=int,
+        choices=(1, 2, 3, 4),
+        default=1,
+        metavar="N",
+        help=(
+            "For lang_* Stage 5 training, sample N times --batch-size episodes, "
+            "sort within segment-chain-length buckets, and accumulate length-sorted "
+            "microbatches into one optimizer step. 1 keeps the current batch behavior."
+        ),
     )
     parser.add_argument(
         "--workspace-task-track",
@@ -10456,6 +10626,11 @@ if __name__ == "__main__":
                         help="Feed the gold previous answer token at answer positions t>0 (production tracks only).")
     parser.add_argument("--workspace-generation-eval", action="store_true",
                         help="Report free-running generation vs teacher-forced metrics (production tracks).")
+    parser.add_argument(
+        "--workspace-progression-eval-only",
+        action="store_true",
+        help="For workspace-capability lang_* runs, keep progression ID evaluations and the workspace dependency check; skip periodic/final OOD, generation, and language probe evaluations.",
+    )
     parser.add_argument("--workspace-eval-samples-per-group", type=int, default=2, metavar="N",
                         help="Console samples (guess vs gold, failures first) per progression group at each developmental/production evaluation; 0 disables.")
     parser.add_argument("--workspace-scheduled-sampling", type=float, default=0.0, metavar="P",
@@ -10496,6 +10671,11 @@ if __name__ == "__main__":
             "teacher forcing/generation/scheduled sampling require a "
             "developmental_production* or lang_* track"
         )
+    if args.workspace_progression_eval_only and not (
+        args.dataset_type == "workspace-capability"
+        and args.workspace_task_track.replace("-", "_").startswith("lang_")
+    ):
+        parser.error("--workspace-progression-eval-only requires --dataset-type workspace-capability and a lang_* task track")
     if not 0.0 <= args.workspace_scheduled_sampling <= 1.0:
         parser.error("--workspace-scheduled-sampling must be in [0, 1]")
     if args.workspace_scheduled_sampling > 0 and not (
@@ -10624,6 +10804,13 @@ if __name__ == "__main__":
         parser.error("DNC addressing and write-salience options require --memory-type dnc")
     if args.batch_size <= 0:
         parser.error("--batch-size must be positive")
+    if args.bf16 and args.fp32:
+        parser.error("--bf16 and --fp32 are mutually exclusive")
+    if args.workspace_length_bucket_microbatches > 1 and not (
+        args.dataset_type == "workspace-capability"
+        and args.workspace_task_track.replace("-", "_").startswith("lang_")
+    ):
+        parser.error("--workspace-length-bucket-microbatches requires a lang_* track")
     if args.activation_offload_cpu_budget_mb <= 0:
         parser.error("--activation-offload-cpu-budget-mb must be positive")
     if args.log_every <= 0:
@@ -11121,6 +11308,19 @@ if __name__ == "__main__":
             "--workspace-entity-keyed-writes, and "
             "--workspace-semantic-entity-addressing"
         )
+    if args.workspace_parallel_scan and not (
+        args.workspace
+        and args.workspace_key_value_loss_weight > 0
+        and args.workspace_entity_keyed_writes
+        and args.workspace_semantic_entity_addressing
+        and args.moe_top_k == 1
+    ):
+        parser.error(
+            "--workspace-parallel-scan requires --workspace, "
+            "--workspace-key-value-loss-weight > 0, "
+            "--workspace-entity-keyed-writes, and "
+            "--workspace-semantic-entity-addressing, with --moe-top-k 1"
+        )
     if args.workspace_attentional_cue_readout:
         args.workspace_attentional_item_memory = True
     if args.workspace_attentional_item_memory:
@@ -11526,6 +11726,10 @@ if __name__ == "__main__":
             run_id += f"_sgrreconsider-{args.workspace_reconsideration_trigger}_{signal_tag}"
         if args.batch_size != BATCH_SIZE:
             run_id += f"_bs{args.batch_size}"
+        if args.bf16:
+            run_id += "_bf16"
+        if args.workspace_length_bucket_microbatches > 1:
+            run_id += f"_lb{args.workspace_length_bucket_microbatches}"
         if args.run_id_suffix:
             run_id = f"{run_id}_{args.run_id_suffix}"
         # Keep execution-path tags at the end so the filesystem-safe ID
@@ -11570,6 +11774,7 @@ if __name__ == "__main__":
             activation_offload_to_cpu=args.activation_offload_to_cpu,
             activation_offload_cpu_budget_mb=args.activation_offload_cpu_budget_mb,
             fp32=args.fp32,
+            bf16=args.bf16,
             split_graph_moe_placement=args.moe_placement,
             split_graph_moe_backbone_block_isolation=args.moe_backbone_block_isolation,
             split_graph_moe_backbone_residual_scale=args.moe_backbone_residual_scale,
@@ -11722,6 +11927,7 @@ if __name__ == "__main__":
             workspace_exact_selection=args.workspace_exact_selection,
             workspace_rule_feedback_update=args.workspace_rule_feedback_update,
             workspace_sparse_recurrence=args.workspace_sparse_recurrence,
+            workspace_parallel_scan=args.workspace_parallel_scan,
             workspace_attentional_item_memory=args.workspace_attentional_item_memory,
             workspace_attentional_cue_readout=args.workspace_attentional_cue_readout,
             workspace_no_report_confidence_readout=args.workspace_no_report_confidence_readout,
@@ -11735,6 +11941,9 @@ if __name__ == "__main__":
             prepared_dataset=prepared_dataset,
             ogs_weights=tuple(args.ogs_weights),
             batch_size=args.batch_size,
+            workspace_length_bucket_microbatches=(
+                args.workspace_length_bucket_microbatches
+            ),
             sgr_prediction_loss_weight=args.sgr_pred_loss_weight,
             sgr_prediction_eval_episodes=args.sgr_pred_eval_episodes,
             sgr_phase2_arm=args.sgr_phase2_arm,
@@ -11744,6 +11953,7 @@ if __name__ == "__main__":
             sgr_workspace_write_salience=args.sgr_workspace_write_salience,
             workspace_teacher_forced_answers=args.workspace_teacher_forced_answers,
             workspace_generation_eval=args.workspace_generation_eval,
+            workspace_progression_eval_only=args.workspace_progression_eval_only,
             workspace_eval_samples_per_group=args.workspace_eval_samples_per_group,
             workspace_scheduled_sampling=args.workspace_scheduled_sampling,
             workspace_scheduled_sampling_steps=args.workspace_scheduled_sampling_steps,

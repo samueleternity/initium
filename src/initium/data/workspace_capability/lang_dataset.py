@@ -63,8 +63,15 @@ def _contains(seq, sub):
 class LanguageDataset(WorkspaceCapabilityDataset):
     """Language tracks, the Stage 5 subset, and the full lang_all mix."""
 
-    def __init__(self, task_track: str = "lang_all", *, batch_size_hint: int = 16):
+    def __init__(
+        self,
+        task_track: str = "lang_all",
+        *,
+        batch_size_hint: int = 16,
+        length_bucket_microbatches: int = 1,
+    ):
         super().__init__(task_track, batch_size_hint=batch_size_hint)
+        self.length_bucket_microbatches = max(1, int(length_bucket_microbatches))
         self.input_dim = self.output_dim = lt.tokenizer().total
         self.diag_episodes = 48  # episodes per slot-probe / surgery / paraphrase diagnostic
         # Generation re-forwards the model once per output token. Keep this
@@ -238,13 +245,62 @@ class LanguageDataset(WorkspaceCapabilityDataset):
         if len(examples) != batch:
             raise RuntimeError("language key-value metadata lost batch/episode alignment")
         cap = KEY_VALUE_OPERAND_CAPACITY
+        copy_tracks = {
+            "lang_parse", "lang_define", "lang_logic", "lang_induce", "lang_act",
+            "lang_discourse", "lang_nlg",
+        }
+        function_pieces = {
+            token
+            for word in (*lg.FUNCTION, *lg.PUNCT)
+            for token in lt.tokenizer().word(word)
+        }
+
+        def copy_source(episode):
+            md = episode.metadata
+            source_ids = tuple(md.get("workspace_copy_source_token_ids", ()))
+            source_positions = tuple(md.get("workspace_copy_source_positions", ()))
+            if episode.track in ("lang_discourse", "lang_act"):
+                # These answers may depend on earlier turns carried in
+                # `prev`; expose those visible input tokens to the copy arm as
+                # well as tokens in the final segment. This is essential for
+                # a_ask: its answer location is absent from the final query.
+                source_ids = tuple(
+                    token
+                    for segment in (*tuple(md.get("prev", ())), episode)
+                    for token in segment.inputs
+                )
+                source_positions = ()
+            elif episode.track == "lang_nlg" and md.get("progression_group") == "retell_all":
+                # Ep (the Stage-4 language builder) predates Ep5's copy
+                # metadata. Retell-all is an exact-context reproduction task.
+                # The final query segment carries the context in `prev`, so
+                # include those tokens as well as the current segment.
+                source_ids = tuple(
+                    token
+                    for segment in (*tuple(md.get("prev", ())), episode)
+                    for token in segment.inputs
+                )
+                source_positions = ()
+            if source_ids and len(source_positions) != len(episode.answer):
+                source_by_token: dict[int, int] = {}
+                for position, token in enumerate(source_ids):
+                    source_by_token[int(token)] = position
+                source_positions = tuple(
+                    source_by_token.get(int(token), -1)
+                    if int(token) < TEXT_BASE or int(token) not in function_pieces
+                    else -1
+                    for token in episode.answer
+                )
+            return source_ids, source_positions
+
+        copy_sources = [copy_source(episode) for episode in examples]
         used: dict[tuple[int, int], int] = {}
         rr, ss, cc, kk, tt = [], [], [], [], []
         route_mask = torch.ones((batch, time), dtype=torch.bool)
         slot_target_ids = torch.full((batch, time), -1, dtype=torch.long)
         copy_target_positions = torch.full((batch, time), -1, dtype=torch.long)
         copy_source_size = max(
-            (len(e.metadata.get("workspace_copy_source_token_ids", ())) for e in examples),
+            (len(source_ids) for source_ids, _ in copy_sources),
             default=0,
         )
         copy_source_token_ids = torch.zeros((batch, copy_source_size), dtype=torch.long)
@@ -254,8 +310,8 @@ class LanguageDataset(WorkspaceCapabilityDataset):
         for row, episode in enumerate(examples):
             limit = min(time, len(episode.inputs))
             md = episode.metadata
-            source_ids = tuple(md.get("workspace_copy_source_token_ids", ()))
-            if episode.track in ("lang_parse", "lang_define", "lang_logic", "lang_induce", "lang_act") and source_ids:
+            source_ids, source_positions = copy_sources[row]
+            if episode.track in copy_tracks and source_ids:
                 copy_source_token_ids[row, :len(source_ids)] = torch.tensor(source_ids)
                 copy_source_mask[row, :len(source_ids)] = True
             for step, target in md.get("workspace_binding_aux", ()):
@@ -275,7 +331,7 @@ class LanguageDataset(WorkspaceCapabilityDataset):
             # the canonical episode answer so any legacy/overlong metadata is
             # safely truncated and EOS remains unsupervised by the copy head.
             for offset, (target_token, source_position) in enumerate(
-                zip(episode.answer, md.get("workspace_copy_source_positions", ()))
+                zip(episode.answer, source_positions)
             ):
                 step = len(episode.inputs) + offset
                 source_position = int(source_position)
@@ -317,9 +373,8 @@ class LanguageDataset(WorkspaceCapabilityDataset):
             "workspace_copy_target_positions": copy_target_positions,
             "workspace_copy_target_token_ids": copy_target_token_ids,
             "workspace_copy_has_targets": any(
-                bool(e.metadata.get("workspace_copy_source_positions"))
-                and any(int(p) >= 0 for p in e.metadata["workspace_copy_source_positions"])
-                for e in examples
+                bool(source_positions) and any(int(p) >= 0 for p in source_positions)
+                for _source_ids, source_positions in copy_sources
             ),
             "workspace_binding_aux_targets": binding_aux_targets,
             "key_value_steps": tuple(sorted(set(ss))),
@@ -342,6 +397,11 @@ class LanguageDataset(WorkspaceCapabilityDataset):
         for row, episode in enumerate(group):
             if episode.metadata.get("context_only"):
                 m[row].zero_()
+        lengths = [len(episode.sequence) for episode in group]
+        max_length = max(lengths, default=0)
+        self.last_batch_sequence_max = max_length
+        self.last_batch_sequence_mean = sum(lengths) / max(1, len(lengths))
+        self.last_batch_padding_utilization = sum(lengths) / max(1, len(lengths) * max_length)
         return x, y, m
 
     def sample_batch(self, curriculum, batch_size):
@@ -356,7 +416,8 @@ class LanguageDataset(WorkspaceCapabilityDataset):
                     self._track_optimizer_step_counts[track] += 1
                 self._pending_chain_tracks.clear()
             return self._emit(group, cont)
-        batch = super().sample_batch(curriculum, batch_size)
+        sample_count = batch_size * self.length_bucket_microbatches
+        batch = super().sample_batch(curriculum, sample_count)
         sampled_tracks = [
             episode.track
             for episode in self.last_batch_examples
@@ -377,21 +438,30 @@ class LanguageDataset(WorkspaceCapabilityDataset):
         ordered = [sorted(buckets[n], key=lambda item: len(item[0].sequence)) for n in sorted(buckets)]
         total_episodes = max(1, len(self.last_batch_examples))
         segments = []
-        for bucket_index, bucket in enumerate(ordered):
+        for bucket in ordered:
             n = len(bucket[0][1])
-            group_weight = len(bucket) / total_episodes
-            for segment_index in range(n):
-                group = [chain[segment_index] for _, chain in bucket]
-                segments.append(
-                    (
-                        group,
-                        segment_index > 0,
-                        n,
-                        group_weight,
-                        bucket_index == 0 and segment_index == 0,
-                        bucket_index == len(ordered) - 1 and segment_index == n - 1,
+            chunk_count = min(self.length_bucket_microbatches, len(bucket))
+            for chunk_index in range(chunk_count):
+                start = (len(bucket) * chunk_index) // chunk_count
+                end = (len(bucket) * (chunk_index + 1)) // chunk_count
+                chunk = bucket[start:end]
+                group_weight = len(chunk) / total_episodes
+                for segment_index in range(n):
+                    group = [chain[segment_index] for _, chain in chunk]
+                    segments.append(
+                        (
+                            group,
+                            segment_index > 0,
+                            n,
+                            group_weight,
+                            not segments,
+                            False,
+                        )
                     )
-                )
+        if segments:
+            final = list(segments[-1])
+            final[-1] = True
+            segments[-1] = tuple(final)
         self._seg_queue = segments[1:]
         group, cont, steps, weight, chain_start, _complete = segments[0]
         self.segment_chain_start = chain_start
@@ -804,6 +874,9 @@ class LanguageDataset(WorkspaceCapabilityDataset):
             )
         )
         diagnostics, episodes, preds = self.last_eval_diagnostics, self._last_id_eval_episodes, self._last_eval_preds
+        if getattr(self, "progression_eval_only", False):
+            self.last_eval_diagnostics, self._last_eval_preds = diagnostics, preds
+            return result
         self._print_samples(episodes, "id")
         diagnostics["stage3_counterfactual"] = self._stage3_metrics(episodes)
         extra: dict = {}

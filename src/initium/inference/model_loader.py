@@ -296,7 +296,13 @@ def _build_split_graph(c: _Cfg, input_dim, hidden, nr_cells, cell_size, read_hea
     return model
 
 
-def load_model(ckpt: dict, device: torch.device, deterministic_write: bool = False) -> LoadedModel:
+def load_model(
+    ckpt: dict,
+    device: torch.device,
+    deterministic_write: bool = False,
+    *,
+    allow_legacy_tokenizer_manifest_mismatch: bool = False,
+) -> LoadedModel:
     raw = ckpt["model_config"]
     c = _Cfg(raw)
     controller = raw.get("controller_type", "lstm")
@@ -335,23 +341,71 @@ def load_model(ckpt: dict, device: torch.device, deterministic_write: bool = Fal
     # otherwise the workspace state is incomplete and cannot reproduce the
     # training-time readout.
     if raw.get("workspace_slot_readout") and isinstance(rnn, SplitGraphDNC):
+        from initium.data.workspace_capability.episode import TEXT_BASE
         from initium.data.workspace_capability.lang_dataset import LanguageDataset
         from initium.data.workspace_capability.tracks import _lang_text
 
         stage5 = int(raw.get("workspace_semantic_entity_count", 64)) == 128
         _lang_text.configure(stage5=stage5)
-        if not raw.get("workspace_lang_manifest_sha256"):
-            raise ValueError("language slot-readout checkpoint is missing its tokenizer manifest hash")
-        actual_manifest = _lang_text.manifest_sha256()
-        if actual_manifest != raw["workspace_lang_manifest_sha256"]:
-            raise ValueError(
-                "language checkpoint tokenizer manifest mismatch: "
-                f"checkpoint={raw['workspace_lang_manifest_sha256']} local={actual_manifest}"
-            )
+        expected_tokenizer_hash = raw.get("workspace_lang_tokenizer_sha256")
+        if expected_tokenizer_hash:
+            actual_tokenizer_hash = _lang_text.tokenizer_sha256()
+            if actual_tokenizer_hash != expected_tokenizer_hash:
+                raise ValueError(
+                    "language checkpoint SentencePiece model mismatch: "
+                    f"checkpoint={expected_tokenizer_hash} local={actual_tokenizer_hash}"
+                )
+            expected_vocab_size = raw.get("workspace_lang_tokenizer_vocab_size")
+            if (
+                expected_vocab_size is not None
+                and int(expected_vocab_size) != _lang_text.tokenizer_vocab_size()
+            ):
+                raise ValueError(
+                    "language checkpoint tokenizer vocabulary size mismatch: "
+                    f"checkpoint={expected_vocab_size} local={_lang_text.tokenizer_vocab_size()}"
+                )
+        else:
+            # Older checkpoints saved the hash of the whole generated corpus
+            # manifest, which can drift when non-tokenizer corpus assets change.
+            # Preserve strict behavior unless a caller explicitly opts in.
+            expected_manifest = raw.get("workspace_lang_manifest_sha256")
+            actual_manifest = _lang_text.manifest_sha256()
+            if not expected_manifest:
+                raise ValueError(
+                    "language slot-readout checkpoint has neither a tokenizer hash "
+                    "nor a legacy corpus-manifest hash"
+                )
+            if (
+                actual_manifest != expected_manifest
+                and not allow_legacy_tokenizer_manifest_mismatch
+            ):
+                raise ValueError(
+                    "legacy language checkpoint corpus-manifest mismatch: "
+                    f"checkpoint={expected_manifest} local={actual_manifest}. "
+                    "The legacy checkpoint does not record its SentencePiece hash; "
+                    "restore the training tokenizer assets or explicitly pass "
+                    "allow_legacy_tokenizer_manifest_mismatch=True after confirming "
+                    "the tokenizer is the same."
+                )
+            if actual_manifest != expected_manifest:
+                local_vocab_size = _lang_text.tokenizer_vocab_size()
+                output_vocab_size = int(ckpt["output_proj_state_dict"]["weight"].shape[0])
+                if local_vocab_size + TEXT_BASE != output_vocab_size:
+                    raise ValueError(
+                        "legacy tokenizer override rejected: local text vocabulary plus "
+                        f"TEXT_BASE is {local_vocab_size + TEXT_BASE}, checkpoint output vocabulary "
+                        f"is {output_vocab_size}"
+                    )
+                print(
+                    "[inference] WARNING: accepting a legacy corpus-manifest mismatch "
+                    "after vocabulary-size validation; tokenizer identity is not proven"
+                )
         columns = LanguageDataset.slot_text_columns()
         import hashlib
 
-        column_hash = hashlib.sha256(",".join(str(int(token)) for token in columns).encode("ascii")).hexdigest()
+        column_hash = hashlib.sha256(
+            ",".join(str(int(token)) for token in columns).encode("ascii")
+        ).hexdigest()
         expected_hash = raw.get("workspace_slot_text_columns_sha256")
         if expected_hash and column_hash != expected_hash:
             raise ValueError(

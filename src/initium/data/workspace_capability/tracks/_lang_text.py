@@ -10,22 +10,50 @@ from pathlib import Path
 from initium.data.workspace_capability.episode import TEXT_BASE
 
 LANG_SINGLE = (
-    "lang_template", "lang_nlg", "lang_story_qa", "lang_dialogue", "lang_syntax_probes", "lang_open",
-    "lang_parse", "lang_define", "lang_induce", "lang_logic", "lang_discourse", "lang_act", "lang_nlu_external",
+    "lang_template",
+    "lang_nlg",
+    "lang_story_qa",
+    "lang_dialogue",
+    "lang_syntax_probes",
+    "lang_open",
+    "lang_parse",
+    "lang_define",
+    "lang_induce",
+    "lang_logic",
+    "lang_discourse",
+    "lang_act",
+    "lang_nlu_external",
 )
 LANG_V5_TRACKS = LANG_SINGLE[6:]
 LANG_V5_SELECTOR = "lang_stage5"
 RETIRED = ("lang_open",)
 LANG_TRACK_NAMES = (*LANG_SINGLE, "lang_all", LANG_V5_SELECTOR)
 DATA_DIR = Path(__file__).resolve().parent.parent / "stage4"
-EXTERNAL_FILES = {"nlg": "nlg.jsonl", "story": "story.jsonl", "accept": "accept.jsonl", "open": "open.jsonl",
-                  "nlu_triples": "nlu_triples.jsonl", "nli": "nli.jsonl", "qa": "qa.jsonl"}
-settings = {"annotator": True, "shuffled_context": False, "external": False, "identity": "truth", "stage5": False}
+EXTERNAL_FILES = {
+    "nlg": "nlg.jsonl",
+    "story": "story.jsonl",
+    "accept": "accept.jsonl",
+    "open": "open.jsonl",
+    "nlu_triples": "nlu_triples.jsonl",
+    "nli": "nli.jsonl",
+    "qa": "qa.jsonl",
+}
+settings = {
+    "annotator": True,
+    "shuffled_context": False,
+    "external": False,
+    "identity": "truth",
+    "stage5": False,
+}
 
 
 def configure(annotator=None, shuffled_context=None, external=None, identity=None, stage5=None):
-    for key, value in (("annotator", annotator), ("shuffled_context", shuffled_context),
-                       ("external", external), ("stage5", stage5)):
+    for key, value in (
+        ("annotator", annotator),
+        ("shuffled_context", shuffled_context),
+        ("external", external),
+        ("stage5", stage5),
+    ):
         if value is not None:
             settings[key] = bool(value)
     if identity is not None:
@@ -45,14 +73,30 @@ def manifest_sha256():
     return hashlib.sha256(_path("manifest.json").read_bytes()).hexdigest()
 
 
+def tokenizer_sha256():
+    """Hash only the SentencePiece model used to assign language token IDs."""
+    manifest = json.loads(_path("manifest.json").read_text(encoding="utf-8"))
+    return str(manifest["sha256"]["spm.model"])
+
+
+def tokenizer_vocab_size():
+    """Return the text vocabulary size recorded with the tokenizer model."""
+    manifest = json.loads(_path("manifest.json").read_text(encoding="utf-8"))
+    return int(manifest["text_vocab_size"])
+
+
 def ext_available(name):
     return (DATA_DIR / EXTERNAL_FILES[name]).exists()
 
 
 def available_tracks():
     return tuple(
-        t for t in LANG_SINGLE
-        if t not in RETIRED and (t != "lang_nlu_external" or all(ext_available(n) for n in ("nlu_triples", "nli", "qa")))
+        t
+        for t in LANG_SINGLE
+        if t not in RETIRED
+        and (
+            t != "lang_nlu_external" or all(ext_available(n) for n in ("nlu_triples", "nli", "qa"))
+        )
     )
 
 
@@ -61,7 +105,9 @@ def sample_group(cfg, rng):
     groups = tuple(cfg["groups"])
     weights = cfg.get("_group_sampling_weights", {})
     if weights:
-        return rng.choices(groups, [max(0.05, float(weights.get(group, 1.0))) for group in groups], k=1)[0]
+        return rng.choices(
+            groups, [max(0.05, float(weights.get(group, 1.0))) for group in groups], k=1
+        )[0]
     return rng.choice(groups)
 
 
@@ -77,7 +123,9 @@ class LangTokenizer:
         manifest = json.loads(_path("manifest.json").read_text(encoding="utf-8"))
         model = _path("spm.model")
         if hashlib.sha256(model.read_bytes()).hexdigest() != manifest["sha256"]["spm.model"]:
-            raise ValueError("spm.model does not match manifest.json (stale or corrupted tokenizer)")
+            raise ValueError(
+                "spm.model does not match manifest.json (stale or corrupted tokenizer)"
+            )
         self.sp = spm.SentencePieceProcessor(model_file=str(model))
         self.text_size = self.sp.get_piece_size()
         if self.text_size != int(manifest["text_vocab_size"]):

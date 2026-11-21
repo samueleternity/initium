@@ -90,7 +90,9 @@ def expand(ckpt, total, gap, seed, vectors=None, model_path=None):
         )
     if vectors:
         adapter = rnn[adapters[0]]
-        table, n = piece_vectors(model_path, vectors, adapter.shape[0], float(legacy[adapters[0]].std()))
+        table, n = piece_vectors(
+            model_path, vectors, adapter.shape[0], float(legacy[adapters[0]].std())
+        )
         for token, vec in table.items():
             adapter[:, token] = vec
             out["weight"][token] = vec
@@ -99,14 +101,34 @@ def expand(ckpt, total, gap, seed, vectors=None, model_path=None):
         print(f"initialised {len(table)} text-piece embeddings from {n} vectors")
     # invariants: legacy slices untouched
     assert torch.equal(rnn[adapters[0]][:, :old], legacy[adapters[0]])
-    for key, value in rnn.items():  # tensors still carrying the old vocab size would break load_state_dict
-        if key not in (*adapters, f"{_DECODER}.weight", f"{_DECODER}.bias") and value.ndim and old in value.shape[:2]:
-            print(f"WARNING: {key} {tuple(value.shape)} still has a legacy-vocabulary dimension (unchanged)")
+    for (
+        key,
+        value,
+    ) in rnn.items():  # tensors still carrying the old vocab size would break load_state_dict
+        if (
+            key not in (*adapters, f"{_DECODER}.weight", f"{_DECODER}.bias")
+            and value.ndim
+            and old in value.shape[:2]
+        ):
+            print(
+                f"WARNING: {key} {tuple(value.shape)} still has a legacy-vocabulary dimension (unchanged)"
+            )
     result = {k: v for k, v in ckpt.items() if k not in _DROP}
-    cfg = dict(cfg, input_size=total, input_dim=total, output_dim=total,
-               workspace_lang_manifest_sha256=lt.manifest_sha256())
-    result.update(model_config=cfg, rnn_state_dict=rnn, output_proj_state_dict=out,
-                  expanded_from={"input_size": old, "total_vocab": total})
+    cfg = dict(
+        cfg,
+        input_size=total,
+        input_dim=total,
+        output_dim=total,
+        workspace_lang_manifest_sha256=lt.manifest_sha256(),
+        workspace_lang_tokenizer_sha256=lt.tokenizer_sha256(),
+        workspace_lang_tokenizer_vocab_size=lt.tokenizer_vocab_size(),
+    )
+    result.update(
+        model_config=cfg,
+        rnn_state_dict=rnn,
+        output_proj_state_dict=out,
+        expanded_from={"input_size": old, "total_vocab": total},
+    )
     return result
 
 
@@ -116,12 +138,16 @@ def main():
     ap.add_argument("output")
     ap.add_argument("--new-logit-gap", type=float, default=10.0)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--word-vectors", default=None, help="text file `word v1 v2 ...` (optional embedding init)")
+    ap.add_argument(
+        "--word-vectors", default=None, help="text file `word v1 v2 ...` (optional embedding init)"
+    )
     a = ap.parse_args()
     manifest = json.loads(lt._path("manifest.json").read_text(encoding="utf-8"))
     total = TEXT_BASE + int(manifest["text_vocab_size"])
     ckpt = torch.load(a.checkpoint, map_location="cpu", weights_only=False)
-    result = expand(ckpt, total, a.new_logit_gap, a.seed, a.word_vectors, str(lt._path("spm.model")))
+    result = expand(
+        ckpt, total, a.new_logit_gap, a.seed, a.word_vectors, str(lt._path("spm.model"))
+    )
     Path(a.output).parent.mkdir(parents=True, exist_ok=True)
     torch.save(result, a.output)
     print(f"expanded {VOCAB_SIZE} -> {total} tokens: {a.output}")

@@ -2,18 +2,59 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 from torch import nn
 from torch.nn import functional as F
-import math
 
 from initium.workspace.adaptive_v3 import AdaptiveWorkspaceOperatorBank as _V3
 
 _NAMES = (
-    "noop", "copy", "gt", "sum", "max", "min", "count_even", "parity",
-    "sub", "and", "or", "xor", "not", "mul", "neg", "inc", "dec", "eq", "member", "cond_copy", "halt",
+    "noop",
+    "copy",
+    "gt",
+    "sum",
+    "max",
+    "min",
+    "count_even",
+    "parity",
+    "sub",
+    "and",
+    "or",
+    "xor",
+    "not",
+    "mul",
+    "neg",
+    "inc",
+    "dec",
+    "eq",
+    "member",
+    "cond_copy",
+    "halt",
 )
-(_COPY, _GT, _SUM, _MAX, _MIN, _CNT, _PAR, _SUB, _AND, _OR, _XOR, _NOT, _MUL, _NEG, _INC, _DEC, _EQ, _MEM, _CW, _HALT) = range(1, 21)
+(
+    _COPY,
+    _GT,
+    _SUM,
+    _MAX,
+    _MIN,
+    _CNT,
+    _PAR,
+    _SUB,
+    _AND,
+    _OR,
+    _XOR,
+    _NOT,
+    _MUL,
+    _NEG,
+    _INC,
+    _DEC,
+    _EQ,
+    _MEM,
+    _CW,
+    _HALT,
+) = range(1, 21)
 _LEFT = (_COPY, _GT, _SUB, _AND, _OR, _XOR, _NOT, _MUL, _NEG, _INC, _DEC, _EQ, _MEM, _CW)
 _RIGHT = (_GT, _SUB, _AND, _OR, _XOR, _MUL, _EQ, _CW)
 _LIT, _RUN, _NF = 64, 128, 10
@@ -37,8 +78,10 @@ def _ctree(re, im):
         if re.shape[1] % 2:
             re = torch.cat((re, torch.ones_like(re[:, :1])), 1)
             im = torch.cat((im, torch.zeros_like(im[:, :1])), 1)
-        re, im = (re[:, 0::2] * re[:, 1::2] - im[:, 0::2] * im[:, 1::2],
-                  re[:, 0::2] * im[:, 1::2] + im[:, 0::2] * re[:, 1::2])
+        re, im = (
+            re[:, 0::2] * re[:, 1::2] - im[:, 0::2] * im[:, 1::2],
+            re[:, 0::2] * im[:, 1::2] + im[:, 0::2] * re[:, 1::2],
+        )
     return re[:, 0], im[:, 0]
 
 
@@ -74,7 +117,7 @@ def _voc(x, base):
 
 class AdaptiveWorkspaceOperatorBankV4(nn.Module):
     operator_names = _NAMES
-    max_ops = 2 # if needed set higher, but it will tank the performance 
+    max_ops = 2  # if needed set higher, but it will tank the performance
     teacher_width = 44
     use_backbone_context = False
     begin_sequence = _V3.begin_sequence
@@ -131,7 +174,11 @@ class AdaptiveWorkspaceOperatorBankV4(nn.Module):
         n, B, L = tokens.shape
         ps = self._parse(tokens.long().reshape(n * B, L))
         return {
-            k: (torch.stack(v, 0).view(4, n, B).transpose(0, 1) if k == "a" else v.view(n, B, *v.shape[1:]))
+            k: (
+                torch.stack(v, 0).view(4, n, B).transpose(0, 1)
+                if k == "a"
+                else v.view(n, B, *v.shape[1:])
+            )
             for k, v in ps.items()
         }
 
@@ -153,7 +200,10 @@ class AdaptiveWorkspaceOperatorBankV4(nn.Module):
             self._failed.add(key)
             import warnings
 
-            warnings.warn(f"V4 '{key}' compile failed ({type(exc).__name__}); using eager.")
+            warnings.warn(
+                f"V4 '{key}' compile failed ({type(exc).__name__}); using eager.",
+                stacklevel=2,
+            )
             return fn(*args)
 
     def _dist_math(self, P, V, wl, wr, m, op_probs, W, bias, C16, S16, C32, S32):
@@ -169,13 +219,15 @@ class AdaptiveWorkspaceOperatorBankV4(nn.Module):
 
         def bit(p):
             return _voc(torch.stack((1 - p, p), -1), 136)
-        
+
         ar = torch.arange(16, device=dev)
         mul_idx = (ar[:, None] * ar[None, :] % 16).reshape(-1)
         d_mul = _voc(
             torch.zeros(B, 16, device=dev, dtype=P.dtype).index_add(
                 1, mul_idx, (PL.unsqueeze(2) * PR.unsqueeze(1)).reshape(B, -1)
-            ), 136)
+            ),
+            136,
+        )
         d_neg = _voc(PL[:, (-ar) % 16], 136)
         d_inc = _voc(PL.roll(1, -1), 136)
         d_dec = _voc(PL.roll(-1, -1), 136)
@@ -185,19 +237,31 @@ class AdaptiveWorkspaceOperatorBankV4(nn.Module):
 
         dists = torch.stack(
             (
-                d_copy, bit(p_gt), _voc(tot, 136),
-                _voc(_extreme_dist(P, m, True), 136), _voc(_extreme_dist(P, m, False), 136),
-                _voc(_count_dist(P, m, C32, S32), 152), _voc(torch.stack((1 - odd, odd), -1), 184),
+                d_copy,
+                bit(p_gt),
+                _voc(tot, 136),
+                _voc(_extreme_dist(P, m, True), 136),
+                _voc(_extreme_dist(P, m, False), 136),
+                _voc(_count_dist(P, m, C32, S32), 152),
+                _voc(torch.stack((1 - odd, odd), -1), 184),
                 _voc(_sub_dist(PL, PR, C16, S16), 136),
-                bit(l1 * r1), bit(l1 + r1 - l1 * r1), bit(l1 + r1 - 2 * l1 * r1), bit(1 - l1),
-                d_mul, d_neg, d_inc, d_dec, bit(p_eq), bit(p_in),
+                bit(l1 * r1),
+                bit(l1 + r1 - l1 * r1),
+                bit(l1 + r1 - 2 * l1 * r1),
+                bit(1 - l1),
+                d_mul,
+                d_neg,
+                d_inc,
+                d_dec,
+                bit(p_eq),
+                bit(p_in),
                 d_copy,
             ),
             1,
         )
         hard = F.one_hot(dists.argmax(-1), 320).float()
         vecs = (hard + dists - dists.detach()) @ W
-        vecs = torch.cat((vec_copy.unsqueeze(1), vecs[:, 1:_CW - 1], vec_copy.unsqueeze(1)), 1)
+        vecs = torch.cat((vec_copy.unsqueeze(1), vecs[:, 1 : _CW - 1], vec_copy.unsqueeze(1)), 1)
         vecs = vecs * (1.0 / vecs.detach().square().mean(-1, keepdim=True).sqrt().clamp_min(1.0))
         sel = F.one_hot(op_probs.argmax(-1), C).float()
         wsel = sel + op_probs - op_probs.detach()
@@ -229,7 +293,8 @@ class AdaptiveWorkspaceOperatorBankV4(nn.Module):
         tok_n = tok.gather(1, (last + 1).clamp(0, L - 1)).squeeze(1)
         is_q = (last.squeeze(1) >= 0) & ((tok_m == 4) | ((tok_m >= 20) & (tok_m <= 22)))
         ref_all = (
-            torch.zeros(B, A, device=tok.device).scatter_add(1, ent.clamp(0, A - 1), named.float()) > 0
+            torch.zeros(B, A, device=tok.device).scatter_add(1, ent.clamp(0, A - 1), named.float())
+            > 0
         )
         first = F.one_hot(a[0].clamp(min=0), A).bool() & (a[0] >= 0).unsqueeze(-1)
         ref = torch.where(is_q.unsqueeze(-1), ref_all, ref_all & ~first).float()
@@ -239,20 +304,50 @@ class AdaptiveWorkspaceOperatorBankV4(nn.Module):
         return dict(a=a, a0p=a0p, ref=ref, has_lit=lp >= 0, lit_tok=lit, tok_m=tok_m, tok_n=tok_n)
 
     def step(
-        self, *, state, context, backbone_context, event_tokens, semantic_value_decoder,
-        active_mask, execution_mask, teacher_targets, teacher_weight, step_index, parsed=None,
+        self,
+        *,
+        state,
+        context,
+        backbone_context,
+        event_tokens,
+        semantic_value_decoder,
+        active_mask,
+        execution_mask,
+        teacher_targets,
+        teacher_weight,
+        step_index,
+        parsed=None,
     ):
         if self.eval_bypass:
             return state
         with torch.autocast(device_type=state.device.type, enabled=False):
             out = self._step(
-                state, context, event_tokens, semantic_value_decoder, active_mask,
-                execution_mask, teacher_targets, teacher_weight, step_index, parsed,
+                state,
+                context,
+                event_tokens,
+                semantic_value_decoder,
+                active_mask,
+                execution_mask,
+                teacher_targets,
+                teacher_weight,
+                step_index,
+                parsed,
             )
         return out.to(dtype=state.dtype)
 
-    def _step(self, state, context, event_tokens, decoder, active_mask, execution_mask,
-              teacher_targets, teacher_weight, step_index, parsed=None):
+    def _step(
+        self,
+        state,
+        context,
+        event_tokens,
+        decoder,
+        active_mask,
+        execution_mask,
+        teacher_targets,
+        teacher_weight,
+        step_index,
+        parsed=None,
+    ):
         A, D, K, C, s = self.address_dim, self.d_model, self.max_ops, len(_NAMES), self.scale
         state = state.float()
         B, S, _ = state.shape
@@ -266,7 +361,12 @@ class AdaptiveWorkspaceOperatorBankV4(nn.Module):
         a, has_lit, lit_tok = ps["a"], ps["has_lit"], ps["lit_tok"]
         a_t = torch.stack(a, -1)  # (B,4)
         lit_f = has_lit.float()
-        P_lit = F.one_hot((lit_tok - 136).clamp(0, 15), 16).float().mul(lit_f.unsqueeze(-1)).unsqueeze(1)
+        P_lit = (
+            F.one_hot((lit_tok - 136).clamp(0, 15), 16)
+            .float()
+            .mul(lit_f.unsqueeze(-1))
+            .unsqueeze(1)
+        )
         V_lit = (W[lit_tok.clamp(0, 319)] * lit_f.unsqueeze(-1)).unsqueeze(1)
         P_snap = decoder(content)[..., 136:152].softmax(-1)
 
@@ -274,7 +374,9 @@ class AdaptiveWorkspaceOperatorBankV4(nn.Module):
             return F.one_hot(x.clamp(min=0), A).float() * (x >= 0).float().unsqueeze(-1)
 
         def match(ids, occ):
-            return ((ids.unsqueeze(-1) == a_t.unsqueeze(1)) & occ.unsqueeze(-1) & a_t.ge(0).unsqueeze(1)).float()
+            return (
+                (ids.unsqueeze(-1) == a_t.unsqueeze(1)) & occ.unsqueeze(-1) & a_t.ge(0).unsqueeze(1)
+            ).float()
 
         ev_ids = torch.cat((tok[:, -6:], ps["tok_m"].unsqueeze(1), ps["tok_n"].unsqueeze(1)), 1)
         ev = self.event_proj(self.event_embedding(ev_ids).flatten(1))
@@ -309,7 +411,8 @@ class AdaptiveWorkspaceOperatorBankV4(nn.Module):
                 need = bool(need_t)
             occ_c = torch.cat((occupied, run_occ, has_lit.unsqueeze(1)), 1)
             addr_c = F.normalize(
-                torch.cat((address, run_addr, self.literal_key.view(1, 1, A).expand(B, 1, A)), 1), dim=-1
+                torch.cat((address, run_addr, self.literal_key.view(1, 1, A).expand(B, 1, A)), 1),
+                dim=-1,
             )
             feat = torch.zeros(B, 2 * S + 1, _NF, device=dev)
             feat[:, :S, :4] = match(aid, occupied)
@@ -342,8 +445,20 @@ class AdaptiveWorkspaceOperatorBankV4(nn.Module):
                 P = torch.cat((P_snap, P_run, P_lit), 1)
                 V = torch.cat((content, V_run, V_lit), 1)
                 dists, r1, out_vec, sel, wsel, gates = self._call(
-                    "dist", self._dist_math, P, V, wl, wr, m, op_probs, W, decoder.bias.float()[:320],
-                    self.C16, self.S16, self.C32, self.S32,
+                    "dist",
+                    self._dist_math,
+                    P,
+                    V,
+                    wl,
+                    wr,
+                    m,
+                    op_probs,
+                    W,
+                    decoder.bias.float()[:320],
+                    self.C16,
+                    self.S16,
+                    self.C32,
+                    self.S32,
                 )
                 mass = (wsel[:, 1 : C - 1] * gates).sum(-1) * active.float() * alive
             else:
@@ -355,7 +470,8 @@ class AdaptiveWorkspaceOperatorBankV4(nn.Module):
                 wsel = sel + op_probs - op_probs.detach()
 
             ent_logits = torch.einsum(
-                "j,bja->ba", self.dest_gain[k],
+                "j,bja->ba",
+                self.dest_gain[k],
                 torch.stack((oh(a[0]), oh(a[1]), oh(a[2]), oh(ps["a0p"]), prev_dest), 1),
             ) + self.dest_head(ctx)
             run_occ_d = run_addr.square().sum(-1).gt(1e-12)
@@ -383,7 +499,7 @@ class AdaptiveWorkspaceOperatorBankV4(nn.Module):
             has = torch.stack([mk.any().float() for mk in present])
             op_loss = 0.5 * (cls * has).sum() / has.sum().clamp_min(1) + 0.5 * mean(ce, zero)
 
-            def slot_tgt(key):
+            def slot_tgt(key, run_addr=run_addr, run_occ=run_occ):
                 run = key.ge(_RUN)
                 kk = torch.where(run, key - _RUN, key).clamp(0, A - 1)
                 t1, f1 = self._target_slot_indices(address, occupied, kk)
@@ -396,51 +512,100 @@ class AdaptiveWorkspaceOperatorBankV4(nn.Module):
             rt, rf = slot_tgt(keys[:, 1])
             lv = torch.isin(op_t, op_t.new_tensor(_LEFT)) & lf
             rv = torch.isin(op_t, op_t.new_tensor(_RIGHT)) & rf
-            lce = F.cross_entropy(left_logits, lt.masked_fill(~lv, -100), reduction="none", ignore_index=-100)
-            rce = F.cross_entropy(right_logits, rt.masked_fill(~rv, -100), reduction="none", ignore_index=-100)
+            lce = F.cross_entropy(
+                left_logits, lt.masked_fill(~lv, -100), reduction="none", ignore_index=-100
+            )
+            rce = F.cross_entropy(
+                right_logits, rt.masked_fill(~rv, -100), reduction="none", ignore_index=-100
+            )
             kv = keys.ge(0)
             # member(x, S): keys[0] is the probe operand, not a set element.
-            keys = torch.cat((torch.where(op_t.eq(_MEM), torch.full_like(keys[:, 0], -1), keys[:, 0]).unsqueeze(1), keys[:, 1:]), 1)
+            keys = torch.cat(
+                (
+                    torch.where(
+                        op_t.eq(_MEM), torch.full_like(keys[:, 0], -1), keys[:, 0]
+                    ).unsqueeze(1),
+                    keys[:, 1:],
+                ),
+                1,
+            )
             tset = torch.cat(
                 (
-                    ((aid.unsqueeze(-1) == keys.unsqueeze(1)) & ((keys >= 0) & (keys < _LIT)).unsqueeze(1)).any(-1) & occupied,
-                    ((aid_r.unsqueeze(-1) == (keys - _RUN).unsqueeze(1)) & keys.ge(_RUN).unsqueeze(1)).any(-1) & run_occ,
+                    (
+                        (aid.unsqueeze(-1) == keys.unsqueeze(1))
+                        & ((keys >= 0) & (keys < _LIT)).unsqueeze(1)
+                    ).any(-1)
+                    & occupied,
+                    (
+                        (aid_r.unsqueeze(-1) == (keys - _RUN).unsqueeze(1))
+                        & keys.ge(_RUN).unsqueeze(1)
+                    ).any(-1)
+                    & run_occ,
                     keys.eq(_LIT).any(-1, keepdim=True),
                 ),
                 1,
             ).float()
             sv = (op_t.ge(_SUM) & op_t.le(_PAR) | op_t.eq(_MEM)) & kv.any(-1)
-            bce = (F.binary_cross_entropy_with_logits(set_logits, tset, reduction="none") * occ_c.float()).sum(-1)
+            bce = (
+                F.binary_cross_entropy_with_logits(set_logits, tset, reduction="none")
+                * occ_c.float()
+            ).sum(-1)
             wr_op = pos & op_t.lt(_HALT)
             dv = wr_op & dest_t.ge(0)
             dce = F.cross_entropy(s * ent_logits, dest_t.clamp(0, A - 1), reduction="none")
-            d_lab = dists.gather(1, (op_t.clamp(1, C - 2) - 1).view(B, 1, 1).expand(B, 1, 320)).squeeze(1)
-            nll = -d_lab.gather(1, out_t.clamp(0, 319).unsqueeze(1)).squeeze(1).clamp_min(1e-6).log()
+            d_lab = dists.gather(
+                1, (op_t.clamp(1, C - 2) - 1).view(B, 1, 1).expand(B, 1, 320)
+            ).squeeze(1)
+            nll = (
+                -d_lab.gather(1, out_t.clamp(0, 319).unsqueeze(1)).squeeze(1).clamp_min(1e-6).log()
+            )
             ov = wr_op & out_t.ge(0)
             cw = op_t.eq(_CW)
-            gl = F.binary_cross_entropy(r1.clamp(1e-4, 1 - 1e-4), out_t.ge(0).float(), reduction="none")
-            losses += [op_loss, mean(lce, lv), mean(rce, rv), mean(bce, sv), mean(dce, dv), mean(nll, ov), mean(gl, cw)]
+            gl = F.binary_cross_entropy(
+                r1.clamp(1e-4, 1 - 1e-4), out_t.ge(0).float(), reduction="none"
+            )
+            losses += [
+                op_loss,
+                mean(lce, lv),
+                mean(rce, rv),
+                mean(bce, sv),
+                mean(dce, dv),
+                mean(nll, ov),
+                mean(gl, cw),
+            ]
             if self.training:
                 pred = op_logits.argmax(-1)
                 cnt = lambda mk: mk.sum().detach()  # noqa: E731
                 diag = {
-                    "teacher_operation_loss": op_loss.detach(), "teacher_operation_loss_count": cnt(valid),
-                    "teacher_operation_accuracy": acc(pred.eq(op_t), valid), "teacher_operation_accuracy_count": cnt(valid),
-                    "teacher_active_operation_accuracy": acc(pred.eq(op_t), pos), "teacher_active_operation_accuracy_count": cnt(pos),
-                    "teacher_noop_accuracy": acc(pred.eq(0), zero), "teacher_noop_accuracy_count": cnt(zero),
-                    "teacher_operand0_loss": mean(lce, lv).detach(), "teacher_operand0_loss_count": cnt(lv),
-                    "teacher_operand1_loss": mean(rce, rv).detach(), "teacher_operand1_loss_count": cnt(rv),
-                    "teacher_output_loss": mean(nll, ov).detach(), "teacher_output_loss_count": cnt(ov),
-                    "teacher_destination0_binding_loss": mean(dce, dv).detach(), "teacher_destination0_binding_loss_count": cnt(dv),
+                    "teacher_operation_loss": op_loss.detach(),
+                    "teacher_operation_loss_count": cnt(valid),
+                    "teacher_operation_accuracy": acc(pred.eq(op_t), valid),
+                    "teacher_operation_accuracy_count": cnt(valid),
+                    "teacher_active_operation_accuracy": acc(pred.eq(op_t), pos),
+                    "teacher_active_operation_accuracy_count": cnt(pos),
+                    "teacher_noop_accuracy": acc(pred.eq(0), zero),
+                    "teacher_noop_accuracy_count": cnt(zero),
+                    "teacher_operand0_loss": mean(lce, lv).detach(),
+                    "teacher_operand0_loss_count": cnt(lv),
+                    "teacher_operand1_loss": mean(rce, rv).detach(),
+                    "teacher_operand1_loss_count": cnt(rv),
+                    "teacher_output_loss": mean(nll, ov).detach(),
+                    "teacher_output_loss_count": cnt(ov),
+                    "teacher_destination0_binding_loss": mean(dce, dv).detach(),
+                    "teacher_destination0_binding_loss_count": cnt(dv),
                     "teacher_feature_off_active_operation_accuracy": acc(pred.eq(op_t), pos),
                     "teacher_feature_off_active_operation_accuracy_count": cnt(pos),
                     "teacher_feature_off_operand0_accuracy": acc(left_logits.argmax(-1).eq(lt), lv),
                     "teacher_feature_off_operand0_accuracy_count": cnt(lv),
-                    "teacher_feature_off_operand1_accuracy": acc(right_logits.argmax(-1).eq(rt), rv),
+                    "teacher_feature_off_operand1_accuracy": acc(
+                        right_logits.argmax(-1).eq(rt), rv
+                    ),
                     "teacher_feature_off_operand1_accuracy_count": cnt(rv),
                     "teacher_feature_off_output_accuracy": acc(d_lab.argmax(-1).eq(out_t), ov),
                     "teacher_feature_off_output_accuracy_count": cnt(ov),
-                    "teacher_feature_off_destination0_binding_accuracy": acc(ent_logits.argmax(-1).eq(dest_t), dv),
+                    "teacher_feature_off_destination0_binding_accuracy": acc(
+                        ent_logits.argmax(-1).eq(dest_t), dv
+                    ),
                     "teacher_feature_off_destination0_binding_accuracy_count": cnt(dv),
                 }
                 for c, name in enumerate(_NAMES):
@@ -451,12 +616,17 @@ class AdaptiveWorkspaceOperatorBankV4(nn.Module):
 
         if losses:
             loss = torch.stack(losses).mean() * float(teacher_weight)
-            self._last_aux_loss = loss if self._last_aux_loss is None else self._last_aux_loss + loss
+            self._last_aux_loss = (
+                loss if self._last_aux_loss is None else self._last_aux_loss + loss
+            )
         if self.training:
             _s = (route_ops[0].detach() * active_mask.float().unsqueeze(-1)).sum(0)
             self._route_sum = _s if self._route_sum is None else self._route_sum + _s
             self._route_n = self._route_n + active_mask.sum()
-            self._last_training_diagnostics["operation_probability"] = self._route_sum / torch.as_tensor(self._route_n, device=self._route_sum.device).clamp_min(1.0)
+            self._last_training_diagnostics["operation_probability"] = (
+                self._route_sum
+                / torch.as_tensor(self._route_n, device=self._route_sum.device).clamp_min(1.0)
+            )
         else:
             r = route_ops[0].argmax(-1)
             for ro in route_ops[1:]:

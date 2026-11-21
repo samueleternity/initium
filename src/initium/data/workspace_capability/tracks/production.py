@@ -2,22 +2,50 @@
 
 from __future__ import annotations
 
-import random
-
 from initium.data.workspace_capability.episode import (
-    BOS, EOS, EV_FACT, EV_KV, EV_RETRACT, EV_SUPERSEDE, QUERY, SEP, TaskEpisode, entity_token as e, fact_token, scalar_token,
+    BOS,
+    EOS,
+    EV_FACT,
+    EV_KV,
+    EV_RETRACT,
+    EV_SUPERSEDE,
+    QUERY,
+    SEP,
+    TaskEpisode,
+    fact_token,
+    scalar_token,
+)
+from initium.data.workspace_capability.episode import (
+    entity_token as e,
 )
 from initium.data.workspace_capability.tracks._shared import common_metadata
 from initium.data.workspace_capability.tracks.developmental import (
-    _LOC, _OBJ, _PROP, _REL, _cross, _lexicon, _pair_ok, _teach,
+    _LOC,
+    _OBJ,
+    _PROP,
+    _REL,
+    _cross,
+    _lexicon,
+    _pair_ok,
+    _teach,
 )
-_ORDERS = ((0, 1, 2), (0, 2, 1), (1, 0, 2), (2, 1, 0), (1, 2, 0), (2, 0, 1))  # role (S,R,O) per output slot; 0-2 train, 3-5 held-out
+
+_ORDERS = (
+    (0, 1, 2),
+    (0, 2, 1),
+    (1, 0, 2),
+    (2, 1, 0),
+    (1, 2, 0),
+    (2, 0, 1),
+)  # role (S,R,O) per output slot; 0-2 train, 3-5 held-out
+
 
 def _top_up(stream, W, R, pool, need):
     """Directly teach just enough unresolved concepts so the answer is determined."""
     for x in [x for x in pool if x not in R][: max(0, need - sum(x in R for x in pool))]:
         stream += [EV_KV, e(x), fact_token(W[x]), SEP]
         R[x] = W[x]
+
 
 def generate(difficulty, rng, *, ood=False, keyed=True, track="developmental_production"):
     grp = rng.choice(tuple(difficulty["groups"]))
@@ -48,7 +76,10 @@ def generate(difficulty, rng, *, ood=False, keyed=True, track="developmental_pro
         others = [x for x in rr if x != rq]
         subs = rng.sample(ro, k + d)
         tgt = subs[:k]
-        cur = {s: (rq if s in tgt else rng.choice(others), rng.choice([x for x in ro if x != s])) for s in subs}
+        cur = {
+            s: (rq if s in tgt else rng.choice(others), rng.choice([x for x in ro if x != s]))
+            for s in subs
+        }
         order = subs[:]
         rng.shuffle(order)
         for s in order:
@@ -83,8 +114,12 @@ def generate(difficulty, rng, *, ood=False, keyed=True, track="developmental_pro
         s = rng.choice(subs)
         r, o, p = facts[s]
         oi = rng.randrange(3) + 3 * int(bool(combos)) if grp == "p_order" else -1
-        stream += [QUERY, e(r) if grp == "p_relation" else fact_token(R[s]) if grp == "p_comp" else e(s),
-                   *(scalar_token(x) for x in _ORDERS[oi] if oi >= 0), SEP]
+        stream += [
+            QUERY,
+            e(r) if grp == "p_relation" else fact_token(R[s]) if grp == "p_comp" else e(s),
+            *(scalar_token(x) for x in _ORDERS[oi] if oi >= 0),
+            SEP,
+        ]
         if grp == "p_comp":
             ans, keys_out, stride, qtype = [e(s)], [], 0, "comprehend_entity"
         else:
@@ -92,25 +127,46 @@ def generate(difficulty, rng, *, ood=False, keyed=True, track="developmental_pro
             if oi >= 0:
                 keys_out = [(s, r, o)[i] for i in _ORDERS[oi]]
             ans = [fact_token(R[x]) for x in keys_out]
-            stride, qtype = len(ans), {"p_entity": "describe_entity", "p_relation": "describe_relation", "p_order": "describe_ordered",
-                                       "p_property": "describe_property"}[grp]
+            stride, qtype = (
+                len(ans),
+                {
+                    "p_entity": "describe_entity",
+                    "p_relation": "describe_relation",
+                    "p_order": "describe_ordered",
+                    "p_property": "describe_property",
+                }[grp],
+            )
         base = 100.0 / len(R)
 
-    extra = {"workspace_query_reads": tuple((len(stream) - 1, c, fact_token(w)) for c, w in R.items())}
+    extra = {
+        "workspace_query_reads": tuple((len(stream) - 1, c, fact_token(w)) for c, w in R.items())
+    }
     extra["lexicon"] = tuple((c, fact_token(w)) for c, w in R.items())
     extra["answer_concepts"] = tuple(keys_out)
     if grp == "p_comp":
-        extra["workspace_output_programs"] = ((0, "argmatch", tuple(R), tuple(fact_token(w) for w in R.values())),)
+        extra["workspace_output_programs"] = (
+            (0, "argmatch", tuple(R), tuple(fact_token(w) for w in R.values())),
+        )
     elif keyed:
         extra["workspace_output_keys"] = tuple(keys_out) + (-1,)
     return TaskEpisode(
-        track, tuple(stream), tuple(ans) + (EOS,),
+        track,
+        tuple(stream),
+        tuple(ans) + (EOS,),
         common_metadata(
-            track=track, sequence_length=len(stream),
+            track=track,
+            sequence_length=len(stream),
             query_type=f"{qtype}_{mode}_{'heldout' if held else 'train'}",
-            relevant_updates=nf, distractor_count=d, candidate_baseline_pct=base,
-            progression_group=grp, answer_stride=stride, heldout_words=held, ood=bool(ood),
-            teacher=mode, resolved_count=len(R), **extra,
+            relevant_updates=nf,
+            distractor_count=d,
+            candidate_baseline_pct=base,
+            progression_group=grp,
+            answer_stride=stride,
+            heldout_words=held,
+            ood=bool(ood),
+            teacher=mode,
+            resolved_count=len(R),
+            **extra,
         ),
     )
 

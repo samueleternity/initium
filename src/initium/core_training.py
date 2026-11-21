@@ -154,8 +154,6 @@ from initium.data.common.causal_prediction import (
     masked_input_prediction_loss,
 )
 from initium.data.dataset_registry import get_dataset
-from initium.data.workspace_capability.tracks import _dev_lexicon
-from initium.data.workspace_capability.tracks import _lang_text
 from initium.data.graph_traversal.order_probe import (
     build_q99_probe_batch,
     evaluate_q99_order_sensitivity,
@@ -171,6 +169,7 @@ from initium.data.surprise_recall.next_token_prediction import (
     evaluate_prediction_signals,
     masked_next_token_loss,
 )
+from initium.data.workspace_capability.tracks import _dev_lexicon, _lang_text
 from initium.diagnostics.segment_logging import SegmentDiagnostics
 from initium.diagnostics.split_graph_forward_trace import SplitGraphForwardTrace
 from initium.diagnostics.surprise_recall_logging import SurpriseRecallLogger
@@ -1340,8 +1339,7 @@ def run(
         and str(workspace_task_track).replace("-", "_").startswith("lang_")
     ):
         raise ValueError(
-            "workspace progression-only evaluation is limited to "
-            "workspace-capability lang_* tracks"
+            "workspace progression-only evaluation is limited to workspace-capability lang_* tracks"
         )
     if split_graph_activation_checkpointing_min_seq_len < 0:
         raise ValueError("activation-checkpoint minimum sequence length must be non-negative")
@@ -1353,14 +1351,22 @@ def run(
         raise ValueError("workspace_semantic_entity_count must be 64 or 128")
     if workspace_semantic_entity_count == 128 and workspace_enabled and workspace_num_slots < 128:
         raise ValueError("128 semantic keys require --workspace-num-slots >= 128")
-    if workspace_semantic_entity_addressing and workspace_semantic_entity_count != 128 and (
-        str(workspace_task_track).replace("-", "_")
-        in (*_lang_text.LANG_V5_TRACKS, "lang_all", _lang_text.LANG_V5_SELECTOR)
+    if (
+        workspace_semantic_entity_addressing
+        and workspace_semantic_entity_count != 128
+        and (
+            str(workspace_task_track).replace("-", "_")
+            in (*_lang_text.LANG_V5_TRACKS, "lang_all", _lang_text.LANG_V5_SELECTOR)
+        )
     ):
-        raise ValueError("Stage 5 lang tracks and lang_all use keys up to 127: pass --workspace-semantic-entity-count 128 --workspace-num-slots 128")
+        raise ValueError(
+            "Stage 5 lang tracks and lang_all use keys up to 127: pass --workspace-semantic-entity-count 128 --workspace-num-slots 128"
+        )
     if str(workspace_task_track).replace("-", "_") in _lang_text.LANG_TRACK_NAMES:
         if sgr_prediction_loss_weight > 0:
-            raise ValueError("language tracks forbid next-token prediction loss (Stage 5 hard rule 1)")
+            raise ValueError(
+                "language tracks forbid next-token prediction loss (Stage 5 hard rule 1)"
+            )
         if workspace_task_track == "lang_open" and not eval_only:
             raise ValueError("lang_open is retired from training (eval-only probe)")
     if workspace_allocator and (
@@ -1435,9 +1441,7 @@ def run(
             "semantic entity addressing, and a supported workspace-capability track"
         )
     if workspace_operation_diagnostics and not workspace_operation_executor:
-        raise ValueError(
-            "workspace operation diagnostics require workspace_operation_executor"
-        )
+        raise ValueError("workspace operation diagnostics require workspace_operation_executor")
     if workspace_functional_signature_diagnostics and not (
         workspace_enabled and dataset_type == "workspace-capability"
     ):
@@ -1459,9 +1463,7 @@ def run(
             "entity addressing, and a supported workspace-capability track"
         )
     if workspace_sparse_recurrence and not (
-        workspace_enabled
-        and workspace_entity_keyed_writes
-        and workspace_semantic_entity_addressing
+        workspace_enabled and workspace_entity_keyed_writes and workspace_semantic_entity_addressing
     ):
         raise ValueError(
             "workspace sparse recurrence requires workspace, entity-keyed writes, "
@@ -1545,8 +1547,7 @@ def run(
     if split_graph_activation_checkpointing and not (
         split_graph_enabled
         and any(
-            kind.strip().lower().startswith("mamba")
-            for kind in str(split_graph_variant).split("+")
+            kind.strip().lower().startswith("mamba") for kind in str(split_graph_variant).split("+")
         )
     ):
         raise ValueError(
@@ -1999,7 +2000,11 @@ def run(
         raise ValueError("choose either --workspace-autoadaptive or --workspace-autoadaptive-v2")
     if workspace_adaptive_active and not (workspace_enabled and workspace_num_slots > 0):
         raise ValueError("adaptive workspace skills require --workspace and at least one slot")
-    if workspace_adaptive_v3_enabled and workspace_train_mode == "frozen" and workspace_train_scope == "gate":
+    if (
+        workspace_adaptive_v3_enabled
+        and workspace_train_mode == "frozen"
+        and workspace_train_scope == "gate"
+    ):
         raise ValueError("adaptive workspace V3 cannot train with frozen gate-only scope")
     if (
         workspace_adaptive_active
@@ -2042,8 +2047,13 @@ def run(
         (resume_checkpoint.get("rnn_state_dict") or {}) if resume_checkpoint is not None else {}
     )
     requested_adaptive_variant = (
-        "v3" if workspace_adaptive_v3_enabled else
-        "v2" if workspace_adaptive_v2_enabled else "v1" if workspace_adaptive_enabled else None
+        "v3"
+        if workspace_adaptive_v3_enabled
+        else "v2"
+        if workspace_adaptive_v2_enabled
+        else "v1"
+        if workspace_adaptive_enabled
+        else None
     )
     checkpoint_adaptive_variant = (
         "v3"
@@ -2055,7 +2065,11 @@ def run(
         or any(key.startswith("workspace_adaptive.") for key in checkpoint_state)
         else None
     )
-    if eval_only and (workspace_adaptive_active or workspace_adaptive_v3_enabled) and checkpoint_adaptive_variant != requested_adaptive_variant:
+    if (
+        eval_only
+        and (workspace_adaptive_active or workspace_adaptive_v3_enabled)
+        and checkpoint_adaptive_variant != requested_adaptive_variant
+    ):
         raise ValueError(
             "adaptive workspace evaluation variant does not match the checkpoint: "
             f"checkpoint={checkpoint_adaptive_variant!r}, "
@@ -2497,7 +2511,15 @@ def run(
             adaptive_route_writer = csv.writer(adaptive_route_file)
             if not resuming or os.path.getsize(adaptive_route_path) == 0:
                 adaptive_route_writer.writerow(
-                    ["step", "lesson", "eval_type", "track", "skill_id", "token_count", "route_fraction"]
+                    [
+                        "step",
+                        "lesson",
+                        "eval_type",
+                        "track",
+                        "skill_id",
+                        "token_count",
+                        "route_fraction",
+                    ]
                 )
 
     memory_usage_file: TextIO | None = None
@@ -2562,6 +2584,7 @@ def run(
 
         def track_lesson(track):
             return int(evaluated_lessons.get(track, lesson_value))
+
         overall_track = (
             "permutation/all_conditions"
             if diagnostics.get("permutation_generalization")
@@ -2615,8 +2638,7 @@ def run(
         ):
             fractions = route_metrics.get("route_token_fractions", ())
             route_summary = ",".join(
-                f"s{skill_id}={float(fraction):.2f}"
-                for skill_id, fraction in enumerate(fractions)
+                f"s{skill_id}={float(fraction):.2f}" for skill_id, fraction in enumerate(fractions)
             )
             print(
                 f"[{run_id}] Step {step_value} adaptive routes/{track}: "
@@ -2631,9 +2653,7 @@ def run(
                     f"{eval_type}/adaptive-pathway-bypassed",
                     "all/adaptive_pathway_bypassed",
                     adaptive_dependency.get("adaptive_pathway_bypassed_accuracy_pct"),
-                    adaptive_dependency.get(
-                        "adaptive_pathway_bypassed_episode_exact_match_pct"
-                    ),
+                    adaptive_dependency.get("adaptive_pathway_bypassed_episode_exact_match_pct"),
                     adaptive_dependency.get("episodes"),
                     None,
                     *([None] * 8),
@@ -2702,9 +2722,7 @@ def run(
                         *([None] * 8),
                     ]
                 )
-        for track, conditions in sorted(
-            diagnostics.get("gnw_process_signatures", {}).items()
-        ):
+        for track, conditions in sorted(diagnostics.get("gnw_process_signatures", {}).items()):
             for condition, metrics in sorted(conditions.items()):
                 for metric, value in sorted(metrics.items()):
                     if metric.endswith("episodes") or metric.endswith("reports"):
@@ -2755,7 +2773,7 @@ def run(
             "strength_levels",
         ):
             value = ignition_fit.get(metric)
-            if isinstance(value, (int, float)):
+            if isinstance(value, int | float):
                 workspace_task_writer.writerow(
                     [
                         step_value,
@@ -2792,7 +2810,7 @@ def run(
             "masked_conflict_episodes",
         ):
             value = priming_metrics.get(metric)
-            if isinstance(value, (int, float)):
+            if isinstance(value, int | float):
                 workspace_task_writer.writerow(
                     [
                         step_value,
@@ -2811,7 +2829,7 @@ def run(
                 )
         balanced_dependency = diagnostics.get("gnw_balanced_workspace_dependency", {})
         for metric, value in sorted(balanced_dependency.items()):
-            if isinstance(value, (int, float)):
+            if isinstance(value, int | float):
                 workspace_task_writer.writerow(
                     [
                         step_value,
@@ -2829,7 +2847,7 @@ def run(
             diagnostics.get("gnw_balanced_workspace_dependency_by_track", {}).items()
         ):
             for metric, value in sorted(metrics.items()):
-                if isinstance(value, (int, float)):
+                if isinstance(value, int | float):
                     workspace_task_writer.writerow(
                         [
                             step_value,
@@ -2863,7 +2881,7 @@ def run(
         for metric, value in sorted(
             diagnostics.get("gnw_natural_report_confidence_calibration", {}).items()
         ):
-            if isinstance(value, (int, float)):
+            if isinstance(value, int | float):
                 workspace_task_writer.writerow(
                     [
                         step_value,
@@ -2872,9 +2890,7 @@ def run(
                         f"GNW-balanced/natural-report-calibration/{metric}",
                         value,
                         None,
-                        diagnostics["gnw_natural_report_confidence_calibration"].get(
-                            "episodes"
-                        ),
+                        diagnostics["gnw_natural_report_confidence_calibration"].get("episodes"),
                         None,
                         *([None] * 8),
                     ]
@@ -2931,9 +2947,7 @@ def run(
                         *([None] * 8),
                     ]
                 )
-        for track, values in sorted(
-            operation_diagnostics.get("final_query_by_track", {}).items()
-        ):
+        for track, values in sorted(operation_diagnostics.get("final_query_by_track", {}).items()):
             workspace_task_writer.writerow(
                 [
                     step_value,
@@ -3206,15 +3220,31 @@ def run(
                     *([None] * 8),
                 ]
             )
-        for _key in ("production", "production_generation", "production_gap", "axis_generalization", "stage3_counterfactual", "stage3_ood"):            
+        for _key in (
+            "production",
+            "production_generation",
+            "production_gap",
+            "axis_generalization",
+            "stage3_counterfactual",
+            "stage3_ood",
+        ):
             for _label, _metrics in sorted((diagnostics.get(_key) or {}).items()):
                 if not isinstance(_metrics, dict):
                     continue
                 for _metric, _value in sorted(_metrics.items()):
                     if _metric != "episodes":
                         workspace_task_writer.writerow(
-                            [step_value, lesson_value, eval_type, f"{_key}/{_label}/{_metric}", _value,
-                             None, _metrics.get("episodes"), None, *([None] * 8)]
+                            [
+                                step_value,
+                                lesson_value,
+                                eval_type,
+                                f"{_key}/{_label}/{_metric}",
+                                _value,
+                                None,
+                                _metrics.get("episodes"),
+                                None,
+                                *([None] * 8),
+                            ]
                         )
         workspace_task_file.flush()
 
@@ -3248,9 +3278,30 @@ def run(
             )
             segment_diagnostics.emit("eval-id-workspace-shuffled")
             rows = [
-                ("all", "full", baseline_accuracy, baseline_exact, baseline_accuracy, baseline_exact),
-                ("all", "readback_bypassed", ablated_accuracy, ablated_exact, baseline_accuracy, baseline_exact),
-                ("all", "readback_shuffled", shuffled_accuracy, shuffled_exact, baseline_accuracy, baseline_exact),
+                (
+                    "all",
+                    "full",
+                    baseline_accuracy,
+                    baseline_exact,
+                    baseline_accuracy,
+                    baseline_exact,
+                ),
+                (
+                    "all",
+                    "readback_bypassed",
+                    ablated_accuracy,
+                    ablated_exact,
+                    baseline_accuracy,
+                    baseline_exact,
+                ),
+                (
+                    "all",
+                    "readback_shuffled",
+                    shuffled_accuracy,
+                    shuffled_exact,
+                    baseline_accuracy,
+                    baseline_exact,
+                ),
             ]
             base_tracks = (baseline_diagnostics or {}).get("tracks", {})
             ablated_tracks = ablated_diagnostics.get("tracks", {})
@@ -3362,9 +3413,7 @@ def run(
             )
             if workspace_functional_signature_diagnostics and feature_ablation_due:
                 eval_feature = getattr(dataset, "evaluate_workspace_feature_ablated", None)
-                enabled_features = getattr(
-                    dataset, "enabled_workspace_functional_features", None
-                )
+                enabled_features = getattr(dataset, "enabled_workspace_functional_features", None)
                 if callable(eval_feature) and callable(enabled_features):
                     for feature_name in enabled_features(rnn):
                         channel = f"eval-id-workspace-feature-{feature_name}"
@@ -3429,7 +3478,9 @@ def run(
             adaptive_ablated_evaluator = getattr(
                 dataset, "evaluate_workspace_adaptive_ablated", None
             )
-            if (workspace_adaptive_active or workspace_adaptive_v3_enabled) and callable(adaptive_ablated_evaluator):
+            if (workspace_adaptive_active or workspace_adaptive_v3_enabled) and callable(
+                adaptive_ablated_evaluator
+            ):
                 adaptive_channel = "eval-id-adaptive-pathway-bypass"
                 segment_diagnostics.set_channel(adaptive_channel)
                 _restore_rng_state(id_eval_rng_state)
@@ -3458,17 +3509,26 @@ def run(
                     matched_tracks = getattr(dataset, "last_eval_diagnostics", {}).get("tracks", {})
                     workspace_check_writer.writerow(
                         [
-                            step_value, lesson_value, "all", "adaptive_pathway_bypassed",
-                            matched_acc, matched_exact,
-                            baseline_accuracy - matched_acc, baseline_exact - matched_exact,
+                            step_value,
+                            lesson_value,
+                            "all",
+                            "adaptive_pathway_bypassed",
+                            matched_acc,
+                            matched_exact,
+                            baseline_accuracy - matched_acc,
+                            baseline_exact - matched_exact,
                         ]
                     )
                     for track in sorted(set(base_tracks) & set(matched_tracks)):
                         full_m, off_m = base_tracks[track], matched_tracks[track]
                         workspace_check_writer.writerow(
                             [
-                                step_value, lesson_value, track, "adaptive_pathway_bypassed",
-                                off_m["accuracy"], off_m["exact_match"],
+                                step_value,
+                                lesson_value,
+                                track,
+                                "adaptive_pathway_bypassed",
+                                off_m["accuracy"],
+                                off_m["exact_match"],
                                 full_m["accuracy"] - off_m["accuracy"],
                                 full_m["exact_match"] - off_m["exact_match"],
                             ]
@@ -4029,9 +4089,7 @@ def run(
             workspace_adaptive_v3_attention_temperature=(
                 workspace_adaptive_v3_attention_temperature
             ),
-            workspace_adaptive_v3_temperature_enabled=(
-                workspace_adaptive_v3_temperature_enabled
-            ),
+            workspace_adaptive_v3_temperature_enabled=(workspace_adaptive_v3_temperature_enabled),
             workspace_adaptive_v3_straight_through_binding=(
                 workspace_adaptive_v3_straight_through_binding
             ),
@@ -4044,9 +4102,7 @@ def run(
             workspace_adaptive_v3_class_balanced_operator_loss=(
                 workspace_adaptive_v3_class_balanced_operator_loss
             ),
-            workspace_adaptive_v3_compile_operators=(
-                workspace_adaptive_v3_compile_operators
-            ),
+            workspace_adaptive_v3_compile_operators=(workspace_adaptive_v3_compile_operators),
             workspace_compile_recurrence=workspace_compile_recurrence,
             workspace_adaptive_v4_enabled=workspace_adaptive_v4_enabled,
             workspace_sparse_recurrence=workspace_sparse_recurrence,
@@ -4149,9 +4205,7 @@ def run(
         rnn.workspace_adaptive_v3_feature_off_tracks = tuple(
             workspace_adaptive_v3_feature_off_tracks
         )
-        rnn.workspace_adaptive_v3_holdout_tracks = tuple(
-            workspace_adaptive_v3_holdout_tracks
-        )
+        rnn.workspace_adaptive_v3_holdout_tracks = tuple(workspace_adaptive_v3_holdout_tracks)
     if workspace_slot_readout and dataset.task_track in _lang_text.LANG_TRACK_NAMES:
         rnn.workspace.enable_slot_text(dataset.slot_text_columns(), tied_input_embedding=True)
         rnn.workspace.to(device)
@@ -4410,15 +4464,11 @@ def run(
         "dataset_name": dataset.name,
         "workspace_task_track": getattr(dataset, "task_track", None),
         "bf16": bool(bf16),
-        "workspace_length_bucket_microbatches": int(
-            workspace_length_bucket_microbatches
-        ),
+        "workspace_length_bucket_microbatches": int(workspace_length_bucket_microbatches),
         "workspace_track_homogeneous_batches": bool(
             getattr(dataset, "track_homogeneous_batches", False)
         ),
-        "workspace_gnw_task_design_version": getattr(
-            dataset, "gnw_task_design_version", None
-        ),
+        "workspace_gnw_task_design_version": getattr(dataset, "gnw_task_design_version", None),
         "workspace_parallel_scan": bool(workspace_parallel_scan),
         "supported_dataset_types": [dataset_type],  # use ["*"] for a future multi-modal model
         "input_dim": INPUT_DIM,
@@ -4482,13 +4532,10 @@ def run(
         "dnc_compute_precision": "fp32",
         "dnc_backward_trace": dnc_backward_trace,
         "batch_size": batch_size,
-        "workspace_length_bucket_microbatches": workspace_length_bucket_microbatches,
-        "bf16": bool(bf16),
         "activation_offload_to_cpu": activation_offload_to_cpu,
         "activation_offload_cpu_budget_mb": activation_offload_cpu_budget_mb,
         "workspace_enabled": workspace_enabled,
         "workspace_num_slots": workspace_num_slots,
-        "workspace_parallel_scan": workspace_parallel_scan,
         "workspace_adaptive_v3_enabled": workspace_adaptive_v3_enabled,
         "workspace_adaptive_v4_enabled": workspace_adaptive_v4_enabled,
         "workspace_adaptive_v3_rank": workspace_adaptive_v3_rank,
@@ -4510,7 +4557,9 @@ def run(
         "workspace_adaptive_v3_teacher_accuracy_threshold": workspace_adaptive_v3_teacher_accuracy_threshold,
         "workspace_adaptive_v3_feature_off_probability": workspace_adaptive_v3_feature_off_probability,
         "workspace_adaptive_v3_feature_off_tracks": tuple(workspace_adaptive_v3_feature_off_tracks),
-        "workspace_adaptive_v3_always_feature_off_tracks": tuple(workspace_adaptive_v3_always_feature_off_tracks),
+        "workspace_adaptive_v3_always_feature_off_tracks": tuple(
+            workspace_adaptive_v3_always_feature_off_tracks
+        ),
         "workspace_adaptive_v3_holdout_tracks": tuple(workspace_adaptive_v3_holdout_tracks),
         "workspace_adaptive_v3_eval_episodes_per_track": workspace_adaptive_v3_eval_episodes_per_track,
         "workspace_adaptive_v3_learning_rate_scale": workspace_adaptive_v3_learning_rate_scale,
@@ -4558,6 +4607,10 @@ def run(
         extra_model_config["workspace_lexical_unkeyed"] = bool(workspace_lexical_unkeyed)
     if getattr(dataset, "task_track", None) in _lang_text.LANG_TRACK_NAMES:
         extra_model_config["workspace_lang_manifest_sha256"] = _lang_text.manifest_sha256()
+        extra_model_config["workspace_lang_tokenizer_sha256"] = _lang_text.tokenizer_sha256()
+        extra_model_config["workspace_lang_tokenizer_vocab_size"] = (
+            _lang_text.tokenizer_vocab_size()
+        )
         if workspace_slot_readout:
             _slot_columns = dataset.slot_text_columns()
             _slot_manifest = ",".join(str(int(token)) for token in _slot_columns).encode("ascii")
@@ -4571,12 +4624,8 @@ def run(
             )
     if workspace_adaptive_v2_enabled:
         extra_model_config["workspace_adaptive_v2_enabled"] = True
-        extra_model_config["workspace_adaptive_v2_num_skills"] = (
-            workspace_adaptive_v2_num_skills
-        )
-        extra_model_config["workspace_adaptive_v2_mi_weight"] = (
-            workspace_adaptive_v2_mi_weight
-        )
+        extra_model_config["workspace_adaptive_v2_num_skills"] = workspace_adaptive_v2_num_skills
+        extra_model_config["workspace_adaptive_v2_mi_weight"] = workspace_adaptive_v2_mi_weight
     if workspace_semantic_entity_addressing:
         extra_model_config["workspace_semantic_entity_addressing"] = True
     if workspace_permutation_transactional:
@@ -5053,7 +5102,9 @@ def run(
     if fp32:
         print(f"[{run_id}] full FP32 mode: CUDA autocast and GradScaler disabled")
     if bf16:
-        print(f"[{run_id}] BF16 autocast enabled; workspace math remains FP32 and GradScaler is disabled")
+        print(
+            f"[{run_id}] BF16 autocast enabled; workspace math remains FP32 and GradScaler is disabled"
+        )
     if finite_check_interval > 1:
         print(
             f"[{run_id}] NaN/Inf tensor scans every {finite_check_interval} steps; "
@@ -5168,9 +5219,7 @@ def run(
     # absolute step, this stays resume-safe for the same reason the original
     # fix was -- a resume past WARMUP_STEPS just lands in the cosine part,
     # no separate warmup state to save/restore.
-    effective_training_batch_size = int(batch_size) * int(
-        workspace_length_bucket_microbatches
-    )
+    effective_training_batch_size = int(batch_size) * int(workspace_length_bucket_microbatches)
     lr_batch_scale = math.sqrt(effective_training_batch_size / max(1, int(BATCH_SIZE)))
     if lr_batch_scale != 1.0:
         print(
@@ -5325,10 +5374,7 @@ def run(
                 key
                 for key in rnn.state_dict()
                 if key.startswith("workspace_adaptive.")
-                or (
-                    gate_variant_warm_start
-                    and key.startswith("workspace.bistable_gate.")
-                )
+                or (gate_variant_warm_start and key.startswith("workspace.bistable_gate."))
             }
             if set(incompatible.missing_keys) != expected_missing or incompatible.unexpected_keys:
                 raise ValueError(
@@ -5374,11 +5420,7 @@ def run(
             and "scaler_state_dict" in ckpt
         ):
             scaler.load_state_dict(ckpt["scaler_state_dict"])
-        elif (
-            not frozen_workspace_warm_start
-            and not workspace_condition_warm_start
-            and amp_enabled
-        ):
+        elif not frozen_workspace_warm_start and not workspace_condition_warm_start and amp_enabled:
             print(
                 f"[{run_id}] WARNING: checkpoint predates GradScaler-state "
                 f"saving (v3 fix) -- scaler starting fresh at "
@@ -5409,16 +5451,20 @@ def run(
             if getattr(curriculum, "track_lessons", None) is not None:
                 restored = ckpt.get("curriculum_track_lessons")
                 if isinstance(restored, dict):
-                    curriculum.track_lessons.update({k: int(v) for k, v in restored.items() if k in curriculum.track_lessons})
+                    curriculum.track_lessons.update(
+                        {k: int(v) for k, v in restored.items() if k in curriculum.track_lessons}
+                    )
                 else:
-                    curriculum.track_lessons = {k: int(curriculum.lesson) for k in curriculum.track_lessons}
+                    curriculum.track_lessons = {
+                        k: int(curriculum.lesson) for k in curriculum.track_lessons
+                    }
                 dataset._curriculum_track_levels = curriculum.track_lessons
             restored_promotion_history = ckpt.get("curriculum_promotion_history")
             if isinstance(restored_promotion_history, dict):
                 curriculum.promotion_history = {
                     str(k): [float(v) for v in values][-2:]
                     for k, values in restored_promotion_history.items()
-                    if isinstance(values, (list, tuple))
+                    if isinstance(values, list | tuple)
                 }
         # Dynamic-N (macro-scale): restore the usage-EMA/cooldown/growth
         # history, so a resumed run doesn't silently reset the trigger's
@@ -5508,8 +5554,7 @@ def run(
                     rnn.workspace_eval_bypass = True
             if eval_workspace_adaptive_bypass:
                 if not isinstance(rnn, SplitGraphDNC) or not (
-                    rnn.workspace_adaptive is not None
-                    or rnn.workspace_adaptive_v3_enabled
+                    rnn.workspace_adaptive is not None or rnn.workspace_adaptive_v3_enabled
                 ):
                     raise ValueError(
                         "adaptive workspace bypass requires an adaptive-workspace checkpoint"
@@ -5545,10 +5590,18 @@ def run(
     )
     rnn.train(not eval_only)
     output_proj.train(not eval_only)
-    if init_from is not None and not resume_requested:  # weights only: fresh optimizer/curriculum/step
+    if (
+        init_from is not None and not resume_requested
+    ):  # weights only: fresh optimizer/curriculum/step
         _init = load_checkpoint_for_resume(init_from, device)
         _cfg = _init.get("model_config", {})
-        for _k in ("input_size", "split_graph_num_blocks", "workspace_num_slots", "moe_num_experts", "memory_type"):
+        for _k in (
+            "input_size",
+            "split_graph_num_blocks",
+            "workspace_num_slots",
+            "moe_num_experts",
+            "memory_type",
+        ):
             if _k in _cfg and _cfg[_k] != expected_resume_model_config.get(_k):
                 expanding_workspace = (
                     _k == "workspace_num_slots"
@@ -5556,14 +5609,19 @@ def run(
                     and workspace_semantic_entity_count == 128
                 )
                 if not expanding_workspace:
-                    raise ValueError(f"--init-from mismatch on {_k}: {_cfg[_k]!r} vs {expected_resume_model_config.get(_k)!r}")
+                    raise ValueError(
+                        f"--init-from mismatch on {_k}: {_cfg[_k]!r} vs {expected_resume_model_config.get(_k)!r}"
+                    )
         _warm_state = dict(_init["rnn_state_dict"])
         _model_state = rnn.state_dict()
         _dropped_warm_keys = []
         _expanded_warm_keys = []
         for _key, _value in list(_warm_state.items()):
             _target = _model_state.get(_key)
-            if _key.startswith("workspace.slot_text_head.") and workspace_semantic_entity_count == 128:
+            if (
+                _key.startswith("workspace.slot_text_head.")
+                and workspace_semantic_entity_count == 128
+            ):
                 # Even an equal-sized legacy head uses a different column
                 # map, so Stage 5 always starts this head from fresh weights.
                 del _warm_state[_key]
@@ -5589,9 +5647,11 @@ def run(
                 )
         _loaded = rnn.load_state_dict(_warm_state, strict=False)
         output_proj.load_state_dict(_init["output_proj_state_dict"])
-        print(f"[{run_id}] warm-started weights from {init_from} (missing={len(_loaded.missing_keys)}, "
-              f"unexpected={len(_loaded.unexpected_keys)}, resized={len(_expanded_warm_keys)}, "
-              f"reinitialized={len(_dropped_warm_keys)}); optimizer/curriculum/step fresh")
+        print(
+            f"[{run_id}] warm-started weights from {init_from} (missing={len(_loaded.missing_keys)}, "
+            f"unexpected={len(_loaded.unexpected_keys)}, resized={len(_expanded_warm_keys)}, "
+            f"reinitialized={len(_dropped_warm_keys)}); optimizer/curriculum/step fresh"
+        )
     if not eval_only:
         set_lr(step)  # Phase 1 FIX: ensure correct clamped LR from the very first
     # iteration -- otherwise a resumed run's first step would briefly use
@@ -5683,13 +5743,14 @@ def run(
     if alloc_enabled and workspace_allocator_label_addresses_only:
         alloc_p = 0.0
         rnn.allocator.use_prob.zero_()
-        print(f"[{run_id}] allocator routing disabled; generator-labeled addresses remain authoritative")
+        print(
+            f"[{run_id}] allocator routing disabled; generator-labeled addresses remain authoritative"
+        )
     if alloc_enabled:
         rnn.allocator_use_prob = alloc_p
     while (
-        (step < total_steps or bool(getattr(dataset, "has_pending_chain_segments", False)))
-        and not eval_only
-    ):
+        step < total_steps or bool(getattr(dataset, "has_pending_chain_segments", False))
+    ) and not eval_only:
         adaptive_v3_teacher_weight_for_step = adaptive_v3_teacher_weight_current
         moe_diagnostics_due = bool(moe_diagnostics_enabled and running_micro_steps + 1 >= log_every)
         for module in moe_diagnostic_modules:
@@ -5756,14 +5817,13 @@ def run(
             and not workspace_exact_value_comparison
             and not workspace_exact_selection
             and not workspace_no_report_confidence_readout
-            and not (
-                split_graph_forward_trace is not None
-                and split_graph_forward_trace.active
-            )
+            and not (split_graph_forward_trace is not None and split_graph_forward_trace.active)
         )
         if isinstance(rnn, SplitGraphDNC):
             rnn._initium_carry = (
-                [seg_carry] if getattr(dataset, "segment_continue", False) and seg_carry is not None else []
+                [seg_carry]
+                if getattr(dataset, "segment_continue", False) and seg_carry is not None
+                else []
             )
             scheduled_sampling_carry = list(rnn._initium_carry)
         if len(batch) == 3:
@@ -5876,7 +5936,9 @@ def run(
                     attentional_item_memory=workspace_attentional_item_memory,
                     no_report_confidence_readout=workspace_no_report_confidence_readout,
                     masked_prime_trace=workspace_masked_prime_trace,
-                    entity_metadata=(workspace_metadata if workspace_semantic_entity_addressing else None),
+                    entity_metadata=(
+                        workspace_metadata if workspace_semantic_entity_addressing else None
+                    ),
                     token_rows=workspace_token_rows,
                 ).items()
             }
@@ -5919,9 +5981,7 @@ def run(
             if workspace_operation_executor:
                 workspace_forward_kwargs.update(
                     {
-                        "operation_metadata": key_value_metadata[
-                            "workspace_operation_metadata"
-                        ],
+                        "operation_metadata": key_value_metadata["workspace_operation_metadata"],
                         "operation_steps": key_value_metadata["workspace_operation_steps"],
                     }
                 )
@@ -5934,9 +5994,7 @@ def run(
                         "adaptive_operator_execution_mask": key_value_metadata[
                             "adaptive_operator_execution_mask"
                         ],
-                        "adaptive_operator_steps": key_value_metadata[
-                            "adaptive_operator_steps"
-                        ],
+                        "adaptive_operator_steps": key_value_metadata["adaptive_operator_steps"],
                         "adaptive_operator_teacher_steps": key_value_metadata[
                             "adaptive_operator_teacher_steps"
                         ],
@@ -6038,9 +6096,7 @@ def run(
         # Keep it defined for all architectures so failure tracing cannot
         # mask the original non-finite activation with UnboundLocalError.
         sequence_valid_mask = None
-        check_finite_this_step = (
-            step % finite_check_interval == 0
-        )
+        check_finite_this_step = step % finite_check_interval == 0
         if check_finite_this_step:
             if not _first_nonfinite_report(input_seq, "input_seq", step):
                 emit_failure_diagnostics("train")
@@ -6052,10 +6108,13 @@ def run(
             optimizer.zero_grad(set_to_none=True)
         forward_backward_started = time.perf_counter()
         if workspace_scheduled_sampling > 0 and input_seq.ndim == 2:
-            p_ss = workspace_scheduled_sampling * min(1.0, step / max(1, workspace_scheduled_sampling_steps))
+            p_ss = workspace_scheduled_sampling * min(
+                1.0, step / max(1, workspace_scheduled_sampling_steps)
+            )
             if p_ss > 0:
-                with torch.no_grad(), torch.amp.autocast(
-                    "cuda", enabled=amp_enabled, dtype=amp_dtype
+                with (
+                    torch.no_grad(),
+                    torch.amp.autocast("cuda", enabled=amp_enabled, dtype=amp_dtype),
                 ):
                     ss_out, ss_hidden = rnn(
                         input_seq,
@@ -6081,8 +6140,12 @@ def run(
                                 ss_rows,
                                 ss_times,
                                 torch.ones_like(ss_rows, dtype=torch.bool),
-                                copy_source_token_ids=(key_value_metadata or {}).get("workspace_copy_source_token_ids"),
-                                copy_source_mask=(key_value_metadata or {}).get("workspace_copy_source_mask"),
+                                copy_source_token_ids=(key_value_metadata or {}).get(
+                                    "workspace_copy_source_token_ids"
+                                ),
+                                copy_source_mask=(key_value_metadata or {}).get(
+                                    "workspace_copy_source_mask"
+                                ),
                             )
                         if workspace_key_value_loss_weight > 0:
                             ss_logits = dataset.apply_workspace_key_value_readout_sparse(
@@ -6099,14 +6162,23 @@ def run(
                         )
                         valid_next = ss_times.lt(prev.shape[1])
                         if bool(valid_next.any()):
-                            prev[ss_rows[valid_next], ss_times[valid_next]] = ss_logits.argmax(-1)[valid_next]
+                            prev[ss_rows[valid_next], ss_times[valid_next]] = ss_logits.argmax(-1)[
+                                valid_next
+                            ]
                     else:
                         ss_logits = output_proj(ss_features)
                         if workspace_slot_readout:
                             ss_logits = rnn.apply_slot_readout(
-                                ss_logits, ss_features, ss_hidden, answer_mask,
-                                copy_source_token_ids=(key_value_metadata or {}).get("workspace_copy_source_token_ids"),
-                                copy_source_mask=(key_value_metadata or {}).get("workspace_copy_source_mask"),
+                                ss_logits,
+                                ss_features,
+                                ss_hidden,
+                                answer_mask,
+                                copy_source_token_ids=(key_value_metadata or {}).get(
+                                    "workspace_copy_source_token_ids"
+                                ),
+                                copy_source_mask=(key_value_metadata or {}).get(
+                                    "workspace_copy_source_mask"
+                                ),
                             )
                         if workspace_key_value_loss_weight > 0:
                             ss_logits = dataset.apply_workspace_key_value_readout_logits(
@@ -6120,7 +6192,9 @@ def run(
                     _layer.pop_aux_loss()
                 ans = answer_mask.bool()
                 swap = ans[:, 1:] & ans[:, :-1] & (torch.rand(prev.shape, device=device) < p_ss)
-                input_seq = torch.cat((input_seq[:, :1], torch.where(swap, prev, input_seq[:, 1:])), 1)
+                input_seq = torch.cat(
+                    (input_seq[:, :1], torch.where(swap, prev, input_seq[:, 1:])), 1
+                )
 
         if dnc_backward_trace and split_graph_enabled:
             rnn.memories[0].set_backward_trace(True, step=step)
@@ -6277,8 +6351,12 @@ def run(
                         sparse_rows,
                         sparse_times,
                         answer_mask[sparse_rows, sparse_times].bool(),
-                        copy_source_token_ids=(key_value_metadata or {}).get("workspace_copy_source_token_ids"),
-                        copy_source_mask=(key_value_metadata or {}).get("workspace_copy_source_mask"),
+                        copy_source_token_ids=(key_value_metadata or {}).get(
+                            "workspace_copy_source_token_ids"
+                        ),
+                        copy_source_mask=(key_value_metadata or {}).get(
+                            "workspace_copy_source_mask"
+                        ),
                     )
             else:
                 output = output_proj(_slot_features)  # (B, T, vocab)
@@ -6288,8 +6366,12 @@ def run(
                         _slot_features,
                         hidden,
                         answer_mask,
-                        copy_source_token_ids=(key_value_metadata or {}).get("workspace_copy_source_token_ids"),
-                        copy_source_mask=(key_value_metadata or {}).get("workspace_copy_source_mask"),
+                        copy_source_token_ids=(key_value_metadata or {}).get(
+                            "workspace_copy_source_token_ids"
+                        ),
+                        copy_source_mask=(key_value_metadata or {}).get(
+                            "workspace_copy_source_mask"
+                        ),
                     )
             key_value_predictions = []
             if workspace_key_value_loss_weight > 0:
@@ -6299,8 +6381,11 @@ def run(
                 key_value_predictions = workspace_module.pop_key_value_predictions()
                 if sparse_positions is not None:
                     output = dataset.apply_workspace_key_value_readout_sparse(
-                        output, sparse_positions, key_value_predictions,
-                        key_value_metadata, answer_mask,
+                        output,
+                        sparse_positions,
+                        key_value_predictions,
+                        key_value_metadata,
+                        answer_mask,
                     )
                 else:
                     output = dataset.apply_workspace_key_value_readout_logits(
@@ -6362,7 +6447,11 @@ def run(
                 slot_target_ids = key_value_metadata.get("workspace_slot_target_ids")
                 if workspace_slot_readout and slot_target_ids is not None:
                     workspace_module = getattr(rnn, "workspace", None)
-                    if workspace_module is not None and isinstance(hidden, tuple) and isinstance(hidden[0], dict):
+                    if (
+                        workspace_module is not None
+                        and isinstance(hidden, tuple)
+                        and isinstance(hidden[0], dict)
+                    ):
                         slot_state = hidden[0].get("_initium_workspace_state")
                         if slot_state is not None:
                             # Train answer-time key selection directly. The target
@@ -6370,34 +6459,42 @@ def run(
                             # to predict the key from the answer-prefix features.
                             if sparse_positions is not None:
                                 pointer_positions = slot_target_ids.ge(0).nonzero(as_tuple=False)
-                                pointer_rows, pointer_times = pointer_positions[:, 0], pointer_positions[:, 1]
-                                pointer_features = _slot_features[pointer_rows, pointer_times].unsqueeze(1)
+                                pointer_rows, pointer_times = (
+                                    pointer_positions[:, 0],
+                                    pointer_positions[:, 1],
+                                )
+                                pointer_features = _slot_features[
+                                    pointer_rows, pointer_times
+                                ].unsqueeze(1)
                                 pointer_state = slot_state.index_select(0, pointer_rows)
-                                pointer_targets = slot_target_ids[pointer_rows, pointer_times].unsqueeze(1)
+                                pointer_targets = slot_target_ids[
+                                    pointer_rows, pointer_times
+                                ].unsqueeze(1)
                                 match_keys = hidden[0].get("_initium_workspace_match_keys")
                                 if match_keys is not None:
                                     match_keys = match_keys.index_select(0, pointer_rows)
                                 pointer_loss = workspace_module.slot_pointer_loss(
-                                    pointer_features, pointer_state, pointer_targets, match_keys,
+                                    pointer_features,
+                                    pointer_state,
+                                    pointer_targets,
+                                    match_keys,
                                 )
                             else:
                                 pointer_loss = workspace_module.slot_pointer_loss(
-                                    _slot_features, slot_state, slot_target_ids,
+                                    _slot_features,
+                                    slot_state,
+                                    slot_target_ids,
                                     hidden[0].get("_initium_workspace_match_keys"),
                                 )
-                            workspace_key_value_loss = workspace_key_value_loss + pointer_loss.to(dtype=task_loss.dtype)
-                copy_source_mask = (key_value_metadata or {}).get(
-                    "workspace_copy_source_mask"
-                )
+                            workspace_key_value_loss = workspace_key_value_loss + pointer_loss.to(
+                                dtype=task_loss.dtype
+                            )
+                copy_source_mask = (key_value_metadata or {}).get("workspace_copy_source_mask")
                 copy_source_token_ids = (key_value_metadata or {}).get(
                     "workspace_copy_source_token_ids"
                 )
-                copy_target_token_ids = key_value_metadata.get(
-                    "workspace_copy_target_token_ids"
-                )
-                copy_target_positions = key_value_metadata.get(
-                    "workspace_copy_target_positions"
-                )
+                copy_target_token_ids = key_value_metadata.get("workspace_copy_target_token_ids")
+                copy_target_positions = key_value_metadata.get("workspace_copy_target_positions")
                 workspace_module = getattr(rnn, "workspace", None)
                 copy_adapter = getattr(getattr(rnn, "backbone", None), "in_adapter", None)
                 if (
@@ -6424,7 +6521,8 @@ def run(
                             copy_target_token_ids[copy_rows, copy_times].unsqueeze(1),
                             (
                                 copy_target_positions[copy_rows, copy_times].unsqueeze(1)
-                                if copy_target_positions is not None else None
+                                if copy_target_positions is not None
+                                else None
                             ),
                         )
                     else:
@@ -6436,7 +6534,9 @@ def run(
                             copy_target_token_ids,
                             copy_target_positions,
                         )
-                    workspace_key_value_loss = workspace_key_value_loss + copy_loss.to(dtype=task_loss.dtype)
+                    workspace_key_value_loss = workspace_key_value_loss + copy_loss.to(
+                        dtype=task_loss.dtype
+                    )
                 binding_aux_targets = key_value_metadata.get("workspace_binding_aux_targets")
                 if binding_aux_targets is not None:
                     binding_mask = binding_aux_targets.ge(0)
@@ -6451,16 +6551,20 @@ def run(
                             sparse_index = torch.full(
                                 binding_mask.shape, -1, device=output.device, dtype=torch.long
                             )
-                            sparse_index[sparse_positions[:, 0], sparse_positions[:, 1]] = torch.arange(
-                                sparse_positions.shape[0], device=output.device
+                            sparse_index[sparse_positions[:, 0], sparse_positions[:, 1]] = (
+                                torch.arange(sparse_positions.shape[0], device=output.device)
                             )
                             binding_logits = output[sparse_index[binding_rows, binding_times]]
                         else:
                             binding_logits = output[binding_mask]
-                        workspace_key_value_loss = workspace_key_value_loss + nn.functional.cross_entropy(
-                            binding_logits,
-                            binding_aux_targets[binding_mask].to(dtype=torch.long),
-                        ).to(dtype=task_loss.dtype) * 2.0
+                        workspace_key_value_loss = (
+                            workspace_key_value_loss
+                            + nn.functional.cross_entropy(
+                                binding_logits,
+                                binding_aux_targets[binding_mask].to(dtype=torch.long),
+                            ).to(dtype=task_loss.dtype)
+                            * 2.0
+                        )
                 if workspace_attentional_cue_readout:
                     workspace_module = getattr(rnn, "workspace", None)
                     if workspace_module is None or key_value_metadata is None:
@@ -6728,15 +6832,19 @@ def run(
                 f"[{run_id}] non-finite MoE auxiliary loss at step {step}; "
                 "stopping before backward."
             )
-        if adaptive_skill_loss is not None and check_finite_this_step and not _first_nonfinite_report(
-            adaptive_skill_loss, "adaptive_skill_loss", step
+        if (
+            adaptive_skill_loss is not None
+            and check_finite_this_step
+            and not _first_nonfinite_report(adaptive_skill_loss, "adaptive_skill_loss", step)
         ):
             emit_failure_diagnostics("train")
             raise FloatingPointError(
                 f"[{run_id}] non-finite adaptive workspace loss at step {step}; stopping."
             )
-        if adaptive_v3_loss is not None and check_finite_this_step and not _first_nonfinite_report(
-            adaptive_v3_loss, "adaptive_v3_loss", step
+        if (
+            adaptive_v3_loss is not None
+            and check_finite_this_step
+            and not _first_nonfinite_report(adaptive_v3_loss, "adaptive_v3_loss", step)
         ):
             emit_failure_diagnostics("train")
             raise FloatingPointError(
@@ -6789,9 +6897,7 @@ def run(
         # the terminal segment), and average the per-segment auxiliary losses
         # so context/workspace supervision does not grow with chain length.
         segment_loss_weight = float(getattr(dataset, "segment_loss_weight", 1.0))
-        backward_loss = segment_loss_weight * (
-            task_loss + (loss - task_loss) / chain_steps
-        )
+        backward_loss = segment_loss_weight * (task_loss + (loss - task_loss) / chain_steps)
         try:
             scaler.scale(backward_loss).backward()
         except RuntimeError:
@@ -6853,7 +6959,9 @@ def run(
                     probe["max"].copy_(torch.maximum(probe["max"], parameter_norm))
                     step_parameter_norms.append(parameter_norm)
                 if step_parameter_norms:
-                    independent_grad_norm = torch.linalg.vector_norm(torch.stack(step_parameter_norms))
+                    independent_grad_norm = torch.linalg.vector_norm(
+                        torch.stack(step_parameter_norms)
+                    )
                     bistable_grad_probe_global_max_step.copy_(
                         torch.where(
                             independent_grad_norm > bistable_grad_probe_global_max,
@@ -7087,9 +7195,7 @@ def run(
         if prediction_loss is not None:
             running_sgr_prediction_loss += prediction_loss.detach()
         if sparse_positions is not None and hasattr(dataset, "diversity_sparse"):
-            running_div += dataset.diversity_sparse(
-                output.detach(), answer_mask, sparse_positions
-            )
+            running_div += dataset.diversity_sparse(output.detach(), answer_mask, sparse_positions)
         else:
             running_div += dataset.diversity(output.detach(), target_digits, answer_mask)
         if optimizer_update_due and math.isfinite(grad_norm_value):
@@ -7109,8 +7215,7 @@ def run(
             step += 1
         if (
             optimizer_update_due
-            and
-            workspace_adaptive_v3_enabled
+            and workspace_adaptive_v3_enabled
             and workspace_adaptive_v3_teacher_anneal_steps > 0
             and step % 100 == 0
             and isinstance(rnn, SplitGraphDNC)
@@ -7118,10 +7223,7 @@ def run(
             teacher_diagnostics = rnn.workspace.adaptive_v3_training_diagnostics()
             measured = []
             for name, value in teacher_diagnostics.items():
-                if (
-                    not name.startswith("teacher_feature_off_")
-                    or not name.endswith("_accuracy")
-                ):
+                if not name.startswith("teacher_feature_off_") or not name.endswith("_accuracy"):
                     continue
                 count_value = teacher_diagnostics.get(f"{name}_count")
                 if count_value is None or float(count_value.item()) <= 0:
@@ -7129,9 +7231,13 @@ def run(
                 measured.append(float(value.item()))
             if measured:
                 delta = (
-                    workspace_adaptive_v3_teacher_weight
-                    - workspace_adaptive_v3_teacher_min_weight
-                ) * 100.0 / workspace_adaptive_v3_teacher_anneal_steps
+                    (
+                        workspace_adaptive_v3_teacher_weight
+                        - workspace_adaptive_v3_teacher_min_weight
+                    )
+                    * 100.0
+                    / workspace_adaptive_v3_teacher_anneal_steps
+                )
                 if min(measured) >= workspace_adaptive_v3_teacher_accuracy_threshold:
                     adaptive_v3_teacher_weight_current = max(
                         workspace_adaptive_v3_teacher_min_weight,
@@ -7145,7 +7251,13 @@ def run(
 
         running_log_steps += int(optimizer_update_due)
         running_micro_steps += 1
-        if optimizer_update_due and alloc_enabled and not workspace_allocator_label_addresses_only and step % 100 == 0 and rnn.allocator_stats:
+        if (
+            optimizer_update_due
+            and alloc_enabled
+            and not workspace_allocator_label_addresses_only
+            and step % 100 == 0
+            and rnn.allocator_stats
+        ):
             _d = 100.0 / max(1, workspace_allocator_anneal_steps)
             _acc = min(float(v) for v in rnn.allocator_stats.values())
             # Predicted addresses are not aligned with the gold KV/readout
@@ -7238,9 +7350,7 @@ def run(
             # t0 is advanced by each evaluation duration below, so evaluation
             # time is already excluded from this training-only window.
             elapsed = max(time.time() - t0, 1e-9)
-            measured_prep_total = (
-                running_batch_prepare_seconds + running_forward_backward_seconds
-            )
+            measured_prep_total = running_batch_prepare_seconds + running_forward_backward_seconds
             batch_prepare_share = (
                 running_batch_prepare_seconds / measured_prep_total
                 if measured_prep_total > 0
@@ -7569,7 +7679,21 @@ def run(
                     parts.append(f"adaptive_v3_events[{','.join(candidate_events)}]")
                 operation_probability = v3_diagnostics.get("operation_probability")
                 if operation_probability is not None:
-                    route_names = getattr(rnn.workspace.adaptive_v3, "operator_names", ("noop", "copy", "add_mod", "compare", "select", "rank", "sort", "swap", "reduce"))
+                    route_names = getattr(
+                        rnn.workspace.adaptive_v3,
+                        "operator_names",
+                        (
+                            "noop",
+                            "copy",
+                            "add_mod",
+                            "compare",
+                            "select",
+                            "rank",
+                            "sort",
+                            "swap",
+                            "reduce",
+                        ),
+                    )
                     route_summary = ",".join(
                         f"{name}:{float(value):.2f}"
                         for name, value in zip(route_names, operation_probability)
@@ -7614,13 +7738,36 @@ def run(
                 teacher_operator_loss_parts = [
                     f"{name}:{float(v3_diagnostics[f'teacher_op_loss_{name}']):.3f}/"
                     f"{int(v3_diagnostics[f'teacher_op_loss_{name}_count'].item())}"
-                    for name in getattr(rnn.workspace.adaptive_v3, "operator_names", ("noop", "copy", "add_mod", "compare", "select", "rank", "sort", "swap", "reduce"))
+                    for name in getattr(
+                        rnn.workspace.adaptive_v3,
+                        "operator_names",
+                        (
+                            "noop",
+                            "copy",
+                            "add_mod",
+                            "compare",
+                            "select",
+                            "rank",
+                            "sort",
+                            "swap",
+                            "reduce",
+                        ),
+                    )
                     if f"teacher_op_loss_{name}" in v3_diagnostics
                 ]
                 teacher_operator_output_parts = [
                     f"{name}:{float(v3_diagnostics[f'teacher_operator_output_loss_{name}']):.3f}/"
                     f"{int(v3_diagnostics[f'teacher_operator_output_loss_{name}_count'].item())}"
-                    for name in ("copy", "add_mod", "compare", "select", "rank", "sort", "swap", "reduce")
+                    for name in (
+                        "copy",
+                        "add_mod",
+                        "compare",
+                        "select",
+                        "rank",
+                        "sort",
+                        "swap",
+                        "reduce",
+                    )
                     if f"teacher_operator_output_loss_{name}" in v3_diagnostics
                 ]
                 if teacher_loss_parts or teacher_accuracy_parts:
@@ -8101,7 +8248,9 @@ def run(
         per_value_loss = None
         prediction_logits = backbone_features = None
 
-        evaluation_started_at = time.time() if optimizer_update_due and step % EVAL_EVERY == 0 else None
+        evaluation_started_at = (
+            time.time() if optimizer_update_due and step % EVAL_EVERY == 0 else None
+        )
         if optimizer_update_due and step % EVAL_EVERY == 0:
             pre_advance_lesson = curriculum.lesson  # capture before maybe_advance can bump it
             id_stage_memory = rnn.memories[0]
@@ -8119,7 +8268,9 @@ def run(
                 surprise_recall_logger.write_evaluation(
                     step, pre_advance_lesson + 1, "id", dataset.last_eval_diagnostics
                 )
-            if not progression_eval_only and isinstance(sgr_prediction_decoder, SurprisePredictionHead):
+            if not progression_eval_only and isinstance(
+                sgr_prediction_decoder, SurprisePredictionHead
+            ):
                 sgr_phase1_eval = evaluate_prediction_signals(
                     rnn.backbone,
                     sgr_prediction_decoder,
@@ -8235,7 +8386,10 @@ def run(
                     field_log=ood_field_log,
                 )
                 write_workspace_task_metrics(
-                    step, curriculum.lesson + 1, "ood", getattr(dataset, "last_eval_diagnostics", None)
+                    step,
+                    curriculum.lesson + 1,
+                    "ood",
+                    getattr(dataset, "last_eval_diagnostics", None),
                 )
                 if surprise_recall_logger is not None:
                     surprise_recall_logger.write_evaluation(
@@ -8262,9 +8416,9 @@ def run(
                         )
                     segment_diagnostics.emit("eval-ood-memory-off")
 
-                if callable(getattr(dataset, "evaluate_permutation_generalization", None)) and getattr(
-                    dataset, "task_track", None
-                ) in {"all", "permutation"}:
+                if callable(
+                    getattr(dataset, "evaluate_permutation_generalization", None)
+                ) and getattr(dataset, "task_track", None) in {"all", "permutation"}:
                     permutation_eval_seed = int(seed) * 1_000_003 + int(step) + 0x5045524D
                     permutation_episodes_per_split = max(8, periodic_ood_episodes // 4)
                     permutation_torch_rng = _capture_torch_rng()
@@ -8286,7 +8440,9 @@ def run(
                     )
                     segment_diagnostics.emit("eval-permutation-generalization")
                     if has_memory:
-                        segment_diagnostics.set_channel("eval-permutation-generalization-memory-off")
+                        segment_diagnostics.set_channel(
+                            "eval-permutation-generalization-memory-off"
+                        )
                         with _replay_torch_rng(permutation_torch_rng):
                             dataset.evaluate_permutation_generalization(
                                 rnn,
@@ -8442,7 +8598,12 @@ def run(
                     kl_diag,
                 )
                 dataset.write_field_log(
-                    field_log_writer, field_log_file, step, curriculum.lesson + 1, "ood", ood_field_log
+                    field_log_writer,
+                    field_log_file,
+                    step,
+                    curriculum.lesson + 1,
+                    "ood",
+                    ood_field_log,
                 )
                 print(
                     f"[{run_id}] Step {step} periodic OOD check: "
@@ -8829,7 +8990,10 @@ def run(
             field_log=final_ood_field_log,
         )
         write_workspace_task_metrics(
-            step, curriculum.lesson + 1, "final-ood", getattr(dataset, "last_eval_diagnostics", None)
+            step,
+            curriculum.lesson + 1,
+            "final-ood",
+            getattr(dataset, "last_eval_diagnostics", None),
         )
         if surprise_recall_logger is not None:
             surprise_recall_logger.write_evaluation(
@@ -9583,11 +9747,19 @@ if __name__ == "__main__":
         help="Distill V3 operation, operand-binding, destination, and output behavior from supported programs.",
     )
     parser.add_argument("--workspace-autoadaptive-v3-teacher-weight", type=float, default=1.0)
-    parser.add_argument("--workspace-autoadaptive-v3-teacher-anneal-steps", type=int, default=20000,
-                        help="Training steps used to lower teacher weight while the accuracy criterion holds; 0 keeps it fixed.")
+    parser.add_argument(
+        "--workspace-autoadaptive-v3-teacher-anneal-steps",
+        type=int,
+        default=20000,
+        help="Training steps used to lower teacher weight while the accuracy criterion holds; 0 keeps it fixed.",
+    )
     parser.add_argument("--workspace-autoadaptive-v3-teacher-min-weight", type=float, default=0.1)
-    parser.add_argument("--workspace-autoadaptive-v3-teacher-accuracy-threshold", type=float, default=0.9)
-    parser.add_argument("--workspace-autoadaptive-v3-feature-off-probability", type=float, default=0.75)
+    parser.add_argument(
+        "--workspace-autoadaptive-v3-teacher-accuracy-threshold", type=float, default=0.9
+    )
+    parser.add_argument(
+        "--workspace-autoadaptive-v3-feature-off-probability", type=float, default=0.75
+    )
     parser.add_argument(
         "--workspace-autoadaptive-v3-feature-off-tracks",
         nargs="+",
@@ -9607,7 +9779,9 @@ if __name__ == "__main__":
         help="Tracks withheld from V3 teacher labels and always run without manual operations.",
     )
     parser.add_argument("--workspace-autoadaptive-v3-usage-floor-weight", type=float, default=0.0)
-    parser.add_argument("--workspace-autoadaptive-v3-readback-consistency-weight", type=float, default=0.0)
+    parser.add_argument(
+        "--workspace-autoadaptive-v3-readback-consistency-weight", type=float, default=0.0
+    )
     parser.add_argument(
         "--workspace-autoadaptive-v3-attention-temperature",
         type=float,
@@ -10622,51 +10796,112 @@ if __name__ == "__main__":
         action="store_true",
         help="prepare and optionally save the dataset, then exit without training.",
     )
-    parser.add_argument("--workspace-teacher-forced-answers", action="store_true",
-                        help="Feed the gold previous answer token at answer positions t>0 (production tracks only).")
-    parser.add_argument("--workspace-generation-eval", action="store_true",
-                        help="Report free-running generation vs teacher-forced metrics (production tracks).")
+    parser.add_argument(
+        "--workspace-teacher-forced-answers",
+        action="store_true",
+        help="Feed the gold previous answer token at answer positions t>0 (production tracks only).",
+    )
+    parser.add_argument(
+        "--workspace-generation-eval",
+        action="store_true",
+        help="Report free-running generation vs teacher-forced metrics (production tracks).",
+    )
     parser.add_argument(
         "--workspace-progression-eval-only",
         action="store_true",
         help="For workspace-capability lang_* runs, keep progression ID evaluations and the workspace dependency check; skip periodic/final OOD, generation, and language probe evaluations.",
     )
-    parser.add_argument("--workspace-eval-samples-per-group", type=int, default=2, metavar="N",
-                        help="Console samples (guess vs gold, failures first) per progression group at each developmental/production evaluation; 0 disables.")
-    parser.add_argument("--workspace-scheduled-sampling", type=float, default=0.0, metavar="P",
-                        help="Max prob of replacing a gold previous token with the model argmax (needs teacher forcing + token-id input).")
-    parser.add_argument("--workspace-scheduled-sampling-steps", type=int, default=20_000)
-    parser.add_argument("--workspace-lexicon-mode", choices=("stable", "episodic"), default="stable",
-                        help="Stage 3: real stable word ids, or arbitrary per-episode ids (Stage 2 calibration arm).")
-    parser.add_argument("--workspace-lexical-family", choices=("words", "senses", "all"), default="words",
-                        help="developmental_lexical groups: 3a words, 3b senses, or both.")
-    parser.add_argument("--workspace-lexical-unkeyed", action="store_true",
-                        help="Stage 3a/3b/3c: drop workspace_output_keys (3d has *_unkeyed tracks).")
-    parser.add_argument("--workspace-slot-readout", action="store_true",
-                        help="Stage 3d unkeyed: learned concept-pointer readout over workspace slots at answer positions.")
-    parser.add_argument("--workspace-lang-annotator-free", action="store_true",
-                        help="Stage 4 control arm: no annotator (no keys, no fact markers, no slot supervision).")
-    parser.add_argument("--workspace-lang-shuffled-context", action="store_true",
-                        help="Stage 4 control arm: context facts come from an unrelated world; gold answers unchanged.")
-    parser.add_argument("--workspace-lang-external", action="store_true",
-                        help="Stage 4: mix in external corpora (nlg/story/accept jsonl built by tools/build_stage4_corpus.py).")
-    parser.add_argument("--init-from", type=str, default=None,
-                        help="Load model weights only (fresh optimizer/curriculum), e.g. a Stage 1 checkpoint.")
-    parser.add_argument("--workspace-semantic-entity-count", type=int, choices=(64, 128), default=64,
-                        help="Semantic key space (Stage 5: 128; needs --workspace-num-slots 128).")
-    parser.add_argument("--workspace-allocator", action="store_true",
-                        help="Learned key allocator (Stage 5); labels distilled from generator, predicted keys annealed in.")
-    parser.add_argument("--workspace-allocator-anneal-steps", type=int, default=20000)
-    parser.add_argument("--workspace-allocator-label-addresses-only", action="store_true",
-                        help="Keep generator-provided workspace keys; train the allocator but never route writes through predicted keys.")
-    parser.add_argument("--workspace-lang-identity", choices=("annotator", "truth"), default="truth",
-                        help="Stage 5 key labels: annotator (no pronoun/coreference labels) or generator ground truth.")
-    args = parser.parse_args()
-    _prod = args.dataset_type == "workspace-capability" and args.workspace_task_track.replace("-", "_").startswith(
-        ("developmental_production", "lang_")
+    parser.add_argument(
+        "--workspace-eval-samples-per-group",
+        type=int,
+        default=2,
+        metavar="N",
+        help="Console samples (guess vs gold, failures first) per progression group at each developmental/production evaluation; 0 disables.",
     )
-    if (args.workspace_teacher_forced_answers or args.workspace_generation_eval
-            or args.workspace_scheduled_sampling > 0) and not _prod:
+    parser.add_argument(
+        "--workspace-scheduled-sampling",
+        type=float,
+        default=0.0,
+        metavar="P",
+        help="Max prob of replacing a gold previous token with the model argmax (needs teacher forcing + token-id input).",
+    )
+    parser.add_argument("--workspace-scheduled-sampling-steps", type=int, default=20_000)
+    parser.add_argument(
+        "--workspace-lexicon-mode",
+        choices=("stable", "episodic"),
+        default="stable",
+        help="Stage 3: real stable word ids, or arbitrary per-episode ids (Stage 2 calibration arm).",
+    )
+    parser.add_argument(
+        "--workspace-lexical-family",
+        choices=("words", "senses", "all"),
+        default="words",
+        help="developmental_lexical groups: 3a words, 3b senses, or both.",
+    )
+    parser.add_argument(
+        "--workspace-lexical-unkeyed",
+        action="store_true",
+        help="Stage 3a/3b/3c: drop workspace_output_keys (3d has *_unkeyed tracks).",
+    )
+    parser.add_argument(
+        "--workspace-slot-readout",
+        action="store_true",
+        help="Stage 3d unkeyed: learned concept-pointer readout over workspace slots at answer positions.",
+    )
+    parser.add_argument(
+        "--workspace-lang-annotator-free",
+        action="store_true",
+        help="Stage 4 control arm: no annotator (no keys, no fact markers, no slot supervision).",
+    )
+    parser.add_argument(
+        "--workspace-lang-shuffled-context",
+        action="store_true",
+        help="Stage 4 control arm: context facts come from an unrelated world; gold answers unchanged.",
+    )
+    parser.add_argument(
+        "--workspace-lang-external",
+        action="store_true",
+        help="Stage 4: mix in external corpora (nlg/story/accept jsonl built by tools/build_stage4_corpus.py).",
+    )
+    parser.add_argument(
+        "--init-from",
+        type=str,
+        default=None,
+        help="Load model weights only (fresh optimizer/curriculum), e.g. a Stage 1 checkpoint.",
+    )
+    parser.add_argument(
+        "--workspace-semantic-entity-count",
+        type=int,
+        choices=(64, 128),
+        default=64,
+        help="Semantic key space (Stage 5: 128; needs --workspace-num-slots 128).",
+    )
+    parser.add_argument(
+        "--workspace-allocator",
+        action="store_true",
+        help="Learned key allocator (Stage 5); labels distilled from generator, predicted keys annealed in.",
+    )
+    parser.add_argument("--workspace-allocator-anneal-steps", type=int, default=20000)
+    parser.add_argument(
+        "--workspace-allocator-label-addresses-only",
+        action="store_true",
+        help="Keep generator-provided workspace keys; train the allocator but never route writes through predicted keys.",
+    )
+    parser.add_argument(
+        "--workspace-lang-identity",
+        choices=("annotator", "truth"),
+        default="truth",
+        help="Stage 5 key labels: annotator (no pronoun/coreference labels) or generator ground truth.",
+    )
+    args = parser.parse_args()
+    _prod = args.dataset_type == "workspace-capability" and args.workspace_task_track.replace(
+        "-", "_"
+    ).startswith(("developmental_production", "lang_"))
+    if (
+        args.workspace_teacher_forced_answers
+        or args.workspace_generation_eval
+        or args.workspace_scheduled_sampling > 0
+    ) and not _prod:
         parser.error(
             "teacher forcing/generation/scheduled sampling require a "
             "developmental_production* or lang_* track"
@@ -10675,12 +10910,17 @@ if __name__ == "__main__":
         args.dataset_type == "workspace-capability"
         and args.workspace_task_track.replace("-", "_").startswith("lang_")
     ):
-        parser.error("--workspace-progression-eval-only requires --dataset-type workspace-capability and a lang_* task track")
+        parser.error(
+            "--workspace-progression-eval-only requires --dataset-type workspace-capability and a lang_* task track"
+        )
     if not 0.0 <= args.workspace_scheduled_sampling <= 1.0:
         parser.error("--workspace-scheduled-sampling must be in [0, 1]")
     if args.workspace_scheduled_sampling > 0 and not (
-            args.workspace_teacher_forced_answers and args.workspace_token_id_input):
-        parser.error("scheduled sampling requires --workspace-teacher-forced-answers and --workspace-token-id-input")
+        args.workspace_teacher_forced_answers and args.workspace_token_id_input
+    ):
+        parser.error(
+            "scheduled sampling requires --workspace-teacher-forced-answers and --workspace-token-id-input"
+        )
     if args.init_from and args.resume:
         parser.error("--init-from and --resume are mutually exclusive")
     _lang_text.configure(
@@ -10690,7 +10930,10 @@ if __name__ == "__main__":
         identity=args.workspace_lang_identity,
         stage5=args.workspace_semantic_entity_count == 128,
     )
-    if args.dataset_type == "workspace-capability" and args.workspace_task_track.replace("-", "_") in _lang_text.LANG_TRACK_NAMES:
+    if (
+        args.dataset_type == "workspace-capability"
+        and args.workspace_task_track.replace("-", "_") in _lang_text.LANG_TRACK_NAMES
+    ):
         if not args.workspace_token_id_input:
             parser.error("lang_* tracks require --workspace-token-id-input")
 
@@ -10725,8 +10968,7 @@ if __name__ == "__main__":
     if args.split_graph_activation_checkpointing and not (
         args.split_graph
         and any(
-            kind.strip().lower().startswith("mamba")
-            for kind in args.split_graph_variant.split("+")
+            kind.strip().lower().startswith("mamba") for kind in args.split_graph_variant.split("+")
         )
     ):
         parser.error(
@@ -10734,8 +10976,7 @@ if __name__ == "__main__":
         )
     if args.activation_offload_to_cpu and args.split_graph_activation_checkpointing:
         parser.error(
-            "choose either --activation-offload-to-cpu or "
-            "--split-graph-activation-checkpointing"
+            "choose either --activation-offload-to-cpu or --split-graph-activation-checkpointing"
         )
     if args.dnc_write_observation_variance <= 0:
         parser.error("--dnc-write-observation-variance must be positive")
@@ -10998,15 +11239,32 @@ if __name__ == "__main__":
             parser.error("prediction-error reconsideration requires --workspace-num-slots >= 1")
     if args.eval_only and args.eval_workspace_mode != "checkpoint" and not args.workspace:
         parser.error("non-default --eval-workspace-mode requires --workspace")
-    if sum((args.workspace_autoadaptive, args.workspace_autoadaptive_v2, args.workspace_autoadaptive_v3)) > 1:
+    if (
+        sum(
+            (
+                args.workspace_autoadaptive,
+                args.workspace_autoadaptive_v2,
+                args.workspace_autoadaptive_v3,
+            )
+        )
+        > 1
+    ):
         parser.error("choose only one adaptive workspace architecture (V1, V2, or V3)")
     if args.workspace_autoadaptive_v4:
-        if args.workspace_autoadaptive or args.workspace_autoadaptive_v2 or args.workspace_autoadaptive_v3:
+        if (
+            args.workspace_autoadaptive
+            or args.workspace_autoadaptive_v2
+            or args.workspace_autoadaptive_v3
+        ):
             parser.error("--workspace-autoadaptive-v4 is exclusive with V1/V2/V3")
         if args.workspace_operation_executor:
             parser.error("--workspace-autoadaptive-v4 replaces the manual operation executor")
         args.workspace_autoadaptive_v3 = True
-    if (args.workspace_autoadaptive or args.workspace_autoadaptive_v2 or args.workspace_autoadaptive_v3) and not args.workspace:
+    if (
+        args.workspace_autoadaptive
+        or args.workspace_autoadaptive_v2
+        or args.workspace_autoadaptive_v3
+    ) and not args.workspace:
         parser.error("adaptive workspace variants require --workspace")
     if args.workspace_autoadaptive_v3 and not (
         args.split_graph
@@ -11014,16 +11272,23 @@ if __name__ == "__main__":
         and args.workspace_semantic_entity_addressing
         and args.workspace_key_value_loss_weight > 0
     ):
-        parser.error("--workspace-autoadaptive-v3 requires split-graph, at least 64 slots, semantic entity addressing, and positive key-value loss")
+        parser.error(
+            "--workspace-autoadaptive-v3 requires split-graph, at least 64 slots, semantic entity addressing, and positive key-value loss"
+        )
     if args.workspace_autoadaptive_v3_compile_operators and not args.workspace_autoadaptive_v3:
-        parser.error("--workspace-autoadaptive-v3-compile-operators requires --workspace-autoadaptive-v3")
+        parser.error(
+            "--workspace-autoadaptive-v3-compile-operators requires --workspace-autoadaptive-v3"
+        )
     if args.workspace_autoadaptive_v3_rank < 1:
         parser.error("--workspace-autoadaptive-v3-rank must be positive")
     if args.workspace_autoadaptive_v3_teacher_anneal_steps < 0:
         parser.error("--workspace-autoadaptive-v3-teacher-anneal-steps must be non-negative")
     if args.workspace_autoadaptive_v3_teacher_min_weight < 0:
         parser.error("--workspace-autoadaptive-v3-teacher-min-weight must be non-negative")
-    if args.workspace_autoadaptive_v3_teacher_min_weight > args.workspace_autoadaptive_v3_teacher_weight:
+    if (
+        args.workspace_autoadaptive_v3_teacher_min_weight
+        > args.workspace_autoadaptive_v3_teacher_weight
+    ):
         parser.error("--workspace-autoadaptive-v3-teacher-min-weight cannot exceed teacher weight")
     if not 0 <= args.workspace_autoadaptive_v3_teacher_accuracy_threshold <= 1:
         parser.error("--workspace-autoadaptive-v3-teacher-accuracy-threshold must be in [0, 1]")
@@ -11041,7 +11306,12 @@ if __name__ == "__main__":
     ):
         parser.error("--workspace-autoadaptive-v2-mi-weight must be finite and >= 0")
     if args.eval_workspace_adaptive_bypass and not (
-        args.eval_only and (args.workspace_autoadaptive or args.workspace_autoadaptive_v2 or args.workspace_autoadaptive_v3)
+        args.eval_only
+        and (
+            args.workspace_autoadaptive
+            or args.workspace_autoadaptive_v2
+            or args.workspace_autoadaptive_v3
+        )
     ):
         parser.error(
             "--eval-workspace-adaptive-bypass requires --eval-only and "
@@ -11123,7 +11393,9 @@ if __name__ == "__main__":
             parser.error(
                 "--workspace-permutation-transactional requires --workspace-num-slots >= 16"
             )
-        if args.dataset_type != "workspace-capability" or args.workspace_task_track.lower().replace("-", "_") not in (
+        if args.dataset_type != "workspace-capability" or args.workspace_task_track.lower().replace(
+            "-", "_"
+        ) not in (
             "permutation",
             "all",
         ):
@@ -11223,7 +11495,10 @@ if __name__ == "__main__":
         or args.workspace_retrieval_value_loss_weight < 0
     ):
         parser.error("--workspace-retrieval-value-loss-weight must be finite and >= 0")
-    if not math.isfinite(args.workspace_key_value_loss_weight) or args.workspace_key_value_loss_weight < 0:
+    if (
+        not math.isfinite(args.workspace_key_value_loss_weight)
+        or args.workspace_key_value_loss_weight < 0
+    ):
         parser.error("--workspace-key-value-loss-weight must be finite and >= 0")
     if args.workspace_key_value_loss_weight > 0 and not (
         args.workspace
@@ -11253,9 +11528,7 @@ if __name__ == "__main__":
                 "mixed_skill, variable_binding, new_all, or all"
             )
     if args.workspace_operation_diagnostics and not args.workspace_operation_executor:
-        parser.error(
-            "--workspace-operation-diagnostics requires --workspace-operation-executor"
-        )
+        parser.error("--workspace-operation-diagnostics requires --workspace-operation-executor")
     if args.workspace_exact_value_comparison:
         if not (
             args.workspace
@@ -11336,17 +11609,17 @@ if __name__ == "__main__":
                 "semantic entity addressing"
             )
         if args.dataset_type != "workspace-capability" or args.workspace_task_track not in (
-            "attentional_blink", "gnw_all", "new_all", "all",
+            "attentional_blink",
+            "gnw_all",
+            "new_all",
+            "all",
         ):
             parser.error(
                 "--workspace-attentional-item-memory supports workspace-capability "
                 "tracks attentional_blink, gnw_all, new_all, or all"
             )
         if args.workspace_num_slots < 26:
-            parser.error(
-                "--workspace-attentional-item-memory requires "
-                "--workspace-num-slots >= 26"
-            )
+            parser.error("--workspace-attentional-item-memory requires --workspace-num-slots >= 26")
     if args.workspace_rule_feedback_update and not (
         args.workspace
         and args.workspace_key_value_loss_weight > 0
@@ -11575,14 +11848,15 @@ if __name__ == "__main__":
                 run_id += "_autoadaptive"
             elif args.workspace_autoadaptive_v2:
                 mi_tag = f"{args.workspace_autoadaptive_v2_mi_weight:g}".replace(".", "p")
-                run_id += (
-                    f"_autoadaptivev2_{args.workspace_autoadaptive_v2_num_skills}s"
-                    f"_mi{mi_tag}"
-                )
+                run_id += f"_autoadaptivev2_{args.workspace_autoadaptive_v2_num_skills}s_mi{mi_tag}"
             elif args.workspace_autoadaptive_v3:
                 teacher_tag = f"{args.workspace_autoadaptive_v3_teacher_weight:g}".replace(".", "p")
-                feature_off_tag = f"{args.workspace_autoadaptive_v3_feature_off_probability:g}".replace(".", "p")
-                always_off_tag = "-".join(args.workspace_autoadaptive_v3_always_feature_off_tracks) or "none"
+                feature_off_tag = (
+                    f"{args.workspace_autoadaptive_v3_feature_off_probability:g}".replace(".", "p")
+                )
+                always_off_tag = (
+                    "-".join(args.workspace_autoadaptive_v3_always_feature_off_tracks) or "none"
+                )
                 run_id += (
                     f"_autoadaptive{'v4' if args.workspace_autoadaptive_v4 else 'v3'}_r{args.workspace_autoadaptive_v3_rank}"
                     f"_teacher{teacher_tag}_off{feature_off_tag}_always{always_off_tag}"
@@ -11689,7 +11963,11 @@ if __name__ == "__main__":
             if args.workspace_autoadaptive_v3_compile_operators:
                 run_id += "_v3compile"
             if args.workspace_task_track in (
-                "all", "gnw_all", "new_all", "mixed_skill", "mixed_binding"
+                "all",
+                "gnw_all",
+                "new_all",
+                "mixed_skill",
+                "mixed_binding",
             ):
                 run_id += "_mixedops6"
         if args.sgr_pred_loss_weight > 0:
@@ -11811,9 +12089,15 @@ if __name__ == "__main__":
             workspace_adaptive_v3_teacher_min_weight=args.workspace_autoadaptive_v3_teacher_min_weight,
             workspace_adaptive_v3_teacher_accuracy_threshold=args.workspace_autoadaptive_v3_teacher_accuracy_threshold,
             workspace_adaptive_v3_feature_off_probability=args.workspace_autoadaptive_v3_feature_off_probability,
-            workspace_adaptive_v3_feature_off_tracks=tuple(args.workspace_autoadaptive_v3_feature_off_tracks),
-            workspace_adaptive_v3_always_feature_off_tracks=tuple(args.workspace_autoadaptive_v3_always_feature_off_tracks),
-            workspace_adaptive_v3_holdout_tracks=tuple(args.workspace_autoadaptive_v3_holdout_tracks),
+            workspace_adaptive_v3_feature_off_tracks=tuple(
+                args.workspace_autoadaptive_v3_feature_off_tracks
+            ),
+            workspace_adaptive_v3_always_feature_off_tracks=tuple(
+                args.workspace_autoadaptive_v3_always_feature_off_tracks
+            ),
+            workspace_adaptive_v3_holdout_tracks=tuple(
+                args.workspace_autoadaptive_v3_holdout_tracks
+            ),
             workspace_adaptive_v3_eval_episodes_per_track=args.workspace_autoadaptive_v3_eval_episodes_per_track,
             workspace_curriculum_eval_episodes_per_group=(
                 args.workspace_curriculum_eval_episodes_per_group
@@ -11910,9 +12194,7 @@ if __name__ == "__main__":
             dataset_link=args.dataset_link,
             test_dataset_link=args.test_dataset_link,
             workspace_task_track=args.workspace_task_track,
-            workspace_track_homogeneous_batches=(
-                args.workspace_track_homogeneous_batches
-            ),
+            workspace_track_homogeneous_batches=(args.workspace_track_homogeneous_batches),
             workspace_semantic_state_diagnostics=args.workspace_semantic_state_diagnostics,
             workspace_state_diagnostic_max_events=args.workspace_state_diagnostic_max_events,
             workspace_state_loss_weight=args.workspace_state_loss_weight,
@@ -11941,9 +12223,7 @@ if __name__ == "__main__":
             prepared_dataset=prepared_dataset,
             ogs_weights=tuple(args.ogs_weights),
             batch_size=args.batch_size,
-            workspace_length_bucket_microbatches=(
-                args.workspace_length_bucket_microbatches
-            ),
+            workspace_length_bucket_microbatches=(args.workspace_length_bucket_microbatches),
             sgr_prediction_loss_weight=args.sgr_pred_loss_weight,
             sgr_prediction_eval_episodes=args.sgr_pred_eval_episodes,
             sgr_phase2_arm=args.sgr_phase2_arm,

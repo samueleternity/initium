@@ -36,7 +36,15 @@ from initium.data.workspace_capability.tracks import _lang_text as lt  # noqa: E
 PUNCT = ".,?!;:|"
 _PUNCT_RE = re.compile("([" + re.escape(PUNCT) + "])")
 KINDS = ("nlg", "story", "accept", "open", "nlu_triples", "nli", "qa")
-TOKEN_BUDGET = {"story": 480, "nlg": 480, "accept": 100, "open": 460, "nlu_triples": 400, "nli": 300, "qa": 400}
+TOKEN_BUDGET = {
+    "story": 480,
+    "nlg": 480,
+    "accept": 100,
+    "open": 460,
+    "nlu_triples": 400,
+    "nli": 300,
+    "qa": 400,
+}
 ALIASES = {
     "nlg": {
         "triples": ("triples", "modified_triple_sets", "triple_set", "mtriple_set", "input"),
@@ -142,13 +150,12 @@ def triples_of(x):
         elif isinstance(v, dict):
             for w in v.values():
                 walk(w)
-        elif isinstance(v, (list, tuple)):
+        elif isinstance(v, list | tuple):
             if len(v) == 3 and all(isinstance(w, str) for w in v):
                 out.append(tuple(p.strip().strip("\"'") for p in v))
             else:
                 for w in v:
                     walk(w)
-                    
 
     walk(x)
     return out
@@ -172,7 +179,11 @@ def story_records(row, over):
             if kind == 0:
                 ctx.append(text)
             elif answer:
-                yield {"context": norm(" ".join(ctx)), "question": norm(text), "answer": norm(answer)}
+                yield {
+                    "context": norm(" ".join(ctx)),
+                    "question": norm(text),
+                    "answer": norm(answer),
+                }
         return
     c, q, a = (col(row, "story", k, over) for k in ("context", "question", "answer"))
     if isinstance(c, str) and isinstance(q, str) and isinstance(a, str) and a:
@@ -197,10 +208,14 @@ def open_records(row, over):
         words = norm(t).split()[:120]
         if len(words) >= 20:
             yield {"text": " ".join(words)}
+
+
 _NLI = {0: "entailment", 1: "neutral", 2: "contradiction"}
 
 
-def nlu_triples_records(row, over):  # same schema as nlg; --map nlu_triples.<field>=<col> is honoured
+def nlu_triples_records(
+    row, over
+):  # same schema as nlg; --map nlu_triples.<field>=<col> is honoured
     return nlg_records(row, {k.replace("nlu_triples.", "nlg.", 1): v for k, v in over.items()})
 
 
@@ -218,7 +233,7 @@ def _first(a):
         a = a.get("text") or a.get("input_text")
     if hasattr(a, "tolist"):
         a = a.tolist()
-    return (a[0] if a else None) if isinstance(a, (list, tuple)) else a
+    return (a[0] if a else None) if isinstance(a, list | tuple) else a
 
 
 def qa_records(row, over):
@@ -228,8 +243,15 @@ def qa_records(row, over):
         yield {"context": norm(c), "question": norm(q), "answer": norm(a)}
 
 
-ADAPTERS = {"nlg": nlg_records, "story": story_records, "accept": accept_records, "open": open_records,
-            "nlu_triples": nlu_triples_records, "nli": nli_records, "qa": qa_records}
+ADAPTERS = {
+    "nlg": nlg_records,
+    "story": story_records,
+    "accept": accept_records,
+    "open": open_records,
+    "nlu_triples": nlu_triples_records,
+    "nli": nli_records,
+    "qa": qa_records,
+}
 SPLIT_KEY = {
     "nlg": lambda r: r["text"],
     "story": lambda r: r["context"] + r["question"],
@@ -251,7 +273,9 @@ def build_external(kind, src, over, limit):
                 seen.add(sig)
                 out.append(rec)
     if not out:
-        sys.exit(f"{kind}: no usable records from {src!r}; run --inspect and pass --map {kind}.<field>=<column>")
+        sys.exit(
+            f"{kind}: no usable records from {src!r}; run --inspect and pass --map {kind}.<field>=<column>"
+        )
     return out
 
 
@@ -268,7 +292,11 @@ def record_lines(kind, r):
 
 
 def token_cost(kind, r, sp):
-    return sum(len(x) for x in sp.encode(record_lines(kind, r)) + ([sp.encode(r["text"])] if kind == "nlg" else []))
+    return sum(
+        len(x)
+        for x in sp.encode(record_lines(kind, r))
+        + ([sp.encode(r["text"])] if kind == "nlg" else [])
+    )
 
 
 # ---------------------------------------------------------------- synthetic grammar corpus
@@ -315,9 +343,17 @@ def synthetic_lines(rng):
         add([n, "has", "the", o + "."]), add([n, "is", "carrying", "the", o + "."])
         add(["where", "will", n, "look", "for", "the", o + "?"])
     for n in N:
-        add(["where", "is", n + "?"]), add(["what", "is", n, "carrying?"]), add([n, "is", "carrying", "nothing."])
+        (
+            add(["where", "is", n + "?"]),
+            add(["what", "is", n, "carrying?"]),
+            add([n, "is", "carrying", "nothing."]),
+        )
     for o in O:
-        add(["where", "is", "the", o + "?"]), add(["who", "has", "the", o + "?"]), add(["nobody", "has", "the", o + "."])
+        (
+            add(["where", "is", "the", o + "?"]),
+            add(["who", "has", "the", o + "?"]),
+            add(["nobody", "has", "the", o + "."]),
+        )
     return sorted(out)
 
 
@@ -326,11 +362,25 @@ def train_spm(corpus: Path, prefix: Path, vocab_size: int, threads: int):
     import sentencepiece as spm
 
     spm.SentencePieceTrainer.train(
-        input=str(corpus), model_prefix=str(prefix), vocab_size=vocab_size, model_type="unigram",
-        normalization_rule_name="nmt_nfkc_cf", character_coverage=0.9995, required_chars=PUNCT,
-        byte_fallback=True, split_digits=True, split_by_whitespace=True, add_dummy_prefix=True,
-        remove_extra_whitespaces=True, unk_id=0, bos_id=-1, eos_id=-1, pad_id=-1,
-        hard_vocab_limit=False, max_sentence_length=8192, num_threads=threads,
+        input=str(corpus),
+        model_prefix=str(prefix),
+        vocab_size=vocab_size,
+        model_type="unigram",
+        normalization_rule_name="nmt_nfkc_cf",
+        character_coverage=0.9995,
+        required_chars=PUNCT,
+        byte_fallback=True,
+        split_digits=True,
+        split_by_whitespace=True,
+        add_dummy_prefix=True,
+        remove_extra_whitespaces=True,
+        unk_id=0,
+        bos_id=-1,
+        eos_id=-1,
+        pad_id=-1,
+        hard_vocab_limit=False,
+        max_sentence_length=8192,
+        num_threads=threads,
         shuffle_input_sentence=False,
     )
     return spm.SentencePieceProcessor(model_file=str(prefix) + ".model")
@@ -353,13 +403,19 @@ def verify(sp, synthetic, external, words):
                 if name == "synthetic":
                     errors.append(f"round-trip/unk failure: {s!r}")
         if lines and bad / len(lines) > tolerance:
-            errors.append(f"{name}: round-trip/unk failure rate {bad / len(lines):.4%} > {tolerance:.2%}")
+            errors.append(
+                f"{name}: round-trip/unk failure rate {bad / len(lines):.4%} > {tolerance:.2%}"
+            )
     for w in words:
         base = sp.encode(w)
         for p in PUNCT:
             ids = sp.encode(w + p)
-            if ids[: len(base)] != base or not all(set(sp.id_to_piece(i)) <= punct_pieces for i in ids[len(base):]):
-                errors.append(f"punctuation merges with {w!r}+{p!r}: {[sp.id_to_piece(i) for i in ids]}")
+            if ids[: len(base)] != base or not all(
+                set(sp.id_to_piece(i)) <= punct_pieces for i in ids[len(base) :]
+            ):
+                errors.append(
+                    f"punctuation merges with {w!r}+{p!r}: {[sp.id_to_piece(i) for i in ids]}"
+                )
     if errors:
         print("\n".join(errors[:20]), file=sys.stderr)
         sys.exit(f"tokenizer verification FAILED ({len(errors)} violations)")
@@ -370,11 +426,15 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default=str(lt.DATA_DIR))
     for kind in KINDS:
-        ap.add_argument(f"--{kind}", default=None, help="HF id[:config], or local json/jsonl/csv/parquet")
+        ap.add_argument(
+            f"--{kind}", default=None, help="HF id[:config], or local json/jsonl/csv/parquet"
+        )
     ap.add_argument("--map", action="append", default=[], help="e.g. nlg.text=lex")
     ap.add_argument("--limit", type=int, default=200_000, help="max source rows per corpus")
     ap.add_argument("--vocab-size", type=int, default=8192)
-    ap.add_argument("--threads", type=int, default=1, help="1 keeps tokenizer training deterministic")
+    ap.add_argument(
+        "--threads", type=int, default=1, help="1 keeps tokenizer training deterministic"
+    )
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--inspect", action="store_true")
     a = ap.parse_args()
@@ -392,18 +452,30 @@ def main():
     rng = random.Random(a.seed)
     external = {k: build_external(k, src, over, a.limit) for k, src in sources.items()}
     synthetic = synthetic_lines(rng)
-    train_lines = [ln for kind, recs in external.items() for r in recs if r["split"] == "train"
-                   for ln in record_lines(kind, r)]
+    train_lines = [
+        ln
+        for kind, recs in external.items()
+        for r in recs
+        if r["split"] == "train"
+        for ln in record_lines(kind, r)
+    ]
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory() as tmp:
         corpus = Path(tmp) / "corpus.txt"
-        corpus.write_text("\n".join(spaced(x) for x in (*synthetic, *train_lines)) + "\n", encoding="utf-8")
+        corpus.write_text(
+            "\n".join(spaced(x) for x in (*synthetic, *train_lines)) + "\n", encoding="utf-8"
+        )
         sp = train_spm(corpus, out / "spm", a.vocab_size, a.threads)
 
     G = lg.grammar()
-    words = sorted({w for i, w in G.word.items() if i in G.ok} | {lg.plural(w) for i, w in G.word.items() if i in G.ok}
-                   | set(lg.NAMES) | set(lg.OBJS) | set(lg.PLACES))
+    words = sorted(
+        {w for i, w in G.word.items() if i in G.ok}
+        | {lg.plural(w) for i, w in G.word.items() if i in G.ok}
+        | set(lg.NAMES)
+        | set(lg.OBJS)
+        | set(lg.PLACES)
+    )
     ext_sample = rng.sample(train_lines, min(len(train_lines), 5000))
     verify(sp, rng.sample(synthetic, min(len(synthetic), 20000)), ext_sample, words)
 
@@ -411,25 +483,46 @@ def main():
     for kind, recs in external.items():
         kept = [r for r in recs if token_cost(kind, r, sp) <= TOKEN_BUDGET[kind]]
         path = out / lt.EXTERNAL_FILES[kind]
-        path.write_text("".join(json.dumps(r, ensure_ascii=False, sort_keys=True) + "\n" for r in kept), encoding="utf-8")
+        path.write_text(
+            "".join(json.dumps(r, ensure_ascii=False, sort_keys=True) + "\n" for r in kept),
+            encoding="utf-8",
+        )
         files[path.name] = sha256(path)
-        counts[kind] = {"read": len(recs), "kept": len(kept), "train": sum(r["split"] == "train" for r in kept),
-                        "test": sum(r["split"] == "test" for r in kept)}
+        counts[kind] = {
+            "read": len(recs),
+            "kept": len(kept),
+            "train": sum(r["split"] == "train" for r in kept),
+            "test": sum(r["split"] == "test" for r in kept),
+        }
     import sentencepiece
 
     for name in ("spm.model", "spm.vocab"):
         files[name] = sha256(out / name)
     size = sp.get_piece_size()
     manifest = {
-        "schema": 1, "seed": a.seed, "text_base": TEXT_BASE, "text_vocab_size": size, "total_vocab": TEXT_BASE + size,
-        "sentencepiece": {"version": sentencepiece.__version__, "model_type": "unigram", "requested_vocab": a.vocab_size,
-                          "normalization": "nmt_nfkc_cf", "byte_fallback": True, "user_pieces": PUNCT},
+        "schema": 1,
+        "seed": a.seed,
+        "text_base": TEXT_BASE,
+        "text_vocab_size": size,
+        "total_vocab": TEXT_BASE + size,
+        "sentencepiece": {
+            "version": sentencepiece.__version__,
+            "model_type": "unigram",
+            "requested_vocab": a.vocab_size,
+            "normalization": "nmt_nfkc_cf",
+            "byte_fallback": True,
+            "user_pieces": PUNCT,
+        },
         "stage3_manifest_sha256": _dev_lexicon.manifest_sha256(),
-        "sources": sources, "counts": counts, "synthetic_lines": len(synthetic),
+        "sources": sources,
+        "counts": counts,
+        "synthetic_lines": len(synthetic),
         "sha256": files,
         "licences_note": "UNVERIFIED: check each external source licence (share-alike) before release",
     }
-    (out / "manifest.json").write_text(json.dumps(manifest, indent=1, sort_keys=True), encoding="utf-8")
+    (out / "manifest.json").write_text(
+        json.dumps(manifest, indent=1, sort_keys=True), encoding="utf-8"
+    )
     print(json.dumps({"text_vocab_size": size, "counts": counts}, indent=1))
     print(f"wrote {out} | total vocabulary {TEXT_BASE + size}")
 

@@ -3,7 +3,17 @@
 from __future__ import annotations
 
 from initium.data.workspace_capability.episode import (
-    BOS, EOS, EV_FACT, EV_SUPERSEDE, QUERY, SEP, TaskEpisode, entity_token as e, fact_token,
+    BOS,
+    EOS,
+    EV_FACT,
+    EV_SUPERSEDE,
+    QUERY,
+    SEP,
+    TaskEpisode,
+    fact_token,
+)
+from initium.data.workspace_capability.episode import (
+    entity_token as e,
 )
 from initium.data.workspace_capability.tracks import _dev_lexicon as dl
 from initium.data.workspace_capability.tracks import _dev_semantics as ds
@@ -24,7 +34,9 @@ def generate(d, rng, *, ood=False, keyed=True, track=TRACK):
     nd = rng.randint(0, int(d["distractors"]))
     subs = [h for h, rs in L.heads[band].items() if len(rs) >= k]
     if not subs:
-        raise ValueError(f"band {band} has no subject with {k} distinct relations; rebuild the lexicon")
+        raise ValueError(
+            f"band {band} has no subject with {k} distinct relations; rebuild the lexicon"
+        )
     X = rng.choice(subs)
     rs = list(L.heads[band][X])
     rng.shuffle(rs)
@@ -51,7 +63,9 @@ def generate(d, rng, *, ood=False, keyed=True, track=TRACK):
     for i in order:
         h_, r_, o_ = cur[i]
         keys_out += [wk[h_], rk[r_], wk[o_]]
-    W = ds.lexicon(rng, {**{kk: w for w, kk in wk.items()}, **{kk: r for r, kk in rk.items()}}, held)
+    W = ds.lexicon(
+        rng, {**{kk: w for w, kk in wk.items()}, **{kk: r for r, kk in rk.items()}}, held
+    )
     need = [wk[X]] if grp == "p_comp" else sorted(set(keys_out))
     stream = [BOS]
     R, mode = ds.teach(rng, stream, W, sorted(wk.values()), sorted(rk.values()), d, need)
@@ -65,7 +79,9 @@ def generate(d, rng, *, ood=False, keyed=True, track=TRACK):
     if grp == "p_comp":  # comprehension counterpart: word -> concept (same world/seed as p_entity)
         stream += [QUERY, fact_token(W[wk[X]]), SEP]
         ans, stride, qtype = [e(wk[X])], 0, "comprehend_entity"
-        extra["workspace_output_programs"] = ((0, "argmatch", tuple(R), tuple(fact_token(w) for w in R.values())),)
+        extra["workspace_output_programs"] = (
+            (0, "argmatch", tuple(R), tuple(fact_token(w) for w in R.values())),
+        )
     else:
         stream += [QUERY, *(() if grp == "p_entity" else (EV_SUPERSEDE,)), e(wk[X]), SEP]
         ans, stride = [fact_token(W[kk]) for kk in keys_out], 3
@@ -73,10 +89,28 @@ def generate(d, rng, *, ood=False, keyed=True, track=TRACK):
         if keyed and not dl.settings["unkeyed"]:
             extra["workspace_output_keys"] = tuple(keys_out) + (-1,)
     qtype = f"{qtype}_{mode}_{'cf' if cf else 'fact'}_{'heldout' if held else 'train'}"
-    return TaskEpisode(track, tuple(stream), tuple(ans) + (EOS,),
-                       ds.meta(track, stream, grp, qtype, 100.0 / len(R), held, ood, R, mode, cf=cf,
-                               band=band, nd=nd, answer_stride=stride, answer_concepts=tuple(keys_out),
-                               **extra))
+    return TaskEpisode(
+        track,
+        tuple(stream),
+        tuple(ans) + (EOS,),
+        ds.meta(
+            track,
+            stream,
+            grp,
+            qtype,
+            100.0 / len(R),
+            held,
+            ood,
+            R,
+            mode,
+            cf=cf,
+            band=band,
+            nd=nd,
+            answer_stride=stride,
+            answer_concepts=tuple(keys_out),
+            **extra,
+        ),
+    )
 
 
 def generate_unkeyed(d, rng, *, ood=False):

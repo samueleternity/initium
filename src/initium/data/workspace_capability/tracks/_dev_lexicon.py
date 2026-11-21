@@ -57,7 +57,10 @@ def load():
         rel_words=rel_words,
         bands={b: [e["idx"] for e in entries if e["band"] == b] for b in "AB"},
         senses={int(k): [(s["category"], s["lexname"]) for s in v] for k, v in senses.items() if v},
-        pairs={}, heads={}, tails_by_rel={}, chains={},
+        pairs={},
+        heads={},
+        tails_by_rel={},
+        chains={},
     )
     for band in "AB":
         pairs, heads, tails = defaultdict(list), defaultdict(dict), defaultdict(set)
@@ -69,8 +72,11 @@ def load():
         L.tails_by_rel[band] = {r: sorted(v) for r, v in tails.items()}
         L.chains[band] = [
             (h, r1, m, r2, t)
-            for (h, r1), ms in L.pairs[band].items() for m in ms
-            for r2, ts in L.heads[band].get(m, {}).items() for t in ts if t not in (h, m)
+            for (h, r1), ms in L.pairs[band].items()
+            for m in ms
+            for r2, ts in L.heads[band].get(m, {}).items()
+            for t in ts
+            if t not in (h, m)
         ]
     return L
 
@@ -90,7 +96,9 @@ def stable_lexicon(rng, keys, held):
     taken = set()
 
     def take(pref, n):
-        out = rng.sample([w for w in pref if w not in taken], min(n, len([w for w in pref if w not in taken])))
+        out = rng.sample(
+            [w for w in pref if w not in taken], min(n, len([w for w in pref if w not in taken]))
+        )
         if len(out) < n:
             out += rng.sample([w for w in pool if w not in taken and w not in out], n - len(out))
         taken.update(out)

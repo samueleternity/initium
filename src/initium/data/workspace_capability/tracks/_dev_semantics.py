@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from initium.data.workspace_capability.episode import EV_KV, SEP, entity_token as e, fact_token
+from initium.data.workspace_capability.episode import EV_KV, SEP, fact_token
+from initium.data.workspace_capability.episode import entity_token as e
 from initium.data.workspace_capability.tracks import _dev_lexicon as dl
 from initium.data.workspace_capability.tracks._shared import common_metadata
 from initium.data.workspace_capability.tracks.developmental import _cross, _pair_ok, _teach
@@ -43,8 +44,10 @@ def counterfactual(rng, band, facts, keep=()):
 def assign(rng, facts, extra_rels=()):
     words = sorted({w for h, _, t in facts for w in (h, t)})
     rels = sorted({r for _, r, _ in facts} | set(extra_rels))
-    return (dict(zip(words, rng.sample(range(24), len(words)))),
-            dict(zip(rels, rng.sample(range(56, 64), len(rels)))))
+    return (
+        dict(zip(words, rng.sample(range(24), len(words)))),
+        dict(zip(rels, rng.sample(range(56, 64), len(rels)))),
+    )
 
 
 def lexicon(rng, W, held):
@@ -67,14 +70,42 @@ def teach(rng, stream, W, objs, rels, d, need):
     return R, mode
 
 
-def meta(track, stream, group, qtype, base, held, ood, R, mode, *, cf=False, band="A", nd=0, reads=(), **extra):
+def meta(
+    track,
+    stream,
+    group,
+    qtype,
+    base,
+    held,
+    ood,
+    R,
+    mode,
+    *,
+    cf=False,
+    band="A",
+    nd=0,
+    reads=(),
+    **extra,
+):
     last = len(stream) - 1
     return common_metadata(
-        track=track, sequence_length=len(stream), query_type=qtype, relevant_updates=len(R),
-        distractor_count=nd, candidate_baseline_pct=base, progression_group=group,
-        heldout_words=held, ood=bool(ood), teacher=mode, resolved_count=len(R), stage3=True,
-        stage3_words=dl.settings["lexicon_mode"] == "stable", lexicon_mode=dl.settings["lexicon_mode"],
-        band=band, counterfactual=cf,
+        track=track,
+        sequence_length=len(stream),
+        query_type=qtype,
+        relevant_updates=len(R),
+        distractor_count=nd,
+        candidate_baseline_pct=base,
+        progression_group=group,
+        heldout_words=held,
+        ood=bool(ood),
+        teacher=mode,
+        resolved_count=len(R),
+        stage3=True,
+        stage3_words=dl.settings["lexicon_mode"] == "stable",
+        lexicon_mode=dl.settings["lexicon_mode"],
+        band=band,
+        counterfactual=cf,
         workspace_query_reads=tuple((last, k, fact_token(w)) for k, w in R.items()) + tuple(reads),
-        lexicon=tuple((k, fact_token(w)) for k, w in R.items()), **extra,
+        lexicon=tuple((k, fact_token(w)) for k, w in R.items()),
+        **extra,
     )

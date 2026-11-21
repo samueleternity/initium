@@ -11,15 +11,29 @@ from __future__ import annotations
 import random
 
 from initium.data.workspace_capability.episode import (
-    BOS, EOS, EV_ASSERT, EV_FACT, EV_INIT, EV_KV, EV_MOVE, EV_UPDATE, LOCATION_COUNT,
-    NONE_TOKEN, QUERY, SEP, TaskEpisode, entity_token, fact_token, location_token,
-    scalar_token, source_token,
+    BOS,
+    EOS,
+    EV_ASSERT,
+    EV_FACT,
+    EV_INIT,
+    EV_KV,
+    EV_MOVE,
+    EV_UPDATE,
+    LOCATION_COUNT,
+    NONE_TOKEN,
+    QUERY,
+    SEP,
+    TaskEpisode,
+    entity_token,
+    fact_token,
+    location_token,
+    scalar_token,
+    source_token,
 )
 from initium.data.workspace_capability.tracks._shared import common_metadata
 
 _OBJ, _LOC, _PROP, _INIT, _REL, _WORDS = 0, 24, 32, 48, 56, 64
 _BUDGET = 280  # token cap for teaching scenes (T4 memory)
-
 
 
 def _pair_ok(s, r, combos):
@@ -42,7 +56,9 @@ def _cross(rng, stream, groups, W, scenes):
         present = [k for c in chosen for k in c]
         must = chosen[-1] if len(groups) > 1 else []
         rest = [k for k in present if k not in must]
-        said = must + rng.sample(rest, rng.randint(0 if must else 1, min(2 if must else 3, len(rest))))
+        said = must + rng.sample(
+            rest, rng.randint(0 if must else 1, min(2 if must else 3, len(rest)))
+        )
         rng.shuffle(said)
         for k in said:
             cand[W[k]] = cand[W[k]] & set(present) if W[k] in cand else set(present)
@@ -74,17 +90,30 @@ def _teach(rng, stream, mode, W, noise):
             for w, f in zip(trials, fb):
                 stream += [EV_ASSERT, entity_token(k), fact_token(w), source_token(int(f)), SEP]
         else:  # direct: supervised EV_KV; demo: same pairing via unsupervised EV_UPDATE
-            stream += [EV_KV if mode == "direct" else EV_UPDATE, entity_token(k), fact_token(W[k]), SEP]
+            stream += [
+                EV_KV if mode == "direct" else EV_UPDATE,
+                entity_token(k),
+                fact_token(W[k]),
+                SEP,
+            ]
     return dict(W)
 
 
 def _episode(stream, answer, family, qtype, baseline, held, ood, updates, **extra):
     return TaskEpisode(
-        "developmental", tuple(stream), answer,
+        "developmental",
+        tuple(stream),
+        answer,
         common_metadata(
-            track="developmental", sequence_length=len(stream), query_type=qtype,
-            relevant_updates=updates, candidate_baseline_pct=baseline,
-            progression_group=family, heldout_words=held, ood=bool(ood), **extra,
+            track="developmental",
+            sequence_length=len(stream),
+            query_type=qtype,
+            relevant_updates=updates,
+            candidate_baseline_pct=baseline,
+            progression_group=family,
+            heldout_words=held,
+            ood=bool(ood),
+            **extra,
         ),
     )
 
@@ -103,8 +132,16 @@ def generate(difficulty: dict, rng: random.Random, *, ood: bool = False) -> Task
         loc = [rng.randrange(LOCATION_COUNT) for _ in range(m)]
         init = list(loc)
         for o in range(m):
-            stream += [EV_INIT, entity_token(_LOC + o), location_token(loc[o]), SEP,
-                       EV_INIT, entity_token(_INIT + o), location_token(loc[o]), SEP]
+            stream += [
+                EV_INIT,
+                entity_token(_LOC + o),
+                location_token(loc[o]),
+                SEP,
+                EV_INIT,
+                entity_token(_INIT + o),
+                location_token(loc[o]),
+                SEP,
+            ]
         moves = rng.randint(1, scenes)
         for _ in range(moves):
             o = rng.randrange(m)
@@ -113,8 +150,14 @@ def generate(difficulty: dict, rng: random.Random, *, ood: bool = False) -> Task
         q, kind = rng.randrange(m), rng.randrange(2)
         stream += [QUERY, entity_token(q), scalar_token(kind), SEP]
         return _episode(
-            stream, (location_token((init if kind else loc)[q]), EOS), family,
-            f"{family}_{'before' if kind else 'now'}", 100.0 / LOCATION_COUNT, False, ood, moves,
+            stream,
+            (location_token((init if kind else loc)[q]), EOS),
+            family,
+            f"{family}_{'before' if kind else 'now'}",
+            100.0 / LOCATION_COUNT,
+            False,
+            ood,
+            moves,
             workspace_output_keys=((_INIT if kind else _LOC) + q, -1),
         )
 
@@ -125,8 +168,16 @@ def generate(difficulty: dict, rng: random.Random, *, ood: bool = False) -> Task
         loc = [rng.randrange(LOCATION_COUNT) for _ in range(m)]
         init = list(loc)
         for i in range(m):
-            stream += [EV_INIT, entity_token(_LOC + i), location_token(loc[i]), SEP,
-                       EV_INIT, entity_token(_INIT + i), location_token(loc[i]), SEP]
+            stream += [
+                EV_INIT,
+                entity_token(_LOC + i),
+                location_token(loc[i]),
+                SEP,
+                EV_INIT,
+                entity_token(_INIT + i),
+                location_token(loc[i]),
+                SEP,
+            ]
         moves = rng.randint(1, scenes)
         for _ in range(moves):
             i = rng.randrange(m)
@@ -135,8 +186,14 @@ def generate(difficulty: dict, rng: random.Random, *, ood: bool = False) -> Task
         q, back = rng.randrange(m), rng.randrange(2)
         stream += [QUERY, fact_token(W[q]), fact_token(W[_REL + back]), SEP]
         return _episode(
-            stream, (location_token((init if back else loc)[q]), EOS), family,
-            f"{family}_{'back' if back else 'go'}", 100.0 / LOCATION_COUNT, held, ood, moves,
+            stream,
+            (location_token((init if back else loc)[q]), EOS),
+            family,
+            f"{family}_{'back' if back else 'go'}",
+            100.0 / LOCATION_COUNT,
+            held,
+            ood,
+            moves,
             workspace_query_reads=tuple((len(stream) - 1, c, fact_token(w)) for c, w in W.items()),
         )
 
@@ -157,7 +214,11 @@ def generate(difficulty: dict, rng: random.Random, *, ood: bool = False) -> Task
     else:
         mode = "direct" if family == "d6_compose" else "ambiguous"
     W, spare = _lexicon(rng, keys, held)
-    R = _cross(rng, stream, groups, W, scenes) if mode == "ambiguous" else _teach(rng, stream, mode, W, noise)
+    R = (
+        _cross(rng, stream, groups, W, scenes)
+        if mode == "ambiguous"
+        else _teach(rng, stream, mode, W, noise)
+    )
 
     if family == "d6_compose":
         pairs = [(s, r) for s in objs for r in rels]
@@ -170,7 +231,12 @@ def generate(difficulty: dict, rng: random.Random, *, ood: bool = False) -> Task
             stream += [EV_FACT, entity_token(s), entity_token(r), entity_token(facts[(s, r)]), SEP]
         s, r = rng.choice(picks)
         stream += [QUERY, fact_token(W[s]), fact_token(W[r]), SEP]
-        answer, direction, extra, baseline = (entity_token(facts[(s, r)]), EOS), "compose", {}, 100.0 / len(objs)
+        answer, direction, extra, baseline = (
+            (entity_token(facts[(s, r)]), EOS),
+            "compose",
+            {},
+            100.0 / len(objs),
+        )
     else:
         withheld = rng.random() < 0.15  # queried word never taught -> NONE
         qk = rng.choice(list(R))
@@ -182,12 +248,26 @@ def generate(difficulty: dict, rng: random.Random, *, ood: bool = False) -> Task
             stream += [QUERY, fact_token(spare if withheld else R[qk]), SEP]
             answer = (NONE_TOKEN if withheld else entity_token(qk), EOS)
             direction, baseline = ("none" if withheld else "w2c"), 100.0 / (len(R) + 1)
-            extra = {"workspace_output_programs": (
-                (0, "argmatch", tuple(R), tuple(fact_token(w) for w in R.values())),)}
+            extra = {
+                "workspace_output_programs": (
+                    (0, "argmatch", tuple(R), tuple(fact_token(w) for w in R.values())),
+                )
+            }
     # Auxiliary slot supervision (training loss only): each resolved concept slot decodes its word.
-    extra["workspace_query_reads"] = tuple((len(stream) - 1, k, fact_token(w)) for k, w in R.items())
+    extra["workspace_query_reads"] = tuple(
+        (len(stream) - 1, k, fact_token(w)) for k, w in R.items()
+    )
     extra["lexicon"] = tuple((k, fact_token(w)) for k, w in R.items())
     return _episode(
-        stream, answer, family, f"{family}_{mode}_{direction}_{'heldout' if held else 'train'}",
-        baseline, held, ood, len(R), teacher=mode, resolved_count=len(R), **extra,
+        stream,
+        answer,
+        family,
+        f"{family}_{mode}_{direction}_{'heldout' if held else 'train'}",
+        baseline,
+        held,
+        ood,
+        len(R),
+        teacher=mode,
+        resolved_count=len(R),
+        **extra,
     )

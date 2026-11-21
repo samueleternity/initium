@@ -678,9 +678,7 @@ class MambaBackboneParallel(nn.Module):
             # temporal-shuffle controls must not move signal into query,
             # answer, or right-padding positions.
             gate_signal = gate_signal.masked_fill(~stream_mask, 0.0)
-            h = self._run_block(
-                self.blocks[1], first_features, prediction_error=gate_signal
-            )
+            h = self._run_block(self.blocks[1], first_features, prediction_error=gate_signal)
         else:
             h = self._run_block(self.blocks[1], first_features)
         h = self.normalize_output(h)

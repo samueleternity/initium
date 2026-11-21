@@ -11,9 +11,9 @@ from __future__ import annotations
 import random
 
 from initium.data.workspace_capability.episode import (
-    BOS,
     BOOL_FALSE,
     BOOL_TRUE,
+    BOS,
     EOS,
     EV_INIT,
     EV_UPDATE,
@@ -36,12 +36,8 @@ def generate(difficulty: dict, rng: random.Random, *, ood: bool = False) -> Task
     # uninformative; at maximum strength, present and absent trials are still
     # noisy rather than deterministic.
     signal_probability = 0.5 + 0.05 * strength
-    evidence_probability = (
-        signal_probability if target_present else 1.0 - signal_probability
-    )
-    observations = tuple(
-        int(rng.random() < evidence_probability) for _ in range(sample_count)
-    )
+    evidence_probability = signal_probability if target_present else 1.0 - signal_probability
+    observations = tuple(int(rng.random() < evidence_probability) for _ in range(sample_count))
 
     stream = [BOS]
     for index, observation in enumerate(observations):

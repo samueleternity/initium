@@ -26,7 +26,7 @@ AMP_INIT_SCALE = 128.0  # GradScaler start scale (default 65536 wasted ~14k step
 
 # ---- Model size -------------------------------------------------------------
 MODEL_HIDDEN_SIZE = 512
-MODEL_NR_CELLS = 256  # link matrix is O(N^2) in memory, so left unchanged
+MODEL_NR_CELLS = 256
 MODEL_CELL_SIZE = 192
 MODEL_READ_HEADS = 8
 

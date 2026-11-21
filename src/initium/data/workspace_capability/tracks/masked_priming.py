@@ -35,25 +35,20 @@ def generate(difficulty: dict, rng: random.Random, *, ood: bool = False) -> Task
     # information. The encoded observation, rather than the latent prime, is
     # available to the model and to the auxiliary workspace trace probe.
     prime_accuracy = 0.68 if masked else 0.96
-    observed_prime = (
-        latent_prime
-        if rng.random() < prime_accuracy
-        else 1 - latent_prime
-    )
+    observed_prime = latent_prime if rng.random() < prime_accuracy else 1 - latent_prime
 
     target_strength = rng.randrange(3)
     target_accuracy = (0.62, 0.76, 0.90)[target_strength]
     evidence_count = 5
     observations = tuple(
-        target if rng.random() < target_accuracy else 1 - target
-        for _ in range(evidence_count)
+        target if rng.random() < target_accuracy else 1 - target for _ in range(evidence_count)
     )
 
     stream = [BOS]
     stream.extend(
         (
             EV_NOISE if masked else EV_INIT,
-            *( () if masked else (entity_token(0),) ),
+            *(() if masked else (entity_token(0),)),
             scalar_token(observed_prime),
             SEP,
             EV_NOISE,

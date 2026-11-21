@@ -11,10 +11,7 @@ VOCAB_ID = "cstr/grundwortschatz-voc-en"
 CONCEPTNET_ID = "relbert/conceptnet"
 OUT = Path("src/initium/data/workspace_capability/stage3")
 
-RELATIONS = (
-    "IsA", "HasProperty", "AtLocation", "CapableOf",
-    "UsedFor", "HasA", "Causes"
-)
+RELATIONS = ("IsA", "HasProperty", "AtLocation", "CapableOf", "UsedFor", "HasA", "Causes")
 
 errors = []
 warnings = []
@@ -51,11 +48,7 @@ def normalize_relation(value):
     value = str(value).lower().replace("/r/", "")
     value = re.sub(r"[^a-z]", "", value)
 
-    return next(
-        (i for i, relation in enumerate(RELATIONS)
-         if relation.lower() == value),
-        None
-    )
+    return next((i for i, relation in enumerate(RELATIONS) if relation.lower() == value), None)
 
 
 def load_vocab():
@@ -82,33 +75,21 @@ def load_conceptnet():
         )
 
         with open(path, encoding="utf-8") as f:
-            rows.extend(
-                json.loads(line)
-                for line in f
-                if line.strip()
-            )
+            rows.extend(json.loads(line) for line in f if line.strip())
 
     return rows
 
 
 def clean_triples(triples):
     # Same cleaning logic as the builder.
-    result = {
-        (h, r, t)
-        for h, r, t in triples
-        if (t, r, h) not in triples
-    }
+    result = {(h, r, t) for h, r, t in triples if (t, r, h) not in triples}
 
     by_pair = collections.defaultdict(set)
 
     for h, r, t in result:
         by_pair[(h, t)].add(r)
 
-    return {
-        (h, r, t)
-        for h, r, t in result
-        if len(by_pair[(h, t)]) == 1
-    }
+    return {(h, r, t) for h, r, t in result if len(by_pair[(h, t)]) == 1}
 
 
 def audit_vocab():
@@ -139,30 +120,19 @@ def audit_vocab():
 
         if raw_frequency:
             try:
-                json.loads(raw_frequency) if isinstance(
-                    raw_frequency, str
-                ) else raw_frequency
+                json.loads(raw_frequency) if isinstance(raw_frequency, str) else raw_frequency
             except (ValueError, TypeError):
                 malformed_frequency += 1
 
     check(len(rows) > 0, f"Loaded {len(rows):,} vocabulary rows")
     check(len(words) > 0, f"{len(words):,} usable unique lemmas")
     check(missing_pos == 0, f"Missing POS fields: {missing_pos}")
-    check(
-        missing_frequency == 0,
-        f"Missing frequency/grade fields: {missing_frequency}"
-    )
-    check(
-        malformed_frequency == 0,
-        f"Malformed frequency JSON: {malformed_frequency}"
-    )
+    check(missing_frequency == 0, f"Missing frequency/grade fields: {missing_frequency}")
+    check(malformed_frequency == 0, f"Malformed frequency JSON: {malformed_frequency}")
 
     print("  POS distribution:")
 
-    print(dict(collections.Counter(
-        str(row.get("word_type"))
-        for row in words.values()
-    )))
+    print(dict(collections.Counter(str(row.get("word_type")) for row in words.values())))
 
     return words
 
@@ -174,6 +144,7 @@ def audit_wordnet(words):
 
     try:
         from nltk.corpus import wordnet as wn
+
         wn.synsets("dog")
     except LookupError:
         nltk.download("wordnet", quiet=True)
@@ -206,10 +177,7 @@ def audit_wordnet(words):
     coverage = covered / max(len(words), 1)
 
     check(covered > 0, f"WordNet covers {covered:,}/{len(words):,} words")
-    check(
-        coverage >= 0.70,
-        f"WordNet coverage >= 70% ({coverage:.1%})"
-    )
+    check(coverage >= 0.70, f"WordNet coverage >= 70% ({coverage:.1%})")
     check(total_senses > covered, f"Multiple senses available: {total_senses:,}")
     check(bool(lexnames), f"Semantic lexnames available: {len(lexnames)}")
 
@@ -253,28 +221,17 @@ def audit_conceptnet(vocab):
 
     cleaned = clean_triples(triples)
 
-    in_vocab = {
-        triple for triple in cleaned
-        if triple[0] in vocab and triple[2] in vocab
-    }
+    in_vocab = {triple for triple in cleaned if triple[0] in vocab and triple[2] in vocab}
 
-    relation_counts = collections.Counter(
-        relation for _, relation, _ in in_vocab
-    )
+    relation_counts = collections.Counter(relation for _, relation, _ in in_vocab)
 
     check(len(rows) > 0, f"Loaded {len(rows):,} ConceptNet rows")
     check(len(triples) > 0, f"Valid normalized triples: {len(triples):,}")
     check(len(cleaned) > 0, f"Triples after cleaning: {len(cleaned):,}")
-    check(
-        len(in_vocab) > 0,
-        f"Triples with both endpoints in vocabulary: {len(in_vocab):,}"
-    )
+    check(len(in_vocab) > 0, f"Triples with both endpoints in vocabulary: {len(in_vocab):,}")
 
     for i, relation in enumerate(RELATIONS):
-        check(
-            relation_counts[i] > 0,
-            f"{relation}: {relation_counts[i]:,} in-vocabulary triples"
-        )
+        check(relation_counts[i] > 0, f"{relation}: {relation_counts[i]:,} in-vocabulary triples")
 
     print(f"  Invalid endpoints/self-loops: {invalid:,}")
     print(f"  Unsupported relations: {unsupported:,}")
@@ -295,10 +252,7 @@ def audit_generated(vocab, wn, source_triples):
     ]
 
     for filename in required:
-        check(
-            (OUT / filename).is_file(),
-            f"{filename} exists"
-        )
+        check((OUT / filename).is_file(), f"{filename} exists")
 
     if not all((OUT / f).is_file() for f in required):
         return
@@ -318,10 +272,7 @@ def audit_generated(vocab, wn, source_triples):
         actual = hashlib.sha256((OUT / filename).read_bytes()).hexdigest()
         check(actual == expected, f"SHA-256: {filename}")
 
-    check(
-        manifest.get("sources", {}).get("wordnet") == "nltk",
-        "Manifest records NLTK WordNet"
-    )
+    check(manifest.get("sources", {}).get("wordnet") == "nltk", "Manifest records NLTK WordNet")
 
     entries = {entry["idx"]: entry for entry in lexicon}
     words = [entry for entry in lexicon if entry["kind"] == "content"]
@@ -330,39 +281,22 @@ def audit_generated(vocab, wn, source_triples):
     a_words = {e["word"] for e in words if e["band"] == "A"}
     b_words = {e["word"] for e in words if e["band"] == "B"}
 
-    check(
-        len(entries) == len(lexicon),
-        "Lexicon indices are unique"
-    )
-    check(
-        len({e["word"] for e in lexicon}) == len(lexicon),
-        "Lexicon words are unique"
-    )
-    check(
-        len(relation_entries) == 7,
-        f"Seven relation tokens: {len(relation_entries)}"
-    )
+    check(len(entries) == len(lexicon), "Lexicon indices are unique")
+    check(len({e["word"] for e in lexicon}) == len(lexicon), "Lexicon words are unique")
+    check(len(relation_entries) == 7, f"Seven relation tokens: {len(relation_entries)}")
     check(
         {e["word"] for e in relation_entries} == set(RELATIONS),
-        "All expected relation tokens are present"
+        "All expected relation tokens are present",
     )
     check(
-        len(a_words) == 57 and len(b_words) == 57,
-        f"Band sizes: A={len(a_words)}, B={len(b_words)}"
+        len(a_words) == 57 and len(b_words) == 57, f"Band sizes: A={len(a_words)}, B={len(b_words)}"
     )
-    check(
-        not (a_words & b_words),
-        "Bands A and B are disjoint"
-    )
-    check(
-        all(w in vocab for w in a_words | b_words),
-        "Every generated word exists in vocabulary"
-    )
+    check(not (a_words & b_words), "Bands A and B are disjoint")
+    check(all(w in vocab for w in a_words | b_words), "Every generated word exists in vocabulary")
 
     # Check both directions of the word/index mapping.
     mapping_ok = all(
-        idx_to_word.get(str(idx)) == word
-        and word_to_idx.get(word) == idx
+        idx_to_word.get(str(idx)) == word and word_to_idx.get(word) == idx
         for word, idx in word_to_idx.items()
     )
 
@@ -370,8 +304,7 @@ def audit_generated(vocab, wn, source_triples):
 
     # Check POS and senses.
     check(
-        all(e.get("pos") in ("n", "v", "a", "r") for e in words),
-        "All content words have valid POS"
+        all(e.get("pos") in ("n", "v", "a", "r") for e in words), "All content words have valid POS"
     )
 
     polysemous = 0
@@ -390,9 +323,7 @@ def audit_generated(vocab, wn, source_triples):
             polysemous += 1
 
         entry = entries[int(idx)]
-        actual_lexnames = {
-            s.lexname() for s in wn.synsets(entry["word"])
-        }
+        actual_lexnames = {s.lexname() for s in wn.synsets(entry["word"])}
 
         for sense in word_senses:
             if sense["lexname"] not in actual_lexnames:
@@ -409,18 +340,13 @@ def audit_generated(vocab, wn, source_triples):
                     sense_errors += 1
 
     check(sense_errors == 0, f"Sense consistency errors: {sense_errors}")
-    check(
-        polysemous == manifest.get("polysemous_words"),
-        f"Polysemy count: {polysemous}"
-    )
+    check(polysemous == manifest.get("polysemous_words"), f"Polysemy count: {polysemous}")
 
     # Check graph structure and source provenance.
     graph_errors = 0
     graph_triples = set()
 
     for band in ("A", "B"):
-        band_words = a_words if band == "A" else b_words
-
         for triple in graph.get(band, []):
             if len(triple) != 3:
                 graph_errors += 1
@@ -445,10 +371,7 @@ def audit_generated(vocab, wn, source_triples):
             graph_triples.add((head["word"], r, tail["word"]))
 
     check(graph_errors == 0, f"Graph consistency errors: {graph_errors}")
-    check(
-        len(graph_triples) == sum(len(graph[b]) for b in ("A", "B")),
-        "Graph triples are unique"
-    )
+    check(len(graph_triples) == sum(len(graph[b]) for b in ("A", "B")), "Graph triples are unique")
 
     # Compare generated band statistics with manifest.
     for band in ("A", "B"):
@@ -457,7 +380,7 @@ def audit_generated(vocab, wn, source_triples):
 
         check(
             actual == expected.get("triples"),
-            f"Band {band} triple count matches manifest ({actual})"
+            f"Band {band} triple count matches manifest ({actual})",
         )
 
 

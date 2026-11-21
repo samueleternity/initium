@@ -6,8 +6,8 @@ import random
 
 from initium.data.workspace_capability.episode import (
     BOS,
-    EV_NOISE,
     EOS,
+    EV_NOISE,
     QUERY,
     SCALAR_COUNT,
     SEP,
@@ -84,7 +84,7 @@ def generate(difficulty: dict, rng: random.Random, *, ood: bool = False) -> Task
 
     # T2 lag is measured in RSVP frames; each intervening frame is an ordinary
     # distractor, including at lag > 1.
-    for gap_index in range(lag - 1):
+    for _gap_index in range(lag - 1):
         color, shape = _distractor(
             rng,
             target_color=target_color,

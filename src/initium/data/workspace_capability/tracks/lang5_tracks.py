@@ -9,20 +9,45 @@ from __future__ import annotations
 from contextlib import contextmanager
 
 from initium.data.workspace_capability.episode import (
-    MARK_O, MARK_R, SEP, SPK_SYS, SPK_USER, TASK_QA, TEXT_BASE, TURN_END,
-    entity_token, location_token, relation_token,
+    MARK_R,
+    SEP,
+    SPK_SYS,
+    SPK_USER,
+    TASK_QA,
+    TEXT_BASE,
+    TURN_END,
+    entity_token,
+    location_token,
+    relation_token,
 )
 from initium.data.workspace_capability.tracks import _lang_grammar as lg
 from initium.data.workspace_capability.tracks import _lang_text as lt
-from initium.data.workspace_capability.tracks.lang_tracks import _canon_say, _rows, _split, _toks, _world
+from initium.data.workspace_capability.tracks.lang_tracks import (
+    _canon_say,
+    _rows,
+    _split,
+    _toks,
+    _world,
+)
 
 TASK_MR, TASK_S2MR, TASK_MR2S, TASK_LOGIC, TASK_NLU, NEG_TOK, PLU_TOK = range(351, 358)
-KEYS_D, PSEUDO, REL_ALL, REL_NO = 48, 100_000, 14, 15  # keys 0-47 discourse; 48-79 S; 80-111 O; 112-127 R
-REL_SOME, REL_IF, SOME_TOK, IF_TOK = 16, 17, 358, 359  # relation ids 0-15 are full; extras map to spare control tokens
+KEYS_D, PSEUDO, REL_ALL, REL_NO = (
+    48,
+    100_000,
+    14,
+    15,
+)  # keys 0-47 discourse; 48-79 S; 80-111 O; 112-127 R
+REL_SOME, REL_IF, SOME_TOK, IF_TOK = (
+    16,
+    17,
+    358,
+    359,
+)  # relation ids 0-15 are full; extras map to spare control tokens
 
 
 def _rel_tok(v):
     return relation_token(v) if v < 16 else (SOME_TOK, IF_TOK)[v - 16]
+
 
 FEM = frozenset(("mary", "sandra", "emma"))
 _NUM = ("zero", "one", "two", "three", "four", "five")
@@ -44,7 +69,14 @@ class Ep5(lg.Ep):
 
     def fork(self, marker):
         n = Ep5(marker, self.ann)
-        n.ent, n.last, n.clock, n.cl, n.nc, n.evict = self.ent, self.last, self.clock, self.cl, self.nc, self.evict
+        n.ent, n.last, n.clock, n.cl, n.nc, n.evict = (
+            self.ent,
+            self.last,
+            self.clock,
+            self.cl,
+            self.nc,
+            self.evict,
+        )
         n.closed, n.evc = self.closed, self.evc
         n.match_writes = self.match_writes
         return n
@@ -79,8 +111,13 @@ class Ep5(lg.Ep):
         p = len(self.t)
         self.t.extend((lg.MARK_S, lg.MARK_R, lg.MARK_O))
         self.addr.extend(((p, 48 + i, True), (p + 1, 112 + i, True), (p + 2, 80 + i, True)))
-        self.evw.extend(((p, 48 + i, self.piece(s)), (p + 1, 112 + i, _rel_tok(r + 7 * neg)),
-                         (p + 2, 80 + i, self.piece(o))))
+        self.evw.extend(
+            (
+                (p, 48 + i, self.piece(s)),
+                (p + 1, 112 + i, _rel_tok(r + 7 * neg)),
+                (p + 2, 80 + i, self.piece(o)),
+            )
+        )
         if len(self.cl) < 16:
             self.cl.append((s, r, o))
         else:
@@ -93,7 +130,13 @@ class Ep5(lg.Ep):
         for i in range(len(self.cl) - 1, -1, -1):
             if self.cl[i] == (s, r, o):
                 st = len(self.t) - 1
-                self.rd.extend(((st, 48 + i, self.piece(s)), (st, 112 + i, relation_token(r)), (st, 80 + i, self.piece(o))))
+                self.rd.extend(
+                    (
+                        (st, 48 + i, self.piece(s)),
+                        (st, 112 + i, relation_token(r)),
+                        (st, 80 + i, self.piece(o)),
+                    )
+                )
                 return
 
     def text(self, ws, *, ctx=True):
@@ -223,9 +266,7 @@ class Ep5(lg.Ep):
             meta.setdefault("workspace_match_writes", tuple(self.match_writes))
         if track in ("lang_parse", "lang_define", "lang_logic", "lang_induce", "lang_act"):
             function_pieces = {
-                token
-                for word in (*lg.FUNCTION, *lg.PUNCT)
-                for token in self.tk.word(word)
+                token for word in (*lg.FUNCTION, *lg.PUNCT) for token in self.tk.word(word)
             }
             source_by_token: dict[int, int] = {}
             for position, token in enumerate(self.t):
@@ -240,13 +281,24 @@ class Ep5(lg.Ep):
                     for token in answer
                 ),
             )
-        return super().done(track, answer, qtype, group, kind, evictions=self.evict, closed_evictions=self.evc, **meta)
+        return super().done(
+            track,
+            answer,
+            qtype,
+            group,
+            kind,
+            evictions=self.evict,
+            closed_evictions=self.evc,
+            **meta,
+        )
 
 
 def pseudo(rng, n):
     G, out = lg.grammar(), []
     while len(out) < n:
-        w = "".join(rng.choice("bdfgklmnprstvz") + rng.choice("aeiou") for _ in range(rng.randint(2, 3)))
+        w = "".join(
+            rng.choice("bdfgklmnprstvz") + rng.choice("aeiou") for _ in range(rng.randint(2, 3))
+        )
         w += rng.choice(("", "n", "r", "l", "m"))
         if w not in out and w not in G.surf and w not in lg.FUNCTION:
             out.append(w)
@@ -265,7 +317,12 @@ def _pseudo_nouns(G, words):
         yield ids
     finally:
         for j, w in zip(ids, words):
-            G.word.pop(j, None), G.pos.pop(j, None), G.surf.pop(w, None), G.surf.pop(lg.plural(w), None)
+            (
+                G.word.pop(j, None),
+                G.pos.pop(j, None),
+                G.surf.pop(w, None),
+                G.surf.pop(lg.plural(w), None),
+            )
 
 
 # ---------------------------------------------------------------- 5a parse
@@ -285,7 +342,12 @@ def _g_parse(cfg, rng):
     sents = [G.say(f, G.row_for(f, cfg, rng), neg) for f, neg in items]
     out, i = [], 0
     while i < len(sents):
-        if grp in ("parse_conj", "parse_ctx") and cfg["conj"] and i + 1 < len(sents) and rng.random() < 0.5:
+        if (
+            grp in ("parse_conj", "parse_ctx")
+            and cfg["conj"]
+            and i + 1 < len(sents)
+            and rng.random() < 0.5
+        ):
             out.append(sents[i][:-1] + [sents[i][-1].rstrip(".")] + ["and"] + sents[i + 1])
             i += 2
         else:
@@ -295,9 +357,21 @@ def _g_parse(cfg, rng):
     for ws in out:
         ep.text(ws)
     ep.ctl(TASK_MR)
-    ans = [t for (h, r, o), neg in items for t in (ep.piece(h), relation_token(r + 7 * neg), ep.piece(o))]
-    return ep.done("lang_parse", ans, grp, grp, kind="mr", grammar_checked=True,
-                   counterfactual=w["cf"], heldout_words=w["heldout"])
+    ans = [
+        t
+        for (h, r, o), neg in items
+        for t in (ep.piece(h), relation_token(r + 7 * neg), ep.piece(o))
+    ]
+    return ep.done(
+        "lang_parse",
+        ans,
+        grp,
+        grp,
+        kind="mr",
+        grammar_checked=True,
+        counterfactual=w["cf"],
+        heldout_words=w["heldout"],
+    )
 
 
 # ---------------------------------------------------------------- 5b define
@@ -414,16 +488,33 @@ def _g_induce(cfg, rng):
         parts = {"s": S, "v": Vb, "o": [N[o]]}
         ws = [x for ch in _ORD[order] for x in parts[ch]]
         ws[-1] += "."
-        mr = [entity_token(s), relation_token(v), entity_token(o)] + ([NEG_TOK] if neg else []) + ([PLU_TOK] if plu else [])
+        mr = (
+            [entity_token(s), relation_token(v), entity_token(o)]
+            + ([NEG_TOK] if neg else [])
+            + ([PLU_TOK] if plu else [])
+        )
         return ws, mr
 
     perm, ex = rng.sample(range(n), n), []
     for i in range(cfg["examples"]):
-        ex.append((perm[i % n], i % 3, rng.randrange(n), na and (i == 0 or rng.random() < 0.35),
-                   pa and (i == 1 or rng.random() < 0.35)))
+        ex.append(
+            (
+                perm[i % n],
+                i % 3,
+                rng.randrange(n),
+                na and (i == 0 or rng.random() < 0.35),
+                pa and (i == 1 or rng.random() < 0.35),
+            )
+        )
     seen_s, seen_v, seen_o = (sorted({e[j] for e in ex}) for j in (0, 1, 2))
     for _ in range(16):
-        q = (rng.choice(seen_s), rng.choice(seen_v), rng.choice(seen_o), na and rng.random() < 0.5, pa and rng.random() < 0.5)
+        q = (
+            rng.choice(seen_s),
+            rng.choice(seen_v),
+            rng.choice(seen_o),
+            na and rng.random() < 0.5,
+            pa and rng.random() < 0.5,
+        )
         if q not in ex:
             break
     ep = Ep5(8)
@@ -452,8 +543,14 @@ def _g_induce(cfg, rng):
         ans, kind = _toks(ws), "text"
         output_keys = ep.output_keys(ws, surface_output_key)
     return ep.done(
-        "lang_induce", ans, f"{grp}_c{c}", grp, kind=kind, heldout_combo=held,
-        grammar_checked=False, workspace_output_keys=output_keys,
+        "lang_induce",
+        ans,
+        f"{grp}_c{c}",
+        grp,
+        kind=kind,
+        heldout_combo=held,
+        grammar_checked=False,
+        workspace_output_keys=output_keys,
         workspace_output_kv_targets=tuple(ans),
     )
 
@@ -463,6 +560,8 @@ def _join(parts):
     out = [w for i, p in enumerate(parts) for w in (p + (["and"] if i < len(parts) - 1 else []))]
     out[-1] += "."
     return out
+
+
 def _g_logic(cfg, rng):
     grp, d = lt.sample_group(cfg, rng), max(1, int(cfg["depth"]))
     C, pl, art = pseudo(rng, d + 3), lg.plural, lg.art
@@ -490,7 +589,9 @@ def _g_logic(cfg, rng):
         prem = [inst(n, C[0]) for n in ns]
         q, ans = ["how", "many", pl(C[0]), "are", "there?"], [_NUM[len(ns)] + "."]
     elif grp == "l_some":
-        if rng.random() < 0.5:  # existential chain: some A are B, all B are C ... -> some A are tail
+        if (
+            rng.random() < 0.5
+        ):  # existential chain: some A are B, all B are C ... -> some A are tail
             prem = [(["some", pl(C[0]), "are", pl(C[1]) + "."], (C[0], REL_SOME, C[1]))]
             cite = [["some", pl(C[0]), "are", pl(C[1])]]
             for i in range(1, d):
@@ -499,10 +600,16 @@ def _g_logic(cfg, rng):
                 derived.append((C[0], REL_SOME, C[i + 1]))
             q, ans = ["are", "some", pl(C[0]), pl(C[d]) + "?"], ["yes,"] + _join(cite)
         else:  # 'some' licenses nothing about an individual
-            prem = [inst(x, C[0]), (["some", pl(C[0]), "are", pl(C[1]) + "."], (C[0], REL_SOME, C[1]))]
+            prem = [
+                inst(x, C[0]),
+                (["some", pl(C[0]), "are", pl(C[1]) + "."], (C[0], REL_SOME, C[1])),
+            ]
             q, ans = ["is", x, art(C[1]), C[1] + "?"], ["i", "do", "not", "know."]
     elif grp == "l_cond":
-        cite = [["if", x, "is", art(C[i]), C[i], "then", x, "is", art(C[i + 1]), C[i + 1]] for i in range(d)]
+        cite = [
+            ["if", x, "is", art(C[i]), C[i], "then", x, "is", art(C[i + 1]), C[i + 1]]
+            for i in range(d)
+        ]
         prem = [(c_[:-1] + [c_[-1] + "."], (C[i], REL_IF, C[i + 1])) for i, c_ in enumerate(cite)]
         if rng.random() < 0.7:  # modus ponens chain
             prem.append(inst(x, C[0]))
@@ -528,7 +635,9 @@ def _g_logic(cfg, rng):
             ans, derived = ["i", "do", "not", "know."], []
         else:
             ans = ["yes," if grp == "l_chain" else "no,"] + [
-                w for i, c_ in enumerate(cite) for w in (c_ + (["and"] if i < len(cite) - 1 else []))
+                w
+                for i, c_ in enumerate(cite)
+                for w in (c_ + (["and"] if i < len(cite) - 1 else []))
             ]
             ans[-1] += "."
     others = [n for n in lg.NAMES if n != x]
@@ -541,7 +650,9 @@ def _g_logic(cfg, rng):
         ep._commit(*f)
     ep.ctl(TASK_LOGIC)
     ep.manual(q, surf, ctx=False)
-    for f in derived:  # derivation scaffold: placeholder tokens whose slots must hold the derived facts
+    for (
+        f
+    ) in derived:  # derivation scaffold: placeholder tokens whose slots must hold the derived facts
         ep._commit(*f)
     plural_forms = {pl(category) for category in C}
     key_by_word = {
@@ -589,13 +700,19 @@ class _W:
     def put_p(s, p):
         l = s.r.randrange(6)
         s.pl[p] = l
-        s.ep.story_ws([lg.NAMES[p], "is", "in", "the", lg.PLACES[l] + "."], [(0, ("p", p), None, False), (4, ("p", p), l, False)])
+        s.ep.story_ws(
+            [lg.NAMES[p], "is", "in", "the", lg.PLACES[l] + "."],
+            [(0, ("p", p), None, False), (4, ("p", p), l, False)],
+        )
         s.rec.append(p)
 
     def put_o(s, o):
         l = s.r.randrange(6)
         s.ol[o] = l
-        s.ep.story_ws(["the", lg.OBJS[o], "is", "in", "the", lg.PLACES[l] + "."], [(1, ("o", o), None, False), (5, ("o", o), l, False)])
+        s.ep.story_ws(
+            ["the", lg.OBJS[o], "is", "in", "the", lg.PLACES[l] + "."],
+            [(1, ("o", o), None, False), (5, ("o", o), l, False)],
+        )
 
     def relocate(s, p, l):
         s.pl[p] = l
@@ -654,7 +771,11 @@ class _W:
 
     def carry(s, p):
         hs = [o for o, hp in s.held.items() if hp == p]
-        return [lg.NAMES[p], "is", "carrying", "the", lg.OBJS[hs[0]] + "."] if hs else [lg.NAMES[p], "is", "carrying", "nothing."]
+        return (
+            [lg.NAMES[p], "is", "carrying", "the", lg.OBJS[hs[0]] + "."]
+            if hs
+            else [lg.NAMES[p], "is", "carrying", "nothing."]
+        )
 
 
 def _g_discourse(cfg, rng):
@@ -681,17 +802,33 @@ def _g_discourse(cfg, rng):
         rd = [(("p", p), location_token(w.pl[p]))]
         cd = -1
         if kind == "d_retell":
-            q, ments, ans = ["tell", "me", "about", lg.NAMES[p] + "."], [(3, ("p", p), None, False)], w.where_p(p) + w.carry(p)
+            q, ments, ans = (
+                ["tell", "me", "about", lg.NAMES[p] + "."],
+                [(3, ("p", p), None, False)],
+                w.where_p(p) + w.carry(p),
+            )
         elif kind in ("d_pron", "d_dist"):
             word, pr = w.ref(p, True)
-            cd = next((i for i, q_ in enumerate(reversed(w.rec)) if q_ == p), len(w.rec)) if pr else -1
+            cd = (
+                next((i for i, q_ in enumerate(reversed(w.rec)) if q_ == p), len(w.rec))
+                if pr
+                else -1
+            )
             q, ments, ans = ["where", "is", word + "?"], [(2, ("p", p), None, pr)], w.where_p(p)
         elif rng.random() < 0.35:
             o = rng.choice(w.O)
-            q, ments, ans = ["where", "is", "the", lg.OBJS[o] + "?"], [(3, ("o", o), None, False)], w.where_o(o)
+            q, ments, ans = (
+                ["where", "is", "the", lg.OBJS[o] + "?"],
+                [(3, ("o", o), None, False)],
+                w.where_o(o),
+            )
             rd = [(("o", o), location_token(w.objloc(o)))]
         else:
-            q, ments, ans = ["where", "is", lg.NAMES[p] + "?"], [(2, ("p", p), None, False)], w.where_p(p)
+            q, ments, ans = (
+                ["where", "is", lg.NAMES[p] + "?"],
+                [(2, ("p", p), None, False)],
+                w.where_p(p),
+            )
         # Supervise the query-to-entity match (including pronoun resolution).
         # This does not expose the answer value; the slot read remains the
         # source of the location that must be generated.
@@ -739,17 +876,28 @@ def _act(w, act):
     if act == "a_confirm":
         yes = r.random() < 0.5
         l = w.pl[p] if yes else r.choice([x for x in range(6) if x != w.pl[p]])
-        ep.story_ws(["is", lg.NAMES[p], "in", "the", lg.PLACES[l] + "?"], [(1, ("p", p), None, False)])
-        ans = (["yes,"] + w.where_p(p)) if yes else ["no,", lg.NAMES[p], "is", "not", "in", "the", lg.PLACES[l] + "."]
+        ep.story_ws(
+            ["is", lg.NAMES[p], "in", "the", lg.PLACES[l] + "?"], [(1, ("p", p), None, False)]
+        )
+        ans = (
+            (["yes,"] + w.where_p(p))
+            if yes
+            else ["no,", lg.NAMES[p], "is", "not", "in", "the", lg.PLACES[l] + "."]
+        )
         return ans, [(("p", p), location_token(w.pl[p]))], "confirm" if yes else "deny"
     if act == "a_correct":
         l = r.choice([x for x in range(6) if x != w.pl[p]])
-        ep.story_ws(["no,", lg.NAMES[p], "is", "in", "the", lg.PLACES[l] + "."], [(1, ("p", p), None, False), (5, ("p", p), l, False)])
+        ep.story_ws(
+            ["no,", lg.NAMES[p], "is", "in", "the", lg.PLACES[l] + "."],
+            [(1, ("p", p), None, False), (5, ("p", p), l, False)],
+        )
         w.relocate(p, l)
         w.rec.append(p)
         return ["ok,"] + w.where_p(p), [(("p", p), location_token(l))], "ack_correct"
     if act == "a_social":
-        u, a = r.choice((("hello.", "hello."), ("thanks.", "you are welcome."), ("goodbye.", "goodbye.")))
+        u, a = r.choice(
+            (("hello.", "hello."), ("thanks.", "you are welcome."), ("goodbye.", "goodbye."))
+        )
         ep.story_ws([u], [])
         return a.split(), [], "social"
     if act == "a_clarify":  # two feminine persons were both just mentioned -> "she" is ambiguous
@@ -821,7 +969,11 @@ def _g_nlu(cfg, rng):
     ep.ctl(TASK_NLU)
     if grp == "triples":
         ep.text(rec["text"].split())
-        ans = [x for s, r, o in rec["triples"] for x in (*s.split(), "|", *r.split(), "|", *o.split(), ";")]
+        ans = [
+            x
+            for s, r, o in rec["triples"]
+            for x in (*s.split(), "|", *r.split(), "|", *o.split(), ";")
+        ]
     elif grp == "nli":
         ep.text(rec["premise"].split())
         ep.ctl(SEP)
@@ -836,6 +988,11 @@ def _g_nlu(cfg, rng):
 
 
 GENERATORS = {
-    "lang_parse": _g_parse, "lang_define": _g_define, "lang_induce": _g_induce, "lang_logic": _g_logic,
-    "lang_discourse": _g_discourse, "lang_act": _g_act, "lang_nlu_external": _g_nlu,
+    "lang_parse": _g_parse,
+    "lang_define": _g_define,
+    "lang_induce": _g_induce,
+    "lang_logic": _g_logic,
+    "lang_discourse": _g_discourse,
+    "lang_act": _g_act,
+    "lang_nlu_external": _g_nlu,
 }

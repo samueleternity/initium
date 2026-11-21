@@ -20,7 +20,10 @@ from initium.data.workspace_capability.episode import (
     source_token,
 )
 from initium.data.workspace_capability.tracks._shared import (
-    EXT_OP_NAMES, EXT_UNARY, common_metadata, ext_op_result,
+    EXT_OP_NAMES,
+    EXT_UNARY,
+    common_metadata,
+    ext_op_result,
 )
 
 _ASSIGN_ADD = 4
@@ -36,9 +39,7 @@ def _initial_plan(
         second_update = rng.randrange(12, 16)
         for third_update in rng.sample(range(SCALAR_COUNT), SCALAR_COUNT):
             result = (values[0] + third_update) % SCALAR_COUNT
-            if result not in {
-                *values.values(), first_update, second_update, third_update
-            }:
+            if result not in {*values.values(), first_update, second_update, third_update}:
                 return values, first_update, second_update, third_update, result
 
     # 7 + 4 = 11, absent from the 6/7 initialization values and the updates.
@@ -47,9 +48,7 @@ def _initial_plan(
 
 def generate(difficulty: dict, rng: random.Random, *, ood: bool = False) -> TaskEpisode:
     variable_count = min(max(5, int(difficulty["variables"])), 12)
-    assignment_count = min(
-        max(7, int(difficulty["assignments"])), 24 if ood else 21
-    )
+    assignment_count = min(max(7, int(difficulty["assignments"])), 24 if ood else 21)
     variable_ids = list(range(variable_count))
     values, first_update, second_update, third_update, planned_result = _initial_plan(
         rng, variable_count
@@ -71,8 +70,10 @@ def generate(difficulty: dict, rng: random.Random, *, ood: bool = False) -> Task
 
     def fresh_literal(exclude: set[int]) -> int:
         candidates = [value for value in range(SCALAR_COUNT) if value not in exclude]
-        return rng.choice(candidates) if candidates else rng.choice(
-            [value for value in range(SCALAR_COUNT) if value != planned_result]
+        return (
+            rng.choice(candidates)
+            if candidates
+            else rng.choice([value for value in range(SCALAR_COUNT) if value != planned_result])
         )
 
     literal_values.add(first_update)
@@ -133,8 +134,15 @@ def generate(difficulty: dict, rng: random.Random, *, ood: bool = False) -> Task
                 name, values[left], values[right] if right is not None else 0
             )
             stream.extend(
-                (EV_VECTOR, entity_token(destination), source_token(i // 4), source_token(i % 4),
-                 entity_token(left), *((entity_token(right),) if right is not None else ()), SEP)
+                (
+                    EV_VECTOR,
+                    entity_token(destination),
+                    source_token(i // 4),
+                    source_token(i % 4),
+                    entity_token(left),
+                    *((entity_token(right),) if right is not None else ()),
+                    SEP,
+                )
             )
             reassignments += 1
         else:

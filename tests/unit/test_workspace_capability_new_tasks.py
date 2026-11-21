@@ -24,8 +24,8 @@ from initium.data.workspace_capability.episode import (
     QUERY,
     SCALAR_BASE,
     SCALAR_COUNT,
-    SOURCE_BASE,
     SEP,
+    SOURCE_BASE,
     VOCAB_SIZE,
     location_token,
     scalar_token,
@@ -40,7 +40,6 @@ from initium.data.workspace_capability.tracks import (
     rule_switching,
     variable_binding,
 )
-
 
 NEW_GENERATORS = {
     "capacity_bottleneck": capacity_bottleneck.generate,
@@ -114,9 +113,7 @@ def test_new_task_curriculum_requires_each_task_specific_challenge_group():
         "mixed_cue_switch",
     )
     assert dataset._curriculum_groups("attentional_blink", 5) == tuple(
-        f"lag_{lag}_{condition}"
-        for lag in range(1, 9)
-        for condition in ("unmasked", "masked")
+        f"lag_{lag}_{condition}" for lag in range(1, 9) for condition in ("unmasked", "masked")
     )
     assert dataset._curriculum_groups("variable_binding", 5) == ("computed_chain_long",)
 
@@ -206,9 +203,7 @@ def test_belief_tracking_oracle_keeps_each_agents_partial_state():
 
 
 def test_mixed_skill_oracle_executes_lookup_copy_add_and_two_output_sort():
-    episode = mixed_skill.generate(
-        {"operations": 8, "keys": 10}, random.Random(91), ood=True
-    )
+    episode = mixed_skill.generate({"operations": 8, "keys": 10}, random.Random(91), ood=True)
     table, stage_values, flattened = {}, {}, []
     skill_counts = {"lookup": 0, "arithmetic": 0, "copy": 0, "sort": 0}
     for segment in _segments(episode.inputs):
@@ -255,9 +250,7 @@ def test_rule_switching_cues_feedback_and_final_selector_labels_are_consistent()
         assert episode.metadata["cue_count"] <= episode.metadata["switch_count"]
 
         final_card = next(
-            segment
-            for segment in reversed(_segments(episode.inputs))
-            if segment[0] == EV_VECTOR
+            segment for segment in reversed(_segments(episode.inputs)) if segment[0] == EV_VECTOR
         )
         final_values = tuple(value - SCALAR_BASE for value in final_card[2:5])
         rule = episode.metadata["final_rule"]
@@ -387,14 +380,10 @@ def test_new_all_collates_all_six_tracks_and_builds_causal_workspace_metadata():
     for row, episode in enumerate(episodes):
         query_step = episode.inputs.index(QUERY)
         assert not entity_metadata["entity_write_mask"][row, query_step:].any()
-        written = entity_metadata["entity_ids"][row][
-            entity_metadata["entity_write_mask"][row]
-        ]
+        written = entity_metadata["entity_ids"][row][entity_metadata["entity_write_mask"][row]]
         assert written.numel() > 0, episode.track
         assert written.ge(0).all() and written.lt(64).all()
-        active_targets = kv_metadata["key_value_targets"][row][
-            kv_metadata["key_value_mask"][row]
-        ]
+        active_targets = kv_metadata["key_value_targets"][row][kv_metadata["key_value_mask"][row]]
         assert active_targets.ge(0).all() and active_targets.lt(VOCAB_SIZE).all()
         for step, key, _value in episode.metadata.get("workspace_query_reads", ()):
             assert step == len(episode.inputs) - 1
@@ -417,9 +406,7 @@ def test_new_all_collates_all_six_tracks_and_builds_causal_workspace_metadata():
     )
     assert kv_metadata["workspace_operation_steps"]
     operation_codes = kv_metadata["workspace_operation_metadata"]
-    mixed_row = next(
-        row for row, episode in enumerate(episodes) if episode.track == "mixed_skill"
-    )
+    mixed_row = next(row for row, episode in enumerate(episodes) if episode.track == "mixed_skill")
     mixed_steps = kv_metadata["workspace_operation_steps"]
     mixed_codes = operation_codes[mixed_row, list(mixed_steps), 0]
     assert mixed_codes.eq(4).any()  # sort has two separately committed outputs.

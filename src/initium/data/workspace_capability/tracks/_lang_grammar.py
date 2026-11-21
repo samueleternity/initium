@@ -7,8 +7,17 @@ import re
 from typing import NamedTuple
 
 from initium.data.workspace_capability.episode import (
-    BOS, EOS, FACT_BASE, LANG_TRACK_BASE, MARK_O, MARK_R, MARK_S, SEP,
-    TaskEpisode, location_token, relation_token,
+    BOS,
+    EOS,
+    FACT_BASE,
+    LANG_TRACK_BASE,
+    MARK_O,
+    MARK_R,
+    MARK_S,
+    SEP,
+    TaskEpisode,
+    location_token,
+    relation_token,
 )
 from initium.data.workspace_capability.tracks import _dev_lexicon as dl
 from initium.data.workspace_capability.tracks import _lang_text as lt
@@ -49,8 +58,12 @@ def negate(b):
         return (h, "not") + b[1:]
     if h == "can":
         return ("cannot",) + b[1:]
-    return {"has": ("does", "not", "have"), "have": ("do", "not", "have"),
-            "causes": ("does", "not", "cause"), "cause": ("do", "not", "cause")}[h]
+    return {
+        "has": ("does", "not", "have"),
+        "have": ("do", "not", "have"),
+        "causes": ("does", "not", "cause"),
+        "cause": ("do", "not", "cause"),
+    }[h]
 
 
 class Row(NamedTuple):
@@ -75,17 +88,31 @@ def _r(rel, s, b, o, *, p=False, t="p", n="s", f="", alt=False, h=False):
 
 
 ROWS = (
-    _r(0, "the", "is", "a"), _r(0, "a", "is", "a", alt=True), _r(0, "pl", "are", "pl", n="p"),
-    _r(0, "the", "was", "a", t="t"), _r(0, "pl", "were", "pl", t="t", n="p"),
-    _r(1, "the", "is", "bare"), _r(1, "pl", "are", "bare", n="p"), _r(1, "the", "was", "bare", t="t"),
-    _r(2, "the", "is in", "the"), _r(2, "the", "can be found in", "the", alt=True, h=True),
-    _r(2, "pl", "are in", "the", n="p"), _r(2, "the", "was in", "the", t="t"),
-    _r(3, "the", "can", "bare"), _r(3, "pl", "can", "bare", n="p"), _r(3, "the", "could", "bare", t="t"),
-    _r(4, "the", "is used for", "the"), _r(4, "pl", "are used for", "the", n="p"),
+    _r(0, "the", "is", "a"),
+    _r(0, "a", "is", "a", alt=True),
+    _r(0, "pl", "are", "pl", n="p"),
+    _r(0, "the", "was", "a", t="t"),
+    _r(0, "pl", "were", "pl", t="t", n="p"),
+    _r(1, "the", "is", "bare"),
+    _r(1, "pl", "are", "bare", n="p"),
+    _r(1, "the", "was", "bare", t="t"),
+    _r(2, "the", "is in", "the"),
+    _r(2, "the", "can be found in", "the", alt=True, h=True),
+    _r(2, "pl", "are in", "the", n="p"),
+    _r(2, "the", "was in", "the", t="t"),
+    _r(3, "the", "can", "bare"),
+    _r(3, "pl", "can", "bare", n="p"),
+    _r(3, "the", "could", "bare", t="t"),
+    _r(4, "the", "is used for", "the"),
+    _r(4, "pl", "are used for", "the", n="p"),
     _r(4, "the", "is used to", "bare", f="v"),
-    _r(5, "the", "has", "a"), _r(5, "the", "has", "the", alt=True, h=True), _r(5, "pl", "have", "pl", n="p"),
-    _r(6, "the", "causes", "the"), _r(6, "the", "is caused by", "the", p=True, alt=True),
-    _r(6, "pl", "cause", "the", n="p"), _r(6, "the", "can cause", "the", f="m", alt=True, h=True),
+    _r(5, "the", "has", "a"),
+    _r(5, "the", "has", "the", alt=True, h=True),
+    _r(5, "pl", "have", "pl", n="p"),
+    _r(6, "the", "causes", "the"),
+    _r(6, "the", "is caused by", "the", p=True, alt=True),
+    _r(6, "pl", "cause", "the", n="p"),
+    _r(6, "the", "can cause", "the", f="m", alt=True, h=True),
 )
 _TP = {0: "n", 1: "a", 2: "n", 3: "v", 4: "nv", 5: "n", 6: "n"}
 _KIND = {"a": "a", "the": "the", "pl": "pl", "bare": None}
@@ -103,8 +130,13 @@ def row_ok(row, pt):
 
 
 def allowed(row, cfg):
-    return ((not row.held or cfg.get("templates", 0)) and (not row.alt or cfg["variety"] >= 2) and (row.num == "s" or cfg["plural"])
-            and (row.tense == "p" or cfg["past"]) and (not row.passive or cfg["passive"]))
+    return (
+        (not row.held or cfg.get("templates", 0))
+        and (not row.alt or cfg["variety"] >= 2)
+        and (row.num == "s" or cfg["plural"])
+        and (row.tense == "p" or cfg["past"])
+        and (not row.passive or cfg["passive"])
+    )
 
 
 class Grammar:
@@ -135,10 +167,14 @@ class Grammar:
                     hr[(h, r)] = good
                     fl.extend((h, r, t) for t in good)
             if not fl:
-                raise RuntimeError(f"band {b} has no verbalisable facts; rebuild the Stage 3 lexicon")
+                raise RuntimeError(
+                    f"band {b} has no verbalisable facts; rebuild the Stage 3 lexicon"
+                )
             self.facts[b], self.hr[b] = sorted(fl), hr
-            self.tails[b] = {r: [t for t in L.tails_by_rel[b].get(r, ()) if t in self.ok and self._tp(r, t)]
-                             for r in range(7)}
+            self.tails[b] = {
+                r: [t for t in L.tails_by_rel[b].get(r, ()) if t in self.ok and self._tp(r, t)]
+                for r in range(7)
+            }
 
     def _tp(self, r, t):
         p = self.pos.get(t)
@@ -165,7 +201,14 @@ class Grammar:
 
     def canon(self, r, pt):
         for row in ROWS:
-            if row.rel == r and row.tense == "p" and row.num == "s" and not row.alt and row.flag != "m" and row_ok(row, pt):
+            if (
+                row.rel == r
+                and row.tense == "p"
+                and row.num == "s"
+                and not row.alt
+                and row.flag != "m"
+                and row_ok(row, pt)
+            ):
                 return row
         raise KeyError((r, pt))
 
@@ -177,18 +220,31 @@ class Grammar:
 
     def ask_wh(self, s, r, pron=False):
         S = ["it"] if pron else self.np(s, "the")
-        q = {0: ["what", "is"] + S, 1: ["what", "is"] + S + ["like"], 2: ["where", "is"] + S,
-             3: ["what", "can"] + S + ["do"], 4: ["what", "is"] + S + ["used", "for"],
-             5: ["what", "does"] + S + ["have"], 6: ["what", "does"] + S + ["cause"]}[r]
+        q = {
+            0: ["what", "is"] + S,
+            1: ["what", "is"] + S + ["like"],
+            2: ["where", "is"] + S,
+            3: ["what", "can"] + S + ["do"],
+            4: ["what", "is"] + S + ["used", "for"],
+            5: ["what", "does"] + S + ["have"],
+            6: ["what", "does"] + S + ["cause"],
+        }[r]
         q[-1] += "?"
         return q
 
     def ask_yn(self, s, r, o, pt):
         S, w = self.np(s, "the"), self.word[o]
-        q = {0: ["is"] + S + self.np(o, "a"), 1: ["is"] + S + [w], 2: ["is"] + S + ["in"] + self.np(o, "the"),
-             3: ["can"] + S + [w],
-             4: ["is"] + S + (["used", "to", w] if pt == "v" else ["used", "for"] + self.np(o, "the")),
-             5: ["does"] + S + ["have"] + self.np(o, "a"), 6: ["does"] + S + ["cause"] + self.np(o, "the")}[r]
+        q = {
+            0: ["is"] + S + self.np(o, "a"),
+            1: ["is"] + S + [w],
+            2: ["is"] + S + ["in"] + self.np(o, "the"),
+            3: ["can"] + S + [w],
+            4: ["is"]
+            + S
+            + (["used", "to", w] if pt == "v" else ["used", "for"] + self.np(o, "the")),
+            5: ["does"] + S + ["have"] + self.np(o, "a"),
+            6: ["does"] + S + ["cause"] + self.np(o, "the"),
+        }[r]
         q[-1] += "?"
         return q
 
@@ -211,7 +267,7 @@ class Grammar:
             if len(ms) < 2:
                 continue
             m1, m2 = ms[0], ms[-1]
-            btw = tuple(toks[m1[1] + 1:m2[0]])
+            btw = tuple(toks[m1[1] + 1 : m2[0]])
             kind = m2[4] or ("pl" if m2[3] else None)
             for tab, neg in ((TAB, False), (NTAB, True)):
                 row = tab.get((btw, kind)) or tab.get((btw, "*"))
@@ -290,7 +346,7 @@ class Ep:
         st, n = sp[i]
         core = self.tk.word(ws[i].strip(PUNCT))
         k = len(core)
-        return st + (k if 0 < k <= n and tuple(self.t[st:st + k]) == core else n) - 1
+        return st + (k if 0 < k <= n and tuple(self.t[st : st + k]) == core else n) - 1
 
     def _key(self, idx, write):
         k = self.ent.get(idx)
@@ -304,7 +360,13 @@ class Ep:
         i, p = len(self.cl), len(self.t)
         self.t.extend((MARK_S, MARK_R, MARK_O))
         self.addr.extend(((p, 24 + i, True), (p + 1, 48 + i, True), (p + 2, 32 + i, True)))
-        self.evw.extend(((p, 24 + i, FACT_BASE + s), (p + 1, 48 + i, relation_token(r)), (p + 2, 32 + i, FACT_BASE + o)))
+        self.evw.extend(
+            (
+                (p, 24 + i, FACT_BASE + s),
+                (p + 1, 48 + i, relation_token(r)),
+                (p + 2, 32 + i, FACT_BASE + o),
+            )
+        )
         self.cl.append((s, r, o))
 
     def text(self, ws, *, ctx=True):
@@ -386,8 +448,15 @@ class Ep:
         for i, c in enumerate(self.cl):
             if c == (s, r, o):
                 st = len(self.t) - 1
-                self.rd.extend(((st, 24 + i, FACT_BASE + s), (st, 48 + i, relation_token(r)), (st, 32 + i, FACT_BASE + o)))
+                self.rd.extend(
+                    (
+                        (st, 24 + i, FACT_BASE + s),
+                        (st, 48 + i, relation_token(r)),
+                        (st, 32 + i, FACT_BASE + o),
+                    )
+                )
                 return
+
     def open_text(self, ws, stop):
         """Open-vocab annotator: each distinct content word (max 24) -> key, written at its last piece; target = its first piece token."""
         sp = self._enc(ws)
@@ -413,7 +482,7 @@ class Ep:
         if self.ann:
             st = len(self.t) - 1
             self.rd.extend((st, k, t) for k, t in self.__dict__.get("ot", {}).items())
-            
+
     def done(self, track, answer, qtype, group, kind="text", **meta):
         ans = tuple(answer) + (EOS,)
         if len(ans) > MAX_ANS or len(self.t) + len(ans) > MAX_T:
@@ -422,11 +491,21 @@ class Ep:
         for pos, k, w in self.addr:
             d[pos] = (k, w)
         return TaskEpisode(
-            track, tuple(self.t), ans,
+            track,
+            tuple(self.t),
+            ans,
             common_metadata(
-                track=track, sequence_length=len(self.t), query_type=qtype, relevant_updates=len(self.cl),
-                candidate_baseline_pct=1.0, progression_group=group, answer_kind=kind, answer_stride=1,
+                track=track,
+                sequence_length=len(self.t),
+                query_type=qtype,
+                relevant_updates=len(self.cl),
+                candidate_baseline_pct=1.0,
+                progression_group=group,
+                answer_kind=kind,
+                answer_stride=1,
                 lang_addr=tuple((p, k, w) for p, (k, w) in d.items()),
-                workspace_event_writes=tuple(self.evw), workspace_query_reads=tuple(self.rd), **meta,
+                workspace_event_writes=tuple(self.evw),
+                workspace_query_reads=tuple(self.rd),
+                **meta,
             ),
         )

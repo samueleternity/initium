@@ -88,7 +88,7 @@ def generate(difficulty: dict, rng: random.Random, *, ood: bool = False) -> Task
     answer = tuple(scalar_token(value) for output in outputs for value in output) + (EOS,)
     output_keys: list[int] = []
     operation_output_keys: list[int] = []
-    for stage_id, skill, stage_output in zip(stage_ids, skills, outputs):
+    for stage_id, skill, _stage_output in zip(stage_ids, skills, outputs):
         if skill == "sort":
             output_keys.extend((-1, -1))
             operation_output_keys.extend((stage_id, stage_id + 1))

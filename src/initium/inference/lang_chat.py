@@ -17,9 +17,9 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-import torch
+import torch  # noqa: E402
 
-from initium.data.workspace_capability.episode import (
+from initium.data.workspace_capability.episode import (  # noqa: E402
     ANSWER,
     BOS,
     EOS,
@@ -28,11 +28,11 @@ from initium.data.workspace_capability.episode import (
     SPK_SYS,
     SPK_USER,
     TEXT_BASE,
-)
-from initium.data.workspace_capability.tracks import _lang_text
-from initium.inference.checkpoint_io import load_checkpoint
-from initium.inference.model_loader import load_model
-from initium.memory_manipulation.nvrtc_compat import patch_prod_jiterator
+)  # noqa: E402
+from initium.data.workspace_capability.tracks import _lang_text  # noqa: E402
+from initium.inference.checkpoint_io import load_checkpoint  # noqa: E402
+from initium.inference.model_loader import load_model  # noqa: E402
+from initium.memory_manipulation.nvrtc_compat import patch_prod_jiterator  # noqa: E402
 
 patch_prod_jiterator()
 
@@ -51,10 +51,42 @@ _ACT_FUNCTION_WORDS = frozenset(
     "nobody nothing you are welcome".split()
 )
 _ACT_TARGET_WORDS = frozenset(
-    (*_ACT_FUNCTION_WORDS, *_SEED_NAMES, "daniel", "emma", "peter", "apple", "ball", "book", "key", "cup", "hat",
-     *_SEED_PLACES, "office", "bedroom", "bathroom", "moved", "went", "travelled", "journeyed", "picked", "up",
-     "took", "grabbed", "dropped", "put", "down", "discarded", "ok", "hello", "goodbye", "thanks", "mean",
-     "carrying", "nothing")
+    (
+        *_ACT_FUNCTION_WORDS,
+        *_SEED_NAMES,
+        "daniel",
+        "emma",
+        "peter",
+        "apple",
+        "ball",
+        "book",
+        "key",
+        "cup",
+        "hat",
+        *_SEED_PLACES,
+        "office",
+        "bedroom",
+        "bathroom",
+        "moved",
+        "went",
+        "travelled",
+        "journeyed",
+        "picked",
+        "up",
+        "took",
+        "grabbed",
+        "dropped",
+        "put",
+        "down",
+        "discarded",
+        "ok",
+        "hello",
+        "goodbye",
+        "thanks",
+        "mean",
+        "carrying",
+        "nothing",
+    )
 )
 _MAX_SEQUENCE = 512
 _MAX_USER_TOKENS = 128
@@ -74,7 +106,12 @@ def _clone_tree(value):
 
 class LanguageChat:
     def __init__(
-        self, loaded, device, *, allocator_routing=False, max_new_tokens=64,
+        self,
+        loaded,
+        device,
+        *,
+        allocator_routing=False,
+        max_new_tokens=64,
         answer_diagnostics=False,
     ):
         self.rnn = loaded.rnn
@@ -117,7 +154,7 @@ class LanguageChat:
         # synthetic training corpora.
         return text.lower().split()
 
-    def _encode_words(self, words):
+    def _encode_words(self, words, *, query=False):
         token_ids: list[int] = []
         ids: list[int] = []
         writes: list[bool] = []
@@ -131,17 +168,22 @@ class LanguageChat:
             copy_mask.extend([source_ok] * len(pieces))
             previously_known = cleaned in self.entity_keys
             key = self._key_for(cleaned) if not is_stop else -1
-            ids.extend([key] * len(pieces))
-            # For unseen content words, store the word's final piece as the
-            # episode annotator does. Known entity mentions are read-only.
+            # Training annotates one semantic address per word, at its final
+            # SentencePiece position; continuation pieces remain unaddressed.
+            ids.extend([-1] * (len(pieces) - 1) + [key] if key >= 0 else [-1] * len(pieces))
+            # A normal observed utterance may establish an unseen lexical
+            # value, as in the annotated episodes. User queries are read-only:
+            # allocating a new word key must not overwrite conversation memory.
             writes.extend([False] * len(pieces))
-            if key >= 0 and not previously_known:
+            if key >= 0 and not previously_known and not query:
                 writes[-1] = True
         return token_ids, ids, writes, copy_mask
 
     def _forward(self, tokens, entity_ids, write_mask, state):
         if len(tokens) > _MAX_SEQUENCE:
-            raise ValueError(f"input is {len(tokens)} tokens; Stage 5 supports at most {_MAX_SEQUENCE}")
+            raise ValueError(
+                f"input is {len(tokens)} tokens; Stage 5 supports at most {_MAX_SEQUENCE}"
+            )
         x = torch.tensor(tokens, dtype=torch.long, device=self.device).unsqueeze(0)
         eids = torch.tensor(entity_ids, dtype=torch.long, device=self.device).unsqueeze(0)
         wm = torch.tensor(write_mask, dtype=torch.bool, device=self.device).unsqueeze(0)
@@ -153,13 +195,26 @@ class LanguageChat:
             pass_through_memory=True,
             entity_ids=eids,
             entity_write_mask=wm,
+            # The training collator supplies these labels for annotated
+            # entity mentions. In chat, the lexical key map gives us the
+            # corresponding observed mentions, so carry their contextual
+            # features into the same match-key state used by slot readout.
+            workspace_match_entity_ids=eids,
+            workspace_match_write_mask=eids.ge(0),
         )
         features = output.transpose(0, 1).contiguous()
         logits = self.output_proj(features).float()
         answer_mask = torch.zeros(x.shape, dtype=torch.float32, device=self.device)
         answer_mask[:, -1] = 1.0
         source_mask = torch.tensor(
-            [[int(t >= TEXT_BASE and ok) for t, ok in zip(tokens, self.last_trace.get("copy_mask", [False] * len(tokens)))]],
+            [
+                [
+                    int(t >= TEXT_BASE and ok)
+                    for t, ok in zip(
+                        tokens, self.last_trace.get("copy_mask", [False] * len(tokens))
+                    )
+                ]
+            ],
             dtype=torch.bool,
             device=self.device,
         )
@@ -199,10 +254,12 @@ class LanguageChat:
             key = write_at.get(wi)
             if key is None:
                 entity = entity_ids_by_name.get(word.strip(_PUNCT), -1)
-                body_ids.extend([entity] * len(pieces))
+                body_ids.extend(
+                    [-1] * (len(pieces) - 1) + [entity] if entity >= 0 else [-1] * len(pieces)
+                )
                 body_writes.extend([False] * len(pieces))
             else:
-                body_ids.extend([key] * len(pieces))
+                body_ids.extend([-1] * (len(pieces) - 1) + [key])
                 body_writes.extend([False] * (len(pieces) - 1) + [True])
             content = word.strip(_PUNCT) not in _STOPS
             body_copy.extend([content] * len(pieces))
@@ -237,10 +294,15 @@ class LanguageChat:
         chosen_probabilities: list[float] = []
         final_state = None
         for _ in range(self.max_new_tokens):
-            tokens = base_tokens + generated + [ANSWER]
-            ids = base_ids + [-1] * (len(generated) + 1)
-            writes = base_writes + [False] * (len(generated) + 1)
-            self.last_trace["copy_mask"] = base_copy + [False] * (len(generated) + 1)
+            # Training keeps one ANSWER input at the first answer position,
+            # then teacher-forces the preceding gold token at each later
+            # position. Mirror that shift during generation: ANSWER comes
+            # before the generated prefix and appears exactly once.
+            answer_prefix = [ANSWER] + generated
+            tokens = base_tokens + answer_prefix
+            ids = base_ids + [-1] * len(answer_prefix)
+            writes = base_writes + [False] * len(answer_prefix)
+            self.last_trace["copy_mask"] = base_copy + [False] * len(answer_prefix)
             logits, candidate_state = self._forward(tokens, ids, writes, prior_state)
             final_state = candidate_state
             next_token = int(logits.argmax(-1).item())
@@ -268,9 +330,12 @@ class LanguageChat:
             self.last_answer_diagnostics = {
                 "mean_token_probability": (
                     sum(chosen_probabilities) / len(chosen_probabilities)
-                    if chosen_probabilities else None
+                    if chosen_probabilities
+                    else None
                 ),
-                "min_token_probability": min(chosen_probabilities) if chosen_probabilities else None,
+                "min_token_probability": min(chosen_probabilities)
+                if chosen_probabilities
+                else None,
                 "ood_fraction": len(unsupported) / len(content_words) if content_words else None,
                 "unsupported_words": unsupported,
                 "content_word_count": len(content_words),
@@ -316,7 +381,11 @@ def parse_args(argv=None):
     parser.add_argument("checkpoint", help="core_training checkpoint (.pt)")
     parser.add_argument("--device", default=None, help="default: cuda:0 when available, else cpu")
     parser.add_argument("--max-new-tokens", type=int, default=64, choices=range(1, 257))
-    parser.add_argument("--seed-world", action="store_true", help="install a small location-query context before chat")
+    parser.add_argument(
+        "--seed-world",
+        action="store_true",
+        help="install a small location-query context before chat",
+    )
     parser.add_argument(
         "--allocator-routing",
         action="store_true",
@@ -327,6 +396,14 @@ def parse_args(argv=None):
         action="store_true",
         help="log mean/min greedy-token probability and a lang_act answer-vocabulary OOD proxy",
     )
+    parser.add_argument(
+        "--allow-legacy-tokenizer-manifest-mismatch",
+        action="store_true",
+        help=(
+            "allow a legacy checkpoint's whole-corpus manifest to differ after "
+            "checking vocabulary size; tokenizer identity cannot be proven"
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -334,14 +411,16 @@ def main(argv=None):
     args = parse_args(argv)
     ckpt = load_checkpoint(args.checkpoint)
     config = ckpt["model_config"]
-    if config.get("dataset_type") != "workspace-capability" or config.get("workspace_task_track") not in (
-        "lang_all", "lang_stage5"
-    ):
+    if config.get("dataset_type") != "workspace-capability" or config.get(
+        "workspace_task_track"
+    ) not in ("lang_all", "lang_stage5"):
         raise SystemExit("checkpoint must be trained on workspace-capability lang_all/lang_stage5")
     if not config.get("split_graph_enabled"):
         raise SystemExit("Stage 5 language chat requires a split-graph checkpoint")
     if not config.get("workspace_token_id_input") or not config.get("workspace_slot_readout"):
-        raise SystemExit("checkpoint must include Stage 5 token-ID input and workspace slot readout")
+        raise SystemExit(
+            "checkpoint must include Stage 5 token-ID input and workspace slot readout"
+        )
     if not config.get("workspace_semantic_entity_addressing"):
         raise SystemExit("checkpoint must use semantic entity addressing")
     if int(config.get("workspace_semantic_entity_count", 64)) != 128:
@@ -349,7 +428,11 @@ def main(argv=None):
     if int(config.get("workspace_num_slots", 0)) < 128:
         raise SystemExit("checkpoint must have at least 128 workspace slots")
     device = torch.device(args.device or ("cuda:0" if torch.cuda.is_available() else "cpu"))
-    loaded = load_model(ckpt, device)
+    loaded = load_model(
+        ckpt,
+        device,
+        allow_legacy_tokenizer_manifest_mismatch=args.allow_legacy_tokenizer_manifest_mismatch,
+    )
     chat = LanguageChat(
         loaded,
         device,
@@ -363,9 +446,13 @@ def main(argv=None):
     )
     if args.seed_world:
         chat.seed_world()
-    print("Commands: /help /seed /reset /slots /facts /trace /allocator on|off /bypass on|off /quit")
+    print(
+        "Commands: /help /seed /reset /slots /facts /trace /allocator on|off /bypass on|off /quit"
+    )
     if args.answer_diagnostics:
-        print("Answer diagnostics on: confidence is greedy-token probability; OOD is a lexical support proxy, not a calibrated probability.")
+        print(
+            "Answer diagnostics on: confidence is greedy-token probability; OOD is a lexical support proxy, not a calibrated probability."
+        )
     while True:
         try:
             line = input("you> ").strip()
@@ -377,7 +464,9 @@ def main(argv=None):
         if line in ("/quit", "/exit"):
             break
         if line == "/help":
-            print("Type a message; use /seed for a small known location world, /reset to clear state, /slots and /trace to inspect the run.")
+            print(
+                "Type a message; use /seed for a small known location world, /reset to clear state, /slots and /trace to inspect the run."
+            )
         elif line == "/seed":
             chat.seed_world()
         elif line == "/reset":
@@ -391,7 +480,9 @@ def main(argv=None):
             trace = chat.last_trace
             print(f"input token ids: {trace.get('input', [])}")
             print(f"generated token ids: {trace.get('generated', [])}")
-            print(f"allocator route probability: {getattr(chat.rnn, 'allocator_use_prob', 0.0):.2f}")
+            print(
+                f"allocator route probability: {getattr(chat.rnn, 'allocator_use_prob', 0.0):.2f}"
+            )
         elif line.startswith("/allocator"):
             parts = line.split()
             if len(parts) != 2 or parts[1] not in ("on", "off"):
@@ -419,7 +510,9 @@ def main(argv=None):
                 d = chat.last_answer_diagnostics
                 mean_p, min_p = d.get("mean_token_probability"), d.get("min_token_probability")
                 if mean_p is None:
-                    print("[answer diagnostics] confidence=n/a | answer OOD proxy=n/a (no generated text)")
+                    print(
+                        "[answer diagnostics] confidence=n/a | answer OOD proxy=n/a (no generated text)"
+                    )
                 else:
                     n_words = int(d["content_word_count"])
                     ood = d.get("ood_fraction")

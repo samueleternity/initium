@@ -5,8 +5,17 @@ from __future__ import annotations
 import random
 
 from initium.data.workspace_capability.episode import (
-    BOS, BOOL_FALSE, BOOL_TRUE, EOS, EV_INIT, EV_UPDATE, QUERY, SEP,
-    TaskEpisode, entity_token, scalar_token,
+    BOOL_FALSE,
+    BOOL_TRUE,
+    BOS,
+    EOS,
+    EV_INIT,
+    EV_UPDATE,
+    QUERY,
+    SEP,
+    TaskEpisode,
+    entity_token,
+    scalar_token,
 )
 from initium.data.workspace_capability.tracks._shared import common_metadata
 
@@ -32,13 +41,21 @@ def generate(difficulty: dict, rng: random.Random, *, ood: bool = False) -> Task
         stream.extend((EV_UPDATE, entity_token(1 + len(evidence) % 8), scalar_token(cue + 1), SEP))
     stream.extend((QUERY, entity_token(0), SEP))
     return TaskEpisode(
-        "bistable_perception", tuple(stream), (BOOL_TRUE if state else BOOL_FALSE, EOS),
+        "bistable_perception",
+        tuple(stream),
+        (BOOL_TRUE if state else BOOL_FALSE, EOS),
         common_metadata(
-            track="bistable_perception", sequence_length=len(stream),
+            track="bistable_perception",
+            sequence_length=len(stream),
             query_type=f"frames_{frames}_switches_{min(switches, 4)}",
-            relevant_updates=frames, distractor_count=frames, candidate_baseline_pct=50.0,
-            frame_count=frames, initial_dominance=initial, dominance_switches=switches,
-            evidence_trace=tuple(evidence), final_dominance=state,
+            relevant_updates=frames,
+            distractor_count=frames,
+            candidate_baseline_pct=50.0,
+            frame_count=frames,
+            initial_dominance=initial,
+            dominance_switches=switches,
+            evidence_trace=tuple(evidence),
+            final_dominance=state,
             progression_group="all",
         ),
     )

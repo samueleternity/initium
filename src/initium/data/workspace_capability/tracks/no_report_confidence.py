@@ -5,8 +5,18 @@ from __future__ import annotations
 import random
 
 from initium.data.workspace_capability.episode import (
-    BOS, BOOL_FALSE, BOOL_TRUE, EOS, EV_ASSERT, EV_INIT, EV_UPDATE, QUERY, SEP,
-    TaskEpisode, entity_token, scalar_token,
+    BOOL_FALSE,
+    BOOL_TRUE,
+    BOS,
+    EOS,
+    EV_ASSERT,
+    EV_INIT,
+    EV_UPDATE,
+    QUERY,
+    SEP,
+    TaskEpisode,
+    entity_token,
+    scalar_token,
 )
 from initium.data.workspace_capability.tracks._shared import common_metadata
 
@@ -36,16 +46,25 @@ def generate(difficulty: dict, rng: random.Random, *, ood: bool = False) -> Task
         answer += (scalar_token(confidence),)
     answer += (EOS,)
     return TaskEpisode(
-        "no_report_confidence", tuple(stream), answer,
+        "no_report_confidence",
+        tuple(stream),
+        answer,
         common_metadata(
-            track="no_report_confidence", sequence_length=len(stream),
+            track="no_report_confidence",
+            sequence_length=len(stream),
             query_type="confidence_probe" if report_condition else "no_report_action",
-            relevant_updates=evidence, candidate_baseline_pct=50.0, evidence_strength=evidence,
-            confidence_bin=confidence, action=action, majority_action=action,
+            relevant_updates=evidence,
+            candidate_baseline_pct=50.0,
+            evidence_strength=evidence,
+            confidence_bin=confidence,
+            action=action,
+            majority_action=action,
             latent_truth=truth,
             observations=tuple(int(value) for value in observations),
-            action_correct=action == truth, cue_error_rate=cue_error_rate,
-            vote_margin=margin, explicit_report=report_condition,
+            action_correct=action == truth,
+            cue_error_rate=cue_error_rate,
+            vote_margin=margin,
+            explicit_report=report_condition,
             progression_group="all",
         ),
     )

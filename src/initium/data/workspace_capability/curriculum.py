@@ -5,20 +5,43 @@ from __future__ import annotations
 import random
 from collections.abc import Iterable
 
-from initium.data.workspace_capability.tracks import _dev_lexicon
-from initium.data.workspace_capability.tracks import _lang_text
+from initium.data.workspace_capability.tracks import _dev_lexicon, _lang_text
 
 _LEVELS = 6
 _STAGE3 = _dev_lexicon.STAGE3_TRACKS
-_DEV = ("developmental", "developmental_production", "developmental_production_unkeyed", "developmental_production_aux", *_STAGE3)
-_LEX_WORDS = ("d1_naming", "d2_cross", "d3_attribute", "d4_relation", "p_entity", "p_relation", "p_property")
+_DEV = (
+    "developmental",
+    "developmental_production",
+    "developmental_production_unkeyed",
+    "developmental_production_aux",
+    *_STAGE3,
+)
+_LEX_WORDS = (
+    "d1_naming",
+    "d2_cross",
+    "d3_attribute",
+    "d4_relation",
+    "p_entity",
+    "p_relation",
+    "p_property",
+)
 _LEX_SENSES = ("s_s2w", "s_w2s", "s_s2c", "s_disambig")
 
 _LANG = _lang_text.LANG_SINGLE
 
 
 def _lang_scale(c):
-    for key, cap in (("facts", 10), ("distractors", 4), ("events", 14), ("turns", 14), ("words", 120), ("filler", 48), ("depth", 6), ("examples", 12), ("pseudo", 6)):
+    for key, cap in (
+        ("facts", 10),
+        ("distractors", 4),
+        ("events", 14),
+        ("turns", 14),
+        ("words", 120),
+        ("filler", 48),
+        ("depth", 6),
+        ("examples", 12),
+        ("pseudo", 6),
+    ):
         if key in c:
             c[key] = max(int(c[key]), min(int(c[key]) + 2, cap))
 
@@ -27,20 +50,37 @@ def _lang_config(track, level):
     L = level
     c = {
         "external": int(bool(_lang_text.settings["external"])),
-        "heldout": (0.0, 0.0, 0.15, 0.15, 0.15, 0.15)[L], "combos": 0, "templates": 0,
-        "facts": (2, 3, 4, 5, 6, 7)[L], "distractors": (0, 0, 1, 1, 2, 3)[L],
-        "variety": (1, 1, 1, 2, 2, 2)[L], "plural": int(L >= 3), "past": int(L >= 4),
-        "passive": int(L >= 4), "conj": int(L >= 3),
+        "heldout": (0.0, 0.0, 0.15, 0.15, 0.15, 0.15)[L],
+        "combos": 0,
+        "templates": 0,
+        "facts": (2, 3, 4, 5, 6, 7)[L],
+        "distractors": (0, 0, 1, 1, 2, 3)[L],
+        "variety": (1, 1, 1, 2, 2, 2)[L],
+        "plural": int(L >= 3),
+        "past": int(L >= 4),
+        "passive": int(L >= 4),
+        "conj": int(L >= 3),
         "counterfactual": (0.0, 0.0, 0.1, 0.2, 0.3, 0.3)[L],
         "filler": (0, 0, 0, 8, 16, 32)[L],
     }
     ext = ("external",) if c["external"] else ()
     if track == "lang_template":
-        c["groups"] = ("qa_wh", "qa_yn", "retell", "paraphrase", "unsupported")[: (1, 2, 3, 4, 5, 5)[L]]
+        c["groups"] = ("qa_wh", "qa_yn", "retell", "paraphrase", "unsupported")[
+            : (1, 2, 3, 4, 5, 5)[L]
+        ]
     elif track == "lang_nlg":
         c["groups"] = ("d2t", "t2d", "retell_all")[: (1, 2, 3, 3, 3, 3)[L]] + ext
     elif track == "lang_story_qa":
-        g = ("where_person", "where_object", "who_has", "yes_no", "carry", "false_belief", "true_belief", "reality")
+        g = (
+            "where_person",
+            "where_object",
+            "who_has",
+            "yes_no",
+            "carry",
+            "false_belief",
+            "true_belief",
+            "reality",
+        )
         c["groups"] = g[: (1, 2, 4, 5, 5, 8)[L]] + ext
         c["events"] = (3, 4, 5, 6, 8, 10)[L]
     elif track == "lang_dialogue":
@@ -51,7 +91,9 @@ def _lang_config(track, level):
         c["groups"] = ("good", "agree", "detnum", "order")[: (2, 3, 4, 4, 4, 4)[L]] + ext
         c["heldout"] = 0.0
     elif track == "lang_parse":
-        c["groups"] = ("parse_basic", "parse_neg", "parse_conj", "parse_ctx")[: (1, 2, 3, 4, 4, 4)[L]]
+        c["groups"] = ("parse_basic", "parse_neg", "parse_conj", "parse_ctx")[
+            : (1, 2, 3, 4, 4, 4)[L]
+        ]
     elif track == "lang_define":
         c["groups"] = ("def_new", "def_prop", "def_redef", "def_unknown")[: (1, 2, 3, 4, 4, 4)[L]]
         c["pseudo"] = (1, 2, 2, 3, 3, 4)[L]
@@ -59,18 +101,40 @@ def _lang_config(track, level):
         # Keep lesson 1 focused on lexical/role binding under one canonical
         # order. Expand word-order induction only after the basic mapping is
         # learnable; otherwise order inference and binding errors compound.
-        c.update(groups=("ind_s2mr",), examples=(5, 6, 7, 8, 9, 10)[L],
-                 nouns=(3, 3, 4, 4, 5, 6)[L], rules=(1, 2, 2, 3, 3, 3)[L],
-                 orders=(1, 1, 3, 3, 3, 3)[L])
+        c.update(
+            groups=("ind_s2mr",),
+            examples=(5, 6, 7, 8, 9, 10)[L],
+            nouns=(3, 3, 4, 4, 5, 6)[L],
+            rules=(1, 2, 2, 3, 3, 3)[L],
+            orders=(1, 1, 3, 3, 3, 3)[L],
+        )
     elif track == "lang_logic":
-        c.update(groups=("l_chain", "l_neg", "l_unknown", "l_contra", "l_count", "l_some", "l_cond")[: (1, 3, 3, 4, 6, 7)[L]],
-                 depth=(1, 1, 2, 2, 3, 4)[L])
+        c.update(
+            groups=("l_chain", "l_neg", "l_unknown", "l_contra", "l_count", "l_some", "l_cond")[
+                : (1, 3, 3, 4, 6, 7)[L]
+            ],
+            depth=(1, 1, 2, 2, 3, 4)[L],
+        )
     elif track == "lang_discourse":
-        c.update(groups=("d_where", "d_pron", "d_dist", "d_update", "d_retell")[: (1, 2, 3, 4, 5, 5)[L]],
-                 turns=(1, 2, 3, 4, 5, 6)[L], events=(3, 4, 5, 6, 8, 10)[L], distract=(0, 1, 2, 3, 4, 6)[L])
+        c.update(
+            groups=("d_where", "d_pron", "d_dist", "d_update", "d_retell")[: (1, 2, 3, 4, 5, 5)[L]],
+            turns=(1, 2, 3, 4, 5, 6)[L],
+            events=(3, 4, 5, 6, 8, 10)[L],
+            distract=(0, 1, 2, 3, 4, 6)[L],
+        )
     elif track == "lang_act":
-        c.update(groups=("a_inform", "a_ask", "a_confirm", "a_correct", "a_social", "a_clarify", "a_refuse")[: (2, 3, 4, 5, 6, 7)[L]],
-                 turns=(2, 3, 4, 6, 8, 12)[L])
+        c.update(
+            groups=(
+                "a_inform",
+                "a_ask",
+                "a_confirm",
+                "a_correct",
+                "a_social",
+                "a_clarify",
+                "a_refuse",
+            )[: (2, 3, 4, 5, 6, 7)[L]],
+            turns=(2, 3, 4, 6, 8, 12)[L],
+        )
     elif track == "lang_nlu_external":
         c["groups"] = ("triples", "nli", "qa")
     else:  # lang_open (always external)
@@ -95,7 +159,11 @@ def difficulty_for(
             axes = {"legacy"} if ood else set()
     else:
         axes = {str(axis).strip().lower() for axis in ood_axes}
-        unknown_axes = axes - (({"labels", "length", "combos"} | ({"templates"} if track in _LANG else set())) if (track in _DEV or track in _LANG) else {"labels", "length"})
+        unknown_axes = axes - (
+            ({"labels", "length", "combos"} | ({"templates"} if track in _LANG else set()))
+            if (track in _DEV or track in _LANG)
+            else {"labels", "length"}
+        )
         if unknown_axes:
             raise ValueError(f"unknown OOD axes for {track!r}: {sorted(unknown_axes)}")
         if track != "permutation" and track not in _DEV and track not in _LANG:
@@ -139,7 +207,10 @@ def difficulty_for(
             "aggregate": (
                 ("recall", "sum_mod16", "count_even", "parity"),
                 ("recall", "sum_mod16", "count_even", "parity"),
-                "sum_mod16", "count_even", "parity", "recall",
+                "sum_mod16",
+                "count_even",
+                "parity",
+                "recall",
             )[level],
         }
     elif track == "capacity_bottleneck":
@@ -204,27 +275,47 @@ def difficulty_for(
         config = {
             "groups": (_LEX_WORDS[: (1, 3, 4, 5, 6, 7)[level]] if family != "senses" else ())
             + (_LEX_SENSES[: (1, 2, 3, 4, 4, 4)[level]] if family != "words" else ()),
-            "concepts": (4, 5, 6, 6, 8, 10)[level], "scenes": (3, 4, 5, 6, 8, 10)[level],
-            "ambiguity": (2, 2, 3, 3, 4, 4)[level], "noise": 0.0, "heldout": (0.0, 0.0, 0.15, 0.15, 0.15, 0.15)[level], "combos": 0,
+            "concepts": (4, 5, 6, 6, 8, 10)[level],
+            "scenes": (3, 4, 5, 6, 8, 10)[level],
+            "ambiguity": (2, 2, 3, 3, 4, 4)[level],
+            "noise": 0.0,
+            "heldout": (0.0, 0.0, 0.15, 0.15, 0.15, 0.15)[level],
+            "combos": 0,
             "ambiguity_prob": (0.0, 0.0, 0.0, 0.5, 0.5, 0.5)[level],
-            "facts_a": (1, 2, 2, 3, 3, 3)[level], "distractors": (0, 0, 0, 0, 0, 2)[level],
-            "ordering": False, "polysemy": (0.25, 0.25, 0.3, 0.4, 0.5, 0.5)[level],
+            "facts_a": (1, 2, 2, 3, 3, 3)[level],
+            "distractors": (0, 0, 0, 0, 0, 2)[level],
+            "ordering": False,
+            "polysemy": (0.25, 0.25, 0.3, 0.4, 0.5, 0.5)[level],
             "senses": (3, 4, 4, 5, 5, 6)[level],
         }
     elif track == "developmental_semantic":
         config = {
-            "groups": ("direct", "compose2", "distractor", "unsupported")[: (1, 2, 3, 4, 4, 4)[level]],
-            "concepts": (4, 5, 6, 6, 8, 10)[level], "scenes": (3, 4, 5, 6, 8, 10)[level],
-            "ambiguity": (2, 2, 3, 3, 4, 4)[level], "noise": 0.0, "heldout": (0.0, 0.0, 0.15, 0.15, 0.15, 0.15)[level], "combos": 0,
+            "groups": ("direct", "compose2", "distractor", "unsupported")[
+                : (1, 2, 3, 4, 4, 4)[level]
+            ],
+            "concepts": (4, 5, 6, 6, 8, 10)[level],
+            "scenes": (3, 4, 5, 6, 8, 10)[level],
+            "ambiguity": (2, 2, 3, 3, 4, 4)[level],
+            "noise": 0.0,
+            "heldout": (0.0, 0.0, 0.15, 0.15, 0.15, 0.15)[level],
+            "combos": 0,
             "ambiguity_prob": (0.0, 0.0, 0.0, 0.3, 0.3, 0.3)[level],
-            "facts_a": (2, 3, 3, 4, 4, 5)[level], "distractors": (0, 1, 2, 2, 3, 3)[level],
+            "facts_a": (2, 3, 3, 4, 4, 5)[level],
+            "distractors": (0, 1, 2, 2, 3, 3)[level],
             "counterfactual": (0.0, 0.0, 0.1, 0.2, 0.3, 0.3)[level],
         }
-    elif track in ("developmental_production_semantic", "developmental_production_semantic_unkeyed"):
+    elif track in (
+        "developmental_production_semantic",
+        "developmental_production_semantic_unkeyed",
+    ):
         config = {
             "groups": ("p_entity", "p_all2", "p_all3")[: (1, 2, 2, 3, 3, 3)[level]],
-            "concepts": (4, 5, 6, 6, 8, 10)[level], "scenes": (3, 4, 5, 6, 8, 10)[level],
-            "ambiguity": (2, 2, 3, 3, 4, 4)[level], "noise": 0.0, "heldout": (0.0, 0.0, 0.15, 0.15, 0.15, 0.15)[level], "combos": 0,
+            "concepts": (4, 5, 6, 6, 8, 10)[level],
+            "scenes": (3, 4, 5, 6, 8, 10)[level],
+            "ambiguity": (2, 2, 3, 3, 4, 4)[level],
+            "noise": 0.0,
+            "heldout": (0.0, 0.0, 0.15, 0.15, 0.15, 0.15)[level],
+            "combos": 0,
             "ambiguity_prob": (0.0, 0.0, 0.0, 0.3, 0.3, 0.3)[level],
             "distractors": (1, 1, 2, 2, 3, 3)[level],
             "counterfactual": (0.0, 0.0, 0.1, 0.2, 0.3, 0.3)[level],
@@ -232,12 +323,13 @@ def difficulty_for(
         }
     elif track in _DEV[1:]:
         config = {
-            "groups": ("p_entity", "p_relation", "p_property", "p_all2", "p_all3", "p_order")[: (1, 2, 3, 3, 4, 6)[level]],
+            "groups": ("p_entity", "p_relation", "p_property", "p_all2", "p_all3", "p_order")[
+                : (1, 2, 3, 3, 4, 6)[level]
+            ],
             "concepts": (4, 5, 6, 6, 8, 10)[level],
             "scenes": (3, 4, 5, 6, 8, 10)[level],
             "ambiguity": (2, 2, 3, 3, 4, 4)[level],
             "noise": 0.0,
-            "heldout": 0.0,
             "combos": 0,
             "ambiguity_prob": (0.0, 0.0, 0.0, 0.5, 0.5, 0.5)[level],
             "heldout": (0.0, 0.0, 0.15, 0.15, 0.15, 0.15)[level],
@@ -249,9 +341,15 @@ def difficulty_for(
         config = _lang_config(track, level)
     elif track == "developmental":
         config = {
-            "families": ("d1_naming", "d2_cross", "d3_attribute", "d4_relation", "d5_temporal", "d6_compose", "d5_action")[
-                : (1, 3, 4, 5, 6, 6)[level]
-            ],
+            "families": (
+                "d1_naming",
+                "d2_cross",
+                "d3_attribute",
+                "d4_relation",
+                "d5_temporal",
+                "d6_compose",
+                "d5_action",
+            )[: (1, 3, 4, 5, 6, 6)[level]],
             "concepts": (3, 4, 5, 6, 7, 8)[level],
             "scenes": (3, 4, 5, 6, 8, 10)[level],
             "ambiguity": (2, 2, 3, 3, 4, 4)[level],
@@ -319,9 +417,7 @@ def difficulty_for(
         elif track == "attentional_blink":
             config["maximum_lag"] = min(int(config["maximum_lag"]) + 1, 9)
             config["distractors"] = min(int(config["distractors"]) + 2, 16)
-            config["lure_probability"] = min(
-                float(config["lure_probability"]) + 0.05, 0.90
-            )
+            config["lure_probability"] = min(float(config["lure_probability"]) + 0.05, 0.90)
         elif track == "variable_binding":
             config["assignments"] = min(int(config["assignments"]) + 2, 24)
         elif track == "ignition":
@@ -395,7 +491,11 @@ class WorkspaceCapabilityCurriculum:
         self.lesson_nr_cells = [max(128, 32 * (i + 1)) for i in range(_LEVELS)]
 
     def level_for(self, track):
-        return int(self.track_lessons.get(track, self.lesson)) if self.track_lessons is not None else self.lesson
+        return (
+            int(self.track_lessons.get(track, self.lesson))
+            if self.track_lessons is not None
+            else self.lesson
+        )
 
     def _smoothed_promotion_score(self, key: str, current: float) -> float | None:
         history = self.promotion_history.setdefault(key, [])
@@ -471,7 +571,9 @@ class WorkspaceCapabilityCurriculum:
                             f"{track}:{level}:{group}:exact",
                             metrics["exact_match"] / 100.0,
                         )
-                        group_ready = smoothed is not None and smoothed >= self.dataset.advance_threshold
+                        group_ready = (
+                            smoothed is not None and smoothed >= self.dataset.advance_threshold
+                        )
                         score_notes.append(
                             f"{group}={smoothed if smoothed is not None else float('nan'):.2f}"
                         )
@@ -483,25 +585,32 @@ class WorkspaceCapabilityCurriculum:
                     overall = self._smoothed_promotion_score(
                         f"{track}:{level}:overall", current_overall
                     )
-                    overall_ready = overall is not None and overall >= self.dataset.advance_threshold
+                    overall_ready = (
+                        overall is not None and overall >= self.dataset.advance_threshold
+                    )
                     score_notes.append(
                         f"overall={overall if overall is not None else float('nan'):.2f}"
                     )
                 ready = ready and overall_ready
                 if score_notes:
-                    print(f"[workspace-curriculum-smoothing] {track} lesson={level + 1} " + "; ".join(score_notes))
+                    print(
+                        f"[workspace-curriculum-smoothing] {track} lesson={level + 1} "
+                        + "; ".join(score_notes)
+                    )
                 if allow_advance and ready:
                     self.track_lessons[track] = level + 1
                     promoted.append(f"{track}:{level + 1}")
             self.lesson = max(self.track_lessons.values(), default=0)
             self.dataset._curriculum_track_levels = self.track_lessons
-            self.dataset.last_eval_diagnostics["active_track_lessons_after_eval"] = dict(self.track_lessons)
+            self.dataset.last_eval_diagnostics["active_track_lessons_after_eval"] = dict(
+                self.track_lessons
+            )
             advance_writer = getattr(self, "advance_log_writer", None)
             if promoted and advance_writer is not None:
                 advance_writer.writerow([step, self.lesson + 1, len(self.table)])
                 self.advance_log_file.flush()
             print(
-                f"[workspace-curriculum] active per-track lessons after evaluation "
+                "[workspace-curriculum] active per-track lessons after evaluation "
                 + ", ".join(f"{t}={l + 1}" for t, l in self.track_lessons.items())
                 + (f"; promoted {', '.join(promoted)}" if promoted else "; no track promoted")
             )
@@ -525,8 +634,7 @@ class WorkspaceCapabilityCurriculum:
                     )
                 elif metrics["exact_match"] / 100.0 < self.dataset.advance_threshold:
                     blockers.append(
-                        f"{track}/{group}={metrics['exact_match']:.1f}% "
-                        f"n={metrics['episodes']}"
+                        f"{track}/{group}={metrics['exact_match']:.1f}% n={metrics['episodes']}"
                     )
             if any(
                 group not in actual
@@ -540,7 +648,8 @@ class WorkspaceCapabilityCurriculum:
             len(per_track) == len(self.dataset._tracks())
             and all(
                 item["exact_match"] / 100.0 >= self.dataset.advance_threshold
-                for _t, item in per_track.items() if _t not in ("ignition", "nth_farthest", "lang_open")
+                for _t, item in per_track.items()
+                if _t not in ("ignition", "nth_farthest", "lang_open")
             )
         )
         if multi_track_run:
@@ -552,8 +661,7 @@ class WorkspaceCapabilityCurriculum:
                     blockers.append(f"{track}/overall=missing")
                 elif metrics["exact_match"] / 100.0 < self.dataset.advance_threshold:
                     blockers.append(
-                        f"{track}/overall={metrics['exact_match']:.1f}% "
-                        f"n={metrics['episodes']}"
+                        f"{track}/overall={metrics['exact_match']:.1f}% n={metrics['episodes']}"
                     )
         if perfect / 100.0 < self.dataset.advance_threshold:
             blockers.insert(
@@ -569,10 +677,7 @@ class WorkspaceCapabilityCurriculum:
                 f"episodes/group={self.dataset.curriculum_eval_episodes_per_group}"
             )
             for start in range(0, len(blockers), 6):
-                print(
-                    "[workspace-curriculum] blockers: "
-                    + " | ".join(blockers[start : start + 6])
-                )
+                print("[workspace-curriculum] blockers: " + " | ".join(blockers[start : start + 6]))
         if (
             allow_advance
             and perfect / 100.0 >= self.dataset.advance_threshold

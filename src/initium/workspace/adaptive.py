@@ -139,9 +139,9 @@ class AdaptiveWorkspaceSkills(nn.Module):
                 route_indices.long().unsqueeze(-1).expand(-1, -1, -1, self.d_model),
             )
         )
-        routed_context = (selected_deltas * route_weights.to(selected_deltas.dtype).unsqueeze(-1)).sum(
-            dim=2
-        )
+        routed_context = (
+            selected_deltas * route_weights.to(selected_deltas.dtype).unsqueeze(-1)
+        ).sum(dim=2)
         route_code = torch.zeros(
             (*expected_prefix, self.num_experts),
             device=route_indices.device,
@@ -153,7 +153,9 @@ class AdaptiveWorkspaceSkills(nn.Module):
         context = self.context_norm(context.float())
         router_probabilities = self.router(context).float().softmax(dim=-1)
         top_skill = router_probabilities.argmax(dim=-1)
-        hard_routes = F.one_hot(top_skill, num_classes=self.num_skills).to(router_probabilities.dtype)
+        hard_routes = F.one_hot(top_skill, num_classes=self.num_skills).to(
+            router_probabilities.dtype
+        )
         straight_through_routes = hard_routes + router_probabilities - router_probabilities.detach()
         token_mask = (
             torch.ones(expected_prefix, device=backbone_features.device, dtype=torch.float32)
@@ -163,7 +165,9 @@ class AdaptiveWorkspaceSkills(nn.Module):
         valid_token_count = token_mask.sum().clamp_min(1.0)
 
         skill_hidden = torch.einsum("bti,sir->btsr", context, self.skill_down)
-        skill_hidden = (skill_hidden + self.skill_bias.view(1, 1, self.num_skills, self.rank)).tanh()
+        skill_hidden = (
+            skill_hidden + self.skill_bias.view(1, 1, self.num_skills, self.rank)
+        ).tanh()
         routed_skill_state = (skill_hidden * straight_through_routes.unsqueeze(-1)).sum(dim=2)
         skill_residual = F.linear(routed_skill_state, self.skill_up.transpose(0, 1))
         output_scale = self.output_scale_logit.sigmoid()
@@ -172,7 +176,9 @@ class AdaptiveWorkspaceSkills(nn.Module):
         )
 
         hard_load = (hard_routes * token_mask.unsqueeze(-1)).sum(dim=(0, 1)) / valid_token_count
-        importance = (router_probabilities * token_mask.unsqueeze(-1)).sum(dim=(0, 1)) / valid_token_count
+        importance = (router_probabilities * token_mask.unsqueeze(-1)).sum(
+            dim=(0, 1)
+        ) / valid_token_count
         balance_loss = self.num_skills * (hard_load * importance).sum() - 1.0
         self._last_aux_loss = balance_loss * self.balance_loss_weight
         self._last_route_assignments = top_skill.detach()

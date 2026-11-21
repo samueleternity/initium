@@ -3,7 +3,17 @@
 from __future__ import annotations
 
 from initium.data.workspace_capability.episode import (
-    BOS, EOS, EV_FACT, NONE_TOKEN, QUERY, SEP, TaskEpisode, entity_token as e, fact_token,
+    BOS,
+    EOS,
+    EV_FACT,
+    NONE_TOKEN,
+    QUERY,
+    SEP,
+    TaskEpisode,
+    fact_token,
+)
+from initium.data.workspace_capability.episode import (
+    entity_token as e,
 )
 from initium.data.workspace_capability.tracks import _dev_lexicon as dl
 from initium.data.workspace_capability.tracks import _dev_semantics as ds
@@ -23,7 +33,9 @@ def generate(d, rng, *, ood=False):
     if grp == "compose2":
         h, r1, m, r2, t = ds.pick_chain(rng, band, combos)
         facts, keep = [(h, r1, m), (m, r2, t)], (0,)
-        facts += ds.other_facts(rng, band, min(nf - 2 + nd, 6), {(h, r1), (m, r2)}, (h, r1) if nd else None)
+        facts += ds.other_facts(
+            rng, band, min(nf - 2 + nd, 6), {(h, r1), (m, r2)}, (h, r1) if nd else None
+        )
     elif grp == "unsupported":
         facts = ds.other_facts(rng, band, min(nf + nd, 8), set())
         s = rng.choice(facts)[0]
@@ -32,8 +44,9 @@ def generate(d, rng, *, ood=False):
         extra_rel = (r,)
     else:
         h, r, t = ds.pick_fact(rng, band, combos)
-        facts = [(h, r, t)] + ds.other_facts(rng, band, min(nf - 1 + nd, 7), {(h, r)},
-                                              (h, r) if grp == "distractor" else None)
+        facts = [(h, r, t)] + ds.other_facts(
+            rng, band, min(nf - 1 + nd, 7), {(h, r)}, (h, r) if grp == "distractor" else None
+        )
     if cf:
         facts = ds.counterfactual(rng, band, facts, keep)
     wk, rk = ds.assign(rng, facts, extra_rel)
@@ -61,10 +74,37 @@ def generate(d, rng, *, ood=False):
     extra = {"workspace_event_writes": tuple(ew)}
     if not dl.settings["unkeyed"]:
         n_, ck = len(ew) // 3, list(R)
-        keys = ck + [24 + i for i in range(n_)] + [48 + i for i in range(n_)] + [32 + i for i in range(n_)]
-        exp = [fact_token(R[k]) for k in ck] + [x[2] for x in ew[0::3]] + [x[2] for x in ew[1::3]] + [x[2] for x in ew[2::3]]
+        keys = (
+            ck
+            + [24 + i for i in range(n_)]
+            + [48 + i for i in range(n_)]
+            + [32 + i for i in range(n_)]
+        )
+        exp = (
+            [fact_token(R[k]) for k in ck]
+            + [x[2] for x in ew[0::3]]
+            + [x[2] for x in ew[1::3]]
+            + [x[2] for x in ew[2::3]]
+        )
         extra["workspace_output_programs"] = ((0, "factmatch", tuple(keys), tuple(exp)),)
     qtype = f"{grp}_{mode}_{'cf' if cf else 'fact'}_{'heldout' if held else 'train'}"
-    return TaskEpisode(TRACK, tuple(stream), ans,
-                       ds.meta(TRACK, stream, grp, qtype, 100.0 / (len(wk) + (grp == "unsupported")),
-                               held, ood, R, mode, cf=cf, band=band, nd=nd, **extra))
+    return TaskEpisode(
+        TRACK,
+        tuple(stream),
+        ans,
+        ds.meta(
+            TRACK,
+            stream,
+            grp,
+            qtype,
+            100.0 / (len(wk) + (grp == "unsupported")),
+            held,
+            ood,
+            R,
+            mode,
+            cf=cf,
+            band=band,
+            nd=nd,
+            **extra,
+        ),
+    )

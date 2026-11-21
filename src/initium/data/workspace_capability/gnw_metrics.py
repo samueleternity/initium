@@ -9,7 +9,9 @@ import math
 from collections.abc import Iterable
 
 
-def wilson_interval(successes: int, total: int, z: float = 1.959963984540054) -> tuple[float, float]:
+def wilson_interval(
+    successes: int, total: int, z: float = 1.959963984540054
+) -> tuple[float, float]:
     """Return a 95% Wilson interval for a binomial proportion, in [0, 1]."""
     if total <= 0:
         return (math.nan, math.nan)
@@ -82,9 +84,7 @@ def psychometric_logistic(
     if not math.isfinite(criterion) or not 0.0 < criterion < 1.0:
         raise ValueError("threshold_probability must be finite and strictly between 0 and 1")
     samples = [
-        (float(x), float(k), float(n))
-        for x, (k, n) in strength_counts.items()
-        if float(n) > 0
+        (float(x), float(k), float(n)) for x, (k, n) in strength_counts.items() if float(n) > 0
     ]
     total = sum(n for _, _, n in samples)
     if len(samples) < 2 or total == 0:
@@ -105,7 +105,6 @@ def psychometric_logistic(
             "strength_levels": len(samples),
             "small_sample_warning": True,
         }
-    mean_x = sum(x * n for x, _, n in samples) / total
     a, b = 0.0, 0.0
     for _ in range(40):
         ga = gb = haa = hab = hbb = 0.0

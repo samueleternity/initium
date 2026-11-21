@@ -21,6 +21,7 @@ from initium.data.workspace_capability.dataset import (
 from initium.data.workspace_capability.episode import (
     BOOL_FALSE,
     BOOL_TRUE,
+    BOS,
     ENTITY_BASE,
     ENTITY_COUNT,
     EOS,
@@ -28,14 +29,20 @@ from initium.data.workspace_capability.episode import (
     FACT_COUNT,
     RELATION_BASE,
     RELATION_COUNT,
+    SEP,
+    TASK_PARA,
+    TASK_QA,
+    TASK_RETELL,
+    TASK_T2D,
+    TEXT_BASE,
+    TaskEpisode,
     validate_episode,
 )
 from initium.data.workspace_capability.tracks import _dev_lexicon
 from initium.data.workspace_capability.tracks import _lang_grammar as lg
 from initium.data.workspace_capability.tracks import _lang_text as lt
-from initium.data.workspace_capability.tracks import lang_tracks as ltr
 from initium.data.workspace_capability.tracks import lang5_tracks as l5
-from initium.data.workspace_capability.episode import BOS, SEP, TEXT_BASE, TASK_PARA, TASK_RETELL, TASK_T2D, TASK_QA, TaskEpisode
+from initium.data.workspace_capability.tracks import lang_tracks as ltr
 
 _GEN = {
     "lang_template": ltr._g_template,
@@ -49,8 +56,28 @@ _RETRIES = 64
 _GEN.update(l5.GENERATORS)
 _SLOT_RANGES5 = ((48, 80, 0), (80, 112, 1), (112, 128, 2))
 _DUMMY = TaskEpisode("lang_pad", (BOS, SEP), (EOS,), {"query_type": "pad"})
-_EXTRA_FUNC = ("ok", "hello", "goodbye", "welcome", "mean", "carrying", "nothing", "everything", "consistent",
-               "zero", "one", "two", "three", "four", "five", "in", "is", "yes,", "no,", "ok,")
+_EXTRA_FUNC = (
+    "ok",
+    "hello",
+    "goodbye",
+    "welcome",
+    "mean",
+    "carrying",
+    "nothing",
+    "everything",
+    "consistent",
+    "zero",
+    "one",
+    "two",
+    "three",
+    "four",
+    "five",
+    "in",
+    "is",
+    "yes,",
+    "no,",
+    "ok,",
+)
 _SLOT_KINDS = ("subject", "object", "relation", "word")
 _SLOT_RANGES = ((24, 32, 0), (32, 40, 1), (48, 56, 2))
 
@@ -97,7 +124,9 @@ class LanguageDataset(WorkspaceCapabilityDataset):
     def slot_text_columns():
         if lt.settings["stage5"]:
             tk = lt.tokenizer()
-            skip = {t for w in (*lg.FUNCTION, *lg.PUNCT, *_EXTRA_FUNC, "|", ";") for t in tk.word(w)}
+            skip = {
+                t for w in (*lg.FUNCTION, *lg.PUNCT, *_EXTRA_FUNC, "|", ";") for t in tk.word(w)
+            }
             # Stage-5 slot values store a word's first SentencePiece only. Keep
             # continuation pieces on the backbone path so the slot head is not
             # asked to hallucinate pieces that were never written to memory.
@@ -116,6 +145,7 @@ class LanguageDataset(WorkspaceCapabilityDataset):
         skip = {tk.word(w)[0] for w in (*lg.FUNCTION, *lg.NAMES, *lg.OBJS, *lg.PUNCT)}
         words = {tk.word(G.word[i])[0] for i in G.ok} | {tk.word(w)[0] for w in lg.PLACES}
         return sorted((words - skip) | {BOOL_FALSE, BOOL_TRUE})
+
     @property
     def token_id_input(self):
         return True
@@ -138,7 +168,9 @@ class LanguageDataset(WorkspaceCapabilityDataset):
     def _curriculum_groups(track, lesson):
         return tuple(difficulty_for(track, lesson)["groups"])
 
-    def _make_episode(self, track, level, rng, *, ood=False, ood_axes=None, generalization_axis=None):
+    def _make_episode(
+        self, track, level, rng, *, ood=False, ood_axes=None, generalization_axis=None
+    ):
         track_level = level
         if track in ("lang_all", lt.LANG_V5_SELECTOR):
             pool = self._tracks()
@@ -163,7 +195,9 @@ class LanguageDataset(WorkspaceCapabilityDataset):
                 return self._split_context_query(episode)
             except OverflowError:  # generator-signalled resample (length/feasibility)
                 continue
-        raise RuntimeError(f"{track}: no valid episode after {_RETRIES} attempts at level {track_level}")
+        raise RuntimeError(
+            f"{track}: no valid episode after {_RETRIES} attempts at level {track_level}"
+        )
 
     @staticmethod
     def _split_context_query(episode):
@@ -179,14 +213,27 @@ class LanguageDataset(WorkspaceCapabilityDataset):
         if not markers or episode.metadata.get("prev"):
             return episode
         prefix_len = 3
-        cut = next((i for i, token in enumerate(episode.inputs[prefix_len:], prefix_len) if token in markers), None)
+        cut = next(
+            (
+                i
+                for i, token in enumerate(episode.inputs[prefix_len:], prefix_len)
+                if token in markers
+            ),
+            None,
+        )
         if cut is None or cut <= prefix_len or cut >= len(episode.inputs) - 1:
             return episode
         prefix = episode.inputs[:prefix_len]
         context_inputs = episode.inputs[:cut]
         query_inputs = prefix + episode.inputs[cut:]
         context_meta, query_meta = dict(episode.metadata), dict(episode.metadata)
-        position_fields = ("lang_addr", "workspace_event_writes", "workspace_query_reads", "workspace_match_writes", "workspace_binding_aux")
+        position_fields = (
+            "lang_addr",
+            "workspace_event_writes",
+            "workspace_query_reads",
+            "workspace_match_writes",
+            "workspace_binding_aux",
+        )
         for field in position_fields:
             vals = episode.metadata.get(field, ())
             left, right = [], []
@@ -198,10 +245,19 @@ class LanguageDataset(WorkspaceCapabilityDataset):
                     mapped = (prefix_len + pos - cut, *row[1:])
                     right.append(mapped)
             context_meta[field], query_meta[field] = tuple(left), tuple(right)
-        context_meta.update(context_only=True, answer_count=0, workspace_output_keys=(), workspace_output_kv_targets=None)
-        query_meta["prev"] = (TaskEpisode(episode.track, tuple(context_inputs), (EOS,), context_meta),)
+        context_meta.update(
+            context_only=True,
+            answer_count=0,
+            workspace_output_keys=(),
+            workspace_output_kv_targets=None,
+        )
+        query_meta["prev"] = (
+            TaskEpisode(episode.track, tuple(context_inputs), (EOS,), context_meta),
+        )
         query_meta["sequence_length"] = len(query_inputs)
-        return validate_episode(TaskEpisode(episode.track, tuple(query_inputs), episode.answer, query_meta))
+        return validate_episode(
+            TaskEpisode(episode.track, tuple(query_inputs), episode.answer, query_meta)
+        )
 
     # ------------------------------------------------------------------ workspace metadata
     def workspace_entity_address_metadata(self, input_vectors, *, episodes=None, **_):
@@ -236,23 +292,32 @@ class LanguageDataset(WorkspaceCapabilityDataset):
             match_ids[mr, mp] = torch.tensor(match_keys)
             match_mask[mr, mp] = True
         device = input_vectors.device
-        return {"entity_ids": ids.to(device), "entity_write_mask": mask.to(device),
-                "workspace_match_entity_ids": match_ids.to(device), "workspace_match_write_mask": match_mask.to(device)}
+        return {
+            "entity_ids": ids.to(device),
+            "entity_write_mask": mask.to(device),
+            "workspace_match_entity_ids": match_ids.to(device),
+            "workspace_match_write_mask": match_mask.to(device),
+        }
 
-    def workspace_key_value_metadata(self, input_vectors, episodes=None, *, include_adaptive_v3=False, **_):
+    def workspace_key_value_metadata(
+        self, input_vectors, episodes=None, *, include_adaptive_v3=False, **_
+    ):
         examples = self.last_batch_examples if episodes is None else episodes
         batch, time = input_vectors.shape[:2]
         if len(examples) != batch:
             raise RuntimeError("language key-value metadata lost batch/episode alignment")
         cap = KEY_VALUE_OPERAND_CAPACITY
         copy_tracks = {
-            "lang_parse", "lang_define", "lang_logic", "lang_induce", "lang_act",
-            "lang_discourse", "lang_nlg",
+            "lang_parse",
+            "lang_define",
+            "lang_logic",
+            "lang_induce",
+            "lang_act",
+            "lang_discourse",
+            "lang_nlg",
         }
         function_pieces = {
-            token
-            for word in (*lg.FUNCTION, *lg.PUNCT)
-            for token in lt.tokenizer().word(word)
+            token for word in (*lg.FUNCTION, *lg.PUNCT) for token in lt.tokenizer().word(word)
         }
 
         def copy_source(episode):
@@ -312,13 +377,16 @@ class LanguageDataset(WorkspaceCapabilityDataset):
             md = episode.metadata
             source_ids, source_positions = copy_sources[row]
             if episode.track in copy_tracks and source_ids:
-                copy_source_token_ids[row, :len(source_ids)] = torch.tensor(source_ids)
-                copy_source_mask[row, :len(source_ids)] = True
+                copy_source_token_ids[row, : len(source_ids)] = torch.tensor(source_ids)
+                copy_source_mask[row, : len(source_ids)] = True
             for step, target in md.get("workspace_binding_aux", ()):
                 step, target = int(step), int(target)
                 if 0 <= step < limit and 0 <= target < self.output_dim:
                     binding_aux_targets[row, step] = target
-            for step, key, target in (*md.get("workspace_event_writes", ()), *md.get("workspace_query_reads", ())):
+            for step, key, target in (
+                *md.get("workspace_event_writes", ()),
+                *md.get("workspace_query_reads", ()),
+            ):
                 col = used.get((row, step), 0)
                 if step >= limit or col >= cap:
                     continue
@@ -354,7 +422,13 @@ class LanguageDataset(WorkspaceCapabilityDataset):
                 if offset >= len(output_kv_targets):
                     continue
                 used[(row, step)] = col + 1
-                rr.append(row), ss.append(step), cc.append(col), kk.append(key), tt.append(int(output_kv_targets[offset]))
+                (
+                    rr.append(row),
+                    ss.append(step),
+                    cc.append(col),
+                    kk.append(key),
+                    tt.append(int(output_kv_targets[offset])),
+                )
                 route_mask[row, step] = False
         ids = torch.full((batch, time, cap), -1, dtype=torch.long)
         targets = torch.full((batch, time, cap), -100, dtype=torch.long)
@@ -382,7 +456,9 @@ class LanguageDataset(WorkspaceCapabilityDataset):
             "key_value_argmatch_locations": {},
         }
         if include_adaptive_v3:  # language tracks carry no operator programs: V3/V4 stay inert
-            result["adaptive_operator_candidate_mask"] = torch.zeros((batch, time), dtype=torch.bool)
+            result["adaptive_operator_candidate_mask"] = torch.zeros(
+                (batch, time), dtype=torch.bool
+            )
             result["adaptive_operator_execution_mask"] = torch.ones((batch, time), dtype=torch.bool)
             result["adaptive_operator_steps"] = ()
             result["adaptive_operator_teacher_steps"] = ()
@@ -392,7 +468,9 @@ class LanguageDataset(WorkspaceCapabilityDataset):
     def _emit(self, group, cont):
         group = [g if g is not None else _DUMMY for g in group]
         self.last_batch_examples, self.segment_continue = group, cont
-        x, y, m = self._collate(group, token_ids_only=True, teacher_forced=self.teacher_forced_answers)
+        x, y, m = self._collate(
+            group, token_ids_only=True, teacher_forced=self.teacher_forced_answers
+        )
         m[torch.tensor([g is _DUMMY for g in group])] = 0.0
         for row, episode in enumerate(group):
             if episode.metadata.get("context_only"):
@@ -417,11 +495,9 @@ class LanguageDataset(WorkspaceCapabilityDataset):
                 self._pending_chain_tracks.clear()
             return self._emit(group, cont)
         sample_count = batch_size * self.length_bucket_microbatches
-        batch = super().sample_batch(curriculum, sample_count)
+        super().sample_batch(curriculum, sample_count)
         sampled_tracks = [
-            episode.track
-            for episode in self.last_batch_examples
-            if episode is not _DUMMY
+            episode.track for episode in self.last_batch_examples if episode is not _DUMMY
         ]
         for track in sampled_tracks:
             self._track_sampled_episode_counts[track] += 1
@@ -435,7 +511,9 @@ class LanguageDataset(WorkspaceCapabilityDataset):
         buckets: dict[int, list] = defaultdict(list)
         for episode, chain in zip(self.last_batch_examples, chains):
             buckets[len(chain)].append((episode, chain))
-        ordered = [sorted(buckets[n], key=lambda item: len(item[0].sequence)) for n in sorted(buckets)]
+        ordered = [
+            sorted(buckets[n], key=lambda item: len(item[0].sequence)) for n in sorted(buckets)
+        ]
         total_episodes = max(1, len(self.last_batch_examples))
         segments = []
         for bucket in ordered:
@@ -501,7 +579,9 @@ class LanguageDataset(WorkspaceCapabilityDataset):
     def loss_sparse(logits, target, mask, positions):
         """Per-example answer CE for logits projected only at selected positions."""
         if logits.ndim != 2 or positions.ndim != 2 or positions.shape[-1] != 2:
-            raise ValueError("sparse language loss expects [positions,vocab] logits and [N,2] coordinates")
+            raise ValueError(
+                "sparse language loss expects [positions,vocab] logits and [N,2] coordinates"
+            )
         if positions.shape[0] != logits.shape[0]:
             raise ValueError("sparse language logits and coordinates differ in length")
         if logits.shape[0] == 0:
@@ -537,12 +617,16 @@ class LanguageDataset(WorkspaceCapabilityDataset):
         return histogram.ne(0).sum().to(dtype=logits.dtype)
 
     @staticmethod
-    def apply_workspace_key_value_readout_sparse(logits, positions, predictions, metadata, answer_mask):
+    def apply_workspace_key_value_readout_sparse(
+        logits, positions, predictions, metadata, answer_mask
+    ):
         """Route language answer positions without materializing dense vocabulary logits."""
         if not predictions:
             return logits
         if metadata.get("key_value_output_programs"):
-            raise ValueError("sparse language readout does not support structured KV output programs")
+            raise ValueError(
+                "sparse language readout does not support structured KV output programs"
+            )
         rows, times = positions[:, 0], positions[:, 1]
         masks = metadata["key_value_mask"].to(device=logits.device)
         route_mask = metadata.get("key_value_route_mask")
@@ -557,21 +641,21 @@ class LanguageDataset(WorkspaceCapabilityDataset):
             # Work over the already-gathered sparse answer rows. Avoid
             # per-step CUDA nonzero()/Python truth checks, which synchronize
             # the device for each workspace prediction time.
-            active = (
-                times.eq(step)
-                & masks[rows, times, 0]
-                & answer_mask[rows, times]
-            )
+            active = times.eq(step) & masks[rows, times, 0] & answer_mask[rows, times]
             if route_mask is not None:
                 active &= route_mask[rows, times]
-            routed = value_logits[:, 0].index_select(0, rows).to(
-                device=logits.device, dtype=logits.dtype
+            routed = (
+                value_logits[:, 0]
+                .index_select(0, rows)
+                .to(device=logits.device, dtype=logits.dtype)
             )
             result = torch.where(active.unsqueeze(-1), routed, result)
         return result
 
     def _evaluate_episodes(self, model, device, episodes, **kw):
-        if not any(e.metadata.get("prev") for e in episodes) or not hasattr(model, "_initium_carry"):
+        if not any(e.metadata.get("prev") for e in episodes) or not hasattr(
+            model, "_initium_carry"
+        ):
             return super()._evaluate_episodes(model, device, episodes, **kw)
         context_teacher_forced = bool(kw.get("teacher_forced", self.teacher_forced_answers))
         hint, carries = min(self.batch_size_hint, max(1, len(episodes))), []
@@ -616,7 +700,11 @@ class LanguageDataset(WorkspaceCapabilityDataset):
                 continue
             supported = set(e.inputs)
             metadata = e.metadata
-            for field in ("workspace_event_writes", "workspace_query_reads", "workspace_binding_aux"):
+            for field in (
+                "workspace_event_writes",
+                "workspace_query_reads",
+                "workspace_binding_aux",
+            ):
                 for row in metadata.get(field, ()):
                     value = int(row[-1])
                     if value >= TEXT_BASE:
@@ -626,7 +714,12 @@ class LanguageDataset(WorkspaceCapabilityDataset):
                 if t >= TEXT_BASE and t not in func:
                     tot += 1
                     bad += t not in supported
-        return {"ungrounded_tokens": {"rate_pct": 100.0 * bad / max(tot, 1), "episodes": n}} if n else {}
+        return (
+            {"ungrounded_tokens": {"rate_pct": 100.0 * bad / max(tot, 1), "episodes": n}}
+            if n
+            else {}
+        )
+
     def _lang5_metrics(self, episodes):
         """Coreference-by-distance, derivation-by-depth and clarification P/R (also printed by the caller)."""
         preds, clar = self._last_eval_preds, [*ltr._toks(["who", "do", "you", "mean?"]), EOS]
@@ -687,48 +780,62 @@ class LanguageDataset(WorkspaceCapabilityDataset):
                 pc += c
                 gc += g
         out = {k: {"exact_pct": 100.0 * a / n, "episodes": n} for k, (a, n) in sorted(acc.items())}
-        out.update({
-            f"induce_answer_position_{position}": {
-                "accuracy_pct": 100.0 * correct / max(count, 1),
-                "episodes": count,
+        out.update(
+            {
+                f"induce_answer_position_{position}": {
+                    "accuracy_pct": 100.0 * correct / max(count, 1),
+                    "episodes": count,
+                }
+                for position, (correct, count) in sorted(induce_positions.items())
             }
-            for position, (correct, count) in sorted(induce_positions.items())
-        })
+        )
         if induce_eos[1]:
             out["induce_eos_accuracy"] = {
                 "accuracy_pct": 100.0 * induce_eos[0] / induce_eos[1],
                 "episodes": induce_eos[1],
             }
-        out.update({
-            f"act_answer_position_{act}_{position}": {
-                "accuracy_pct": 100.0 * correct / max(count, 1),
-                "episodes": count,
+        out.update(
+            {
+                f"act_answer_position_{act}_{position}": {
+                    "accuracy_pct": 100.0 * correct / max(count, 1),
+                    "episodes": count,
+                }
+                for (act, position), (correct, count) in sorted(act_positions.items())
             }
-            for (act, position), (correct, count) in sorted(act_positions.items())
-        })
-        out.update({
-            f"act_eos_accuracy_{act}": {
-                "accuracy_pct": 100.0 * correct / max(count, 1),
-                "episodes": count,
+        )
+        out.update(
+            {
+                f"act_eos_accuracy_{act}": {
+                    "accuracy_pct": 100.0 * correct / max(count, 1),
+                    "episodes": count,
+                }
+                for act, (correct, count) in sorted(act_eos.items())
             }
-            for act, (correct, count) in sorted(act_eos.items())
-        })
-        out.update({
-            f"{track}_answer_position_{group}_{position}": {
-                "accuracy_pct": 100.0 * correct / max(count, 1),
-                "episodes": count,
+        )
+        out.update(
+            {
+                f"{track}_answer_position_{group}_{position}": {
+                    "accuracy_pct": 100.0 * correct / max(count, 1),
+                    "episodes": count,
+                }
+                for (track, group, position), (correct, count) in sorted(output_positions.items())
             }
-            for (track, group, position), (correct, count) in sorted(output_positions.items())
-        })
-        out.update({
-            f"{track}_eos_accuracy_{group}": {
-                "accuracy_pct": 100.0 * correct / max(count, 1),
-                "episodes": count,
+        )
+        out.update(
+            {
+                f"{track}_eos_accuracy_{group}": {
+                    "accuracy_pct": 100.0 * correct / max(count, 1),
+                    "episodes": count,
+                }
+                for (track, group), (correct, count) in sorted(output_eos.items())
             }
-            for (track, group), (correct, count) in sorted(output_eos.items())
-        })
+        )
         if gc or pc:
-            out["clarify"] = {"precision_pct": 100.0 * tp / max(pc, 1), "recall_pct": 100.0 * tp / max(gc, 1), "episodes": gc}
+            out["clarify"] = {
+                "precision_pct": 100.0 * tp / max(pc, 1),
+                "recall_pct": 100.0 * tp / max(gc, 1),
+                "episodes": gc,
+            }
         return out
 
     # ------------------------------------------------------------------ display
@@ -740,9 +847,13 @@ class LanguageDataset(WorkspaceCapabilityDataset):
             toks = [int(t) for t in tokens]
             toks = toks[: toks.index(EOS)] if EOS in toks else toks
             if kind == "bool":
-                return " ".join("yes" if t == BOOL_TRUE else "no" if t == BOOL_FALSE else "?" for t in toks)
+                return " ".join(
+                    "yes" if t == BOOL_TRUE else "no" if t == BOOL_FALSE else "?" for t in toks
+                )
             if kind == "mr":
-                return " ".join(lt.tokenizer().decode([t]) if t >= TEXT_BASE else f"<{t}>" for t in toks)
+                return " ".join(
+                    lt.tokenizer().decode([t]) if t >= TEXT_BASE else f"<{t}>" for t in toks
+                )
             if kind == "typed":
                 return " ".join(
                     _dev_lexicon.word_name(t - FACT_BASE)
@@ -780,7 +891,14 @@ class LanguageDataset(WorkspaceCapabilityDataset):
         }
         total = sum(int(values.get("episodes", 0)) for values in by_track.values())
         overall = {}
-        for metric in ("exact", "token_accuracy", "length_accuracy", "repetition_rate", "fact_set_match", "teacher_forced_exact"):
+        for metric in (
+            "exact",
+            "token_accuracy",
+            "length_accuracy",
+            "repetition_rate",
+            "fact_set_match",
+            "teacher_forced_exact",
+        ):
             overall[metric] = sum(
                 float(values.get(metric, 0.0)) * int(values.get("episodes", 0))
                 for values in by_track.values()
@@ -792,7 +910,8 @@ class LanguageDataset(WorkspaceCapabilityDataset):
 
     def evaluate_curriculum_id(self, model, device, lesson_idx, *, field_log=None):
         self._curriculum_track_levels = (
-            dict(lesson_idx) if isinstance(lesson_idx, dict)
+            dict(lesson_idx)
+            if isinstance(lesson_idx, dict)
             else {track: int(lesson_idx) for track in self._tracks()}
         )
         result = super().evaluate_curriculum_id(model, device, lesson_idx, field_log=field_log)
@@ -807,10 +926,11 @@ class LanguageDataset(WorkspaceCapabilityDataset):
             group_scores = [
                 float(group_values["exact_match"])
                 for group_values in progression_groups.get(track, {}).values()
-                if group_values.get("episodes", 0) > 0
-                and "exact_match" in group_values
+                if group_values.get("episodes", 0) > 0 and "exact_match" in group_values
             ]
-            weight_basis_exact[track] = min(group_scores) if group_scores else float(values["exact_match"])
+            weight_basis_exact[track] = (
+                min(group_scores) if group_scores else float(values["exact_match"])
+            )
         self._track_group_sampling_weights = {
             track: {
                 group: max(
@@ -825,9 +945,9 @@ class LanguageDataset(WorkspaceCapabilityDataset):
         raw_weights = {
             # Keep solved Stage-4 tracks in the replay mixture so they retain
             # a meaningful minimum share while weak Stage-5 tracks are favored.
-            track: 0.05 if track == "lang_open" else 0.05 + max(
-                0.0, 0.9 - weight_basis_exact[track] / 100.0
-            )
+            track: 0.05
+            if track == "lang_open"
+            else 0.05 + max(0.0, 0.9 - weight_basis_exact[track] / 100.0)
             for track in diagnostics.get("tracks", {})
         }
         stalled = set()
@@ -862,9 +982,13 @@ class LanguageDataset(WorkspaceCapabilityDataset):
         diagnostics["track_sampling"] = {
             track: {
                 "sampled_episodes": int(sampled_episodes.get(track, 0)),
-                "sampled_episode_share_pct": 100.0 * sampled_episodes.get(track, 0) / max(episode_total, 1),
+                "sampled_episode_share_pct": 100.0
+                * sampled_episodes.get(track, 0)
+                / max(episode_total, 1),
                 "sampled_batches": int(sampled_batches.get(track, 0)),
-                "sampled_batch_share_pct": 100.0 * sampled_batches.get(track, 0) / max(batch_total, 1),
+                "sampled_batch_share_pct": 100.0
+                * sampled_batches.get(track, 0)
+                / max(batch_total, 1),
                 "optimizer_steps": int(sampled_steps.get(track, 0)),
                 "observed_step_share_pct": 100.0 * sampled_steps.get(track, 0) / max(step_total, 1),
                 "weight_basis_exact_pct": float(weight_basis_exact.get(track, 0.0)),
@@ -889,8 +1013,35 @@ class LanguageDataset(WorkspaceCapabilityDataset):
                 for track, weight in sorted(self._track_weights.items())
             )
         )
-        diagnostics, episodes, preds = self.last_eval_diagnostics, self._last_id_eval_episodes, self._last_eval_preds
+        diagnostics, episodes, preds = (
+            self.last_eval_diagnostics,
+            self._last_id_eval_episodes,
+            self._last_eval_preds,
+        )
         if getattr(self, "progression_eval_only", False):
+            # Keep the cheap, prediction-only breakdowns that explain why a
+            # progression group misses its gate.  These reuse the just-finished
+            # ID evaluation and do not add model forwards (unlike generation,
+            # slot surgery, paraphrase, or grounding probes).
+            try:
+                position_metrics = self._lang5_metrics(episodes)
+                diagnostics["progression_position_metrics"] = position_metrics
+                for key, values in sorted(position_metrics.items()):
+                    if key.startswith(
+                        (
+                            "induce_answer_position_",
+                            "induce_eos_accuracy",
+                            "act_answer_position_",
+                            "act_eos_accuracy_",
+                        )
+                    ):
+                        print(
+                            f"  [lang/progression/{key}] "
+                            f"accuracy={values.get('accuracy_pct', values.get('exact_pct', 0.0)):.1f}% "
+                            f"n={values.get('episodes', 0)}"
+                        )
+            except (RuntimeError, ValueError, KeyError) as exc:
+                print(f"[lang-progression-diagnostics] skipped: {exc!r}")
             self.last_eval_diagnostics, self._last_eval_preds = diagnostics, preds
             return result
         self._print_samples(episodes, "id")
@@ -910,21 +1061,37 @@ class LanguageDataset(WorkspaceCapabilityDataset):
                         f"n={int(values.get('episodes', 0))}"
                     )
             workspace = getattr(model, "workspace", None)
-            if workspace is not None and getattr(model, "workspace_semantic_entity_addressing", False):
+            if workspace is not None and getattr(
+                model, "workspace_semantic_entity_addressing", False
+            ):
                 if getattr(model, "workspace_key_value_readout_enabled", False):
                     extra.update(self._slot_probe(model, device, episodes))
-                probe_level = max(lesson_idx.values(), default=0) if isinstance(lesson_idx, dict) else int(lesson_idx)
+                probe_level = (
+                    max(lesson_idx.values(), default=0)
+                    if isinstance(lesson_idx, dict)
+                    else int(lesson_idx)
+                )
                 extra.update(self._slot_surgery(model, device, probe_level))
-            probe_level = max(lesson_idx.values(), default=0) if isinstance(lesson_idx, dict) else int(lesson_idx)
+            probe_level = (
+                max(lesson_idx.values(), default=0)
+                if isinstance(lesson_idx, dict)
+                else int(lesson_idx)
+            )
             extra.update(self._paraphrase_probe(model, device, probe_level))
-            self._last_eval_preds = preds  # the probes above overwrote it; the metrics below need ID predictions
+            self._last_eval_preds = (
+                preds  # the probes above overwrote it; the metrics below need ID predictions
+            )
             extra.update(self._ungrounded(episodes))
             extra.update(self._lang5_metrics(episodes))
         except (RuntimeError, ValueError, KeyError) as exc:  # diagnostics must not kill a long run
             print(f"[lang-diagnostics] skipped: {exc!r}")
         diagnostics["production"] = extra
         for k, v in sorted(extra.items()):
-            print(f"  [lang/{k}] " + " ".join(f"{a}={b:.1f}" for a, b in v.items() if a != "episodes") + f" n={v.get('episodes', 0)}")
+            print(
+                f"  [lang/{k}] "
+                + " ".join(f"{a}={b:.1f}" for a, b in v.items() if a != "episodes")
+                + f" n={v.get('episodes', 0)}"
+            )
         self.last_eval_diagnostics, self._last_eval_preds = diagnostics, preds
         return result
 
@@ -942,7 +1109,10 @@ class LanguageDataset(WorkspaceCapabilityDataset):
     ):
         """Microbatched eval forward; calls on_batch(group, answer_preds, kv_meta, kv_preds)."""
         workspace = model.workspace
-        prior, was_training = getattr(workspace, "_initium_recurrent_state_observer", None), model.training
+        prior, was_training = (
+            getattr(workspace, "_initium_recurrent_state_observer", None),
+            model.training,
+        )
         model.eval()
         try:
             with torch.no_grad():
@@ -954,7 +1124,10 @@ class LanguageDataset(WorkspaceCapabilityDataset):
                         teacher_forced=teacher_forced,
                     )
                     kwargs = {
-                        k: v.to(device) for k, v in self.workspace_entity_address_metadata(x, episodes=group).items()
+                        k: v.to(device)
+                        for k, v in self.workspace_entity_address_metadata(
+                            x, episodes=group
+                        ).items()
                     }
                     kv = self.workspace_key_value_metadata(x, group) if want_kv else None
                     if kv is not None:
@@ -963,8 +1136,12 @@ class LanguageDataset(WorkspaceCapabilityDataset):
                             key_value_mask=kv["key_value_mask"].to(device),
                             key_value_steps=kv["key_value_steps"],
                         )
-                    workspace._initium_recurrent_state_observer = make_observer(group) if make_observer else None
-                    output, state = model(x.to(device), (None, None, None), reset_experience=True, **kwargs)
+                    workspace._initium_recurrent_state_observer = (
+                        make_observer(group) if make_observer else None
+                    )
+                    output, state = model(
+                        x.to(device), (None, None, None), reset_experience=True, **kwargs
+                    )
                     if state_only:
                         if want_kv:
                             workspace.pop_key_value_predictions()
@@ -981,8 +1158,13 @@ class LanguageDataset(WorkspaceCapabilityDataset):
                             copy_source_mask=(kv or {}).get("workspace_copy_source_mask"),
                         )
                     tokens = logits.argmax(-1).cpu().tolist()
-                    preds = [t[len(e.inputs) : len(e.inputs) + len(e.answer)] for e, t in zip(group, tokens)]
-                    on_batch(group, preds, kv, workspace.pop_key_value_predictions() if want_kv else None)
+                    preds = [
+                        t[len(e.inputs) : len(e.inputs) + len(e.answer)]
+                        for e, t in zip(group, tokens)
+                    ]
+                    on_batch(
+                        group, preds, kv, workspace.pop_key_value_predictions() if want_kv else None
+                    )
         finally:
             workspace._initium_recurrent_state_observer = prior
             model.train(was_training)
@@ -1009,7 +1191,7 @@ class LanguageDataset(WorkspaceCapabilityDataset):
                 hit = logits.argmax(-1).cpu().eq(kv["key_value_targets"][:, step])
                 retention = last.eq(step).expand_as(mask)
                 kinds = torch.full_like(keys, 3)
-                for lo, hi, idx in (_SLOT_RANGES5 if lt.settings["stage5"] else _SLOT_RANGES):
+                for lo, hi, idx in _SLOT_RANGES5 if lt.settings["stage5"] else _SLOT_RANGES:
                     kinds[(keys >= lo) & (keys < hi)] = idx
                 for phase, flag in (("write", False), ("retention", True)):
                     in_phase = mask & (retention == flag)
@@ -1091,7 +1273,10 @@ class LanguageDataset(WorkspaceCapabilityDataset):
                     address = state[row, :, :address_dim]
                     occupied = address.square().sum(-1) > 1e-12
                     slot = address.argmax(-1)
-                    ia, ib = ((slot == ka) & occupied).nonzero(), ((slot == kb) & occupied).nonzero()
+                    ia, ib = (
+                        ((slot == ka) & occupied).nonzero(),
+                        ((slot == kb) & occupied).nonzero(),
+                    )
                     if ia.numel() and ib.numel():
                         ia, ib = ia[0, 0], ib[0, 0]
                         swap = state[row, ia, address_dim:].clone()
@@ -1101,7 +1286,13 @@ class LanguageDataset(WorkspaceCapabilityDataset):
             return observe
 
         base, edited = {}, {}
-        sink = lambda store: lambda group, preds, *_: store.update({id(e): p for e, p in zip(group, preds)})  # noqa: E731
+
+        def sink(store):
+            def update(group, preds, *_):
+                store.update({id(e): p for e, p in zip(group, preds)})
+
+            return update
+
         self._probe_forward(model, device, eps, sink(base))
         self._probe_forward(model, device, eps, sink(edited), make_observer)
         present = followed = changed = 0
@@ -1124,7 +1315,11 @@ class LanguageDataset(WorkspaceCapabilityDataset):
     def _paraphrase_probe(self, model, device, lesson):
         if "lang_template" not in self._tracks():
             return {}
-        cfg, rng, pairs = difficulty_for("lang_template", lesson), random.Random(91_700 + lesson), []
+        cfg, rng, pairs = (
+            difficulty_for("lang_template", lesson),
+            random.Random(91_700 + lesson),
+            [],
+        )
         for _ in range(40 * self.diag_episodes):
             if len(pairs) == self.diag_episodes:
                 break

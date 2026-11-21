@@ -486,9 +486,7 @@ class SplitGraphDNC(nn.Module):
         self.workspace_attentional_item_memory_enabled = bool(
             workspace_attentional_item_memory or workspace_attentional_cue_readout
         )
-        self.workspace_attentional_cue_readout_enabled = bool(
-            workspace_attentional_cue_readout
-        )
+        self.workspace_attentional_cue_readout_enabled = bool(workspace_attentional_cue_readout)
         self.workspace_rule_feedback_update_enabled = bool(workspace_rule_feedback_update)
         self.workspace_no_report_confidence_readout_enabled = bool(
             workspace_no_report_confidence_readout
@@ -525,9 +523,15 @@ class SplitGraphDNC(nn.Module):
                 "workspace parallel scan requires entity-keyed semantic addressing "
                 "and key-value readout"
             )
-        if self.workspace_operation_executor_enabled and not self.workspace_key_value_readout_enabled:
+        if (
+            self.workspace_operation_executor_enabled
+            and not self.workspace_key_value_readout_enabled
+        ):
             raise ValueError("workspace operation executor requires key-value readout")
-        if self.workspace_operation_diagnostics_enabled and not self.workspace_operation_executor_enabled:
+        if (
+            self.workspace_operation_diagnostics_enabled
+            and not self.workspace_operation_executor_enabled
+        ):
             raise ValueError("workspace operation diagnostics require the operation executor")
         self.workspace_key_match_threshold = float(workspace_key_match_threshold)
         self.workspace_no_selection = workspace_no_selection
@@ -820,9 +824,13 @@ class SplitGraphDNC(nn.Module):
         if workspace_adaptive_enabled and workspace_adaptive_v2_enabled:
             raise ValueError("choose either workspace adaptive v1 or v2, not both")
         if workspace_adaptive_enabled and not (workspace_enabled and workspace_num_slots > 0):
-            raise ValueError("adaptive workspace skills require an active workspace with at least one slot")
+            raise ValueError(
+                "adaptive workspace skills require an active workspace with at least one slot"
+            )
         if workspace_adaptive_v2_enabled and not (workspace_enabled and workspace_num_slots > 0):
-            raise ValueError("adaptive workspace v2 requires an active workspace with at least one slot")
+            raise ValueError(
+                "adaptive workspace v2 requires an active workspace with at least one slot"
+            )
         if workspace_compile_recurrence and (not workspace_enabled or workspace_num_slots < 1):
             raise ValueError(
                 "compiled workspace recurrence requires workspace_enabled=True "
@@ -1017,7 +1025,9 @@ class SplitGraphDNC(nn.Module):
             copy_delta = copy_vocab * 8.0 * gate.unsqueeze(-1)
         if ws.slot_text_cols is None:
             delta = out.to(logits.dtype)
-            result = logits + delta * answer_mask.to(device=logits.device, dtype=logits.dtype).unsqueeze(-1)
+            result = logits + delta * answer_mask.to(
+                device=logits.device, dtype=logits.dtype
+            ).unsqueeze(-1)
             if copy_delta is not None:
                 result = result + copy_delta.to(dtype=result.dtype) * answer_mask.to(
                     device=result.device, dtype=result.dtype
@@ -1032,7 +1042,9 @@ class SplitGraphDNC(nn.Module):
             # Copy logits share the input token embeddings. A token unseen as a
             # slot-head target can still be emitted when its input embedding
             # has been learned.
-            slot_logits = (ws.slot_readout_scale * (out[sel] @ adapter.weight[:, ws.slot_text_cols])).to(rows.dtype)
+            slot_logits = (
+                ws.slot_readout_scale * (out[sel] @ adapter.weight[:, ws.slot_text_cols])
+            ).to(rows.dtype)
         else:
             if ws.slot_text_head is None:
                 raise RuntimeError("slot-text copy requires a compatible token input embedding")
@@ -1045,7 +1057,9 @@ class SplitGraphDNC(nn.Module):
         address, _content = torch.split(slots.float(), [ws._address_dim, ws.d_model], dim=-1)
         occupied = address.square().sum(-1) > 1e-12
         slot_ids = address.argmax(-1)
-        present = torch.zeros(address.shape[0], ws._SEMANTIC_ENTITY_COUNT, dtype=torch.int32, device=address.device)
+        present = torch.zeros(
+            address.shape[0], ws._SEMANTIC_ENTITY_COUNT, dtype=torch.int32, device=address.device
+        )
         present.scatter_add_(1, slot_ids, occupied.to(torch.int32))
         present = present > 0
         pointer = ws.slot_pointer_logits(features, match_features, present).softmax(-1)
@@ -1084,7 +1098,9 @@ class SplitGraphDNC(nn.Module):
     ):
         """Apply the ordinary slot/copy readout to already-gathered positions."""
         if logits.ndim != 2 or features.ndim != 2:
-            raise ValueError("sparse slot readout expects [positions,vocab] logits and [positions,hidden] features")
+            raise ValueError(
+                "sparse slot readout expects [positions,vocab] logits and [positions,hidden] features"
+            )
         if logits.shape[0] == 0:
             return logits
         if self.workspace is None or self.workspace.slot_pointer is None:
@@ -1101,9 +1117,7 @@ class SplitGraphDNC(nn.Module):
         slots = batch_slots.index_select(0, rows)
         match_features = chx.get("_initium_workspace_match_keys")
         sparse_match_features = (
-            match_features.index_select(0, rows)
-            if match_features is not None
-            else None
+            match_features.index_select(0, rows) if match_features is not None else None
         )
         sparse_answer = answer_positions.to(device=logits.device, dtype=logits.dtype)
         out = self.workspace.slot_readout_logits(
@@ -1130,10 +1144,15 @@ class SplitGraphDNC(nn.Module):
             )
             occupied = address.square().sum(-1) > 1e-12
             slot_ids = address.argmax(-1)
-            present = torch.zeros(
-                address.shape[0], self.workspace._SEMANTIC_ENTITY_COUNT,
-                dtype=torch.int32, device=address.device,
-            ).scatter_add_(1, slot_ids, occupied.to(torch.int32)) > 0
+            present = (
+                torch.zeros(
+                    address.shape[0],
+                    self.workspace._SEMANTIC_ENTITY_COUNT,
+                    dtype=torch.int32,
+                    device=address.device,
+                ).scatter_add_(1, slot_ids, occupied.to(torch.int32))
+                > 0
+            )
             pointer = self.workspace.slot_pointer_logits(
                 features.unsqueeze(1), sparse_match_features, present
             ).softmax(-1)
@@ -1156,9 +1175,7 @@ class SplitGraphDNC(nn.Module):
             else None
         )
         sparse_copy_mask = (
-            copy_source_mask.index_select(0, rows)
-            if copy_source_mask is not None
-            else None
+            copy_source_mask.index_select(0, rows) if copy_source_mask is not None else None
         )
         if (
             not self.workspace_eval_bypass
@@ -1188,6 +1205,7 @@ class SplitGraphDNC(nn.Module):
                 * (8.0 * copy_gate.to(result.dtype) * sparse_answer).unsqueeze(-1)
             )
         return result
+
     def _allocate(self, feats, state, ids, wm, valid):
         a = self.allocator
         out = a(feats.float(), state.float())
@@ -1195,7 +1213,9 @@ class SplitGraphDNC(nn.Module):
             loss, st = a.loss(out, ids, wm, valid)
             self._alloc_loss = loss
             e = self.allocator_stats
-            self.allocator_stats = st if not e else {k: 0.99 * e[k] + 0.01 * v for k, v in st.items()}
+            self.allocator_stats = (
+                st if not e else {k: 0.99 * e[k] + 0.01 * v for k, v in st.items()}
+            )
         if self.allocator_use_prob > 0.0:
             pid, pw, confidence = a.predict(out)
             use = (
@@ -1209,6 +1229,7 @@ class SplitGraphDNC(nn.Module):
     def pop_allocator_loss(self):
         loss, self._alloc_loss = self._alloc_loss, None
         return loss
+
     def set_sgr_prediction_decoder(self, decoder: nn.Module | None, signal_mode: str) -> None:
         object.__setattr__(
             self,
@@ -1311,7 +1332,9 @@ class SplitGraphDNC(nn.Module):
         """
         original_hx = hx
         chx, mhx, last_read = hx
-        if self._initium_carry:  # segment-carry: recurrent stores survive after old tokens are dropped
+        if (
+            self._initium_carry
+        ):  # segment-carry: recurrent stores survive after old tokens are dropped
             _c = self._initium_carry.pop(0)
             if _c is not None:
                 if "chx" in _c:
@@ -1400,7 +1423,11 @@ class SplitGraphDNC(nn.Module):
             if isinstance(chx, dict) and not reset_experience:
                 workspace_match_keys = chx.get("_initium_workspace_match_keys")
             if workspace_match_keys is None or reset_experience:
-                workspace_match_keys = torch.zeros((B, self.workspace._SEMANTIC_ENTITY_COUNT, self.workspace.d_model), device=input.device, dtype=recurrent_state_dtype)
+                workspace_match_keys = torch.zeros(
+                    (B, self.workspace._SEMANTIC_ENTITY_COUNT, self.workspace.d_model),
+                    device=input.device,
+                    dtype=recurrent_state_dtype,
+                )
         if start_step:
             if not (0 < start_step < T):
                 raise ValueError(f"start_step={start_step} must be in (0, T={T})")
@@ -1632,16 +1659,32 @@ class SplitGraphDNC(nn.Module):
             base, specialists, route_indices, route_weights = forward_with_specialists(
                 stage_input, **specialist_kwargs
             )
-            if workspace_match_keys is not None and workspace_match_entity_ids is not None and workspace_match_write_mask is not None:
+            if (
+                workspace_match_keys is not None
+                and workspace_match_entity_ids is not None
+                and workspace_match_write_mask is not None
+            ):
                 match_ids = workspace_match_entity_ids[:, start_step:]
                 match_mask = workspace_match_write_mask[:, start_step:] & match_ids.ge(0)
-                positions = torch.arange(match_ids.shape[1], device=input.device).expand_as(match_ids)
+                positions = torch.arange(match_ids.shape[1], device=input.device).expand_as(
+                    match_ids
+                )
                 src = torch.where(match_mask, positions, torch.full_like(positions, -1))
                 latest = torch.full_like(workspace_match_keys[:, :, 0], -1, dtype=torch.long)
-                latest.scatter_reduce_(1, match_ids.clamp(0, self.workspace._SEMANTIC_ENTITY_COUNT - 1), src, reduce="amax", include_self=True)
+                latest.scatter_reduce_(
+                    1,
+                    match_ids.clamp(0, self.workspace._SEMANTIC_ENTITY_COUNT - 1),
+                    src,
+                    reduce="amax",
+                    include_self=True,
+                )
                 observed = base[:, start_step:]
-                gathered = observed.gather(1, latest.clamp_min(0).unsqueeze(-1).expand(-1, -1, observed.shape[-1]))
-                workspace_match_keys = torch.where(latest.ge(0).unsqueeze(-1), gathered, workspace_match_keys)
+                gathered = observed.gather(
+                    1, latest.clamp_min(0).unsqueeze(-1).expand(-1, -1, observed.shape[-1])
+                )
+                workspace_match_keys = torch.where(
+                    latest.ge(0).unsqueeze(-1), gathered, workspace_match_keys
+                )
             if self.allocator is not None and entity_ids is not None:
                 # Use the final contextual backbone representation. The old
                 # block-0 side pass added a full extra backbone execution and
@@ -1661,10 +1704,10 @@ class SplitGraphDNC(nn.Module):
             event_window = None
             if self.workspace_adaptive_v3_enabled:
                 _ids = input_token_ids if input_token_ids is not None else input.argmax(dim=-1)
-                event_window = torch.nn.functional.pad(_ids, (11, 0)).unfold(1, 12, 1)[:, start_step:]
-            self.workspace.adaptive_v3_eval_bypass = bool(
-                self.workspace_adaptive_v3_eval_bypass
-            )
+                event_window = torch.nn.functional.pad(_ids, (11, 0)).unfold(1, 12, 1)[
+                    :, start_step:
+                ]
+            self.workspace.adaptive_v3_eval_bypass = bool(self.workspace_adaptive_v3_eval_bypass)
             workspace_result = self.workspace(
                 specialists,
                 route_indices[:, start_step:],
@@ -1682,7 +1725,9 @@ class SplitGraphDNC(nn.Module):
                     if prediction_error is not None and workspace_error_consumer
                     else None
                 ),
-                backbone_context=(base[:, start_step:] if self.workspace_adaptive_v3_enabled else None),
+                backbone_context=(
+                    base[:, start_step:] if self.workspace_adaptive_v3_enabled else None
+                ),
                 selected_specialists_only=selected_specialists_only,
                 entity_ids=(entity_ids[:, start_step:] if entity_ids is not None else None),
                 entity_write_mask=(
@@ -1750,7 +1795,9 @@ class SplitGraphDNC(nn.Module):
                     key_value_mask[:, start_step:] if key_value_mask is not None else None
                 ),
                 key_value_steps=(
-                    tuple(step - start_step for step in (key_value_steps or ()) if step >= start_step)
+                    tuple(
+                        step - start_step for step in (key_value_steps or ()) if step >= start_step
+                    )
                     if key_value_entity_ids is not None
                     else None
                 ),
@@ -1794,15 +1841,11 @@ class SplitGraphDNC(nn.Module):
                     else None
                 ),
                 operation_metadata=(
-                    operation_metadata[:, start_step:]
-                    if operation_metadata is not None
-                    else None
+                    operation_metadata[:, start_step:] if operation_metadata is not None else None
                 ),
                 operation_steps=(
                     tuple(
-                        step - start_step
-                        for step in (operation_steps or ())
-                        if step >= start_step
+                        step - start_step for step in (operation_steps or ()) if step >= start_step
                     )
                     if operation_metadata is not None
                     else None

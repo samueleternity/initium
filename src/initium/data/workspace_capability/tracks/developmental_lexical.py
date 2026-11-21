@@ -5,7 +5,18 @@ from __future__ import annotations
 from contextlib import contextmanager, nullcontext
 
 from initium.data.workspace_capability.episode import (
-    BOS, EOS, EV_KV, QUERY, SEP, TaskEpisode, count_token, entity_token as e, fact_token, scalar_token,
+    BOS,
+    EOS,
+    EV_KV,
+    QUERY,
+    SEP,
+    TaskEpisode,
+    count_token,
+    fact_token,
+    scalar_token,
+)
+from initium.data.workspace_capability.episode import (
+    entity_token as e,
 )
 from initium.data.workspace_capability.tracks import _dev_lexicon as dl
 from initium.data.workspace_capability.tracks import _dev_semantics as ds
@@ -31,14 +42,20 @@ def generate(difficulty, rng, *, ood=False):
     stable = dl.settings["lexicon_mode"] == "stable"
     keyed = not dl.settings["unkeyed"]
     cfg = {**difficulty, "groups": (grp,), "families": (grp,)}
-    with (_stable_words() if stable else nullcontext()):
+    with _stable_words() if stable else nullcontext():
         if grp.startswith("d"):
             ep = developmental.generate(cfg, rng, ood=ood)
         else:
             ep = production.generate(cfg, rng, ood=ood, keyed=keyed, track=TRACK)
-    md = {**ep.metadata, "track": TRACK, "stage3": True, "stage3_words": stable,
-          "lexicon_mode": dl.settings["lexicon_mode"],
-          "band": "B" if ep.metadata.get("heldout_words") else "A", "counterfactual": False}
+    md = {
+        **ep.metadata,
+        "track": TRACK,
+        "stage3": True,
+        "stage3_words": stable,
+        "lexicon_mode": dl.settings["lexicon_mode"],
+        "band": "B" if ep.metadata.get("heldout_words") else "A",
+        "counterfactual": False,
+    }
     if not keyed:
         md.pop("workspace_output_keys", None)
     return TaskEpisode(TRACK, ep.inputs, ep.answer, md)
@@ -52,7 +69,11 @@ def _sense_episode(d, rng, grp, ood):
     band = "B" if held else "A"
     cand = [w for w in L.bands[band] if w in L.senses]
     poly = [w for w in cand if len(L.senses[w]) == 2]
-    pw = rng.choice(poly) if poly and (grp == "s_disambig" or rng.random() < float(d["polysemy"])) else None
+    pw = (
+        rng.choice(poly)
+        if poly and (grp == "s_disambig" or rng.random() < float(d["polysemy"]))
+        else None
+    )
     if grp == "s_disambig" and pw is None:
         raise ValueError("band has no polysemous words with two mapped categories")
     budget = max(3, int(d["senses"]))
@@ -79,7 +100,11 @@ def _sense_episode(d, rng, grp, ood):
     if grp == "s_s2w":
         k, w, c = rng.choice(recs)
         stream += [QUERY, e(k), scalar_token(0), SEP]
-        ans, extra, base = (fact_token(tok[w]), EOS), {"workspace_output_keys": (k, -1)}, 100.0 / len(words)
+        ans, extra, base = (
+            (fact_token(tok[w]), EOS),
+            {"workspace_output_keys": (k, -1)},
+            100.0 / len(words),
+        )
     elif grp == "s_s2c":
         k, w, c = rng.choice(recs)
         stream += [QUERY, e(k), scalar_token(1), SEP]
@@ -89,20 +114,48 @@ def _sense_episode(d, rng, grp, ood):
         k, w, c = rng.choice([r for r in recs if r[1] in mono])
         stream += [QUERY, fact_token(tok[w]), SEP]
         ans, base = (e(k), EOS), 100.0 / len(recs)
-        extra = {"workspace_output_programs": ((0, "argmatch", tuple(r[0] for r in recs),
-                                                tuple(fact_token(tok[r[1]]) for r in recs)),)}
+        extra = {
+            "workspace_output_programs": (
+                (
+                    0,
+                    "argmatch",
+                    tuple(r[0] for r in recs),
+                    tuple(fact_token(tok[r[1]]) for r in recs),
+                ),
+            )
+        }
     else:  # s_disambig
         pr = [r for r in recs if r[1] == pw]
         k, w, c = rng.choice(pr)
         stream += [QUERY, fact_token(tok[pw]), count_token(c), SEP]
         ans, base = (e(32 + k), EOS), 50.0
-        extra = {"workspace_output_programs": ((0, "argmatch", tuple(32 + r[0] for r in pr),
-                                                tuple(count_token(r[2]) for r in pr)),)}
+        extra = {
+            "workspace_output_programs": (
+                (0, "argmatch", tuple(32 + r[0] for r in pr), tuple(count_token(r[2]) for r in pr)),
+            )
+        }
     if dl.settings["unkeyed"]:
         extra.pop("workspace_output_keys", None)
     R = {k: tok[w] for k, w, c in recs}
     reads = tuple((len(stream) - 1, 32 + k, count_token(c)) for k, w, c in recs)
     qtype = f"{grp}_{'poly' if pw is not None else 'mono'}_{'heldout' if held else 'train'}"
-    return TaskEpisode(TRACK, tuple(stream), ans,
-                       ds.meta(TRACK, stream, grp, qtype, base, held, ood, R, "direct", band=band,
-                               reads=reads, polysemous=pw is not None, **extra))
+    return TaskEpisode(
+        TRACK,
+        tuple(stream),
+        ans,
+        ds.meta(
+            TRACK,
+            stream,
+            grp,
+            qtype,
+            base,
+            held,
+            ood,
+            R,
+            "direct",
+            band=band,
+            reads=reads,
+            polysemous=pw is not None,
+            **extra,
+        ),
+    )

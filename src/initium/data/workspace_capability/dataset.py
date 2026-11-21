@@ -11,9 +11,6 @@ import torch
 import torch.nn.functional as F
 
 from initium.data.base_dataset import BaseDataset
-from initium.data.workspace_capability.tracks._shared import (
-    EXT_OP_IDS, EXT_OP_NAMES, EXT_UNARY, ext_op_result,
-)
 from initium.data.workspace_capability.curriculum import (
     WorkspaceCapabilityCurriculum,
     difficulty_for,
@@ -26,9 +23,6 @@ from initium.data.workspace_capability.episode import (
     ENTITY_BASE,
     ENTITY_COUNT,
     EOS,
-    FACT_BASE,
-    FACT_COUNT,
-    NONE_TOKEN,
     EV_ASSERT,
     EV_COMMIT,
     EV_COUNT_QUERY,
@@ -45,52 +39,28 @@ from initium.data.workspace_capability.episode import (
     EV_SWAP,
     EV_UPDATE,
     EV_VECTOR,
+    FACT_BASE,
+    FACT_COUNT,
     LOCATION_BASE,
     LOCATION_COUNT,
+    NONE_TOKEN,
     QUERY,
     RELATION_BASE,
     RELATION_COUNT,
     SCALAR_BASE,
     SCALAR_COUNT,
+    SEP,
     SOURCE_BASE,
     SOURCE_COUNT,
-    SEP,
     TRACK_TOKEN_IDS,
-    track_marker_info,
-    track_token,
     VOCAB_SIZE,
     TaskEpisode,
     entity_token,
     scalar_token,
     source_token,
+    track_marker_info,
+    track_token,
     validate_episode,
-)
-from initium.data.workspace_capability.tracks import (
-    attentional_blink,
-    belief_tracking,
-    bistable_perception,
-    capacity_bottleneck,
-    entity_state,
-    ignition,
-    masked_priming,
-    mixed_skill,
-    no_report_confidence,
-    nth_farthest,
-    permutation,
-    psychological_refractory,
-    relational_join,
-    retrieval_aggregation,
-    rule_switching,
-    sustained_maintenance,
-    trace_conditioning,
-    variable_binding,
-    conditional_ops,
-    developmental,
-    production,
-    developmental_lexical,
-    developmental_semantic,
-    developmental_production_semantic,
-    _dev_lexicon,
 )
 from initium.data.workspace_capability.gnw_metrics import (
     binary_brier,
@@ -98,6 +68,40 @@ from initium.data.workspace_capability.gnw_metrics import (
     psychometric_logistic,
     type2_auc,
     wilson_interval,
+)
+from initium.data.workspace_capability.tracks import (
+    _dev_lexicon,
+    attentional_blink,
+    belief_tracking,
+    bistable_perception,
+    capacity_bottleneck,
+    conditional_ops,
+    developmental,
+    developmental_lexical,
+    developmental_production_semantic,
+    developmental_semantic,
+    entity_state,
+    ignition,
+    masked_priming,
+    mixed_skill,
+    no_report_confidence,
+    nth_farthest,
+    permutation,
+    production,
+    psychological_refractory,
+    relational_join,
+    retrieval_aggregation,
+    rule_switching,
+    sustained_maintenance,
+    trace_conditioning,
+    variable_binding,
+)
+from initium.data.workspace_capability.tracks._lang_text import LANG_TRACK_NAMES
+from initium.data.workspace_capability.tracks._shared import (
+    EXT_OP_IDS,
+    EXT_OP_NAMES,
+    EXT_UNARY,
+    ext_op_result,
 )
 
 _GENERATORS = {
@@ -128,13 +132,21 @@ _GENERATORS = {
     "developmental_production_semantic": developmental_production_semantic.generate,
     "developmental_production_semantic_unkeyed": developmental_production_semantic.generate_unkeyed,
 }
+
 STAGE3_TRACKS = _dev_lexicon.STAGE3_TRACKS
-from initium.data.workspace_capability.tracks._lang_text import LANG_TRACK_NAMES
+
 PRODUCTION_TRACKS = (
-    "developmental_production", "developmental_production_unkeyed",
-    "developmental_production_semantic", "developmental_production_semantic_unkeyed",
+    "developmental_production",
+    "developmental_production_unkeyed",
+    "developmental_production_semantic",
+    "developmental_production_semantic_unkeyed",
 )
-DEV_TRACKS = ("developmental", "developmental_production", "developmental_production_unkeyed", *STAGE3_TRACKS)
+DEV_TRACKS = (
+    "developmental",
+    "developmental_production",
+    "developmental_production_unkeyed",
+    *STAGE3_TRACKS,
+)
 TRACKS = tuple(t for t in _GENERATORS if t not in DEV_TRACKS)  # marker space holds 19 tracks
 ALL_TRACK = "all"
 NEW_TRACKS = (
@@ -147,8 +159,14 @@ NEW_TRACKS = (
 )
 NEW_ALL_TRACK = "new_all"
 GNW_TRACKS = (
-    "ignition", "attentional_blink", "psychological_refractory", "masked_priming",
-    "sustained_maintenance", "no_report_confidence", "bistable_perception", "trace_conditioning",
+    "ignition",
+    "attentional_blink",
+    "psychological_refractory",
+    "masked_priming",
+    "sustained_maintenance",
+    "no_report_confidence",
+    "bistable_perception",
+    "trace_conditioning",
 )
 GNW_ALL_TRACK = "gnw_all"
 MIXED_BINDING_TRACK = "mixed_binding"
@@ -197,8 +215,19 @@ _WORKSPACE_OPERATION_CODES = {
     "rank": 7,
     "swap": 8,
     "reduce": 9,
-    "sub": 10, "mul": 11, "neg": 12, "inc": 13, "dec": 14, "eq": 15, "member": 16,
-    "cond_copy": 17, "and": 18, "or": 19, "xor": 20, "not": 21, "max": 22,
+    "sub": 10,
+    "mul": 11,
+    "neg": 12,
+    "inc": 13,
+    "dec": 14,
+    "eq": 15,
+    "member": 16,
+    "cond_copy": 17,
+    "and": 18,
+    "or": 19,
+    "xor": 20,
+    "not": 21,
+    "max": 22,
     **{name: 20 + i for i, name in enumerate(EXT_OP_NAMES)},
 }
 _WORKSPACE_OPERATION_NAMES = {
@@ -216,9 +245,21 @@ _WORKSPACE_OPERAND_KEY = 1
 _WORKSPACE_OPERAND_LITERAL = 2
 _REDUCE_RESULT_KEY = 63
 # Must match adaptive_v4.py ids (copy=1 ... halt=20).
-_V4_COND_OP_IDS = {"sub": 8, "and": 9, "or": 10, "xor": 11, "not": 12, "mul": 13,
-                   "neg": 14, "inc": 15, "dec": 16, "eq": 17, "member": 18,
-                   "cond_copy": 19, "max": 4}
+_V4_COND_OP_IDS = {
+    "sub": 8,
+    "and": 9,
+    "or": 10,
+    "xor": 11,
+    "not": 12,
+    "mul": 13,
+    "neg": 14,
+    "inc": 15,
+    "dec": 16,
+    "eq": 17,
+    "member": 18,
+    "cond_copy": 19,
+    "max": 4,
+}
 _ENTITY_ADDRESS_EVENT_TOKENS = {
     "capacity_bottleneck": {EV_INIT, EV_MOVE, EV_UPDATE},
     "rule_switching": {EV_ASSERT, EV_VECTOR},
@@ -248,7 +289,10 @@ class WorkspaceCapabilityDataset(BaseDataset):
     old_lesson_mix_rate = 0.0
 
     def __new__(cls, task_track: str = ALL_TRACK, *args, **kwargs):
-        if cls is WorkspaceCapabilityDataset and str(task_track or "").lower().replace("-", "_") in LANG_TRACK_NAMES:
+        if (
+            cls is WorkspaceCapabilityDataset
+            and str(task_track or "").lower().replace("-", "_") in LANG_TRACK_NAMES
+        ):
             from initium.data.workspace_capability.lang_dataset import LanguageDataset
 
             cls = LanguageDataset
@@ -256,7 +300,14 @@ class WorkspaceCapabilityDataset(BaseDataset):
 
     def __init__(self, task_track: str = ALL_TRACK, *, batch_size_hint: int = 16):
         task_track = (task_track or ALL_TRACK).lower().replace("-", "_")
-        if task_track not in (*_GENERATORS, ALL_TRACK, NEW_ALL_TRACK, GNW_ALL_TRACK, MIXED_BINDING_TRACK, *LANG_TRACK_NAMES):
+        if task_track not in (
+            *_GENERATORS,
+            ALL_TRACK,
+            NEW_ALL_TRACK,
+            GNW_ALL_TRACK,
+            MIXED_BINDING_TRACK,
+            *LANG_TRACK_NAMES,
+        ):
             raise ValueError(
                 "unknown workspace task track "
                 f"{task_track!r}; choose one of "
@@ -297,7 +348,13 @@ class WorkspaceCapabilityDataset(BaseDataset):
         """Convert a V3 operation record into two V4 sub-op rows: [op, dest, out, key0..key7]."""
 
         def key(o):
-            return o[1] if o[0] == _WORKSPACE_OPERAND_KEY else 64 if o[0] == _WORKSPACE_OPERAND_LITERAL else -1
+            return (
+                o[1]
+                if o[0] == _WORKSPACE_OPERAND_KEY
+                else 64
+                if o[0] == _WORKSPACE_OPERAND_LITERAL
+                else -1
+            )
 
         k0, k1 = key(op0), key(op1)
         o0 = int(outputs[0])
@@ -353,23 +410,28 @@ class WorkspaceCapabilityDataset(BaseDataset):
         """Paired label-only / length-only / combo-only / combined OOD splits."""
         rng = rng or random.Random(171_001)
         lang = self.task_track in LANG_TRACK_NAMES
-        splits = (("in_distribution", ()), ("label_only", ("labels",)), ("length_only", ("length",)),
-                  ("combo_only", ("combos",)), *((("template_only", ("templates",)),) if lang else ()),
-                  ("combined", ("labels", "length", "combos") + (("templates",) if lang else ())))
+        splits = (
+            ("in_distribution", ()),
+            ("label_only", ("labels",)),
+            ("length_only", ("length",)),
+            ("combo_only", ("combos",)),
+            *((("template_only", ("templates",)),) if lang else ()),
+            ("combined", ("labels", "length", "combos") + (("templates",) if lang else ())),
+        )
         episodes = []
         track_levels = getattr(self, "_curriculum_track_levels", None)
         eval_tracks = self._tracks() if lang else (self.task_track,)
         strata_count = max(1, len(splits) * len(eval_tracks))
-        samples_per_track_axis = max(
-            1, (int(num_episodes) + strata_count - 1) // strata_count
-        )
+        samples_per_track_axis = max(1, (int(num_episodes) + strata_count - 1) // strata_count)
         if len(eval_tracks) == 1:
             samples_per_track_axis = max(8, int(num_episodes) // max(1, len(splits)))
         for track in eval_tracks:
             level = (
                 int(track_levels.get(track, 5))
                 if isinstance(track_levels, dict)
-                else int(track_levels) if track_levels is not None else 5
+                else int(track_levels)
+                if track_levels is not None
+                else 5
             )
             for _ in range(samples_per_track_axis):
                 seed = rng.getrandbits(64)
@@ -378,7 +440,11 @@ class WorkspaceCapabilityDataset(BaseDataset):
                     ep.metadata["axis"] = name
                     episodes.append(ep)
         self._evaluate_episodes(model, device, episodes, field_log=field_log, verbose_n=verbose_n)
-        self._print_samples(episodes, "ood", self.sample_print_per_group // 2 or (1 if self.sample_print_per_group else 0))
+        self._print_samples(
+            episodes,
+            "ood",
+            self.sample_print_per_group // 2 or (1 if self.sample_print_per_group else 0),
+        )
         stat_by_track_axis: dict[tuple[str, str], list[int]] = defaultdict(lambda: [0, 0, 0, 0])
         for ep in episodes:
             p = self._last_eval_preds[id(ep)]
@@ -396,7 +462,9 @@ class WorkspaceCapabilityDataset(BaseDataset):
             level = (
                 int(track_levels.get(track, 5))
                 if isinstance(track_levels, dict)
-                else int(track_levels) if track_levels is not None else 5
+                else int(track_levels)
+                if track_levels is not None
+                else 5
             )
             by_track[track][axis] = {
                 "lesson": level + 1,
@@ -428,14 +496,21 @@ class WorkspaceCapabilityDataset(BaseDataset):
                     s[1] += 1
         ood = {k: {"exact_match": 100.0 * a / n, "episodes": n} for k, (a, n) in sp.items()}
         for ax in [n for n, _ in splits] + ["all_axes"]:
-            for lo, hi, name in (("factual", "counterfactual", "cf_gap"), ("heldout_no", "heldout_yes", "heldout_gap")):
+            for lo, hi, name in (
+                ("factual", "counterfactual", "cf_gap"),
+                ("heldout_no", "heldout_yes", "heldout_gap"),
+            ):
                 a, b = ood.get(f"{ax}/{lo}"), ood.get(f"{ax}/{hi}")
                 if a and b:
-                    ood[f"{ax}/{name}"] = {"gap_pp": a["exact_match"] - b["exact_match"],
-                                           "episodes": min(a["episodes"], b["episodes"])}
+                    ood[f"{ax}/{name}"] = {
+                        "gap_pp": a["exact_match"] - b["exact_match"],
+                        "episodes": min(a["episodes"], b["episodes"]),
+                    }
         self.last_eval_diagnostics["stage3_ood"] = ood
         for k, v in sorted(ood.items()):
-            val = f"gap {v['gap_pp']:+.1f} pp" if "gap_pp" in v else f"exact {v['exact_match']:.1f}%"
+            val = (
+                f"gap {v['gap_pp']:+.1f} pp" if "gap_pp" in v else f"exact {v['exact_match']:.1f}%"
+            )
             print(f"  [ood-split/{k}] {val} n={v['episodes']}")
         self.last_eval_diagnostics["axis_generalization"] = res
         self.last_eval_diagnostics["axis_generalization_by_track"] = dict(by_track)
@@ -454,15 +529,24 @@ class WorkspaceCapabilityDataset(BaseDataset):
             s, p = e.metadata.get("answer_stride"), self._last_eval_preds.get(id(e))
             if not s or p is None:
                 continue
-            chunk = lambda a: [tuple(a[i : i + s]) for i in range(0, len(a) - 1, s)]  # noqa: E731
+
+            def chunk(a, stride=s):
+                return [tuple(a[i : i + stride]) for i in range(0, len(a) - 1, stride)]
+
             gf, pf = chunk(list(e.answer)), chunk(p)
             m = out.setdefault(e.metadata["progression_group"], [0, 0, 0, 0])
             m[0] += set(pf) == set(gf)
             m[1] += 1
             m[2] += sum(f in pf for f in gf)
             m[3] += len(gf)
-        return {g: {"fact_set_match": 100.0 * m[0] / m[1], "fact_accuracy": 100.0 * m[2] / max(m[3], 1),
-                    "episodes": m[1]} for g, m in out.items()}
+        return {
+            g: {
+                "fact_set_match": 100.0 * m[0] / m[1],
+                "fact_accuracy": 100.0 * m[2] / max(m[3], 1),
+                "episodes": m[1],
+            }
+            for g, m in out.items()
+        }
 
     def _production_gap(self, model, device, lesson_idx, n=64):
         """Same world/seed asked both ways: concept->word (p_entity) vs word->concept (p_comp)."""
@@ -471,11 +555,20 @@ class WorkspaceCapabilityDataset(BaseDataset):
         for _ in range(n):
             seed = rng.getrandbits(64)
             for g in eps:
-                eps[g].append(validate_episode(
-                    _GENERATORS[self.task_track]({**base, "groups": (g,)}, random.Random(seed))))
+                eps[g].append(
+                    validate_episode(
+                        _GENERATORS[self.task_track]({**base, "groups": (g,)}, random.Random(seed))
+                    )
+                )
         ex = {g: self._evaluate_episodes(model, device, lst)[1] for g, lst in eps.items()}
-        return {"p_entity": {"production_exact": ex["p_entity"], "comprehension_exact": ex["p_comp"],
-                             "gap_pp": ex["p_entity"] - ex["p_comp"], "episodes": n}}
+        return {
+            "p_entity": {
+                "production_exact": ex["p_entity"],
+                "comprehension_exact": ex["p_comp"],
+                "gap_pp": ex["p_entity"] - ex["p_comp"],
+                "episodes": n,
+            }
+        }
 
     def _generation_metrics(self, model, device, episodes, cap=16):
         """Free-running generation: re-forward with fed-back tokens; causality lets padding stay inert."""
@@ -491,9 +584,14 @@ class WorkspaceCapabilityDataset(BaseDataset):
             for e, g in zip(eps, gen):
                 kk = tuple(e.metadata.get("workspace_output_keys", ()))[: t + 1]
                 kk += (-1,) * (t + 2 - len(kk))
-                batch.append(TaskEpisode(
-                    e.track, e.inputs, tuple(g) + (EOS,) * (t - len(g)) + (FACT_BASE, EOS),
-                    {**e.metadata, "workspace_output_keys": kk}))
+                batch.append(
+                    TaskEpisode(
+                        e.track,
+                        e.inputs,
+                        tuple(g) + (EOS,) * (t - len(g)) + (FACT_BASE, EOS),
+                        {**e.metadata, "workspace_output_keys": kk},
+                    )
+                )
             with contextlib.redirect_stdout(sink):
                 self._evaluate_episodes(model, device, batch, teacher_forced=True)
             for i, b in enumerate(batch):
@@ -507,7 +605,10 @@ class WorkspaceCapabilityDataset(BaseDataset):
         exact = tok_acc = length_ok = rep = rep_n = fs = 0
         for e, g in zip(eps, gen):
             a, s = list(e.answer), e.metadata["answer_stride"]
-            ch = lambda q: {tuple(q[i : i + s]) for i in range(0, len(q) - 1, s)}  # noqa: E731
+
+            def ch(q, stride=s):
+                return {tuple(q[i : i + stride]) for i in range(0, len(q) - 1, stride)}
+
             exact += g == a
             tok_acc += sum(x == y for x, y in zip(g, a)) / len(a)
             length_ok += len(g) == len(a) and g[-1] == EOS
@@ -519,10 +620,17 @@ class WorkspaceCapabilityDataset(BaseDataset):
         with contextlib.redirect_stdout(sink):
             tf_exact = self._evaluate_episodes(model, device, eps, teacher_forced=True)[1]
         ge = 100.0 * exact / n
-        return {"exact": ge, "token_accuracy": 100.0 * tok_acc / n, "length_accuracy": 100.0 * length_ok / n,
-                "repetition_rate": 100.0 * rep / max(rep_n, 1), "fact_set_match": 100.0 * fs / n,
-                "teacher_forced_exact": tf_exact, "gap_pp": tf_exact - ge,
-                "free_over_tf": ge / max(tf_exact, 1e-9), "episodes": n}
+        return {
+            "exact": ge,
+            "token_accuracy": 100.0 * tok_acc / n,
+            "length_accuracy": 100.0 * length_ok / n,
+            "repetition_rate": 100.0 * rep / max(rep_n, 1),
+            "fact_set_match": 100.0 * fs / n,
+            "teacher_forced_exact": tf_exact,
+            "gap_pp": tf_exact - ge,
+            "free_over_tf": ge / max(tf_exact, 1e-9),
+            "episodes": n,
+        }
 
     def _print_samples(self, episodes, label, per_group=None):
         """Console: model guess vs gold (+concept gloss) per progression group, failures first."""
@@ -535,11 +643,15 @@ class WorkspaceCapabilityDataset(BaseDataset):
             g = e.metadata.get("progression_group")
             if p is None or g is None:
                 continue
-            picked.setdefault((e.metadata.get("axis", label), str(g)), ([], []))[p == list(e.answer)].append((e, p))
+            picked.setdefault((e.metadata.get("axis", label), str(g)), ([], []))[
+                p == list(e.answer)
+            ].append((e, p))
         for (lab, group), (bad, good) in sorted(picked.items()):
             for e, p in (bad + good)[:k]:
                 ok = "OK" if p == list(e.answer) else "XX"
-                print(f"  [sample/{lab}/{group}] {ok} | {e.metadata['query_type']} | {self._fmt_answer(e, p)}")
+                print(
+                    f"  [sample/{lab}/{group}] {ok} | {e.metadata['query_type']} | {self._fmt_answer(e, p)}"
+                )
 
     @staticmethod
     def _fmt_answer(e, pred):
@@ -553,7 +665,11 @@ class WorkspaceCapabilityDataset(BaseDataset):
             if t == NONE_TOKEN:
                 return "NONE"
             if t >= FACT_BASE:
-                name = _dev_lexicon.word_name(t - FACT_BASE) if e.metadata.get("stage3_words") else f"w{t - FACT_BASE}"
+                name = (
+                    _dev_lexicon.word_name(t - FACT_BASE)
+                    if e.metadata.get("stage3_words")
+                    else f"w{t - FACT_BASE}"
+                )
                 return name + (f"=c{rev[t]}" if t in rev else "")
             if ENTITY_BASE <= t < ENTITY_BASE + ENTITY_COUNT:
                 return f"e{t - ENTITY_BASE}"
@@ -572,13 +688,17 @@ class WorkspaceCapabilityDataset(BaseDataset):
 
     def _attach_production_diagnostics(self, model, device, episodes, lesson_idx):
         diag = self.last_eval_diagnostics
-        diag["production"] = self._production_metrics(episodes)  # must precede other evals (uses preds)
+        diag["production"] = self._production_metrics(
+            episodes
+        )  # must precede other evals (uses preds)
         if self.task_track in STAGE3_TRACKS:
             diag["stage3_counterfactual"] = self._stage3_metrics(episodes)
         self._print_samples(episodes, "id")
         diag["production_gap"] = self._production_gap(model, device, lesson_idx)
         if self.generation_eval:
-            diag["production_generation"] = {"all": self._generation_metrics(model, device, episodes)}
+            diag["production_generation"] = {
+                "all": self._generation_metrics(model, device, episodes)
+            }
         self.last_eval_diagnostics = diag
 
     def _stage3_metrics(self, episodes):
@@ -592,10 +712,14 @@ class WorkspaceCapabilityDataset(BaseDataset):
         res = {k: {"exact_match": 100.0 * a / n, "episodes": n} for k, (a, n) in acc.items()}
         if len(res) == 2:
             n = min(v["episodes"] for v in res.values())
-            res["cf_gap"] = {"gap_pp": res["factual"]["exact_match"] - res["counterfactual"]["exact_match"],
-                             "episodes": n}
+            res["cf_gap"] = {
+                "gap_pp": res["factual"]["exact_match"] - res["counterfactual"]["exact_match"],
+                "episodes": n,
+            }
         for k, v in sorted(res.items()):
-            val = f"gap {v['gap_pp']:+.1f} pp" if "gap_pp" in v else f"exact {v['exact_match']:.1f}%"
+            val = (
+                f"gap {v['gap_pp']:+.1f} pp" if "gap_pp" in v else f"exact {v['exact_match']:.1f}%"
+            )
             print(f"  [id-split/{k}] {val} n={v['episodes']}")
         return res
 
@@ -603,7 +727,10 @@ class WorkspaceCapabilityDataset(BaseDataset):
         diag = self.last_eval_diagnostics
         diag["stage3_counterfactual"] = self._stage3_metrics(episodes)
         self._print_samples(episodes, "id")
-        if self.task_track == "developmental_lexical" and _dev_lexicon.settings["family"] != "senses":
+        if (
+            self.task_track == "developmental_lexical"
+            and _dev_lexicon.settings["family"] != "senses"
+        ):
             diag["production_gap"] = self._production_gap(model, device, lesson_idx)
         self.last_eval_diagnostics = diag
 
@@ -655,8 +782,12 @@ class WorkspaceCapabilityDataset(BaseDataset):
         if track == "ignition":
             return ("all",)
         if track in {
-            "psychological_refractory", "masked_priming", "sustained_maintenance",
-            "no_report_confidence", "bistable_perception", "trace_conditioning",
+            "psychological_refractory",
+            "masked_priming",
+            "sustained_maintenance",
+            "no_report_confidence",
+            "bistable_perception",
+            "trace_conditioning",
         }:
             return ("all",)
         return ("all",)
@@ -673,7 +804,9 @@ class WorkspaceCapabilityDataset(BaseDataset):
         episodes_per_group = max(1, int(episodes_per_group))
         episodes: list[TaskEpisode] = []
         for track in self._tracks():
-            track_level = int(lesson_idx.get(track, 0)) if isinstance(lesson_idx, dict) else int(lesson_idx)
+            track_level = (
+                int(lesson_idx.get(track, 0)) if isinstance(lesson_idx, dict) else int(lesson_idx)
+            )
             required = self._curriculum_groups(track, track_level)
             counts = {group: 0 for group in required}
             attempts = 0
@@ -697,13 +830,19 @@ class WorkspaceCapabilityDataset(BaseDataset):
         return episodes
 
     def evaluate_curriculum_id(self, model, device, lesson_idx, *, field_log=None):
-        seed_level = sum((i + 1) * int(v) for i, v in enumerate(lesson_idx.values())) if isinstance(lesson_idx, dict) else int(lesson_idx)
+        seed_level = (
+            sum((i + 1) * int(v) for i, v in enumerate(lesson_idx.values()))
+            if isinstance(lesson_idx, dict)
+            else int(lesson_idx)
+        )
         rng = random.Random(91_000 + seed_level)
         episodes = self._make_curriculum_eval_episodes(lesson_idx, rng)
         self._last_id_eval_lesson = lesson_idx
         self._last_id_eval_episodes = episodes
         result = self._evaluate_episodes(model, device, episodes, field_log=field_log)
-        diag_level = max(lesson_idx.values(), default=0) if isinstance(lesson_idx, dict) else int(lesson_idx)
+        diag_level = (
+            max(lesson_idx.values(), default=0) if isinstance(lesson_idx, dict) else int(lesson_idx)
+        )
         if self.task_track in PRODUCTION_TRACKS:
             self._attach_production_diagnostics(model, device, episodes, diag_level)
         elif self.task_track in STAGE3_TRACKS:
@@ -713,7 +852,9 @@ class WorkspaceCapabilityDataset(BaseDataset):
         _t = (self.last_eval_diagnostics or {}).get("tracks", {})
         # self._track_weights = {t: 0.1 + max(0.0, 1.0 - m["exact_match"] / 100.0) for t, m in _t.items()}
         self._track_weights = {t: 0.05 for t in _t}
-        _cand = [t for t in _t if t not in ("ignition", "masked_priming", "nth_farthest", "lang_open")]
+        _cand = [
+            t for t in _t if t not in ("ignition", "masked_priming", "nth_farthest", "lang_open")
+        ]
         if _cand:
             _worst = min(_cand, key=lambda t: _t[t]["exact_match"])
             self._track_weights[_worst] = 0.05 * (len(_t) - 1)  # ~50% of steps
@@ -798,9 +939,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
                         {
                             "workspace_query_reads": tuple(
                                 (int(step) + prefix_shift, int(key), int(value))
-                                for step, key, value in episode.metadata[
-                                    "workspace_query_reads"
-                                ]
+                                for step, key, value in episode.metadata["workspace_query_reads"]
                             )
                         }
                         if episode.metadata.get("workspace_query_reads")
@@ -833,7 +972,11 @@ class WorkspaceCapabilityDataset(BaseDataset):
             # every track appears in each batch when batch_size >= track count.
             start_track = random.randrange(len(tracks))
             selected_tracks = [tracks[(start_track + i) % len(tracks)] for i in range(batch_size)]
-            _w = getattr(self, "_track_weights", None) if getattr(self, "_weighted_sampling", False) else None
+            _w = (
+                getattr(self, "_track_weights", None)
+                if getattr(self, "_weighted_sampling", False)
+                else None
+            )
             selected_tracks = (
                 random.choices(tracks, [_w.get(t, 1.0) for t in tracks], k=batch_size)
                 if _w
@@ -841,7 +984,9 @@ class WorkspaceCapabilityDataset(BaseDataset):
             )
             random.shuffle(selected_tracks)
         episodes = [
-            self._make_episode(track, int(level_for(track)) if callable(level_for) else level, random)
+            self._make_episode(
+                track, int(level_for(track)) if callable(level_for) else level, random
+            )
             for track in selected_tracks
         ]
         self.last_batch_examples = episodes
@@ -851,10 +996,14 @@ class WorkspaceCapabilityDataset(BaseDataset):
         valid_tokens = sum(lengths)
         padded_tokens = batch_size * self.last_batch_sequence_max
         self.last_batch_padding_utilization = valid_tokens / max(padded_tokens, 1)
-        return self._collate(episodes, token_ids_only=self.token_id_input, teacher_forced=self.teacher_forced_answers)
+        return self._collate(
+            episodes, token_ids_only=self.token_id_input, teacher_forced=self.teacher_forced_answers
+        )
 
     @staticmethod
-    def _collate(episodes: list[TaskEpisode], *, token_ids_only: bool = False, teacher_forced: bool = False):
+    def _collate(
+        episodes: list[TaskEpisode], *, token_ids_only: bool = False, teacher_forced: bool = False
+    ):
         sequences = [episode.sequence for episode in episodes]
         max_len = max(map(len, sequences))
         batch = len(episodes)
@@ -866,7 +1015,9 @@ class WorkspaceCapabilityDataset(BaseDataset):
         mask = torch.zeros(batch, max_len, dtype=torch.float32)
         for row, (episode, sequence) in enumerate(zip(episodes, sequences)):
             seq = list(sequence)
-            if teacher_forced:  # input at answer position t>0 = gold token t-1; position 0 keeps ANSWER
+            if (
+                teacher_forced
+            ):  # input at answer position t>0 = gold token t-1; position 0 keeps ANSWER
                 seq[len(episode.inputs) + 1 :] = episode.answer[:-1]
             row_token_ids = torch.tensor(seq, dtype=torch.long)
             length = row_token_ids.numel()
@@ -982,9 +1133,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 track = self.task_track
             if track != "permutation":
                 if track == "attentional_blink" and attentional_item_memory:
-                    self._add_attentional_item_address_writes(
-                        row, tokens, entity_ids, write_mask
-                    )
+                    self._add_attentional_item_address_writes(row, tokens, entity_ids, write_mask)
                     continue
                 if track == "rule_switching":
                     self._add_rule_switching_address_writes(row, tokens, entity_ids, write_mask)
@@ -1088,9 +1237,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 .tolist()
             )
         if attentional_cue_readout:
-            cue_metadata = self.workspace_attentional_cue_metadata(
-                input_vectors, episodes=examples
-            )
+            cue_metadata = self.workspace_attentional_cue_metadata(input_vectors, episodes=examples)
             metadata.update(cue_metadata)
         return metadata
 
@@ -1522,9 +1669,13 @@ class WorkspaceCapabilityDataset(BaseDataset):
     @staticmethod
     def _add_attentional_item_address_writes(row, tokens, entity_ids, write_mask) -> None:
         """Address every RSVP item by stream order, without target-position labels."""
-        for position, frame_index, _color, _shape, _value in (
-            WorkspaceCapabilityDataset._attentional_item_frame_records(tokens)
-        ):
+        for (
+            position,
+            frame_index,
+            _color,
+            _shape,
+            _value,
+        ) in WorkspaceCapabilityDataset._attentional_item_frame_records(tokens):
             if frame_index >= ENTITY_COUNT:
                 continue
             entity_ids[row, position] = frame_index
@@ -1551,9 +1702,13 @@ class WorkspaceCapabilityDataset(BaseDataset):
         for row, (episode, tokens) in enumerate(zip(examples, token_rows)):
             if episode.track != "attentional_blink":
                 continue
-            for position, frame_index, _color, _shape, _value in (
-                self._attentional_item_frame_records(tokens)
-            ):
+            for (
+                position,
+                frame_index,
+                _color,
+                _shape,
+                _value,
+            ) in self._attentional_item_frame_records(tokens):
                 if frame_index < ENTITY_COUNT and position < input_vectors.shape[1]:
                     frame_entity_ids[row, position] = frame_index
                     frame_mask[row, position] = True
@@ -1624,9 +1779,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 if not 0 <= output_step < logits.shape[1]:
                     continue
                 value_logits = value_logits.to(device=logits.device, dtype=logits.dtype)
-                selected_logits = result.new_full(
-                    (result.shape[0], result.shape[-1]), -1e4
-                )
+                selected_logits = result.new_full((result.shape[0], result.shape[-1]), -1e4)
                 selected_logits[:, SCALAR_BASE : SCALAR_BASE + SCALAR_COUNT] = value_logits
                 result[:, output_step] = torch.where(
                     active.unsqueeze(-1), selected_logits, result[:, output_step]
@@ -1803,22 +1956,31 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 if ENTITY_BASE <= value < ENTITY_BASE + ENTITY_COUNT
             ]
             scalar_fields = [
-                value
-                for value in fields
-                if SCALAR_BASE <= value < SCALAR_BASE + SCALAR_COUNT
+                value for value in fields if SCALAR_BASE <= value < SCALAR_BASE + SCALAR_COUNT
             ]
             step = end
             if episode.track == "permutation":
                 if event == EV_INIT and entity_fields:
-                    loc = next((v for v in fields if LOCATION_BASE <= v < LOCATION_BASE + LOCATION_COUNT), None)
+                    loc = next(
+                        (v for v in fields if LOCATION_BASE <= v < LOCATION_BASE + LOCATION_COUNT),
+                        None,
+                    )
                     if loc is not None:
                         current_values[entity_fields[0]] = loc
                 elif event == EV_SWAP and len(entity_fields) >= 2:
                     left, right = entity_fields[:2]
                     lv, rv = current_values[left], current_values[right]
                     records.append(
-                        (step, "swap", left, right, (_WORKSPACE_OPERAND_KEY, left),
-                         (_WORKSPACE_OPERAND_KEY, right), (rv, lv), (lv, rv))
+                        (
+                            step,
+                            "swap",
+                            left,
+                            right,
+                            (_WORKSPACE_OPERAND_KEY, left),
+                            (_WORKSPACE_OPERAND_KEY, right),
+                            (rv, lv),
+                            (lv, rv),
+                        )
                     )
                     current_values[left], current_values[right] = rv, lv
                 index = end + 1
@@ -1845,8 +2007,10 @@ class WorkspaceCapabilityDataset(BaseDataset):
                         operand1 = (_WORKSPACE_OPERAND_LITERAL, literal)
                         outputs = (
                             SCALAR_BASE
-                            + ((current_values[operands[0]] - SCALAR_BASE + literal - SCALAR_BASE)
-                               % SCALAR_COUNT),
+                            + (
+                                (current_values[operands[0]] - SCALAR_BASE + literal - SCALAR_BASE)
+                                % SCALAR_COUNT
+                            ),
                         )
                         expected_operands = (current_values[operands[0]], literal)
                     elif skill == 2 and operands:
@@ -1859,18 +2023,13 @@ class WorkspaceCapabilityDataset(BaseDataset):
                         operation = "sort"
                         operand0 = (_WORKSPACE_OPERAND_KEY, operands[0])
                         operand1 = (_WORKSPACE_OPERAND_LITERAL, literal)
-                        outputs = tuple(
-                            sorted((current_values[operands[0]], literal))
-                        )
+                        outputs = tuple(sorted((current_values[operands[0]], literal)))
                         expected_operands = (current_values[operands[0]], literal)
                     elif skill == 4 and operands and literal >= 0:
                         operation = "compare"
                         operand0 = (_WORKSPACE_OPERAND_KEY, operands[0])
                         operand1 = (_WORKSPACE_OPERAND_LITERAL, literal)
-                        outputs = (
-                            SCALAR_BASE
-                            + int(current_values[operands[0]] > literal),
-                        )
+                        outputs = (SCALAR_BASE + int(current_values[operands[0]] > literal),)
                         expected_operands = (current_values[operands[0]], literal)
                     elif skill == 5 and operands and literal >= 0:
                         operation = "select"
@@ -1882,10 +2041,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
                         operation = "rank"
                         operand0 = (_WORKSPACE_OPERAND_KEY, operands[0])
                         operand1 = (_WORKSPACE_OPERAND_LITERAL, literal)
-                        outputs = (
-                            SCALAR_BASE
-                            + int(current_values[operands[0]] < literal),
-                        )
+                        outputs = (SCALAR_BASE + int(current_values[operands[0]] < literal),)
                         expected_operands = (current_values[operands[0]], literal)
                     else:
                         raise ValueError(f"invalid mixed-skill operation code {skill}")
@@ -1924,10 +2080,15 @@ class WorkspaceCapabilityDataset(BaseDataset):
                         )
                     )
                     current_values[destination] = value
-                elif event == EV_VECTOR and sum(
-                    SOURCE_BASE <= v < SOURCE_BASE + SOURCE_COUNT for v in fields
-                ) == 2:
-                    codes = [v - SOURCE_BASE for v in fields if SOURCE_BASE <= v < SOURCE_BASE + SOURCE_COUNT]
+                elif (
+                    event == EV_VECTOR
+                    and sum(SOURCE_BASE <= v < SOURCE_BASE + SOURCE_COUNT for v in fields) == 2
+                ):
+                    codes = [
+                        v - SOURCE_BASE
+                        for v in fields
+                        if SOURCE_BASE <= v < SOURCE_BASE + SOURCE_COUNT
+                    ]
                     name = EXT_OP_NAMES[codes[0] * 4 + codes[1]]
                     destination, left = entity_fields[:2]
                     right = entity_fields[2] if len(entity_fields) > 2 else None
@@ -1936,10 +2097,14 @@ class WorkspaceCapabilityDataset(BaseDataset):
                     result = SCALAR_BASE + ext_op_result(name, a, b)
                     records.append(
                         (
-                            step, name, destination, -1,
+                            step,
+                            name,
+                            destination,
+                            -1,
                             (_WORKSPACE_OPERAND_KEY, left),
                             (_WORKSPACE_OPERAND_KEY, right) if right is not None else (0, -1),
-                            (result,), (current_values[left], -100),
+                            (result,),
+                            (current_values[left], -100),
                         )
                     )
                     current_values[destination] = result
@@ -1970,7 +2135,6 @@ class WorkspaceCapabilityDataset(BaseDataset):
             index = end + 1
         return tuple(records)
 
-
     @staticmethod
     def _retrieval_reduce_records(episode, tokens):
         """Reduce teacher record for retrieval aggregate queries (sum/count_even/parity)."""
@@ -1981,8 +2145,14 @@ class WorkspaceCapabilityDataset(BaseDataset):
             return ()
         return (
             (
-                n - 1, "reduce", _REDUCE_RESULT_KEY, -1, (0, -1), (0, -1),
-                (int(episode.answer[0]),), (-100, kinds[int(tokens[q + 1])]),
+                n - 1,
+                "reduce",
+                _REDUCE_RESULT_KEY,
+                -1,
+                (0, -1),
+                (0, -1),
+                (int(episode.answer[0]),),
+                (-100, kinds[int(tokens[q + 1])]),
             ),
         )
 
@@ -2078,9 +2248,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
         batch, time = input_vectors.shape[:2]
         if len(examples) != batch:
             raise RuntimeError("workspace key-value metadata lost batch/episode alignment")
-        operand_capacity = (
-            KEY_VALUE_OPERAND_CAPACITY
-        )
+        operand_capacity = KEY_VALUE_OPERAND_CAPACITY
         entity_meta = entity_metadata or self.workspace_entity_address_metadata(
             input_vectors,
             episodes=examples,
@@ -2106,7 +2274,11 @@ class WorkspaceCapabilityDataset(BaseDataset):
             else None
         )
         adaptive_teacher_targets = (
-            torch.full((batch, time, 44 if getattr(self, "v4_teacher", False) else 12), -100, dtype=torch.long)
+            torch.full(
+                (batch, time, 44 if getattr(self, "v4_teacher", False) else 12),
+                -100,
+                dtype=torch.long,
+            )
             if include_adaptive_v3 and adaptive_v3_distillation
             else None
         )
@@ -2149,20 +2321,18 @@ class WorkspaceCapabilityDataset(BaseDataset):
             per_step: dict[int, list[tuple[int, int]]] = {}
             operation_records = (
                 self._workspace_operation_events(episode, tokens)
-                if include_operations
-                or include_adaptive_v3
+                if include_operations or include_adaptive_v3
                 else ()
             )
-            feature_off = bool(
-                include_adaptive_v3 and episode.track in adaptive_v3_holdout_tracks
-            )
+            feature_off = bool(include_adaptive_v3 and episode.track in adaptive_v3_holdout_tracks)
             if include_adaptive_v3 and (
-                adaptive_v3_feature_off_probability > 0
-                or adaptive_v3_always_feature_off_tracks
+                adaptive_v3_feature_off_probability > 0 or adaptive_v3_always_feature_off_tracks
             ):
                 is_holdout = episode.track in adaptive_v3_holdout_tracks
                 always_off = episode.track in adaptive_v3_always_feature_off_tracks
-                rng = random.Random(int(adaptive_v3_seed) + int(adaptive_v3_step) * 1_000_003 + row * 97)
+                rng = random.Random(
+                    int(adaptive_v3_seed) + int(adaptive_v3_step) * 1_000_003 + row * 97
+                )
                 sampled_off = (
                     episode.track in adaptive_v3_feature_off_tracks
                     and rng.random() < adaptive_v3_feature_off_probability
@@ -2175,9 +2345,20 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 stats["episodes"] += 1
                 stats["manual_off"] += int(feature_off)
                 pending_operator_event = False
-                for candidate_step, token_value in enumerate(tokens[: min(time, len(episode.inputs))]):
+                for candidate_step, token_value in enumerate(
+                    tokens[: min(time, len(episode.inputs))]
+                ):
                     token = int(token_value)
-                    if token in (EV_INIT, EV_MOVE, EV_UPDATE, EV_ASSERT, EV_KV, EV_VECTOR, EV_SWAP, QUERY):
+                    if token in (
+                        EV_INIT,
+                        EV_MOVE,
+                        EV_UPDATE,
+                        EV_ASSERT,
+                        EV_KV,
+                        EV_VECTOR,
+                        EV_SWAP,
+                        QUERY,
+                    ):
                         pending_operator_event = True
                     elif token == SEP and pending_operator_event:
                         adaptive_candidate_mask[row, candidate_step] = True
@@ -2232,7 +2413,8 @@ class WorkspaceCapabilityDataset(BaseDataset):
                     adaptive_execution_mask[row, step] = False
                 if (
                     adaptive_teacher_targets is not None
-                    and episode.track in ("mixed_skill", "variable_binding", "permutation", "retrieval_aggregation")
+                    and episode.track
+                    in ("mixed_skill", "variable_binding", "permutation", "retrieval_aggregation")
                     and not getattr(self, "v4_teacher", False)
                     and episode.track not in adaptive_v3_holdout_tracks
                 ):
@@ -2257,12 +2439,26 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 if (
                     getattr(self, "v4_teacher", False)
                     and adaptive_teacher_targets is not None
-                    and episode.track in ("mixed_skill", "variable_binding", "permutation", "retrieval_aggregation", "conditional_ops")
+                    and episode.track
+                    in (
+                        "mixed_skill",
+                        "variable_binding",
+                        "permutation",
+                        "retrieval_aggregation",
+                        "conditional_ops",
+                    )
                     and episode.track not in adaptive_v3_holdout_tracks
                 ):
                     adaptive_teacher_targets[row, step] = self._v4_teacher_row(
-                        episode, tokens, operation, destination0, destination1,
-                        operand0, operand1, output_values, expected_operands,
+                        episode,
+                        tokens,
+                        operation,
+                        destination0,
+                        destination1,
+                        operand0,
+                        operand1,
+                        output_values,
+                        expected_operands,
                     )
                 if operation_diagnostic_targets is not None:
                     operation_diagnostic_targets[row, step] = torch.tensor(
@@ -2303,9 +2499,13 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 else ()
             )
             if attentional_item_memory and episode.track == "attentional_blink":
-                for frame_step, frame_id, color_token, shape_token, value_token in (
-                    self._attentional_item_frame_records(tokens)
-                ):
+                for (
+                    frame_step,
+                    frame_id,
+                    color_token,
+                    shape_token,
+                    value_token,
+                ) in self._attentional_item_frame_records(tokens):
                     if frame_step >= min(time, len(episode.inputs)) or frame_id >= ENTITY_COUNT:
                         continue
                     attentional_color_targets[row, frame_step] = color_token - SOURCE_BASE
@@ -2318,9 +2518,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
             for position, token_value in enumerate(tokens[: len(episode.inputs)]):
                 token = int(token_value)
                 if token in (EV_INIT, EV_MOVE, EV_UPDATE, EV_ASSERT, EV_KV) or (
-                    masked_prime_trace
-                    and episode.track == "masked_priming"
-                    and token == EV_NOISE
+                    masked_prime_trace and episode.track == "masked_priming" and token == EV_NOISE
                 ):
                     active_event, payload, source_payload = token, -100, -1
                     if episode.track == "rule_switching" and token == EV_ASSERT:
@@ -2372,12 +2570,9 @@ class WorkspaceCapabilityDataset(BaseDataset):
                     and event_writes[position]
                     and payload >= 0
                     and position not in row_operation_steps
+                    and not (attentional_item_memory and episode.track == "attentional_blink")
                     and not (
-                        attentional_item_memory and episode.track == "attentional_blink"
-                    )
-                    and not (
-                        episode.track == "rule_switching"
-                        and active_event in (EV_UPDATE, EV_ASSERT)
+                        episode.track == "rule_switching" and active_event in (EV_UPDATE, EV_ASSERT)
                     )
                 ):
                     key = int(event_keys[position])
@@ -2448,7 +2643,9 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 if key < 0 or key >= ENTITY_COUNT:
                     raise ValueError(f"{episode.track} workspace query key is outside [0, 64)")
                 if target_value < 0 or target_value >= VOCAB_SIZE:
-                    raise ValueError(f"{episode.track} workspace query target is outside the vocabulary")
+                    raise ValueError(
+                        f"{episode.track} workspace query target is outside the vocabulary"
+                    )
                 if not 0 <= step < min(time, len(episode.inputs)):
                     continue
                 free = torch.nonzero(~masks[row, step], as_tuple=False).flatten()
@@ -2481,7 +2678,9 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 step = len(episode.inputs) + offset
                 answer_keys = tuple(int(key) for key in keys)
                 if step >= time:
-                    raise RuntimeError(f"{episode.track} workspace output exceeds its batch sequence")
+                    raise RuntimeError(
+                        f"{episode.track} workspace output exceeds its batch sequence"
+                    )
                 if not answer_keys:
                     continue
                 expected_values = tuple(int(value) for value in expected)
@@ -2498,15 +2697,16 @@ class WorkspaceCapabilityDataset(BaseDataset):
                         SOURCE_BASE + int(rule_feedback_targets[-1]),
                         *expected_values[1:],
                     )
-                if (
-                    len(answer_keys) != len(expected_values)
-                    or len(answer_keys) > operand_capacity
-                ):
-                    raise ValueError(f"{episode.track} has invalid workspace output program operands")
+                if len(answer_keys) != len(expected_values) or len(answer_keys) > operand_capacity:
+                    raise ValueError(
+                        f"{episode.track} has invalid workspace output program operands"
+                    )
                 if any(key < 0 or key >= ENTITY_COUNT for key in answer_keys):
                     raise ValueError(f"{episode.track} workspace output key is outside [0, 64)")
                 if any(value < 0 or value >= VOCAB_SIZE for value in expected_values):
-                    raise ValueError(f"{episode.track} workspace output target is outside the vocabulary")
+                    raise ValueError(
+                        f"{episode.track} workspace output target is outside the vocabulary"
+                    )
                 if operation in {"equal", "not_equal"} and len(answer_keys) != 2:
                     raise ValueError("workspace comparison output requires exactly two values")
                 if operation == "select" and len(answer_keys) != 4:
@@ -2521,7 +2721,10 @@ class WorkspaceCapabilityDataset(BaseDataset):
                     nc = sum(1 for k_ in answer_keys if k_ < 24 or k_ >= 56)
                     nw = 3 if episode.metadata.get("progression_group") == "compose2" else 2
                     argmatch_locations[(row, step)] = (
-                        tuple(int(x) for x in tokens[len(episode.inputs) - 1 - nw : len(episode.inputs) - 1]),
+                        tuple(
+                            int(x)
+                            for x in tokens[len(episode.inputs) - 1 - nw : len(episode.inputs) - 1]
+                        ),
                         nc,
                         (len(answer_keys) - nc) // 3,
                     )
@@ -2548,9 +2751,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
             result["adaptive_operator_candidate_mask"] = adaptive_candidate_mask
             result["adaptive_operator_execution_mask"] = adaptive_execution_mask
             result["adaptive_operator_steps"] = tuple(sorted(adaptive_steps))
-            result["adaptive_operator_teacher_steps"] = tuple(
-                sorted(adaptive_teacher_steps)
-            )
+            result["adaptive_operator_teacher_steps"] = tuple(sorted(adaptive_teacher_steps))
             self.last_adaptive_v3_batch_stats = {
                 track: dict(stats) for track, stats in adaptive_v3_batch_stats.items()
             }
@@ -2558,18 +2759,14 @@ class WorkspaceCapabilityDataset(BaseDataset):
             # adding reductions or synchronization to the recurrent CUDA path.
             self.last_adaptive_v3_batch_stats["__totals__"] = {
                 "candidate_tokens": int(adaptive_candidate_mask.sum()),
-                "executed_tokens": int(
-                    (adaptive_candidate_mask & adaptive_execution_mask).sum()
-                ),
+                "executed_tokens": int((adaptive_candidate_mask & adaptive_execution_mask).sum()),
                 "candidate_steps": len(adaptive_steps),
             }
             if adaptive_teacher_targets is not None:
                 result["adaptive_operator_teacher_targets"] = adaptive_teacher_targets
         if include_operation_diagnostics:
             if not include_operations or operation_diagnostic_targets is None:
-                raise ValueError(
-                    "operation diagnostic targets require operation metadata"
-                )
+                raise ValueError("operation diagnostic targets require operation metadata")
             result["workspace_operation_diagnostic_targets"] = operation_diagnostic_targets
         return result
 
@@ -2602,9 +2799,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
             routed = value_logits[:, 0].to(device=logits.device, dtype=logits.dtype)
             result[:, int(step)] = torch.where(active.unsqueeze(-1), routed, result[:, int(step)])
         predictions_by_step = {int(step): value for step, value in predictions}
-        for row, step, operation, operand_count in metadata.get(
-            "key_value_output_programs", ()
-        ):
+        for row, step, operation, operand_count in metadata.get("key_value_output_programs", ()):
             value_logits = predictions_by_step.get(int(step))
             if value_logits is None:
                 continue
@@ -2667,9 +2862,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
             elif operation in {"vote", "vote_confidence"}:
                 if int(operand_count) < 1:
                     raise ValueError("workspace vote readout requires at least one evidence value")
-                binary_logits = operands[
-                    :, SCALAR_BASE : SCALAR_BASE + 2
-                ]
+                binary_logits = operands[:, SCALAR_BASE : SCALAR_BASE + 2]
                 binary_probs = binary_logits.softmax(dim=-1)[:, 1]
                 count_distribution = binary_probs.new_ones((1,))
                 for positive_probability in binary_probs:
@@ -2678,9 +2871,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
                         (count_distribution * (1.0 - positive_probability), zero)
                     ) + torch.cat((zero, count_distribution * positive_probability))
                 evidence_count = int(operand_count)
-                positive_counts = torch.arange(
-                    evidence_count + 1, device=logits.device
-                )
+                positive_counts = torch.arange(evidence_count + 1, device=logits.device)
                 hard_values = binary_logits.argmax(dim=-1)
                 hard_positive_count = hard_values.sum()
                 hard_margin = (2 * hard_positive_count - evidence_count).abs()
@@ -2730,9 +2921,13 @@ class WorkspaceCapabilityDataset(BaseDataset):
                     metadata["key_value_entity_ids"][int(row), int(step), :nc].long() + ENTITY_BASE
                 ).to(logits.device)
 
-                def _w2c(word):
-                    m = operands[:nc, FACT_BASE : FACT_BASE + FACT_COUNT].softmax(dim=-1)[:, word - FACT_BASE]
-                    return torch.zeros(nv, device=logits.device).scatter_add(0, ctok, m) / m.sum().clamp_min(1e-6)
+                def _w2c(word, operands=operands, nc=nc, nv=nv, ctok=ctok):
+                    m = operands[:nc, FACT_BASE : FACT_BASE + FACT_COUNT].softmax(dim=-1)[
+                        :, word - FACT_BASE
+                    ]
+                    return torch.zeros(nv, device=logits.device).scatter_add(
+                        0, ctok, m
+                    ) / m.sum().clamp_min(1e-6)
 
                 P = operands[nc : nc + 3 * nf].softmax(dim=-1)
                 S_, R_, O_ = P[:nf], P[nf : 2 * nf], P[2 * nf :]
@@ -2756,11 +2951,16 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 )
                 match = operands[:, base : base + size].softmax(dim=-1)[:, query_token - base]
                 entity_tokens = (
-                    metadata["key_value_entity_ids"][int(row), int(step), : int(operand_count)].long() + ENTITY_BASE
+                    metadata["key_value_entity_ids"][
+                        int(row), int(step), : int(operand_count)
+                    ].long()
+                    + ENTITY_BASE
                 ).to(logits.device)
                 if base == FACT_BASE:
                     # No operand holds the queried word -> NONE (noisy-OR mass).
-                    entity_tokens = torch.cat((entity_tokens, entity_tokens.new_tensor([NONE_TOKEN])))
+                    entity_tokens = torch.cat(
+                        (entity_tokens, entity_tokens.new_tensor([NONE_TOKEN]))
+                    )
                     match = torch.cat((match, (1.0 - match).prod().unsqueeze(0)))
                 operation_probs = torch.zeros(
                     result.shape[-1], device=logits.device, dtype=torch.float32
@@ -2773,22 +2973,16 @@ class WorkspaceCapabilityDataset(BaseDataset):
             # NLL and has scale independent of vocabulary size or logit units.
             operation_probs = operation_probs.clamp_min(1e-7)
             operation_log_probs = operation_probs.log()
-            operation_log_probs = operation_log_probs - torch.logsumexp(
-                operation_log_probs, dim=-1
-            )
+            operation_log_probs = operation_log_probs - torch.logsumexp(operation_log_probs, dim=-1)
             if hard_program_probs is not None:
                 # The forward pass uses an exact discrete comparison. Keep a
                 # finite hard decision for NLL while using the soft categorical
                 # comparison only as a straight-through training gradient.
                 hard_program_probs = hard_program_probs.clamp_min(1e-7)
                 hard_log_probs = hard_program_probs.log()
-                hard_log_probs = hard_log_probs - torch.logsumexp(
-                    hard_log_probs, dim=-1
-                )
+                hard_log_probs = hard_log_probs - torch.logsumexp(hard_log_probs, dim=-1)
                 operation_log_probs = (
-                    hard_log_probs
-                    + operation_log_probs
-                    - operation_log_probs.detach()
+                    hard_log_probs + operation_log_probs - operation_log_probs.detach()
                 )
             is_answer = answer_mask[int(row), int(step)].to(device=logits.device).bool()
             result[int(row), int(step)] = torch.where(
@@ -2821,11 +3015,11 @@ class WorkspaceCapabilityDataset(BaseDataset):
         color_logits = torch.stack([color for _, color, _, _ in predictions], dim=1).float()
         shape_logits = torch.stack([shape for _, _, shape, _ in predictions], dim=1).float()
         found = torch.stack([valid for _, _, _, valid in predictions], dim=1).bool()
-        color_targets = metadata["attentional_frame_color_targets"].to(device=device).index_select(
-            1, steps
+        color_targets = (
+            metadata["attentional_frame_color_targets"].to(device=device).index_select(1, steps)
         )
-        shape_targets = metadata["attentional_frame_shape_targets"].to(device=device).index_select(
-            1, steps
+        shape_targets = (
+            metadata["attentional_frame_shape_targets"].to(device=device).index_select(1, steps)
         )
         color_valid = color_targets.ge(0) & found
         shape_valid = shape_targets.ge(0) & found
@@ -3174,7 +3368,9 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 )
             model.workspace_eval_shuffle_readback = True
         if ablate_workspace_adaptive:
-            if (adaptive_module is None and not adaptive_v3_enabled) or prior_adaptive_bypass is None:
+            if (
+                adaptive_module is None and not adaptive_v3_enabled
+            ) or prior_adaptive_bypass is None:
                 raise ValueError("adaptive workspace ablation requires an adaptive workspace")
             if adaptive_module is not None:
                 model.workspace_adaptive_eval_bypass = True
@@ -3220,15 +3416,11 @@ class WorkspaceCapabilityDataset(BaseDataset):
             and getattr(model, "workspace_operation_executor_enabled", False)
         )
         totals: dict[str, list[int]] = defaultdict(lambda: [0, 0, 0, 0])
-        progression_totals: dict[tuple[str, str], list[int]] = defaultdict(
-            lambda: [0, 0, 0, 0]
-        )
+        progression_totals: dict[tuple[str, str], list[int]] = defaultdict(lambda: [0, 0, 0, 0])
         logic_quality_totals: dict[tuple[str, str], list[int]] = defaultdict(
             lambda: [0, 0, 0, 0, 0, 0]
         )
-        query_type_totals: dict[tuple[str, str], list[int]] = defaultdict(
-            lambda: [0, 0, 0, 0]
-        )
+        query_type_totals: dict[tuple[str, str], list[int]] = defaultdict(lambda: [0, 0, 0, 0])
         gnw_process_totals: dict[tuple[str, str], list[int]] = defaultdict(
             lambda: [0, 0, 0, 0, 0, 0]
         )
@@ -3402,9 +3594,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
                                     adaptive_v3_holdout_tracks=tuple(
                                         getattr(model, "workspace_adaptive_v3_holdout_tracks", ())
                                     ),
-                                    include_operation_diagnostics=(
-                                        operation_diagnostics_enabled
-                                    ),
+                                    include_operation_diagnostics=(operation_diagnostics_enabled),
                                     rule_feedback_update=bool(
                                         getattr(
                                             model,
@@ -3427,7 +3617,9 @@ class WorkspaceCapabilityDataset(BaseDataset):
                                         )
                                     ),
                                     masked_prime_trace=bool(
-                                        getattr(model, "workspace_masked_prime_trace_enabled", False)
+                                        getattr(
+                                            model, "workspace_masked_prime_trace_enabled", False
+                                        )
                                     ),
                                     entity_metadata=binding_entity_metadata,
                                     token_rows=token_rows,
@@ -3623,9 +3815,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
                     logits = self._output_proj(output.transpose(0, 1).contiguous())
                     if key_value_metadata is not None:
                         key_value_predictions = workspace.pop_key_value_predictions()
-                        if bool(
-                            getattr(model, "workspace_masked_prime_trace_enabled", False)
-                        ):
+                        if bool(getattr(model, "workspace_masked_prime_trace_enabled", False)):
                             targets_by_step = key_value_metadata["key_value_targets"]
                             masks_by_step = key_value_metadata["key_value_mask"]
                             for read_step, read_logits in key_value_predictions:
@@ -3633,10 +3823,14 @@ class WorkspaceCapabilityDataset(BaseDataset):
                                     if (
                                         episode.track == "variable_binding"
                                         and int(read_step) == len(episode.inputs)
-                                        and bool(key_value_metadata["key_value_mask"][row, read_step, 0])
+                                        and bool(
+                                            key_value_metadata["key_value_mask"][row, read_step, 0]
+                                        )
                                     ):
                                         target_value = int(
-                                            key_value_metadata["key_value_targets"][row, read_step, 0]
+                                            key_value_metadata["key_value_targets"][
+                                                row, read_step, 0
+                                            ]
                                         )
                                         variable_binding_query_read_correct += int(
                                             int(read_logits[row, 0].argmax().item()) == target_value
@@ -3651,9 +3845,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
                                     if not bool(read_mask.any()):
                                         continue
                                     target_values = targets_by_step[row, read_step][read_mask]
-                                    predicted_values = (
-                                        read_logits[row, read_mask].argmax(dim=-1)
-                                    )
+                                    predicted_values = read_logits[row, read_mask].argmax(dim=-1)
                                     trace_counts = masked_prime_trace_reads[
                                         str(episode.metadata["query_type"])
                                     ]
@@ -3693,22 +3885,24 @@ class WorkspaceCapabilityDataset(BaseDataset):
                                 )
                                 if operation in {"equal", "not_equal"} and exact_comparison:
                                     if operand_count != 2 or not bool(
-                                        targets.ge(LOCATION_BASE).logical_and(
-                                            targets.lt(LOCATION_BASE + LOCATION_COUNT)
-                                        ).all()
+                                        targets.ge(LOCATION_BASE)
+                                        .logical_and(targets.lt(LOCATION_BASE + LOCATION_COUNT))
+                                        .all()
                                     ):
                                         continue
-                                    predicted_values = values[
-                                        int(row), :2,
-                                        LOCATION_BASE : LOCATION_BASE + LOCATION_COUNT,
-                                    ].argmax(dim=-1) + LOCATION_BASE
+                                    predicted_values = (
+                                        values[
+                                            int(row),
+                                            :2,
+                                            LOCATION_BASE : LOCATION_BASE + LOCATION_COUNT,
+                                        ].argmax(dim=-1)
+                                        + LOCATION_BASE
+                                    )
                                     predictions_for_row = predicted_values
                                     counts = value_program_totals[str(operation)]
                                     expected_equal = targets[0].eq(targets[1])
                                     expected_true = (
-                                        expected_equal
-                                        if operation == "equal"
-                                        else ~expected_equal
+                                        expected_equal if operation == "equal" else ~expected_equal
                                     )
                                     predicted_true = (
                                         predicted_values[0].eq(predicted_values[1])
@@ -3724,9 +3918,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
                                     if not 0 <= expected_index < 3:
                                         continue
                                     predicted_index = int(
-                                        values[
-                                            int(row), 0, SOURCE_BASE : SOURCE_BASE + 3
-                                        ].argmax()
+                                        values[int(row), 0, SOURCE_BASE : SOURCE_BASE + 3].argmax()
                                     )
                                     predicted_output = int(
                                         values[int(row), predicted_index + 1].argmax()
@@ -3737,7 +3929,8 @@ class WorkspaceCapabilityDataset(BaseDataset):
                                 elif operation in {"vote", "vote_confidence"} and exact_no_report:
                                     counts = value_program_totals[operation]
                                     predicted_values = values[
-                                        int(row), :operand_count,
+                                        int(row),
+                                        :operand_count,
                                         SCALAR_BASE : SCALAR_BASE + 2,
                                     ].argmax(dim=-1)
                                     predicted_positive = int(predicted_values.sum().item())
@@ -3786,9 +3979,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
                     ):
                         for row, episode in enumerate(group):
                             answer_start = len(episode.inputs)
-                            answer_end = min(
-                                answer_start + len(episode.answer), logits.shape[1]
-                            )
+                            answer_end = min(answer_start + len(episode.answer), logits.shape[1])
                             if answer_end > answer_start:
                                 v3_answer_logits[episode.track].append(
                                     logits[row, answer_start:answer_end]
@@ -3819,17 +4010,15 @@ class WorkspaceCapabilityDataset(BaseDataset):
                             value1 = destination1_values.detach().cpu().tolist()
                             expected = diagnostic_targets[:, operation_step].tolist()
                             operand_kinds = (
-                                key_value_metadata["workspace_operation_metadata"][:, operation_step][
-                                    :, [3, 5]
-                                ]
+                                key_value_metadata["workspace_operation_metadata"][
+                                    :, operation_step
+                                ][:, [3, 5]]
                                 .detach()
                                 .cpu()
                                 .tolist()
                             )
                             for row, operation_code in enumerate(step_codes):
-                                operation_name = _WORKSPACE_OPERATION_NAMES.get(
-                                    int(operation_code)
-                                )
+                                operation_name = _WORKSPACE_OPERATION_NAMES.get(int(operation_code))
                                 if operation_name is None:
                                     continue
                                 episode = group[row]
@@ -4042,7 +4231,9 @@ class WorkspaceCapabilityDataset(BaseDataset):
                             copy_source_token_ids=(key_value_metadata or {}).get(
                                 "workspace_copy_source_token_ids"
                             ),
-                            copy_source_mask=(key_value_metadata or {}).get("workspace_copy_source_mask"),
+                            copy_source_mask=(key_value_metadata or {}).get(
+                                "workspace_copy_source_mask"
+                            ),
                         )
                     predictions = logits.argmax(dim=-1)
                     for local_idx, episode in enumerate(group):
@@ -4056,9 +4247,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
                         episode_results_by_track[episode.track].append(
                             (n_correct / max(n_answers, 1), bool(exact))
                         )
-                        progression_group = str(
-                            episode.metadata.get("progression_group", "all")
-                        )
+                        progression_group = str(episode.metadata.get("progression_group", "all"))
                         if episode.track == "lang_logic":
                             verdict_len = max(
                                 0, min(int(episode.metadata.get("verdict_len", 0)), n_answers)
@@ -4077,11 +4266,8 @@ class WorkspaceCapabilityDataset(BaseDataset):
                                 if justification:
                                     quality[4] += int(predicted_justification == justification)
                                     quality[5] += 1
-                        if (
-                            episode.track == "rule_switching"
-                            and bool(
-                                getattr(model, "workspace_rule_feedback_update_enabled", False)
-                            )
+                        if episode.track == "rule_switching" and bool(
+                            getattr(model, "workspace_rule_feedback_update_enabled", False)
                         ):
                             tokens = token_rows[local_idx]
                             inferred_rules = self._rule_feedback_targets(episode, tokens)
@@ -4092,9 +4278,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
                                 for index in range(matched)
                             )
                             rule_feedback_tracker_count += matched
-                        progression_counts = progression_totals[
-                            (episode.track, progression_group)
-                        ]
+                        progression_counts = progression_totals[(episode.track, progression_group)]
                         progression_counts[0] += n_correct
                         progression_counts[1] += n_answers
                         progression_counts[2] += 1
@@ -4124,8 +4308,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
                                 )
                             )
                             latent_correct = int(
-                                (pred[0] == BOOL_TRUE)
-                                == bool(episode.metadata["latent_truth"])
+                                (pred[0] == BOOL_TRUE) == bool(episode.metadata["latent_truth"])
                             )
                             process[0] += action_correct
                             process[1] += 1
@@ -4133,14 +4316,22 @@ class WorkspaceCapabilityDataset(BaseDataset):
                             process[3] += 1
                             reported = bool(episode.metadata["explicit_report"])
                             if reported:
-                                confidence_logits = logits[
-                                    local_idx, start + 1,
-                                    SCALAR_BASE : SCALAR_BASE + 4,
-                                ].float().softmax(dim=-1)
+                                confidence_logits = (
+                                    logits[
+                                        local_idx,
+                                        start + 1,
+                                        SCALAR_BASE : SCALAR_BASE + 4,
+                                    ]
+                                    .float()
+                                    .softmax(dim=-1)
+                                )
                                 confidence_score = float(
-                                    (confidence_logits * confidence_logits.new_tensor(
-                                        (0.125, 0.375, 0.625, 0.875)
-                                    )).sum().item()
+                                    (
+                                        confidence_logits
+                                        * confidence_logits.new_tensor((0.125, 0.375, 0.625, 0.875))
+                                    )
+                                    .sum()
+                                    .item()
                                 )
                                 no_report_confidence_scores.append(confidence_score)
                                 no_report_confidence_correct.append(latent_correct)
@@ -4162,9 +4353,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
                             curve_counts[4] += int(response_present == int(target_present))
                             curve_counts[5] += 1
                         elif episode.track == "masked_priming":
-                            process = gnw_process_totals[
-                                (episode.track, query_type)
-                            ]
+                            process = gnw_process_totals[(episode.track, query_type)]
                             predicted_response = (
                                 int(pred[0]) - SCALAR_BASE
                                 if SCALAR_BASE <= int(pred[0]) < SCALAR_BASE + 2
@@ -4174,9 +4363,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
                             response = int(episode.metadata["target_value"])
                             process[0] += int(predicted_response == response)
                             process[1] += 1
-                            process[2] += int(
-                                prime != response and predicted_response == prime
-                            )
+                            process[2] += int(prime != response and predicted_response == prime)
                             process[3] += int(prime != response)
                             process[4] += int(
                                 predicted_response == int(episode.metadata["latent_target"])
@@ -4184,7 +4371,9 @@ class WorkspaceCapabilityDataset(BaseDataset):
                             process[5] += 1
                             condition = (
                                 "masked" if bool(episode.metadata["mask_condition"]) else "visible",
-                                "congruent" if bool(episode.metadata["prime_congruent"]) else "incongruent",
+                                "congruent"
+                                if bool(episode.metadata["prime_congruent"])
+                                else "incongruent",
                             )
                             condition_counts = masked_prime_condition_totals[condition]
                             condition_counts[0] += int(predicted_response == response)
@@ -4358,12 +4547,26 @@ class WorkspaceCapabilityDataset(BaseDataset):
             "adaptive_v3_operator_routes_by_track": {
                 track: {
                     "candidate_count": int(sum(counts)),
-                    "operator_names": list(getattr(getattr(workspace, "adaptive_v3", None), "operator_names", ("noop", "copy", "add_mod", "compare", "select", "rank", "sort", "swap", "reduce"))),
+                    "operator_names": list(
+                        getattr(
+                            getattr(workspace, "adaptive_v3", None),
+                            "operator_names",
+                            (
+                                "noop",
+                                "copy",
+                                "add_mod",
+                                "compare",
+                                "select",
+                                "rank",
+                                "sort",
+                                "swap",
+                                "reduce",
+                            ),
+                        )
+                    ),
                     "_pad": 0,
                     "operator_counts": [int(count) for count in counts],
-                    "operator_fractions": [
-                        float(count / max(sum(counts), 1)) for count in counts
-                    ],
+                    "operator_fractions": [float(count / max(sum(counts), 1)) for count in counts],
                 }
                 for track, counts in sorted(adaptive_v3_route_totals.items())
             },
@@ -4404,16 +4607,16 @@ class WorkspaceCapabilityDataset(BaseDataset):
             },
         }
         for (track, group), counts in logic_quality_totals.items():
-            group_metrics = diagnostics["progression_groups"].setdefault(track, {}).setdefault(group, {})
+            group_metrics = (
+                diagnostics["progression_groups"].setdefault(track, {}).setdefault(group, {})
+            )
             group_metrics.update(
                 verdict_exact_match=100.0 * counts[0] / max(counts[1], 1),
                 verdict_episodes=int(counts[1]),
                 justification_token_accuracy=(
                     100.0 * counts[2] / counts[3] if counts[3] else 100.0
                 ),
-                justification_exact_match=(
-                    100.0 * counts[4] / counts[5] if counts[5] else 100.0
-                ),
+                justification_exact_match=(100.0 * counts[4] / counts[5] if counts[5] else 100.0),
                 justification_tokens=int(counts[3]),
                 justification_episodes=int(counts[5]),
             )
@@ -4463,7 +4666,9 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 }
             if masked_prime_condition_totals:
                 conditions = {}
-                for (visibility, congruency), counts in sorted(masked_prime_condition_totals.items()):
+                for (visibility, congruency), counts in sorted(
+                    masked_prime_condition_totals.items()
+                ):
                     low, high = wilson_interval(counts[0], counts[4])
                     intrusion_low, intrusion_high = wilson_interval(counts[1], counts[2])
                     conditions[f"{visibility}_{congruency}"] = {
@@ -4471,7 +4676,8 @@ class WorkspaceCapabilityDataset(BaseDataset):
                         "target_response_accuracy_wilson95_pct": [100.0 * low, 100.0 * high],
                         "prime_intrusion_on_conflict_pct": 100.0 * counts[1] / max(counts[2], 1),
                         "prime_intrusion_wilson95_pct": [
-                            100.0 * intrusion_low, 100.0 * intrusion_high
+                            100.0 * intrusion_low,
+                            100.0 * intrusion_high,
                         ],
                         "conflict_episodes": counts[2],
                         "latent_target_alignment_pct": 100.0 * counts[3] / max(counts[4], 1),
@@ -4549,13 +4755,13 @@ class WorkspaceCapabilityDataset(BaseDataset):
                     / max(counts[1] + counts[3], 1),
                     "balanced_accuracy_wilson95_pct": [
                         100.0
-                        * wilson_interval(
-                            counts[0] + counts[3] - counts[2], counts[1] + counts[3]
-                        )[0],
+                        * wilson_interval(counts[0] + counts[3] - counts[2], counts[1] + counts[3])[
+                            0
+                        ],
                         100.0
-                        * wilson_interval(
-                            counts[0] + counts[3] - counts[2], counts[1] + counts[3]
-                        )[1],
+                        * wilson_interval(counts[0] + counts[3] - counts[2], counts[1] + counts[3])[
+                            1
+                        ],
                     ],
                     "response_accuracy": 100.0 * counts[4] / max(counts[5], 1),
                     "present_trials": counts[1],
@@ -4703,7 +4909,8 @@ class WorkspaceCapabilityDataset(BaseDataset):
             }
             diagnostics["variable_binding_stage_diagnostics"] = {
                 "query_slot_read_accuracy": (
-                    100.0 * variable_binding_query_read_correct
+                    100.0
+                    * variable_binding_query_read_correct
                     / max(variable_binding_query_read_count, 1)
                 ),
                 "query_slot_reads_correct": variable_binding_query_read_correct,
@@ -4727,7 +4934,8 @@ class WorkspaceCapabilityDataset(BaseDataset):
             }
         if bool(getattr(model, "workspace_rule_feedback_update_enabled", False)):
             diagnostics["workspace_rule_feedback_tracker"] = {
-                "feedback_only_target_accuracy_pct": 100.0 * rule_feedback_tracker_correct
+                "feedback_only_target_accuracy_pct": 100.0
+                * rule_feedback_tracker_correct
                 / max(rule_feedback_tracker_count, 1),
                 "correct_updates": rule_feedback_tracker_correct,
                 "updates": rule_feedback_tracker_count,
@@ -4755,13 +4963,25 @@ class WorkspaceCapabilityDataset(BaseDataset):
             route_text = ",".join(
                 f"{name}:{count / total:.1%}"
                 for name, count in zip(
-                    getattr(getattr(workspace, "adaptive_v3", None), "operator_names", ("noop", "copy", "add_mod", "compare", "select", "rank", "sort", "swap", "reduce")), counts
+                    getattr(
+                        getattr(workspace, "adaptive_v3", None),
+                        "operator_names",
+                        (
+                            "noop",
+                            "copy",
+                            "add_mod",
+                            "compare",
+                            "select",
+                            "rank",
+                            "sort",
+                            "swap",
+                            "reduce",
+                        ),
+                    ),
+                    counts,
                 )
             )
-            print(
-                f"  [adaptive-v3/routes/{track}] candidates={sum(counts)} "
-                f"{route_text}"
-            )
+            print(f"  [adaptive-v3/routes/{track}] candidates={sum(counts)} {route_text}")
         print(
             f"[workspace-capability/{self.task_track}] accuracy {accuracy:.2f}% | "
             f"episode exact {perfect:.2f}% | episodes {len(episodes)}"
@@ -4790,9 +5010,11 @@ class WorkspaceCapabilityDataset(BaseDataset):
                         f"latent-target alignment={metrics['latent_target_alignment']:.1f}% "
                         f"({metrics['episodes']} episodes)"
                     )
-        for condition, accuracy_value in diagnostics.get("gnw_process_context", {}).get(
-            "masked_prime_trace_read_accuracy_by_condition", {}
-        ).items():
+        for condition, accuracy_value in (
+            diagnostics.get("gnw_process_context", {})
+            .get("masked_prime_trace_read_accuracy_by_condition", {})
+            .items()
+        ):
             print(
                 f"  [GNW-process/masked-prime-trace/{condition}] workspace prime "
                 f"read accuracy={accuracy_value:.1f}%"
@@ -4977,14 +5199,16 @@ class WorkspaceCapabilityDataset(BaseDataset):
             print(
                 "  [evaluation-track-lessons] "
                 + ", ".join(
-                    f"{track}={level + 1}" for track, level in sorted(evaluation_track_lessons.items())
+                    f"{track}={level + 1}"
+                    for track, level in sorted(evaluation_track_lessons.items())
                 )
                 + " (lessons used to generate these evaluation episodes)"
             )
         for track, metrics in diagnostics["tracks"].items():
             level_text = (
                 f" lesson={evaluation_track_lessons[track] + 1}"
-                if track in evaluation_track_lessons else ""
+                if track in evaluation_track_lessons
+                else ""
             )
             print(
                 f"  [{track}{level_text}] answer {metrics['accuracy']:.2f}% | "
@@ -4994,7 +5218,8 @@ class WorkspaceCapabilityDataset(BaseDataset):
         for track, groups in diagnostics.get("progression_groups", {}).items():
             level_text = (
                 f" lesson={evaluation_track_lessons[track] + 1}"
-                if track in evaluation_track_lessons else ""
+                if track in evaluation_track_lessons
+                else ""
             )
             for group, metrics in sorted(groups.items()):
                 quality_text = ""
@@ -5073,9 +5298,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
                         for cell, values in selected.items()
                         if len(values) < episodes_per_cell
                     }
-                    raise RuntimeError(
-                        f"could not balance GNW probe {track} cells: {short}"
-                    )
+                    raise RuntimeError(f"could not balance GNW probe {track} cells: {short}")
                 episode = self._make_episode(track, 5, rng)
                 cell = key_fn(episode)
                 attempts += 1
@@ -5130,9 +5353,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
             and getattr(model, "workspace_enabled", False)
         )
         if workspace_available:
-            bypass_result = self._evaluate_episodes(
-                model, device, episodes, ablate_workspace=True
-            )
+            bypass_result = self._evaluate_episodes(model, device, episodes, ablate_workspace=True)
             bypass_diagnostics = self.last_eval_diagnostics
             shuffled_result = self._evaluate_episodes(
                 model, device, episodes, shuffle_workspace_readback=True
@@ -5162,9 +5383,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 ]
                 if not feature_episodes:
                     continue
-                feature_baseline = self._evaluate_episodes(
-                    model, device, feature_episodes
-                )
+                feature_baseline = self._evaluate_episodes(model, device, feature_episodes)
                 feature_result = self._evaluate_episodes(
                     model,
                     device,
@@ -5176,9 +5395,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
                     "baseline_accuracy_pct": float(feature_baseline[0]),
                     "accuracy_pct": float(feature_result[0]),
                     "episode_exact_pct": float(feature_result[1]),
-                    "full_minus_feature_off_pp": float(
-                        feature_baseline[0] - feature_result[0]
-                    ),
+                    "full_minus_feature_off_pp": float(feature_baseline[0] - feature_result[0]),
                     "episodes": len(feature_episodes),
                 }
                 print(
@@ -5192,9 +5409,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
         attempts = 0
         while len(natural_report_episodes) < natural_report_n:
             if attempts >= natural_report_n * 20:
-                raise RuntimeError(
-                    "could not build natural-prevalence reported-confidence sample"
-                )
+                raise RuntimeError("could not build natural-prevalence reported-confidence sample")
             episode = self._make_episode("no_report_confidence", 5, rng)
             attempts += 1
             if bool(episode.metadata["explicit_report"]):
@@ -5240,26 +5455,24 @@ class WorkspaceCapabilityDataset(BaseDataset):
             track: {
                 "full_exact_match_pct": float(metrics["exact_match"]),
                 "workspace_bypassed_exact_match_pct": float(
-                    bypass_diagnostics.get("tracks", {}).get(track, {}).get(
-                        "exact_match", math.nan
-                    )
+                    bypass_diagnostics.get("tracks", {}).get(track, {}).get("exact_match", math.nan)
                 ),
                 "readback_shuffled_exact_match_pct": float(
-                    shuffled_diagnostics.get("tracks", {}).get(track, {}).get(
-                        "exact_match", math.nan
-                    )
+                    shuffled_diagnostics.get("tracks", {})
+                    .get(track, {})
+                    .get("exact_match", math.nan)
                 ),
                 "full_minus_bypassed_pp": float(
                     metrics["exact_match"]
-                    - bypass_diagnostics.get("tracks", {}).get(track, {}).get(
-                        "exact_match", math.nan
-                    )
+                    - bypass_diagnostics.get("tracks", {})
+                    .get(track, {})
+                    .get("exact_match", math.nan)
                 ),
                 "full_minus_shuffled_pp": float(
                     metrics["exact_match"]
-                    - shuffled_diagnostics.get("tracks", {}).get(track, {}).get(
-                        "exact_match", math.nan
-                    )
+                    - shuffled_diagnostics.get("tracks", {})
+                    .get(track, {})
+                    .get("exact_match", math.nan)
                 ),
                 "episodes": int(metrics["episodes"]),
             }
@@ -5270,14 +5483,10 @@ class WorkspaceCapabilityDataset(BaseDataset):
             "full_accuracy_pct": float(result[0]),
             "full_episode_exact_match_pct": float(result[1]),
             "adaptive_pathway_bypassed_accuracy_pct": (
-                float(adaptive_bypass_result[0])
-                if adaptive_bypass_result is not None
-                else math.nan
+                float(adaptive_bypass_result[0]) if adaptive_bypass_result is not None else math.nan
             ),
             "adaptive_pathway_bypassed_episode_exact_match_pct": (
-                float(adaptive_bypass_result[1])
-                if adaptive_bypass_result is not None
-                else math.nan
+                float(adaptive_bypass_result[1]) if adaptive_bypass_result is not None else math.nan
             ),
             "full_minus_adaptive_bypassed_pp": (
                 float(result[0] - adaptive_bypass_result[0])
@@ -5290,26 +5499,27 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 track: {
                     "full_accuracy_pct": float(metrics["accuracy"]),
                     "adaptive_pathway_bypassed_accuracy_pct": float(
-                        adaptive_bypass_diagnostics.get("tracks", {}).get(track, {}).get(
-                            "accuracy", math.nan
-                        )
+                        adaptive_bypass_diagnostics.get("tracks", {})
+                        .get(track, {})
+                        .get("accuracy", math.nan)
                     ),
                     "full_exact_match_pct": float(metrics["exact_match"]),
                     "adaptive_pathway_bypassed_exact_match_pct": float(
-                        adaptive_bypass_diagnostics.get("tracks", {}).get(track, {}).get(
-                            "exact_match", math.nan
-                        )
+                        adaptive_bypass_diagnostics.get("tracks", {})
+                        .get(track, {})
+                        .get("exact_match", math.nan)
                     ),
                     "full_minus_adaptive_bypassed_pp": float(
                         metrics["exact_match"]
-                        - adaptive_bypass_diagnostics.get("tracks", {}).get(track, {}).get(
-                            "exact_match", math.nan
-                        )
+                        - adaptive_bypass_diagnostics.get("tracks", {})
+                        .get(track, {})
+                        .get("exact_match", math.nan)
                     ),
                     "episodes": int(metrics["episodes"]),
                 }
                 for track, metrics in full_diagnostics.get("tracks", {}).items()
-                if track in {
+                if track
+                in {
                     "ignition",
                     "attentional_blink",
                     "masked_priming",
@@ -5905,16 +6115,17 @@ class WorkspaceCapabilityDataset(BaseDataset):
         """Evaluate paired ID episodes with adaptive workspace mechanisms bypassed."""
         if bool(getattr(model, "workspace_adaptive_v3_enabled", False)):
             count = int(getattr(model, "workspace_adaptive_v3_eval_episodes_per_track", 128))
-            tracks = tuple(
-                getattr(model, "workspace_adaptive_v3_feature_off_tracks", ())
-            ) or ("mixed_skill", "variable_binding")
+            tracks = tuple(getattr(model, "workspace_adaptive_v3_feature_off_tracks", ())) or (
+                "mixed_skill",
+                "variable_binding",
+            )
             rng = random.Random(1_910_003 + int(lesson_idx))
             episodes = [
                 self._make_episode(track, int(lesson_idx), rng)
                 for track in tracks
                 for _ in range(count)
             ]
-            full = self._evaluate_episodes(
+            self._evaluate_episodes(
                 model,
                 device,
                 episodes,
@@ -5952,9 +6163,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
                     accuracy_delta = enabled_acc - bypass_acc
                     exact_delta = enabled_exact - bypass_exact
                     generator = torch.Generator().manual_seed(1_910_003 + paired_count)
-                    indices = torch.randint(
-                        paired_count, (4096, paired_count), generator=generator
-                    )
+                    indices = torch.randint(paired_count, (4096, paired_count), generator=generator)
                     accuracy_bootstrap = accuracy_delta[indices].mean(dim=1) * 100.0
                     exact_bootstrap = exact_delta[indices].mean(dim=1) * 100.0
                     accuracy_ci = torch.quantile(
@@ -6001,23 +6210,23 @@ class WorkspaceCapabilityDataset(BaseDataset):
                     bypass_prob = bypass_logp.exp()
                     midpoint = 0.5 * (enabled_prob + bypass_prob)
                     midpoint_log = midpoint.clamp_min(1e-8).log()
-                    js = 0.5 * (
-                        enabled_prob * (enabled_logp - midpoint_log)
-                    ).sum(dim=-1) + 0.5 * (
+                    js = 0.5 * (enabled_prob * (enabled_logp - midpoint_log)).sum(dim=-1) + 0.5 * (
                         bypass_prob * (bypass_logp - midpoint_log)
                     ).sum(dim=-1)
                     js = js.clamp_min(0.0)
                     mean_abs_logit_shift = (
-                        enabled_logits.double() - bypassed_logits.double()
-                    ).abs().mean()
-                    flips = enabled_logits.argmax(dim=-1).ne(
-                        bypassed_logits.argmax(dim=-1)
+                        (enabled_logits.double() - bypassed_logits.double()).abs().mean()
                     )
+                    flips = enabled_logits.argmax(dim=-1).ne(bypassed_logits.argmax(dim=-1))
                     by_track[track] = {
                         "answer_tokens": int(count),
                         "mean_js_divergence_nats": float(js.mean().item()) if count else 0.0,
-                        "mean_abs_logit_shift": float(mean_abs_logit_shift.item()) if count else 0.0,
-                        "prediction_flip_fraction": float(flips.float().mean().item()) if count else 0.0,
+                        "mean_abs_logit_shift": float(mean_abs_logit_shift.item())
+                        if count
+                        else 0.0,
+                        "prediction_flip_fraction": float(flips.float().mean().item())
+                        if count
+                        else 0.0,
                     }
                     print(
                         f"  [adaptive-v3/logits/{track}] tokens={count} "
@@ -6029,9 +6238,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
             self.last_eval_diagnostics["adaptive_v3_paired_metrics"] = paired_metrics
             return bypass[:2]
         episodes = self._paired_id_episodes(lesson_idx)
-        return self._evaluate_episodes(
-            model, device, episodes, ablate_workspace_adaptive=True
-        )[:2]
+        return self._evaluate_episodes(model, device, episodes, ablate_workspace_adaptive=True)[:2]
 
     def evaluate_workspace_shuffled(self, model, device, curriculum, lesson_idx):
         episodes = self._paired_id_episodes(lesson_idx)

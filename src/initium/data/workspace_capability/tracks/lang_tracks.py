@@ -7,12 +7,39 @@ import json
 import random as _random
 
 from initium.data.workspace_capability.episode import (
-    BOOL_FALSE, BOOL_TRUE, FACT_BASE, MASK_TOKEN, SPK_SYS, SPK_USER, TASK_ACCEPT, TASK_CLOZE, TASK_D2T,
-    TASK_FIRST, TASK_PARA, TASK_QA, TASK_RETELL, TASK_T2D, TURN_END, location_token, relation_token,
+    BOOL_FALSE,
+    BOOL_TRUE,
+    FACT_BASE,
+    MASK_TOKEN,
+    SPK_SYS,
+    SPK_USER,
+    TASK_ACCEPT,
+    TASK_CLOZE,
+    TASK_D2T,
+    TASK_FIRST,
+    TASK_PARA,
+    TASK_QA,
+    TASK_RETELL,
+    TASK_T2D,
+    TURN_END,
+    location_token,
+    relation_token,
 )
 from initium.data.workspace_capability.tracks import _lang_text as lt
 from initium.data.workspace_capability.tracks._lang_grammar import (
-    DROP_V, MOVE_V, NAMES, OBJS, PICK_V, PLACES, PUNCT, ROWS, Ep, allowed, art, grammar, plural, row_ok,
+    DROP_V,
+    MOVE_V,
+    NAMES,
+    OBJS,
+    PICK_V,
+    PLACES,
+    PUNCT,
+    ROWS,
+    Ep,
+    allowed,
+    grammar,
+    plural,
+    row_ok,
 )
 from initium.data.workspace_capability.tracks.developmental import _pair_ok
 
@@ -32,7 +59,9 @@ def _rows(name, split):
     if not path.exists():
         raise FileNotFoundError(f"{path} missing; build it with tools/build_stage4_corpus.py")
     with open(path, encoding="utf-8") as f:
-        return tuple(r for r in map(json.loads, (l for l in f if l.strip())) if r.get("split") == split)
+        return tuple(
+            r for r in map(json.loads, (l for l in f if l.strip())) if r.get("split") == split
+        )
 
 
 def _split(cfg):
@@ -72,7 +101,15 @@ def _world(cfg, rng, grp):
     if cf:
         ctx = [(h, r, _alt_tail(G, band, r, h, t, rng)) for h, r, t in ctx]
         f0 = ctx[0]
-    w = {"grp": grp, "band": band, "heldout": heldout, "cf": cf, "f0": f0, "yes": rng.random() < 0.5, "t2": None}
+    w = {
+        "grp": grp,
+        "band": band,
+        "heldout": heldout,
+        "cf": cf,
+        "f0": f0,
+        "yes": rng.random() < 0.5,
+        "t2": None,
+    }
     if grp == "unsupported":
         ctx = ctx[1:]
         if not ctx:
@@ -116,8 +153,10 @@ def _render(cfg, w, rng):
             i += 1
     seq = list(out)
     for _ in range(int(cfg.get("filler", 0))):
-        seq.insert(rng.randrange(len(seq) + 1),
-                   (rng.choice(NAMES), rng.choice(MOVE_V), "to", "the", rng.choice(PLACES) + "."))
+        seq.insert(
+            rng.randrange(len(seq) + 1),
+            (rng.choice(NAMES), rng.choice(MOVE_V), "to", "the", rng.choice(PLACES) + "."),
+        )
     ep = Ep(0)
     for ws in seq:
         ep.text(ws, ctx=not isinstance(ws, tuple))
@@ -148,7 +187,14 @@ def _render(cfg, w, rng):
         ans = G.say(f0, b)
     else:  # unsupported
         ep.ctl(TASK_QA)
-        r2 = rng.choice([x for x in range(7) if all((h, x) != (s, x) or h != s for h, rr, _ in w["ctx"] if rr == x)] or [r])
+        rng.choice(
+            [
+                x
+                for x in range(7)
+                if all((h, x) != (s, x) or h != s for h, rr, _ in w["ctx"] if rr == x)
+            ]
+            or [r]
+        )
         if rng.random() < 0.5:
             ep.text(G.ask_wh(s, r), ctx=False)
         else:
@@ -157,8 +203,15 @@ def _render(cfg, w, rng):
         ans = ["i", "do", "not", "know."]
     if grp != "unsupported":
         ep.ask(f0)
-    return ep.done("lang_template", _toks(ans), f"{grp}{sub}_{'cf' if w['cf'] else 'fact'}_{'heldout' if w['heldout'] else 'train'}",
-                   grp, grammar_checked=True, counterfactual=w["cf"], heldout_words=w["heldout"])
+    return ep.done(
+        "lang_template",
+        _toks(ans),
+        f"{grp}{sub}_{'cf' if w['cf'] else 'fact'}_{'heldout' if w['heldout'] else 'train'}",
+        grp,
+        grammar_checked=True,
+        counterfactual=w["cf"],
+        heldout_words=w["heldout"],
+    )
 
 
 def _g_template(cfg, rng):
@@ -179,7 +232,9 @@ def _ext_nlg(cfg, rng):
     ep.ctl(TASK_D2T)
     for s, r, o in rec["triples"]:
         ep.text(s.split() + ["|"] + r.split() + ["|"] + o.split() + [";"])
-    return ep.done("lang_nlg", _toks(rec["text"].split()), "external_nlg", "external", grammar_checked=False)
+    return ep.done(
+        "lang_nlg", _toks(rec["text"].split()), "external_nlg", "external", grammar_checked=False
+    )
 
 
 def _g_nlg(cfg, rng):
@@ -220,7 +275,13 @@ def _ext_story(cfg, rng):
     ep.text(rec["context"].split())
     ep.ctl(TASK_QA)
     ep.text(rec["question"].split())
-    return ep.done("lang_story_qa", _toks(rec["answer"].split()), "external_story", "external", grammar_checked=False)
+    return ep.done(
+        "lang_story_qa",
+        _toks(rec["answer"].split()),
+        "external_story",
+        "external",
+        grammar_checked=False,
+    )
 
 
 def _is_in(p, l):
@@ -244,14 +305,21 @@ def _g_story(cfg, rng):
             ep.story(s)
         mp = [NAMES[p2], rng.choice(MOVE_V), "to", "the", PLACES[l2] + "."]
         mo = [NAMES[p1], "moved", "the", OBJS[o], "to", "the", PLACES[l3] + "."]
-        for s in ([mp, mo] if grp != "true_belief" else [mo, mp]):
+        for s in [mp, mo] if grp != "true_belief" else [mo, mp]:
             ep.story(s)
         ep.ctl(TASK_QA)
         if grp == "reality":
             q, a = ["where", "is", "the", OBJS[o] + "?"], _obj_in(o, l3)
         else:
             q = ["where", "will", NAMES[p2], "look", "for", "the", OBJS[o] + "?"]
-            a = [NAMES[p2], "will", "look", "in", "the", PLACES[l1 if grp == "false_belief" else l3] + "."]
+            a = [
+                NAMES[p2],
+                "will",
+                "look",
+                "in",
+                "the",
+                PLACES[l1 if grp == "false_belief" else l3] + ".",
+            ]
         ep.story(q, ctx=False)
         return ep.done("lang_story_qa", _toks(a), grp, grp, grammar_checked=False)
     persons = rng.sample(range(6), rng.randint(2, 3))
@@ -299,12 +367,19 @@ def _g_story(cfg, rng):
         yes = rng.random() < 0.5
         l = pl[p] if yes else rng.choice([x for x in range(6) if x != pl[p]])
         q = ["is", NAMES[p], "in", "the", PLACES[l] + "?"]
-        a = ["yes,", NAMES[p], "is", "in", "the", PLACES[l] + "."] if yes else \
-            ["no,", NAMES[p], "is", "not", "in", "the", PLACES[l] + "."]
+        a = (
+            ["yes,", NAMES[p], "is", "in", "the", PLACES[l] + "."]
+            if yes
+            else ["no,", NAMES[p], "is", "not", "in", "the", PLACES[l] + "."]
+        )
     else:  # carry
         hs = [x for x, hp in held.items() if hp == p]
         q = ["what", "is", NAMES[p], "carrying?"]
-        a = [NAMES[p], "is", "carrying", "the", OBJS[hs[0]] + "."] if hs else [NAMES[p], "is", "carrying", "nothing."]
+        a = (
+            [NAMES[p], "is", "carrying", "the", OBJS[hs[0]] + "."]
+            if hs
+            else [NAMES[p], "is", "carrying", "nothing."]
+        )
     ep.ctl(TASK_QA)
     ep.story(q, ctx=False)
     if grp == "yes_no" and ep.ann:
@@ -313,7 +388,9 @@ def _g_story(cfg, rng):
         # location, so the model can learn the comparison before verbalizing
         # the yes/no plus rationale. This does not put the answer in the input.
         ep.rd.append((len(ep.t) - 1, p, location_token(pl[p])))
-    return ep.done("lang_story_qa", _toks(a), f"{grp}_ev{cfg['events']}", grp, grammar_checked=False)
+    return ep.done(
+        "lang_story_qa", _toks(a), f"{grp}_ev{cfg['events']}", grp, grammar_checked=False
+    )
 
 
 # ---------------------------------------------------------------- 4d dialogue
@@ -372,7 +449,11 @@ def _g_dialogue(cfg, rng):
     cf = rng.random() < cfg["counterfactual"]
     if cf:
         ctx = {(h, r): _alt_tail(G, band, r, h, t, rng) for (h, r), t in ctx.items()}
-    T = rng.randint(2, max(2, cfg["turns"])) if grp in ("pronoun", "ellipsis") else rng.randint(1, max(1, cfg["turns"]))
+    T = (
+        rng.randint(2, max(2, cfg["turns"]))
+        if grp in ("pronoun", "ellipsis")
+        else rng.randint(1, max(1, cfg["turns"]))
+    )
     c2 = {**cfg, "plural": 0}
     facts = [(h, r, t) for (h, r), t in ctx.items()]
     rng.shuffle(facts)
@@ -382,7 +463,13 @@ def _g_dialogue(cfg, rng):
     prev, turns = None, []
     for k in range(T):
         last = k == T - 1
-        res = _turn(G, ctx, grp if last else rng.choice(("fresh", "fresh", "pronoun", "ellipsis", "unsupported")), prev, rng)
+        res = _turn(
+            G,
+            ctx,
+            grp if last else rng.choice(("fresh", "fresh", "pronoun", "ellipsis", "unsupported")),
+            prev,
+            rng,
+        )
         if res is None:
             if last:
                 raise OverflowError
@@ -401,14 +488,40 @@ def _g_dialogue(cfg, rng):
     ep.ctl(SPK_SYS)
     if fact is not None:
         ep.ask(fact)
-    return ep.done("lang_dialogue", _toks(a), f"{grp}_turn{T}", grp, grammar_checked=True, counterfactual=cf,
-                   heldout_words=band == "B", turn=T)
+    return ep.done(
+        "lang_dialogue",
+        _toks(a),
+        f"{grp}_turn{T}",
+        grp,
+        grammar_checked=True,
+        counterfactual=cf,
+        heldout_words=band == "B",
+        turn=T,
+    )
 
 
 # ---------------------------------------------------------------- 4e syntax probes
 TRAIN_PHEN, HELD_PHEN = ("agree", "detnum", "order"), ("article", "aux")
-_AGREE = {"is": "are", "are": "is", "was": "were", "were": "was", "has": "have", "have": "has", "causes": "cause", "cause": "causes"}
-_AUX = {"is": "has", "are": "can", "was": "has", "were": "can", "can": "is", "could": "is", "has": "is", "have": "are"}
+_AGREE = {
+    "is": "are",
+    "are": "is",
+    "was": "were",
+    "were": "was",
+    "has": "have",
+    "have": "has",
+    "causes": "cause",
+    "cause": "causes",
+}
+_AUX = {
+    "is": "has",
+    "are": "can",
+    "was": "has",
+    "were": "can",
+    "can": "is",
+    "could": "is",
+    "has": "is",
+    "have": "are",
+}
 _ART = {"a": "an", "an": "a"}
 
 
@@ -435,14 +548,14 @@ def _corrupt(G, ws, kind, rng):
         if not M:
             return None
         st, we, idx, _, _ = M[0]
-        out = core[:st] + ["a", plural(G.word[idx])] + core[we + 1:]
+        out = core[:st] + ["a", plural(G.word[idx])] + core[we + 1 :]
     else:  # order
         if len(core) < 3:
             return None
         i = rng.randrange(len(core) - 1)
         out = list(core)
         out[i], out[i + 1] = out[i + 1], out[i]
-    out[-1] += ws[-1][len(ws[-1].rstrip(PUNCT)):]
+    out[-1] += ws[-1][len(ws[-1].rstrip(PUNCT)) :]
     return out
 
 
@@ -455,7 +568,13 @@ def _g_probe(cfg, rng):
         ep.ctl(TASK_ACCEPT)
         ep.text(rec["sentence"].split())
         ep.mark(0, BOOL_TRUE if int(rec["label"]) else BOOL_FALSE)
-        return ep.done("lang_syntax_probes", [BOOL_TRUE if int(rec["label"]) else BOOL_FALSE], "external", "external", kind="bool")
+        return ep.done(
+            "lang_syntax_probes",
+            [BOOL_TRUE if int(rec["label"]) else BOOL_FALSE],
+            "external",
+            "external",
+            kind="bool",
+        )
     band = "B" if rng.random() < cfg["heldout"] * 0 else "A"
     for _ in range(20):
         f = rng.choice(G.facts[band])
@@ -474,11 +593,15 @@ def _g_probe(cfg, rng):
     ep.ctl(TASK_ACCEPT)
     ep.text(ws, ctx=False)
     ep.mark(0, BOOL_TRUE if label else BOOL_FALSE)
-    return ep.done("lang_syntax_probes", [BOOL_TRUE if label else BOOL_FALSE], name, name, kind="bool")
+    return ep.done(
+        "lang_syntax_probes", [BOOL_TRUE if label else BOOL_FALSE], name, name, kind="bool"
+    )
 
 
 # ---------------------------------------------------------------- 4f open (external, exploratory)
-_STOP = frozenset("that this with from have were been they their there which would about into than then them".split())
+_STOP = frozenset(
+    "that this with from have were been they their there which would about into than then them".split()
+)
 
 
 def _g_open(cfg, rng):
@@ -487,20 +610,26 @@ def _g_open(cfg, rng):
     words = rec["text"].split()[: cfg["words"]]
     ep = Ep(5)
     if grp == "cloze":
-        c = [i for i, w in enumerate(words) if w.strip(PUNCT).isalpha() and len(w.strip(PUNCT)) >= 4 and w.strip(PUNCT) not in _STOP]
+        c = [
+            i
+            for i, w in enumerate(words)
+            if w.strip(PUNCT).isalpha() and len(w.strip(PUNCT)) >= 4 and w.strip(PUNCT) not in _STOP
+        ]
         if not c:
             raise OverflowError
         i = rng.choice(c)
         ep.open_text(words[:i], _STOP)
         ep.ctl(MASK_TOKEN)
-        ep.open_text(words[i + 1:], _STOP)
+        ep.open_text(words[i + 1 :], _STOP)
         ep.open_reads()
         ep.ctl(TASK_CLOZE)
-        return ep.done("lang_open", _toks([words[i].strip(PUNCT)]), "cloze", grp, grammar_checked=False)
+        return ep.done(
+            "lang_open", _toks([words[i].strip(PUNCT)]), "cloze", grp, grammar_checked=False
+        )
     end = next((i for i, w in enumerate(words) if w[-1:] in ".?!"), None)
     if end is None or end >= 40 or end + 1 >= len(words):
         raise OverflowError
-    ep.open_text(words[end + 1:], _STOP)
+    ep.open_text(words[end + 1 :], _STOP)
     ep.open_reads()
     ep.ctl(TASK_FIRST)
     return ep.done("lang_open", _toks(words[: end + 1]), "first", grp, grammar_checked=False)

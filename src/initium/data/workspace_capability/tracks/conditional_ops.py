@@ -5,14 +5,40 @@ from __future__ import annotations
 import random
 
 from initium.data.workspace_capability.episode import (
-    BOS, ENTITY_BASE, ENTITY_COUNT, EOS, EV_INIT, EV_VECTOR, QUERY, RELATION_BASE,
-    RELATION_COUNT, SCALAR_BASE, SCALAR_COUNT, SEP, TaskEpisode, entity_token,
-    relation_token, scalar_token,
+    BOS,
+    ENTITY_BASE,
+    ENTITY_COUNT,
+    EOS,
+    EV_INIT,
+    EV_VECTOR,
+    QUERY,
+    RELATION_BASE,
+    RELATION_COUNT,
+    SCALAR_BASE,
+    SCALAR_COUNT,
+    SEP,
+    TaskEpisode,
+    entity_token,
+    relation_token,
+    scalar_token,
 )
 from initium.data.workspace_capability.tracks._shared import common_metadata
 
-OPERATIONS = ("sub", "mul", "neg", "inc", "dec", "eq", "member", "cond_copy",
-              "and", "or", "xor", "not", "max")
+OPERATIONS = (
+    "sub",
+    "mul",
+    "neg",
+    "inc",
+    "dec",
+    "eq",
+    "member",
+    "cond_copy",
+    "and",
+    "or",
+    "xor",
+    "not",
+    "max",
+)
 _BIT_RESULT = ("eq", "member", "and", "or", "xor", "not")
 _HELD_OUT = {"mul": "dec", "sub": "max", "inc": "eq", "neg": "member"}
 _HELD_OUT_PAIRS = set(_HELD_OUT.items())
@@ -81,8 +107,9 @@ def generate(difficulty: dict, rng: random.Random, *, ood: bool = False) -> Task
             args = tuple(entity_token(e) for e in f)
             x, y = values[f[0]], values[f[1]]
             out = {"and": x & y, "or": x | y, "xor": x ^ y}[op]
-        stream.extend((EV_VECTOR, entity_token(dest), relation_token(OPERATIONS.index(op)),
-                       *args, SEP))
+        stream.extend(
+            (EV_VECTOR, entity_token(dest), relation_token(OPERATIONS.index(op)), *args, SEP)
+        )
         values[dest] = out
         if op in _BIT_RESULT:
             bits.append(dest)
@@ -90,12 +117,20 @@ def generate(difficulty: dict, rng: random.Random, *, ood: bool = False) -> Task
         final = dest
     stream.extend((QUERY, entity_token(final), SEP))
     return TaskEpisode(
-        "conditional_ops", tuple(stream), (scalar_token(values[final]), EOS),
+        "conditional_ops",
+        tuple(stream),
+        (scalar_token(values[final]), EOS),
         common_metadata(
-            track="conditional_ops", sequence_length=len(stream), query_type=f"ops{n_ops}",
-            relevant_updates=n_ops, distractor_count=keys,
-            candidate_baseline_pct=100.0 / SCALAR_COUNT, operations=tuple(chosen),
-            progression_group="all", workspace_output_keys=(final, -1), ood=bool(ood),
+            track="conditional_ops",
+            sequence_length=len(stream),
+            query_type=f"ops{n_ops}",
+            relevant_updates=n_ops,
+            distractor_count=keys,
+            candidate_baseline_pct=100.0 / SCALAR_COUNT,
+            operations=tuple(chosen),
+            progression_group="all",
+            workspace_output_keys=(final, -1),
+            ood=bool(ood),
         ),
     )
 
@@ -127,8 +162,11 @@ def parse_records(tokens, n_inputs):
         if ev == EV_INIT:
             values[ents[0]] = scal[0] - SCALAR_BASE
             continue
-        op = OPERATIONS[next(t - RELATION_BASE for t in f
-                             if RELATION_BASE <= t < RELATION_BASE + RELATION_COUNT)]
+        op = OPERATIONS[
+            next(
+                t - RELATION_BASE for t in f if RELATION_BASE <= t < RELATION_BASE + RELATION_COUNT
+            )
+        ]
         dest, d1 = ents[0], -1
         o0, o1 = (1, ents[1]) if len(ents) > 1 else (0, -1), (0, -1)
         ea, eb = -100, -100

@@ -5,9 +5,9 @@ from __future__ import annotations
 import random
 
 from initium.data.workspace_capability.episode import (
-    BOS,
     BOOL_FALSE,
     BOOL_TRUE,
+    BOS,
     EOS,
     EV_ASSERT,
     EV_UPDATE,
@@ -66,8 +66,10 @@ def generate(difficulty: dict, rng: random.Random, *, ood: bool = False) -> Task
         # The chosen feature is observable, but feedback is noisy. A single
         # success/failure therefore cannot identify the active rule reliably.
         choice_dimension = rng.randrange(3)
-        feedback_correct = rng.random() >= feedback_noise if choice_dimension == current_rule else (
-            rng.random() < feedback_noise
+        feedback_correct = (
+            rng.random() >= feedback_noise
+            if choice_dimension == current_rule
+            else (rng.random() < feedback_noise)
         )
         stream.extend(
             (
@@ -109,9 +111,7 @@ def generate(difficulty: dict, rng: random.Random, *, ood: bool = False) -> Task
         common_metadata(
             track="rule_switching",
             sequence_length=len(stream),
-            query_type=(
-                f"{progression_group}_trials{evidence_trials}_switches{switch_count}"
-            ),
+            query_type=(f"{progression_group}_trials{evidence_trials}_switches{switch_count}"),
             relevant_updates=evidence_trials,
             distractor_count=evidence_trials - switch_count,
             source_count=3,

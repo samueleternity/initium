@@ -5,9 +5,9 @@ from __future__ import annotations
 import random
 
 from initium.data.workspace_capability.episode import (
-    BOS,
     BOOL_FALSE,
     BOOL_TRUE,
+    BOS,
     EOS,
     EV_INIT,
     EV_MOVE,

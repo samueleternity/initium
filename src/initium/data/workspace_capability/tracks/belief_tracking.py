@@ -36,9 +36,7 @@ def generate(difficulty: dict, rng: random.Random, *, ood: bool = False) -> Task
     # Everyone observes the initial arrangement. Subsequent moves update only
     # those agents who observe that move, leaving other beliefs stale.
     for object_id in object_ids:
-        stream.extend(
-            (EV_INIT, entity_token(object_id), location_token(world[object_id]), SEP)
-        )
+        stream.extend((EV_INIT, entity_token(object_id), location_token(world[object_id]), SEP))
         for agent_id in range(agents):
             stream.extend(
                 (
@@ -118,12 +116,14 @@ def generate(difficulty: dict, rng: random.Random, *, ood: bool = False) -> Task
             false_belief=(
                 query_condition == "false_belief" and answer_value != world[query_object]
             ),
-            true_belief=(
-                query_condition == "true_belief" and answer_value == world[query_object]
-            ),
+            true_belief=(query_condition == "true_belief" and answer_value == world[query_object]),
             ood=bool(ood),
             workspace_output_keys=(
-                (query_object if query_condition == "reality" else 8 + query_agent * 8 + query_object),
+                (
+                    query_object
+                    if query_condition == "reality"
+                    else 8 + query_agent * 8 + query_object
+                ),
                 -1,
             ),
         ),

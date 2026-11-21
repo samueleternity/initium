@@ -51,17 +51,13 @@ class AdaptiveWorkspaceSkillsV2(nn.Module):
 
         self.context_norm = nn.LayerNorm(self.context_width)
         self.router = nn.Linear(self.context_width, self.num_skills, bias=False)
-        self.skill_down = nn.Parameter(
-            torch.empty(self.num_skills, self.context_width, self.rank)
-        )
+        self.skill_down = nn.Parameter(torch.empty(self.num_skills, self.context_width, self.rank))
         self.skill_up = nn.Parameter(torch.empty(self.num_skills, self.rank, self.d_model))
         self.skill_bias = nn.Parameter(torch.zeros(self.num_skills, self.rank))
         initial_scale_logit = math.log(
             self._INITIAL_OUTPUT_SCALE / (1.0 - self._INITIAL_OUTPUT_SCALE)
         )
-        self.output_scale_logit = nn.Parameter(
-            torch.full((self.num_skills,), initial_scale_logit)
-        )
+        self.output_scale_logit = nn.Parameter(torch.full((self.num_skills,), initial_scale_logit))
         nn.init.xavier_uniform_(self.skill_down)
         nn.init.normal_(self.skill_up, mean=0.0, std=self._OUTPUT_WEIGHT_STD)
 
@@ -138,9 +134,7 @@ class AdaptiveWorkspaceSkillsV2(nn.Module):
 
         probabilities = self.router(context).float().softmax(dim=-1)
         selected_skill = probabilities.argmax(dim=-1)
-        hard_routes = F.one_hot(selected_skill, num_classes=self.num_skills).to(
-            probabilities.dtype
-        )
+        hard_routes = F.one_hot(selected_skill, num_classes=self.num_skills).to(probabilities.dtype)
         token_mask = (
             torch.ones(expected_prefix, device=context.device, dtype=torch.float32)
             if valid_mask is None
@@ -170,13 +164,11 @@ class AdaptiveWorkspaceSkillsV2(nn.Module):
             soft_weight = probabilities[..., skill_index : skill_index + 1]
             hard_raw_delta = hard_raw_delta + skill_output * hard_weight
             hard_delta = hard_delta + skill_output * scale * hard_weight
-            router_surrogate_delta = router_surrogate_delta + (
-                skill_output * scale
-            ).detach() * soft_weight
+            router_surrogate_delta = (
+                router_surrogate_delta + (skill_output * scale).detach() * soft_weight
+            )
 
-        adaptive_delta = (
-            hard_delta + router_surrogate_delta - router_surrogate_delta.detach()
-        )
+        adaptive_delta = hard_delta + router_surrogate_delta - router_surrogate_delta.detach()
 
         hard_load = (hard_routes * token_mask.unsqueeze(-1)).sum(dim=(0, 1)) / token_count
         importance = (probabilities * token_mask.unsqueeze(-1)).sum(dim=(0, 1)) / token_count
@@ -188,9 +180,7 @@ class AdaptiveWorkspaceSkillsV2(nn.Module):
             .sum()
             .div(token_count)
         )
-        marginal_entropy = -(
-            importance * importance.clamp_min(1e-8).log()
-        ).sum()
+        marginal_entropy = -(importance * importance.clamp_min(1e-8).log()).sum()
         mutual_information = (marginal_entropy - conditional_entropy).clamp_min(0.0)
         self._last_aux_loss = (
             balance_loss * self.balance_loss_weight

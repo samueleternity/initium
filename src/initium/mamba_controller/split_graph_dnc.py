@@ -140,6 +140,20 @@ from initium.memory_manipulation.dnc_mechanisms import build_memory
 from initium.memory_manipulation.sequence_memories import CausalKVMemory, GatedDeltaMemory
 from initium.workspace.broadcast import WorkspaceBroadcast
 from initium.workspace.kv_bridge import WorkspaceKVBridge, WorkspaceKVState
+from initium.workspace.parallel_workspace import ParallelWorkspace
+
+
+def _detach_state_tree(value):
+    if isinstance(value, torch.Tensor):
+        return value.detach()
+    if isinstance(value, dict):
+        return {key: _detach_state_tree(child) for key, child in value.items()}
+    if isinstance(value, list):
+        return [_detach_state_tree(child) for child in value]
+    if isinstance(value, tuple):
+        children = tuple(_detach_state_tree(child) for child in value)
+        return type(value)(*children) if hasattr(value, "_fields") else children
+    return value
 
 
 class _ModelCapacityMetadata:
@@ -268,6 +282,14 @@ class SplitGraphDNC(nn.Module):
         workspace_write_to_kv: bool = False,
         workspace_kv_read_scale: float = 0.1,
         workspace_token_id_input: bool = False,
+        workspace_slot_readout: bool = False,
+        workspace_semantic_entity_count: int = 64,
+        workspace_allocator: bool = False,
+        workspace_parallel_dense: bool = False,
+        workspace_block_index: int = 1,
+        workspace_key_dim: int = 64,
+        workspace_scan_chunk: int = 32,
+        activation_checkpointing: bool = False,
         sgr_write_salience_enabled: bool = False,
         sgr_workspace_salience_enabled: bool = False,
     ):
@@ -395,10 +417,19 @@ class SplitGraphDNC(nn.Module):
                 "moe_backbone_block_isolation requires active backbone MoE "
                 "(moe_enabled=True and moe_placement='backbone')"
             )
-        if workspace_enabled and not backbone_moe_enabled:
+        if workspace_enabled and not backbone_moe_enabled and not workspace_parallel_dense:
             raise ValueError(
                 "--workspace requires backbone MoE because it broadcasts to backbone specialists"
             )
+        self.workspace_parallel_dense = bool(workspace_parallel_dense)
+        self.workspace_block_index = int(workspace_block_index)
+        self.workspace_key_dim = int(workspace_key_dim)
+        self.workspace_scan_chunk = int(workspace_scan_chunk)
+        if self.workspace_parallel_dense:
+            if not (0 <= self.workspace_block_index < num_backbone_blocks):
+                raise ValueError(
+                    f"workspace_block_index {self.workspace_block_index} must be in [0, {num_backbone_blocks - 1}]"
+                )
         if workspace_train_mode not in ("coadapted", "frozen"):
             raise ValueError("workspace_train_mode must be 'coadapted' or 'frozen'")
         if workspace_enabled and workspace_train_mode == "frozen" and workspace_num_slots == 0:
@@ -759,6 +790,55 @@ class SplitGraphDNC(nn.Module):
         )
         if workspace_rng_state is not None:
             torch.random.set_rng_state(workspace_rng_state)
+        parallel_ws_rng_state = (
+            torch.random.get_rng_state() if self.workspace_parallel_dense else None
+        )
+        self.parallel_workspace = (
+            ParallelWorkspace(
+                hidden_size,
+                num_slots=workspace_num_slots,
+                key_dim=self.workspace_key_dim,
+                chunk=self.workspace_scan_chunk,
+            )
+            if self.workspace_parallel_dense
+            else None
+        )
+        if parallel_ws_rng_state is not None:
+            torch.random.set_rng_state(parallel_ws_rng_state)
+        self.last_parallel_workspace_aux: dict[str, Any] = {}
+        self.workspace_adaptive: AdaptiveWorkspaceSkills | AdaptiveWorkspaceSkillsV2 | None = None
+        if workspace_adaptive_enabled or workspace_adaptive_v2_enabled:
+            adaptive_rng_state = torch.random.get_rng_state()
+            if workspace_adaptive_v2_enabled:
+                self.workspace_adaptive = AdaptiveWorkspaceSkillsV2(
+                    hidden_size,
+                    moe_num_experts,
+                    num_skills=workspace_adaptive_v2_num_skills,
+                    mutual_information_loss_weight=workspace_adaptive_v2_mi_weight,
+                )
+            else:
+                self.workspace_adaptive = AdaptiveWorkspaceSkills(hidden_size, moe_num_experts)
+            torch.random.set_rng_state(adaptive_rng_state)
+        self.workspace_adaptive_eval_bypass = False
+        self._initium_carry: list = []
+        self._carry_out = None
+        self.allocator_use_prob = 0.0
+        self.allocator_stats: dict = {}
+        self._alloc_loss = None
+        self.allocator = None
+        if workspace_allocator:
+            if (
+                self.workspace is None
+                or not (self.workspace_token_id_input and workspace_semantic_entity_addressing)
+                or num_backbone_blocks < 2
+            ):
+                raise ValueError(
+                    "allocator requires workspace + semantic addressing + token-ID input + >=2 backbone blocks"
+                )
+            _rs = torch.random.get_rng_state()
+            self.allocator = KeyAllocator(hidden_size, self.workspace._address_dim)
+            torch.random.set_rng_state(_rs)
+        self.workspace_adaptive_v3_eval_bypass = False
         if self.workspace_write_to_kv:
             # Keep this optional sidecar from changing the random stream used
             # by existing modules or matched-seed controls.
@@ -1131,7 +1211,34 @@ class SplitGraphDNC(nn.Module):
             prediction_features = features
             compute_prediction_error(features)
 
-        if self.workspace is not None:
+        if self.parallel_workspace is not None:
+            if start_step > 0:
+                raise NotImplementedError("parallel workspace does not support start_step > 0")
+            parallel_ws_state = None
+            if isinstance(chx, dict) and not reset_experience:
+                parallel_ws_state = chx.get("_initium_workspace_state")
+            if parallel_ws_state is None or reset_experience:
+                parallel_ws_state = torch.zeros(
+                    (B, self.parallel_workspace.num_slots, self.hidden_size),
+                    device=input.device,
+                    dtype=torch.float32,
+                )
+            self.parallel_workspace.eval_bypass = bool(self.workspace_eval_bypass)
+            self.parallel_workspace.eval_shuffle_readback = bool(self.workspace_eval_shuffle_readback)
+            H, ws_state, ws_aux = self.backbone.forward_with_parallel_workspace(
+                input,
+                workspace=self.parallel_workspace,
+                ws_block=self.workspace_block_index,
+                ws_state=parallel_ws_state,
+                token_mask=sequence_valid_mask,
+                input_token_ids=input_token_ids,
+                input_valid_mask=input_valid_mask,
+            )
+            chx = {"_initium_workspace_state": ws_state}
+            self.last_parallel_workspace_aux = ws_aux
+            observe_tensor("split_graph.h_after_parallel_workspace", H)
+            observe_numeric_tree("backbone.parallel_workspace_output", H)
+        elif self.workspace is not None:
             backbone_stages = (
                 list(self.backbone) if isinstance(self.backbone, nn.Sequential) else [self.backbone]
             )
@@ -1554,6 +1661,8 @@ class SplitGraphDNC(nn.Module):
                 chx = {"_initium_workspace_state": workspace_state}
                 if self.workspace_kv_memory is not None:
                     chx["_initium_workspace_kv_state"] = workspace_kv_state
+            elif self.parallel_workspace is not None:
+                pass
             state = (chx, memory_states, last_read)
             if return_backbone_features:
                 assert backbone_features is not None
@@ -1572,6 +1681,12 @@ class SplitGraphDNC(nn.Module):
             output = H[:, start_step:].transpose(0, 1)
             if self.workspace is not None:
                 chx = {"_initium_workspace_state": workspace_state}
+                if workspace_match_keys is not None:
+                    chx["_initium_workspace_match_keys"] = workspace_match_keys
+                if self.workspace_kv_memory is not None:
+                    chx["_initium_workspace_kv_state"] = workspace_kv_state
+            elif self.parallel_workspace is not None:
+                pass
             else:
                 chx = None
             state = (chx, None, None)
@@ -1706,6 +1821,10 @@ class SplitGraphDNC(nn.Module):
                     combiner_hx if self.combiner_mode == "controller" else combiner_hx_in
                 ),
             }
+            if workspace_match_keys is not None:
+                chx["_initium_workspace_match_keys"] = workspace_match_keys
+        elif self.parallel_workspace is not None:
+            chx = {"_initium_workspace_state": ws_state}
 
         mhx = [mem_state]
         output = torch.stack(outputs, dim=0)  # (T, B, input_size)

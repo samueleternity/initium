@@ -832,6 +832,10 @@ def load_frozen_workspace_warm_start(
         "nr_cells",  # resized to the checkpoint size for load, then back to lesson 1
         "dnc_backward_trace",  # diagnostic instrumentation, not architecture
         "workspace_enabled",
+        "workspace_parallel_dense",
+        "workspace_block_index",
+        "workspace_key_dim",
+        "workspace_scan_chunk",
         "workspace_num_slots",
         "workspace_entity_keyed_writes",
         "workspace_semantic_entity_addressing",
@@ -1134,6 +1138,10 @@ def run(
     workspace_kv_read_scale: float = 0.1,
     workspace_bistable_deterministic: bool = False,
     workspace_stability_max_activation: float = 100_000.0,
+    workspace_parallel_dense: bool = False,
+    workspace_block_index: int = 1,
+    workspace_key_dim: int = 64,
+    workspace_scan_chunk: int = 32,
     eval_only: bool = False,
     eval_workspace_mode: str = "checkpoint",
     eval_seed: int | None = None,
@@ -1560,8 +1568,8 @@ def run(
         "prediction_error_random_rate_matched",
     ):
         raise ValueError("unknown workspace reconsideration trigger mode")
-    if eval_only and eval_workspace_mode != "checkpoint" and not workspace_enabled:
-        raise ValueError("workspace evaluation modes require --workspace")
+    if eval_only and eval_workspace_mode != "checkpoint" and not (workspace_enabled or workspace_parallel_dense):
+        raise ValueError("workspace evaluation modes require --workspace or --workspace-parallel-dense")
     resume_checkpoint = (
         load_checkpoint_for_resume(resume_from, device) if resume_requested else None
     )
@@ -1904,7 +1912,9 @@ def run(
 
     workspace_check_file: TextIO | None = None
     workspace_check_writer: Any | None = None
-    if workspace_enabled and callable(getattr(dataset, "evaluate_workspace_ablated", None)):
+    if (workspace_enabled or workspace_parallel_dense) and callable(
+        getattr(dataset, "evaluate_workspace_ablated", None)
+    ):
         workspace_check_path = os.path.join(LOG_DIR, f"run_{run_id}_workspace_dependency.csv")
         workspace_check_header = [
             "step",
@@ -2834,6 +2844,10 @@ def run(
             dnc_implementation=dnc_implementation,
             sgr_write_salience_enabled=sgr_dnc_write_salience,
             sgr_workspace_salience_enabled=sgr_workspace_write_salience,
+            workspace_parallel_dense=workspace_parallel_dense,
+            workspace_block_index=workspace_block_index,
+            workspace_key_dim=workspace_key_dim,
+            workspace_scan_chunk=workspace_scan_chunk,
             workspace_enabled=workspace_enabled,
             workspace_num_slots=workspace_num_slots,
             workspace_compile_recurrence=workspace_compile_recurrence,
@@ -3211,6 +3225,43 @@ def run(
         "workspace_bistable_deterministic": workspace_bistable_deterministic,
         "workspace_stability_max_activation": workspace_stability_max_activation,
     }
+    if workspace_parallel_dense:
+        extra_model_config["workspace_parallel_dense"] = True
+        extra_model_config["workspace_block_index"] = int(workspace_block_index)
+        extra_model_config["workspace_key_dim"] = int(workspace_key_dim)
+        extra_model_config["workspace_scan_chunk"] = int(workspace_scan_chunk)
+    if workspace_adaptive_enabled:
+        extra_model_config["workspace_adaptive_enabled"] = True
+    if workspace_semantic_entity_count != 64:
+        extra_model_config["workspace_semantic_entity_count"] = int(workspace_semantic_entity_count)
+    if workspace_allocator:
+        extra_model_config["workspace_allocator"] = True
+    if getattr(dataset, "task_track", None) in _dev_lexicon.STAGE3_TRACKS:
+        extra_model_config["workspace_stage3_manifest_sha256"] = _dev_lexicon.manifest_sha256()
+        extra_model_config["workspace_lexicon_mode"] = workspace_lexicon_mode
+        extra_model_config["workspace_lexical_family"] = workspace_lexical_family
+        extra_model_config["workspace_lexical_unkeyed"] = bool(workspace_lexical_unkeyed)
+    if getattr(dataset, "task_track", None) in _lang_text.LANG_TRACK_NAMES:
+        extra_model_config["workspace_lang_manifest_sha256"] = _lang_text.manifest_sha256()
+        extra_model_config["workspace_lang_tokenizer_sha256"] = _lang_text.tokenizer_sha256()
+        extra_model_config["workspace_lang_tokenizer_vocab_size"] = (
+            _lang_text.tokenizer_vocab_size()
+        )
+        if workspace_slot_readout:
+            _slot_columns = dataset.slot_text_columns()
+            _slot_manifest = ",".join(str(int(token)) for token in _slot_columns).encode("ascii")
+            extra_model_config["workspace_slot_readout"] = True
+            extra_model_config["workspace_slot_text_columns_count"] = len(_slot_columns)
+            extra_model_config["workspace_slot_text_columns_sha256"] = hashlib.sha256(
+                _slot_manifest
+            ).hexdigest()
+            extra_model_config["workspace_slot_pointer_supervision"] = bool(
+                workspace_key_value_loss_weight > 0
+            )
+    if workspace_adaptive_v2_enabled:
+        extra_model_config["workspace_adaptive_v2_enabled"] = True
+        extra_model_config["workspace_adaptive_v2_num_skills"] = workspace_adaptive_v2_num_skills
+        extra_model_config["workspace_adaptive_v2_mi_weight"] = workspace_adaptive_v2_mi_weight
     if workspace_semantic_entity_addressing:
         extra_model_config["workspace_semantic_entity_addressing"] = True
     if workspace_permutation_transactional:
@@ -3970,7 +4021,9 @@ def run(
                 f"the next {KL_ANNEAL_STEPS} steps."
             )
         if eval_only:
-            if not isinstance(rnn, SplitGraphDNC) or rnn.workspace is None:
+            if not isinstance(rnn, SplitGraphDNC) or (
+                rnn.workspace is None and getattr(rnn, "parallel_workspace", None) is None
+            ):
                 if eval_workspace_mode != "checkpoint":
                     raise ValueError(
                         "workspace evaluation mode requires a checkpoint with an active workspace"
@@ -7082,10 +7135,209 @@ if __name__ == "__main__":
         help="Phase 0 shared workspace: competitively write selected MoE expert outputs to persistent slots, then broadcast slots back to every specialist. Requires --split-graph and --moe.",
     )
     parser.add_argument(
+        "--workspace-parallel-dense",
+        action="store_true",
+        help="Enable dense parallel workspace running across all timesteps via chunked affine scan.",
+    )
+    parser.add_argument(
+        "--workspace-block-index",
+        type=int,
+        default=1,
+        help="Backbone block index k where the parallel workspace is attached (default: 1).",
+    )
+    parser.add_argument(
+        "--workspace-key-dim",
+        type=int,
+        default=64,
+        help="Key dimension for parallel workspace addressing (default: 64).",
+    )
+    parser.add_argument(
+        "--workspace-scan-chunk",
+        type=int,
+        default=32,
+        help="Chunk size C for the chunked affine scan in parallel workspace (default: 32).",
+    )
+    parser.add_argument(
         "--workspace-num-slots",
         type=int,
         default=WORKSPACE_NUM_SLOTS,
         help="Persistent workspace slot count (0 is the plumbing/bypass control).",
+    )
+    parser.add_argument(
+        "--workspace-autoadaptive",
+        action="store_true",
+        help=(
+            "Add a learned sparse bank of low-rank workspace skill pathways. "
+            "The task loss trains the pathways and context router without task IDs "
+            "or task-specific decoders. Requires --workspace."
+        ),
+    )
+    parser.add_argument(
+        "--workspace-autoadaptive-v2",
+        action="store_true",
+        help=(
+            "Use adaptive workspace v2: per-skill low-rank output projections "
+            "and a mutual-information routing objective. Mutually exclusive "
+            "with --workspace-autoadaptive; requires --workspace."
+        ),
+    )
+    parser.add_argument(
+        "--workspace-autoadaptive-v2-num-skills",
+        type=int,
+        default=8,
+        help="Number of independently projected adaptive workspace v2 pathways (default: 8).",
+    )
+    parser.add_argument(
+        "--workspace-autoadaptive-v2-mi-weight",
+        type=float,
+        default=0.01,
+        help=(
+            "Weight for the v2 routing mutual-information objective, which "
+            "encourages confident assignments and broad pathway use (default: 0.01)."
+        ),
+    )
+    parser.add_argument(
+        "--workspace-autoadaptive-v3",
+        action="store_true",
+        help=(
+            "Enable the learned address-aware operator bank inside the workspace. "
+            "Requires semantic entity addressing and key-value readout; mutually exclusive with V1/V2."
+        ),
+    )
+    parser.add_argument("--workspace-autoadaptive-v3-rank", type=int, default=32)
+    parser.add_argument(
+        "--workspace-autoadaptive-v4",
+        action="store_true",
+        help="Adaptive workspace V4: primitive operators, set reductions, 2 sub-ops per event. Exclusive with V1/V2/V3; implies the V3 plumbing. Do not combine with --workspace-operation-executor.",
+    )
+    parser.add_argument(
+        "--workspace-autoadaptive-v3-distillation",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Distill V3 operation, operand-binding, destination, and output behavior from supported programs.",
+    )
+    parser.add_argument("--workspace-autoadaptive-v3-teacher-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--workspace-autoadaptive-v3-teacher-anneal-steps",
+        type=int,
+        default=20000,
+        help="Training steps used to lower teacher weight while the accuracy criterion holds; 0 keeps it fixed.",
+    )
+    parser.add_argument("--workspace-autoadaptive-v3-teacher-min-weight", type=float, default=0.1)
+    parser.add_argument(
+        "--workspace-autoadaptive-v3-teacher-accuracy-threshold", type=float, default=0.9
+    )
+    parser.add_argument(
+        "--workspace-autoadaptive-v3-feature-off-probability", type=float, default=0.75
+    )
+    parser.add_argument(
+        "--workspace-autoadaptive-v3-feature-off-tracks",
+        nargs="+",
+        default=("mixed_skill", "variable_binding"),
+        help="Tracks where each episode independently has this probability of disabling the manual executor.",
+    )
+    parser.add_argument(
+        "--workspace-autoadaptive-v3-always-feature-off-tracks",
+        nargs="*",
+        default=("variable_binding",),
+        help="Tracks trained permanently without the manual executor while retaining teacher supervision.",
+    )
+    parser.add_argument(
+        "--workspace-autoadaptive-v3-holdout-tracks",
+        nargs="*",
+        default=(),
+        help="Tracks withheld from V3 teacher labels and always run without manual operations.",
+    )
+    parser.add_argument("--workspace-autoadaptive-v3-usage-floor-weight", type=float, default=0.0)
+    parser.add_argument(
+        "--workspace-autoadaptive-v3-readback-consistency-weight", type=float, default=0.0
+    )
+    parser.add_argument(
+        "--workspace-autoadaptive-v3-attention-temperature",
+        type=float,
+        default=12.0,
+        help="Initial learned inverse temperature for V3 address binding (1-32; default 12).",
+    )
+    parser.add_argument(
+        "--workspace-autoadaptive-v3-temperature-binding",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable the learned inverse temperature for slot binding (default remains the original unscaled cosine scores).",
+    )
+    parser.add_argument(
+        "--workspace-autoadaptive-v3-straight-through-binding",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use hard top-1 operand/destination routing in the forward pass with soft straight-through gradients.",
+    )
+    parser.add_argument(
+        "--workspace-autoadaptive-v3-entity-destinations",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Predict semantic entity IDs for writes, then resolve existing or first-free slots using the workspace allocator.",
+    )
+    parser.add_argument(
+        "--workspace-autoadaptive-v3-split-context-norm",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Normalize routed expert context and mean slot content separately before the V3 controller.",
+    )
+    parser.add_argument(
+        "--workspace-autoadaptive-v3-use-backbone-context",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Append the final backbone residual stream to V3's input-derived controller context.",
+    )
+    parser.add_argument(
+        "--workspace-autoadaptive-v3-teacher-forced-operator-outputs",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Train each operator's output head on its own teacher-labeled examples, independently of router probability.",
+    )
+    parser.add_argument(
+        "--workspace-autoadaptive-v3-class-balanced-operator-loss",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Average operation-selection teacher loss per represented operation class.",
+    )
+    parser.add_argument(
+        "--workspace-autoadaptive-v3-compile-operators",
+        action="store_true",
+        help=(
+            "Compile V3's pure low-rank operator-bank projection with torch.compile "
+            "on first CUDA use; falls back to the equivalent eager kernel if Inductor "
+            "cannot compile it. Can add startup latency; compare steady-state steps/s."
+        ),
+    )
+    parser.add_argument("--workspace-autoadaptive-v3-learning-rate-scale", type=float, default=2.0)
+    parser.add_argument(
+        "--workspace-autoadaptive-v3-logit-diagnostics",
+        action="store_true",
+        help="On paired evaluation episodes, report answer-logit KL and prediction flips with V3 active vs bypassed (manual executor disabled for both sides).",
+    )
+    parser.add_argument(
+        "--workspace-autoadaptive-v3-eval-episodes-per-track",
+        type=int,
+        default=128,
+        help="Paired V3-on/off evaluation episodes per feature-off track.",
+    )
+    parser.add_argument(
+        "--workspace-curriculum-eval-episodes-per-group",
+        type=int,
+        default=16,
+        help=(
+            "Balanced episodes per required track/stratum used by curriculum "
+            "promotion checks; use 128 or more when diagnosing a multi-track stall."
+        ),
+    )
+    parser.add_argument(
+        "--eval-workspace-adaptive-bypass",
+        action="store_true",
+        help=(
+            "Evaluation-only causal ablation: keep learned workspace memory active "
+            "but disable the adaptive workspace pathway. Requires --eval-only and "
+            "an adaptive workspace checkpoint (V1, V2, or V3)."
+        ),
     )
     parser.add_argument(
         "--workspace-write-to-kv",
@@ -8064,8 +8316,92 @@ if __name__ == "__main__":
             and args.workspace_num_slots < 1
         ):
             parser.error("prediction-error reconsideration requires --workspace-num-slots >= 1")
-    if args.eval_only and args.eval_workspace_mode != "checkpoint" and not args.workspace:
-        parser.error("non-default --eval-workspace-mode requires --workspace")
+    if (
+        args.eval_only
+        and args.eval_workspace_mode != "checkpoint"
+        and not (args.workspace or args.workspace_parallel_dense)
+    ):
+        parser.error(
+            "non-default --eval-workspace-mode requires --workspace or --workspace-parallel-dense"
+        )
+    if (
+        sum(
+            (
+                args.workspace_autoadaptive,
+                args.workspace_autoadaptive_v2,
+                args.workspace_autoadaptive_v3,
+            )
+        )
+        > 1
+    ):
+        parser.error("choose only one adaptive workspace architecture (V1, V2, or V3)")
+    if args.workspace_autoadaptive_v4:
+        if (
+            args.workspace_autoadaptive
+            or args.workspace_autoadaptive_v2
+            or args.workspace_autoadaptive_v3
+        ):
+            parser.error("--workspace-autoadaptive-v4 is exclusive with V1/V2/V3")
+        if args.workspace_operation_executor:
+            parser.error("--workspace-autoadaptive-v4 replaces the manual operation executor")
+        args.workspace_autoadaptive_v3 = True
+    if (
+        args.workspace_autoadaptive
+        or args.workspace_autoadaptive_v2
+        or args.workspace_autoadaptive_v3
+    ) and not args.workspace:
+        parser.error("adaptive workspace variants require --workspace")
+    if args.workspace_autoadaptive_v3 and not (
+        args.split_graph
+        and args.workspace_num_slots >= 64
+        and args.workspace_semantic_entity_addressing
+        and args.workspace_key_value_loss_weight > 0
+    ):
+        parser.error(
+            "--workspace-autoadaptive-v3 requires split-graph, at least 64 slots, semantic entity addressing, and positive key-value loss"
+        )
+    if args.workspace_autoadaptive_v3_compile_operators and not args.workspace_autoadaptive_v3:
+        parser.error(
+            "--workspace-autoadaptive-v3-compile-operators requires --workspace-autoadaptive-v3"
+        )
+    if args.workspace_autoadaptive_v3_rank < 1:
+        parser.error("--workspace-autoadaptive-v3-rank must be positive")
+    if args.workspace_autoadaptive_v3_teacher_anneal_steps < 0:
+        parser.error("--workspace-autoadaptive-v3-teacher-anneal-steps must be non-negative")
+    if args.workspace_autoadaptive_v3_teacher_min_weight < 0:
+        parser.error("--workspace-autoadaptive-v3-teacher-min-weight must be non-negative")
+    if (
+        args.workspace_autoadaptive_v3_teacher_min_weight
+        > args.workspace_autoadaptive_v3_teacher_weight
+    ):
+        parser.error("--workspace-autoadaptive-v3-teacher-min-weight cannot exceed teacher weight")
+    if not 0 <= args.workspace_autoadaptive_v3_teacher_accuracy_threshold <= 1:
+        parser.error("--workspace-autoadaptive-v3-teacher-accuracy-threshold must be in [0, 1]")
+    if args.workspace_autoadaptive_v3_eval_episodes_per_track < 1:
+        parser.error("--workspace-autoadaptive-v3-eval-episodes-per-track must be positive")
+    if args.workspace_curriculum_eval_episodes_per_group < 1:
+        parser.error("--workspace-curriculum-eval-episodes-per-group must be positive")
+    if not 0 <= args.workspace_autoadaptive_v3_feature_off_probability <= 1:
+        parser.error("--workspace-autoadaptive-v3-feature-off-probability must be in [0, 1]")
+    if args.workspace_autoadaptive_v2_num_skills < 2:
+        parser.error("--workspace-autoadaptive-v2-num-skills must be >= 2")
+    if (
+        not math.isfinite(args.workspace_autoadaptive_v2_mi_weight)
+        or args.workspace_autoadaptive_v2_mi_weight < 0
+    ):
+        parser.error("--workspace-autoadaptive-v2-mi-weight must be finite and >= 0")
+    if args.eval_workspace_adaptive_bypass and not (
+        args.eval_only
+        and (
+            args.workspace_autoadaptive
+            or args.workspace_autoadaptive_v2
+            or args.workspace_autoadaptive_v3
+        )
+    ):
+        parser.error(
+            "--eval-workspace-adaptive-bypass requires --eval-only and "
+            "an adaptive workspace variant"
+        )
     if args.eval_only and args.run_id_suffix is None:
         args.run_id_suffix = f"eval-{args.eval_workspace_mode}"
         if args.eval_seed is not None:
@@ -8313,6 +8649,31 @@ if __name__ == "__main__":
     ):
         parser.error("--workspace-stability-max-activation must be finite and > 0")
 
+    if args.workspace_parallel_dense:
+        if not args.split_graph or args.split_graph_variant != "mamba1":
+            parser.error("--workspace-parallel-dense requires --split-graph and --split-graph-variant mamba1")
+        if args.split_graph_num_blocks <= args.workspace_block_index + 1:
+            parser.error(
+                f"--workspace-parallel-dense requires --split-graph-num-blocks > workspace_block_index + 1 "
+                f"(got num_blocks={args.split_graph_num_blocks}, block_index={args.workspace_block_index})"
+            )
+        if args.memory_type != "none":
+            parser.error("--workspace-parallel-dense requires --memory-type none")
+        if args.workspace_compile_recurrence:
+            parser.error("--workspace-parallel-dense is incompatible with --workspace-compile-recurrence")
+        if args.workspace_gate_variant == "bistable":
+            parser.error("--workspace-parallel-dense is incompatible with --workspace-gate-variant bistable")
+        if args.workspace_semantic_entity_addressing or args.workspace_entity_keyed_writes:
+            parser.error("--workspace-parallel-dense is incompatible with semantic keyed workspace modes")
+        if args.workspace:
+            parser.error("--workspace and --workspace-parallel-dense are mutually exclusive")
+        if args.workspace_block_index < 0:
+            parser.error("--workspace-block-index must be non-negative")
+        if args.workspace_key_dim <= 0:
+            parser.error("--workspace-key-dim must be positive")
+        if args.workspace_scan_chunk <= 0:
+            parser.error("--workspace-scan-chunk must be positive")
+
     if args.beta is not None:
         betas_to_run = [args.beta]
         if args.beta not in BETAS_TO_SWEEP:
@@ -8446,6 +8807,8 @@ if __name__ == "__main__":
                 run_id += "_randomwrite"
             if args.workspace_reset_each_step:
                 run_id += "_resetstep"
+        if args.workspace_parallel_dense:
+            run_id += f"_wpdense{args.workspace_num_slots}s_k{args.workspace_block_index}"
         if args.split_graph:
             run_id = f"{run_id}_splitgraph_{args.split_graph_variant.replace('+', '')}"
             if args.split_graph_backbone_only:
@@ -8637,6 +9000,25 @@ if __name__ == "__main__":
             sgr_gate_eval_override=args.sgr_gate_eval_override,
             sgr_dnc_write_salience=args.sgr_dnc_write_salience,
             sgr_workspace_write_salience=args.sgr_workspace_write_salience,
+            workspace_teacher_forced_answers=args.workspace_teacher_forced_answers,
+            workspace_generation_eval=args.workspace_generation_eval,
+            workspace_progression_eval_only=args.workspace_progression_eval_only,
+            workspace_eval_samples_per_group=args.workspace_eval_samples_per_group,
+            workspace_scheduled_sampling=args.workspace_scheduled_sampling,
+            workspace_scheduled_sampling_steps=args.workspace_scheduled_sampling_steps,
+            init_from=args.init_from,
+            workspace_lexicon_mode=args.workspace_lexicon_mode,
+            workspace_lexical_family=args.workspace_lexical_family,
+            workspace_lexical_unkeyed=args.workspace_lexical_unkeyed,
+            workspace_slot_readout=args.workspace_slot_readout,
+            workspace_semantic_entity_count=args.workspace_semantic_entity_count,
+            workspace_allocator=args.workspace_allocator,
+            workspace_allocator_anneal_steps=args.workspace_allocator_anneal_steps,
+            workspace_allocator_label_addresses_only=args.workspace_allocator_label_addresses_only,
+            workspace_parallel_dense=args.workspace_parallel_dense,
+            workspace_block_index=args.workspace_block_index,
+            workspace_key_dim=args.workspace_key_dim,
+            workspace_scan_chunk=args.workspace_scan_chunk,
         )
         all_summaries.append(summary)
 

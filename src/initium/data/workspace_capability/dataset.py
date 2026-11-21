@@ -933,14 +933,20 @@ class WorkspaceCapabilityDataset(BaseDataset):
         if ablate_workspace:
             if (
                 not hasattr(model, "workspace_eval_bypass")
-                or getattr(model, "workspace", None) is None
+                or (
+                    getattr(model, "workspace", None) is None
+                    and getattr(model, "parallel_workspace", None) is None
+                )
             ):
                 raise ValueError("workspace ablation requires a model with active workspace")
             model.workspace_eval_bypass = True
         if shuffle_workspace_readback:
             if (
                 not hasattr(model, "workspace_eval_shuffle_readback")
-                or getattr(model, "workspace", None) is None
+                or (
+                    getattr(model, "workspace", None) is None
+                    and getattr(model, "parallel_workspace", None) is None
+                )
             ):
                 raise ValueError(
                     "workspace readback shuffle requires a model with active workspace"

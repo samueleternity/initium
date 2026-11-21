@@ -554,6 +554,82 @@ class MambaBackboneParallel(nn.Module):
                     numeric_observer("inter_layer_memory.output", h)
         return self.normalize_output(h)
 
+    def forward_with_parallel_workspace(
+        self,
+        x: torch.Tensor,
+        *,
+        workspace: nn.Module,
+        ws_block: int,
+        ws_state: torch.Tensor | None = None,
+        modulation_fn: Any = None,
+        mod_blocks: tuple[int, ...] = (),
+        token_mask: torch.Tensor | None = None,
+        input_token_ids: torch.Tensor | None = None,
+        input_valid_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+        """Run parallel backbone blocks with an interleaved parallel workspace.
+
+        1. h = self._adapt_input(...)
+        2. For i, block: h = self._run_block(block, h) (MoE block applied if present)
+        3. After i == ws_block: delta, ws_state, aux = workspace(h, ws_state),
+           h = h + delta, and mod = modulation_fn(h, aux) if given, else None.
+        4. For i > ws_block and i in mod_blocks: h = block.forward_modulated(h, mod[i]).
+           Otherwise _run_block as normal.
+        5. Return normalize_output(h), ws_state, and aux plus modulation stats.
+        """
+        if ws_block < 0 or ws_block >= len(self.blocks):
+            raise ValueError(
+                f"ws_block {ws_block} out of range for {len(self.blocks)} backbone blocks"
+            )
+        h = self._adapt_input(x, input_token_ids=input_token_ids, input_valid_mask=input_valid_mask)
+        numeric_observer = getattr(self, "_initium_forward_numeric_observer", None)
+        if numeric_observer is not None:
+            numeric_observer("input_adapter.output", h)
+
+        ws_valid_mask = input_valid_mask
+        if ws_valid_mask is None and input_token_ids is not None:
+            ws_valid_mask = input_token_ids.ne(0)
+        if ws_valid_mask is None:
+            ws_valid_mask = token_mask
+
+        moe_blocks = self.moe_blocks
+        mod = None
+        mod_stats: dict[int, Any] = {}
+        aux: dict[str, Any] = {}
+
+        for i, block in enumerate(self.blocks):
+            if (
+                i > ws_block
+                and i in mod_blocks
+                and mod is not None
+                and hasattr(block, "forward_modulated")
+            ):
+                h, b_stats = block.forward_modulated(h, mod.get(i, {}))
+                mod_stats[i] = b_stats
+            else:
+                h = self._run_block(block, h)
+
+            if numeric_observer is not None:
+                numeric_observer(f"block.{i}.output", h)
+
+            if moe_blocks is not None and isinstance(moe_blocks[i], MoEBlock):
+                h = moe_blocks[i](h, token_mask=token_mask)
+                if numeric_observer is not None:
+                    numeric_observer(f"block.{i}.moe_output", h)
+
+            if i == ws_block:
+                delta, ws_state, aux = workspace(h, ws_state, valid_mask=ws_valid_mask)
+                h = h + delta
+                if numeric_observer is not None:
+                    numeric_observer("workspace.output", h)
+                if modulation_fn is not None:
+                    mod = modulation_fn(h, aux)
+
+        if mod_stats:
+            aux["modulation_stats"] = mod_stats
+
+        return self.normalize_output(h), ws_state, aux
+
     def forward_sgr(
         self,
         x: torch.Tensor,

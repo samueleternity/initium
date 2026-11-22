@@ -585,6 +585,37 @@ class MambaBackboneParallel(nn.Module):
                     numeric_observer("inter_layer_memory.output", h)
         return self.normalize_output(h)
 
+    def forward_with_parallel_workspace(
+        self,
+        x: torch.Tensor,
+        *,
+        workspace,
+        ws_block: int,
+        ws_state: torch.Tensor,
+        token_mask: torch.Tensor | None = None,
+        input_token_ids: torch.Tensor | None = None,
+        input_valid_mask: torch.Tensor | None = None,
+        bypass: bool = False,
+        shuffle_readback: bool = False,
+    ):
+        """Backbone with a dense parallel workspace applied after block ``ws_block``."""
+        h = self._adapt_input(x, input_token_ids=input_token_ids, input_valid_mask=input_valid_mask)
+        aux: dict = {}
+        for i, block in enumerate(self.blocks):
+            h = self._run_block(block, h)
+            if self.moe_blocks is not None and isinstance(self.moe_blocks[i], MoEBlock):
+                h = self.moe_blocks[i](h, token_mask=token_mask)
+            if i == ws_block:
+                delta, ws_state, aux = workspace(
+                    h,
+                    ws_state,
+                    valid_mask=input_valid_mask,
+                    bypass=bypass,
+                    shuffle_readback=shuffle_readback,
+                )
+                h = h + delta.to(h.dtype)
+        return self.normalize_output(h), ws_state, aux
+
     def forward_sgr(
         self,
         x: torch.Tensor,

@@ -914,7 +914,11 @@ def load_frozen_workspace_warm_start(
         "dnc_compile_memory",  # exact execution optimization; state-dict compatible
         "dnc_link_sharpness",  # parameter-free read-addressing experiment
         "dnc_allocation_topk",  # parameter-free allocation experiment
-        "batch_size",  # training hyperparameter, not model architecture
+        "batch_size",  
+        "workspace_parallel_dense",
+        "workspace_block_index",
+        "workspace_key_dim",
+        "workspace_scan_chunk",
         "bf16",  # training precision; state-dict-compatible
         "workspace_length_bucket_microbatches",  # batching policy
     }
@@ -1313,6 +1317,10 @@ def run(
     workspace_allocator: bool = False,
     workspace_allocator_anneal_steps: int = 20_000,
     workspace_allocator_label_addresses_only: bool = False,
+    workspace_parallel_dense: bool = False,
+    workspace_block_index: int = 1,
+    workspace_key_dim: int = 64,
+    workspace_scan_chunk: int = 32,
 ):
     original_run_id = run_id
     progression_eval_only = bool(workspace_progression_eval_only)
@@ -1576,6 +1584,31 @@ def run(
         )
     if memory_type != "dnc" and not split_graph_enabled:
         raise ValueError("non-DNC memory types require --split-graph")
+    if workspace_parallel_dense:
+        if (
+            workspace_enabled
+            or workspace_compile_recurrence
+            or workspace_gate_variant != "continuous"
+            or workspace_entity_keyed_writes
+            or workspace_semantic_entity_addressing
+        ):
+            raise ValueError(
+                "--workspace-parallel-dense excludes --workspace, compiled recurrence, "
+                "bistable gating and keyed/semantic addressing"
+            )
+        if (
+            not split_graph_enabled
+            or split_graph_variant != "mamba1"
+            or memory_type != "none"
+            or workspace_block_index < 0
+            or split_graph_num_blocks <= workspace_block_index + 1
+        ):
+            raise ValueError(
+                "--workspace-parallel-dense requires --split-graph mamba1, --memory-type none "
+                "and --split-graph-num-blocks > --workspace-block-index + 1"
+            )
+        if min(workspace_num_slots, workspace_key_dim, workspace_scan_chunk) < 1:
+            raise ValueError("parallel workspace slots/key-dim/scan-chunk must be positive")
     if split_graph_backbone_only and memory_type != "dnc":
         raise ValueError("--split-graph-backbone-only cannot be combined with a memory module")
     if memory_type != "dnc" and dynamic_n_mode:
@@ -2450,7 +2483,9 @@ def run(
 
     workspace_check_file: TextIO | None = None
     workspace_check_writer: Any | None = None
-    if workspace_enabled and callable(getattr(dataset, "evaluate_workspace_ablated", None)):
+    if (workspace_enabled or workspace_parallel_dense) and callable(
+        getattr(dataset, "evaluate_workspace_ablated", None)
+    ):
         workspace_check_path = os.path.join(LOG_DIR, f"run_{run_id}_workspace_dependency.csv")
         workspace_check_header = [
             "step",
@@ -4116,6 +4151,10 @@ def run(
             workspace_slot_readout=workspace_slot_readout,
             workspace_semantic_entity_count=workspace_semantic_entity_count,
             workspace_allocator=workspace_allocator,
+            workspace_parallel_dense=workspace_parallel_dense,
+            workspace_block_index=workspace_block_index,
+            workspace_key_dim=workspace_key_dim,
+            workspace_scan_chunk=workspace_scan_chunk,
             workspace_entity_keyed_writes=workspace_entity_keyed_writes,
             workspace_semantic_entity_addressing=workspace_semantic_entity_addressing,
             workspace_permutation_transactional=workspace_permutation_transactional,
@@ -4536,6 +4575,10 @@ def run(
         "activation_offload_cpu_budget_mb": activation_offload_cpu_budget_mb,
         "workspace_enabled": workspace_enabled,
         "workspace_num_slots": workspace_num_slots,
+        "workspace_parallel_dense": workspace_parallel_dense,
+        "workspace_block_index": workspace_block_index,
+        "workspace_key_dim": workspace_key_dim,
+        "workspace_scan_chunk": workspace_scan_chunk,
         "workspace_adaptive_v3_enabled": workspace_adaptive_v3_enabled,
         "workspace_adaptive_v4_enabled": workspace_adaptive_v4_enabled,
         "workspace_adaptive_v3_rank": workspace_adaptive_v3_rank,
@@ -9701,6 +9744,14 @@ if __name__ == "__main__":
         help="Persistent workspace slot count (0 is the plumbing/bypass control).",
     )
     parser.add_argument(
+        "--workspace-parallel-dense",
+        action="store_true",
+        help="Dense parallel workspace (chunked affine scan over all tokens) after block --workspace-block-index. Excludes --workspace; requires --split-graph mamba1 and --memory-type none. Uses --workspace-num-slots.",
+    )
+    parser.add_argument("--workspace-block-index", type=int, default=1)
+    parser.add_argument("--workspace-key-dim", type=int, default=64)
+    parser.add_argument("--workspace-scan-chunk", type=int, default=32)
+    parser.add_argument(
         "--workspace-autoadaptive",
         action="store_true",
         help=(
@@ -11939,6 +11990,8 @@ if __name__ == "__main__":
                 run_id += f"_allocK{args.dnc_allocation_topk}"
             if args.split_graph_combiner_mode == "controller":
                 run_id = f"{run_id}_combctrl{args.split_graph_combiner_variant.replace('+', '')}"
+        if args.workspace_parallel_dense:
+            run_id += f"_wpdense{args.workspace_num_slots}s_k{args.workspace_block_index}"
         if args.dnc_implementation == "optimized":
             run_id += "_optimizeddnc" if args.dnc_compile_memory else "_dncfastalloc"
         elif args.dnc_compile_memory:
@@ -12253,6 +12306,10 @@ if __name__ == "__main__":
             workspace_allocator=args.workspace_allocator,
             workspace_allocator_anneal_steps=args.workspace_allocator_anneal_steps,
             workspace_allocator_label_addresses_only=args.workspace_allocator_label_addresses_only,
+            workspace_parallel_dense=args.workspace_parallel_dense,
+            workspace_block_index=args.workspace_block_index,
+            workspace_key_dim=args.workspace_key_dim,
+            workspace_scan_chunk=args.workspace_scan_chunk,
         )
         all_summaries.append(summary)
 

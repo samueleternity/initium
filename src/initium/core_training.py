@@ -919,6 +919,9 @@ def load_frozen_workspace_warm_start(
         "workspace_block_index",
         "workspace_key_dim",
         "workspace_scan_chunk",
+        "modulation_enabled", "modulation_targets", "modulation_blocks", "modulation_source",
+        "modulation_rank", "modulation_alphas", "modulation_lambda",
+        "modulation_temporal_lambda", "modulation_alpha_warmup_steps",
         "bf16",  # training precision; state-dict-compatible
         "workspace_length_bucket_microbatches",  # batching policy
     }
@@ -1321,6 +1324,17 @@ def run(
     workspace_block_index: int = 1,
     workspace_key_dim: int = 64,
     workspace_scan_chunk: int = 32,
+    modulation_enabled: bool = False,
+    modulation_targets: tuple = ("dt",),
+    modulation_blocks: tuple = (3,),
+    modulation_source: str = "workspace",
+    modulation_rank: int = 32,
+    modulation_alphas: dict | None = None,
+    modulation_lambda: float = 0.0,
+    modulation_temporal_lambda: float = 0.0,
+    modulation_lr_scale: float = 1.0,
+    modulation_alpha_warmup_steps: int = 3000,
+    eval_modulation_mode: str = "checkpoint",
 ):
     original_run_id = run_id
     progression_eval_only = bool(workspace_progression_eval_only)
@@ -2219,7 +2233,15 @@ def run(
         and checkpoint_config.get("workspace_gate_variant", "continuous") == "continuous"
         and not eval_only
     )
+    modulation_warm_start = bool(
+        resume_requested
+        and modulation_enabled
+        and not eval_only
+        and not any(k.startswith("modulation_head.") for k in checkpoint_state)
+    )
     workspace_condition_warm_start = bool(
+        modulation_warm_start
+        or
         phase4_gate_control_warm_start
         or workspace_mode_warm_start
         or workspace_bptt_warm_start
@@ -3442,6 +3464,15 @@ def run(
                             base_blink[query_type]["episode_exact_match"],
                         )
                     )
+            if getattr(rnn, "modulation_head", None) is not None:
+                for _mode, _name in (("off", "modulation_off"), ("shuffle", "modulation_shuffled")):
+                    segment_diagnostics.set_channel(f"eval-id-{_name}")
+                    _restore_rng_state(id_eval_rng_state)
+                    _macc, _mex = dataset.evaluate_modulation_ablated(
+                        rnn, device, curriculum, lesson_value - 1, _mode
+                    )
+                    segment_diagnostics.emit(f"eval-id-{_name}")
+                    rows.append(("all", _name, _macc, _mex, baseline_accuracy, baseline_exact))
             feature_ablation_due = (
                 int(step_value) == int(total_steps)
                 or int(step_value) % max(int(EVAL_EVERY) * 10, 1) == 0
@@ -4155,6 +4186,14 @@ def run(
             workspace_block_index=workspace_block_index,
             workspace_key_dim=workspace_key_dim,
             workspace_scan_chunk=workspace_scan_chunk,
+            modulation_enabled=modulation_enabled,
+            modulation_targets=tuple(modulation_targets),
+            modulation_blocks=tuple(modulation_blocks),
+            modulation_source=modulation_source,
+            modulation_rank=modulation_rank,
+            modulation_alphas=modulation_alphas,
+            modulation_lambda=modulation_lambda,
+            modulation_temporal_lambda=modulation_temporal_lambda,
             workspace_entity_keyed_writes=workspace_entity_keyed_writes,
             workspace_semantic_entity_addressing=workspace_semantic_entity_addressing,
             workspace_permutation_transactional=workspace_permutation_transactional,
@@ -4579,6 +4618,15 @@ def run(
         "workspace_block_index": workspace_block_index,
         "workspace_key_dim": workspace_key_dim,
         "workspace_scan_chunk": workspace_scan_chunk,
+        "modulation_enabled": modulation_enabled,
+        "modulation_targets": tuple(modulation_targets),
+        "modulation_blocks": tuple(modulation_blocks),
+        "modulation_source": modulation_source,
+        "modulation_rank": modulation_rank,
+        "modulation_alphas": dict(modulation_alphas or {}),
+        "modulation_lambda": modulation_lambda,
+        "modulation_temporal_lambda": modulation_temporal_lambda,
+        "modulation_alpha_warmup_steps": modulation_alpha_warmup_steps,
         "workspace_adaptive_v3_enabled": workspace_adaptive_v3_enabled,
         "workspace_adaptive_v4_enabled": workspace_adaptive_v4_enabled,
         "workspace_adaptive_v3_rank": workspace_adaptive_v3_rank,
@@ -5120,6 +5168,19 @@ def run(
             optimizer_kwargs = {"lr": LR}
             fused_optimizer_enabled = False
             optimizer = torch.optim.Adam(trainable_parameters, **optimizer_kwargs)
+    if modulation_enabled and modulation_lr_scale != 1.0:
+        _mid = {id(p) for p in rnn.modulation_head.parameters()}
+        for _g in list(optimizer.param_groups):
+            _mp = [p for p in _g["params"] if id(p) in _mid]
+            if _mp:
+                _g["params"] = [p for p in _g["params"] if id(p) not in _mid]
+                optimizer.add_param_group(
+                    {
+                        **{k: v for k, v in _g.items() if k != "params"},
+                        "params": _mp,
+                        "lr_multiplier": float(_g.get("lr_multiplier", 1.0)) * modulation_lr_scale,
+                    }
+                )
     # Option 3 (Concept 24/LB-17): multi-axis efficiency accounting.
     # param_count is fixed for the life of this run -- static Option 2's
     # nr_cells resize never changes it (every Memory sublayer is sized by
@@ -5435,6 +5496,15 @@ def run(
                 f"at checkpoint step {ckpt['step']}; restored existing model and "
                 "workspace weights, initialized the skill bank, and reset the optimizer."
             )
+        elif modulation_warm_start:
+            _inc = rnn.load_state_dict(ckpt["rnn_state_dict"], strict=False)
+            if _inc.unexpected_keys or any(not k.startswith("modulation_head.") for k in _inc.missing_keys):
+                raise ValueError(
+                    "Modulation warm start only permits new modulation_head.* parameters "
+                    f"(missing={_inc.missing_keys[:8]}, unexpected={_inc.unexpected_keys[:8]})."
+                )
+            output_proj.load_state_dict(ckpt["output_proj_state_dict"])
+            print(f"[{run_id}] Modulation head initialized fresh on top of {resume_from} (step {step}); optimizer reset.")
         elif workspace_condition_warm_start:
             rnn.load_state_dict(ckpt["rnn_state_dict"])
             output_proj.load_state_dict(ckpt["output_proj_state_dict"])
@@ -5635,6 +5705,8 @@ def run(
     )
     rnn.train(not eval_only)
     output_proj.train(not eval_only)
+    if getattr(rnn, "modulation_head", None) is not None:
+        rnn.eval_modulation_mode = eval_modulation_mode
     if (
         init_from is not None and not resume_requested
     ):  # weights only: fresh optimizer/curriculum/step
@@ -5797,6 +5869,8 @@ def run(
         step < total_steps or bool(getattr(dataset, "has_pending_chain_segments", False))
     ) and not eval_only:
         adaptive_v3_teacher_weight_for_step = adaptive_v3_teacher_weight_current
+        if getattr(rnn, "modulation_head", None) is not None:
+            rnn.modulation_head.alpha_scale = min(1.0, step / max(1, modulation_alpha_warmup_steps))
         moe_diagnostics_due = bool(moe_diagnostics_enabled and running_micro_steps + 1 >= log_every)
         for module in moe_diagnostic_modules:
             if module.diagnostics_enabled != moe_diagnostics_due:
@@ -6900,6 +6974,11 @@ def run(
                 f"[{run_id}] non-finite adaptive workspace V3 loss at step {step}; stopping."
             )
         alloc_loss = rnn.pop_allocator_loss() if isinstance(rnn, SplitGraphDNC) else None
+        mod_aux_loss = (
+            rnn.modulation_head.pop_aux_loss()
+            if getattr(rnn, "modulation_head", None) is not None
+            else None
+        )
         global_ramp = min(1.0, (step - anneal_start_step) / max(1, KL_ANNEAL_STEPS))
         lesson_dip_ramp = min(1.0, (step - lesson_dip_start_step) / max(1, LESSON_KL_DIP_STEPS))
         beta_eff = beta_target * global_ramp * lesson_dip_ramp
@@ -6931,6 +7010,7 @@ def run(
             + (adaptive_skill_loss if adaptive_skill_loss is not None else 0.0)
             + (adaptive_v3_loss if adaptive_v3_loss is not None else 0.0)
             + (alloc_loss if alloc_loss is not None else 0.0)
+            + (mod_aux_loss if mod_aux_loss is not None else 0.0)
         )
         if split_graph_forward_trace is not None and split_graph_forward_trace.active:
             split_graph_forward_trace.observe("training.total_loss", loss)
@@ -7949,6 +8029,14 @@ def run(
                             f"scale={scale_text}{routing_info} "
                             f"balance={adaptive_diag['balance_loss'].item():.4g}]"
                         )
+            if getattr(rnn, "modulation_head", None) is not None:
+                _md = {k: float(v) for k, v in rnn.modulation_head.last_diagnostics.items()}
+                _ms = {k: float(v) for k, v in getattr(rnn.backbone, "last_modulation_stats", {}).items()}
+                parts.append("mod[" + " ".join(f"{k}={v:.3g}" for k, v in {**_md, **_ms}.items()) + "]")
+                if any(k.endswith("last_state_norm") and v > 1e4 for k, v in _ms.items()):
+                    print(f"[{run_id}] [mod-ALERT] step {step}: SSM last-state norm > 1e4")
+                if any(k.endswith("_sat") and v > 0.2 for k, v in _md.items()):
+                    print(f"[{run_id}] [mod-ALERT] step {step}: modulation saturation > 0.2")
             if dyn_n_str:
                 parts.append(dyn_n_str.strip(" |"))
             if bistable_grad_probe is not None:
@@ -9751,6 +9839,22 @@ if __name__ == "__main__":
     parser.add_argument("--workspace-block-index", type=int, default=1)
     parser.add_argument("--workspace-key-dim", type=int, default=64)
     parser.add_argument("--workspace-scan-chunk", type=int, default=32)
+    parser.add_argument("--modulation", action="store_true",
+                        help="Phase B: workspace-conditioned Mamba parameter modulation (needs --workspace-parallel-dense).")
+    parser.add_argument("--mod-targets", nargs="+", choices=("dt", "a", "B", "C", "D"), default=["dt"])
+    parser.add_argument("--mod-blocks", nargs="+", type=int, default=[3])
+    parser.add_argument("--mod-source", choices=("workspace", "backbone", "static"), default="workspace")
+    parser.add_argument("--mod-rank", type=int, default=32)
+    parser.add_argument("--mod-alpha-dt", type=float, default=0.5)
+    parser.add_argument("--mod-alpha-a", type=float, default=0.5)
+    parser.add_argument("--mod-alpha-B", type=float, default=0.3)
+    parser.add_argument("--mod-alpha-C", type=float, default=0.3)
+    parser.add_argument("--mod-alpha-D", type=float, default=0.3)
+    parser.add_argument("--mod-lambda", type=float, default=0.0)
+    parser.add_argument("--mod-temporal-lambda", type=float, default=0.0)
+    parser.add_argument("--mod-lr-scale", type=float, default=1.0)
+    parser.add_argument("--mod-alpha-warmup-steps", type=int, default=3000)
+    parser.add_argument("--eval-modulation-mode", choices=("checkpoint", "off", "shuffle"), default="checkpoint")
     parser.add_argument(
         "--workspace-autoadaptive",
         action="store_true",
@@ -11377,6 +11481,8 @@ if __name__ == "__main__":
         )
     if args.eval_only and args.run_id_suffix is None:
         args.run_id_suffix = f"eval-{args.eval_workspace_mode}"
+        if args.eval_modulation_mode != "checkpoint":
+            args.run_id_suffix += f"-mod{args.eval_modulation_mode}"
         if args.eval_seed is not None:
             args.run_id_suffix += f"-seed{args.eval_seed}"
 
@@ -11433,6 +11539,16 @@ if __name__ == "__main__":
         parser.error("--workspace requires backbone MoE; use --moe-placement backbone or all")
     if args.workspace_num_slots < 0:
         parser.error("--workspace-num-slots must be >= 0")
+    if args.modulation:
+        if not args.workspace_parallel_dense:
+            parser.error("--modulation requires --workspace-parallel-dense")
+        if (
+            min(args.mod_blocks) <= args.workspace_block_index
+            or max(args.mod_blocks) >= args.split_graph_num_blocks
+        ):
+            parser.error("--mod-blocks must be > --workspace-block-index and < --split-graph-num-blocks")
+    if args.eval_modulation_mode != "checkpoint" and not (args.eval_only and args.modulation):
+        parser.error("--eval-modulation-mode requires --eval-only --modulation")
     if args.workspace_entity_keyed_writes and (not args.workspace or args.workspace_num_slots < 1):
         parser.error("--workspace-entity-keyed-writes requires --workspace and at least one slot")
     if args.workspace_semantic_entity_addressing and not args.workspace_entity_keyed_writes:
@@ -11992,6 +12108,8 @@ if __name__ == "__main__":
                 run_id = f"{run_id}_combctrl{args.split_graph_combiner_variant.replace('+', '')}"
         if args.workspace_parallel_dense:
             run_id += f"_wpdense{args.workspace_num_slots}s_k{args.workspace_block_index}"
+        if args.modulation:
+            run_id += f"_mod{''.join(args.mod_targets)}_b{''.join(map(str, args.mod_blocks))}_{args.mod_source}"
         if args.dnc_implementation == "optimized":
             run_id += "_optimizeddnc" if args.dnc_compile_memory else "_dncfastalloc"
         elif args.dnc_compile_memory:
@@ -12310,6 +12428,23 @@ if __name__ == "__main__":
             workspace_block_index=args.workspace_block_index,
             workspace_key_dim=args.workspace_key_dim,
             workspace_scan_chunk=args.workspace_scan_chunk,
+            modulation_enabled=args.modulation,
+            modulation_targets=tuple(args.mod_targets),
+            modulation_blocks=tuple(args.mod_blocks),
+            modulation_source=args.mod_source,
+            modulation_rank=args.mod_rank,
+            modulation_alphas={
+                "dt": args.mod_alpha_dt,
+                "a": args.mod_alpha_a,
+                "B": args.mod_alpha_B,
+                "C": args.mod_alpha_C,
+                "D": args.mod_alpha_D,
+            },
+            modulation_lambda=args.mod_lambda,
+            modulation_temporal_lambda=args.mod_temporal_lambda,
+            modulation_lr_scale=args.mod_lr_scale,
+            modulation_alpha_warmup_steps=args.mod_alpha_warmup_steps,
+            eval_modulation_mode=args.eval_modulation_mode,
         )
         all_summaries.append(summary)
 

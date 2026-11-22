@@ -6268,6 +6268,17 @@ class WorkspaceCapabilityDataset(BaseDataset):
         episodes = self._paired_id_episodes(lesson_idx)
         return self._evaluate_episodes(model, device, episodes, shuffle_workspace_readback=True)[:2]
 
+    def evaluate_modulation_ablated(self, model, device, curriculum, lesson_idx, mode="off"):
+        """Paired ID eval with modulation removed ('off') or batch-shuffled ('shuffle');
+        the workspace delta stays active."""
+        prior = getattr(model, "eval_modulation_mode", None)
+        if prior is None or getattr(model, "modulation_head", None) is None:
+            raise ValueError("modulation ablation requires a model with a modulation head")
+        model.eval_modulation_mode = mode
+        try:
+            return self._evaluate_episodes(model, device, self._paired_id_episodes(lesson_idx))[:2]
+        finally:
+            model.eval_modulation_mode = prior
     def evaluate_workspace_feature_ablated(
         self, model, device, curriculum, lesson_idx, feature_name: str
     ):

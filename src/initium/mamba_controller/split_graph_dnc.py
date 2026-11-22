@@ -322,6 +322,14 @@ class SplitGraphDNC(nn.Module):
         workspace_block_index: int = 1,
         workspace_key_dim: int = 64,
         workspace_scan_chunk: int = 32,
+        modulation_enabled: bool = False,
+        modulation_targets: tuple = ("dt",),
+        modulation_blocks: tuple = (3,),
+        modulation_source: str = "workspace",
+        modulation_rank: int = 32,
+        modulation_alphas: dict | None = None,
+        modulation_lambda: float = 0.0,
+        modulation_temporal_lambda: float = 0.0,
         activation_checkpointing: bool = False,
         sgr_write_salience_enabled: bool = False,
         sgr_workspace_salience_enabled: bool = False,
@@ -918,6 +926,10 @@ class SplitGraphDNC(nn.Module):
         self.workspace_adaptive: AdaptiveWorkspaceSkills | AdaptiveWorkspaceSkillsV2 | None = None
         self.workspace_block_index = int(workspace_block_index)
         self.parallel_workspace: ParallelWorkspace | None = None
+        self.modulation_head = None
+        self.eval_modulation_mode = "checkpoint"  # runtime only: checkpoint | off | shuffle
+        if modulation_enabled and not workspace_parallel_dense:
+            raise ValueError("modulation requires workspace_parallel_dense")
         if workspace_parallel_dense:
             if workspace_enabled or mamba_variant != "mamba1":
                 raise ValueError("parallel workspace requires mamba1 and excludes the sequential workspace")
@@ -928,6 +940,22 @@ class SplitGraphDNC(nn.Module):
                 hidden_size, workspace_num_slots, workspace_key_dim, workspace_scan_chunk
             )
             torch.random.set_rng_state(_pw_rng)
+            if modulation_enabled:
+                from initium.workspace.modulation import ModulationHead
+
+                if not (
+                    min(modulation_blocks) > self.workspace_block_index
+                    and max(modulation_blocks) < num_backbone_blocks
+                ):
+                    raise ValueError("modulation blocks must lie in (workspace_block_index, num_blocks)")
+                _mx = self.backbone.blocks[0].mixer
+                _mod_rng = torch.random.get_rng_state()
+                self.modulation_head = ModulationHead(
+                    hidden_size, _mx.d_inner, _mx.d_state, modulation_blocks, modulation_targets,
+                    source=modulation_source, rank=modulation_rank, alphas=modulation_alphas,
+                    lam=modulation_lambda, temporal_lam=modulation_temporal_lambda,
+                )
+                torch.random.set_rng_state(_mod_rng)
         if workspace_adaptive_enabled or workspace_adaptive_v2_enabled:
             adaptive_rng_state = torch.random.get_rng_state()
             if workspace_adaptive_v2_enabled:
@@ -994,6 +1022,20 @@ class SplitGraphDNC(nn.Module):
 
         if self.device is not None and getattr(self.device, "type", None) == "cuda":
             self.to(self.device)
+
+    def _modulation_fn(self, valid_mask):
+        head = self.modulation_head
+        if head is None or self.workspace_eval_bypass or self.eval_modulation_mode == "off":
+            return None
+        shuffle = self.eval_modulation_mode == "shuffle"
+
+        def fn(h, aux):
+            mod = head(h, aux.get("readout"), valid_mask)
+            if shuffle and h.shape[0] > 1:
+                mod = {b: {t: v.roll(1, 0) for t, v in d.items()} for b, d in mod.items()}
+            return mod
+
+        return fn
 
     def apply_slot_readout(
         self,
@@ -1650,6 +1692,8 @@ class SplitGraphDNC(nn.Module):
                 input_valid_mask=ws_valid,
                 bypass=self.workspace_eval_bypass,
                 shuffle_readback=self.workspace_eval_shuffle_readback,
+                modulation_fn=self._modulation_fn(ws_valid),
+                mod_blocks=tuple(self.modulation_head.mod_blocks) if self.modulation_head is not None else (),
             )
         elif self.workspace is not None:
             backbone_stages = (

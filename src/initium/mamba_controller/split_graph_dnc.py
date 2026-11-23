@@ -1682,7 +1682,7 @@ class SplitGraphDNC(nn.Module):
             if ws_state is None:
                 ws_state = self.parallel_workspace.init_state(B, device=input.device)
             ws_valid = input_valid_mask if input_valid_mask is not None else input.ne(0).any(-1)
-            H, workspace_state, _ = self.backbone.forward_with_parallel_workspace(
+            H, workspace_state, self._ws_aux = self.backbone.forward_with_parallel_workspace(
                 input,
                 workspace=self.parallel_workspace,
                 ws_block=self.workspace_block_index,

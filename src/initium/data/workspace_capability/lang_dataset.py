@@ -1108,7 +1108,7 @@ class LanguageDataset(WorkspaceCapabilityDataset):
         state_only=False,
     ):
         """Microbatched eval forward; calls on_batch(group, answer_preds, kv_meta, kv_preds)."""
-        workspace = model.workspace
+        workspace = getattr(model, "workspace", None)
         prior, was_training = (
             getattr(workspace, "_initium_recurrent_state_observer", None),
             model.training,
@@ -1136,9 +1136,10 @@ class LanguageDataset(WorkspaceCapabilityDataset):
                             key_value_mask=kv["key_value_mask"].to(device),
                             key_value_steps=kv["key_value_steps"],
                         )
-                    workspace._initium_recurrent_state_observer = (
-                        make_observer(group) if make_observer else None
-                    )
+                    if workspace is not None:
+                        workspace._initium_recurrent_state_observer = (
+                            make_observer(group) if make_observer else None
+                        )
                     output, state = model(
                         x.to(device), (None, None, None), reset_experience=True, **kwargs
                     )
@@ -1166,7 +1167,8 @@ class LanguageDataset(WorkspaceCapabilityDataset):
                         group, preds, kv, workspace.pop_key_value_predictions() if want_kv else None
                     )
         finally:
-            workspace._initium_recurrent_state_observer = prior
+            if workspace is not None:
+                workspace._initium_recurrent_state_observer = prior
             model.train(was_training)
 
     def _slot_probe(self, model, device, episodes):

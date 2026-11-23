@@ -114,6 +114,7 @@ from initium.config.controller_config import (
 )
 from initium.config.train_config import (
     AMP_INIT_SCALE,
+    BACKBONE_WD,
     BATCH_SIZE,
     BETA_CTRL_ACC_TARGET,
     BETA_CTRL_EMA_DECAY,
@@ -135,6 +136,7 @@ from initium.config.train_config import (
     LR,
     LR_DECAY_STEPS,
     LR_MIN,
+    LR_SCALE,
     MODEL_CELL_SIZE,
     MODEL_HIDDEN_SIZE,
     MODEL_NR_CELLS,
@@ -1333,6 +1335,8 @@ def run(
     modulation_lambda: float = 0.0,
     modulation_temporal_lambda: float = 0.0,
     modulation_lr_scale: float = 1.0,
+    workspace_probe_loss_weight: float = 0.0,
+    workspace_lr_scale: float = 1.0,
     modulation_alpha_warmup_steps: int = 3000,
     eval_modulation_mode: str = "checkpoint",
 ):
@@ -5125,7 +5129,24 @@ def run(
                 "Frozen gate-only training has parameters outside the selected write gate: "
                 + ", ".join(unexpected_trainable)
             )
-    fused_optimizer_enabled = device.type == "cuda"
+    fused_optimizer_enabled = bool(device.type == "cuda")
+    _bb_wd = BACKBONE_WD
+    _wd_ids = {
+        id(p)
+        for n, p in trainable_named_parameters
+        if _bb_wd > 0
+        and ".backbone.blocks." in n
+        and ".mixer." in n
+        and n.endswith(".weight")
+        and p.ndim == 2  # in/x/dt/out_proj only; excludes conv1d, norms, biases, A_log, D
+    }
+    _wd_groups = [
+        {"params": [p for p in trainable_parameters if id(p) in _wd_ids], "weight_decay": _bb_wd},
+        {"params": [p for p in trainable_parameters if id(p) not in _wd_ids], "weight_decay": 0.0},
+    ]
+    _wd_groups = [g for g in _wd_groups if g["params"]]
+    if _wd_ids:
+        print(f"[{run_id}] AdamW backbone mixer weight decay={_bb_wd:g} on {len(_wd_ids)} tensors")
     optimizer_kwargs: dict[str, Any] = (
         {"lr": LR, "fused": True} if fused_optimizer_enabled else {"lr": LR}
     )
@@ -5160,14 +5181,27 @@ def run(
             optimizer = torch.optim.Adam(parameter_groups, **optimizer_kwargs)
     else:
         try:
-            optimizer = torch.optim.Adam(trainable_parameters, **optimizer_kwargs)
+            optimizer = torch.optim.AdamW(_wd_groups, **optimizer_kwargs)
         except (TypeError, RuntimeError) as exc:
             if not fused_optimizer_enabled:
                 raise
             print(f"[{run_id}] fused Adam unavailable ({exc}); using standard Adam")
             optimizer_kwargs = {"lr": LR}
             fused_optimizer_enabled = False
-            optimizer = torch.optim.Adam(trainable_parameters, **optimizer_kwargs)
+            optimizer = torch.optim.AdamW(_wd_groups, **optimizer_kwargs)
+    if workspace_parallel_dense and workspace_lr_scale != 1.0:
+        _wid = {id(p) for p in rnn.parallel_workspace.parameters()}
+        for _g in list(optimizer.param_groups):
+            _wp = [p for p in _g["params"] if id(p) in _wid]
+            if _wp:
+                _g["params"] = [p for p in _g["params"] if id(p) not in _wid]
+                optimizer.add_param_group(
+                    {
+                        **{k: v for k, v in _g.items() if k != "params"},
+                        "params": _wp,
+                        "lr_multiplier": float(_g.get("lr_multiplier", 1.0)) * workspace_lr_scale,
+                    }
+                )
     if modulation_enabled and modulation_lr_scale != 1.0:
         _mid = {id(p) for p in rnn.modulation_head.parameters()}
         for _g in list(optimizer.param_groups):
@@ -5326,7 +5360,7 @@ def run(
     # fix was -- a resume past WARMUP_STEPS just lands in the cosine part,
     # no separate warmup state to save/restore.
     effective_training_batch_size = int(batch_size) * int(workspace_length_bucket_microbatches)
-    lr_batch_scale = math.sqrt(effective_training_batch_size / max(1, int(BATCH_SIZE)))
+    lr_batch_scale = math.sqrt(effective_training_batch_size / max(1, int(BATCH_SIZE))) * LR_SCALE
     if lr_batch_scale != 1.0:
         print(
             f"[{run_id}] batch-scaled LR: effective batch "
@@ -6172,6 +6206,11 @@ def run(
                 device, non_blocking=True
             )
         running_batch_prepare_seconds += time.perf_counter() - batch_prepare_started
+        ws_probe_targets = ws_probe_mask = None
+        if workspace_parallel_dense and workspace_probe_loss_weight > 0:
+            _pm = dataset.workspace_retrieval_metadata(input_seq)
+            ws_probe_targets = _pm["retrieval_value_targets"].to(device, non_blocking=True)
+            ws_probe_mask = _pm["retrieval_value_mask"].to(device, non_blocking=True)
         input_seq = input_seq.to(device, non_blocking=True)
         target_digits = target_digits.to(device, non_blocking=True)
         answer_mask = answer_mask.to(device, non_blocking=True)
@@ -6982,6 +7021,15 @@ def run(
         global_ramp = min(1.0, (step - anneal_start_step) / max(1, KL_ANNEAL_STEPS))
         lesson_dip_ramp = min(1.0, (step - lesson_dip_start_step) / max(1, LESSON_KL_DIP_STEPS))
         beta_eff = beta_target * global_ramp * lesson_dip_ramp
+        ws_probe_loss = None
+        _wsa = getattr(rnn, "_ws_aux", None)
+        if ws_probe_targets is not None and _wsa and "written" in _wsa and ws_probe_mask.any():
+            _pl = rnn.parallel_workspace.probe(_wsa["written"]).float()
+            ws_probe_loss = nn.functional.cross_entropy(
+                _pl.transpose(1, 2),
+                ws_probe_targets.long().masked_fill(~ws_probe_mask.bool(), -100),
+                ignore_index=-100,
+            )
         loss = (
             task_loss
             + (sgr_prediction_loss_weight * prediction_loss if prediction_loss is not None else 0.0)
@@ -7011,6 +7059,7 @@ def run(
             + (adaptive_v3_loss if adaptive_v3_loss is not None else 0.0)
             + (alloc_loss if alloc_loss is not None else 0.0)
             + (mod_aux_loss if mod_aux_loss is not None else 0.0)
+            + (workspace_probe_loss_weight * ws_probe_loss if ws_probe_loss is not None else 0.0)
         )
         if split_graph_forward_trace is not None and split_graph_forward_trace.active:
             split_graph_forward_trace.observe("training.total_loss", loss)
@@ -8033,7 +8082,8 @@ def run(
                 _md = {k: float(v) for k, v in rnn.modulation_head.last_diagnostics.items()}
                 _ms = {k: float(v) for k, v in getattr(rnn.backbone, "last_modulation_stats", {}).items()}
                 parts.append("mod[" + " ".join(f"{k}={v:.3g}" for k, v in {**_md, **_ms}.items()) + "]")
-                if any(k.endswith("last_state_norm") and v > 1e4 for k, v in _ms.items()):
+                if any(k.endswith("last_state_norm") and v > 1e4 for k, v in _ms.items()) and not getattr(run, "_ls_alerted", False):
+                    run._ls_alerted = True
                     print(f"[{run_id}] [mod-ALERT] step {step}: SSM last-state norm > 1e4")
                 if any(k.endswith("_sat") and v > 0.2 for k, v in _md.items()):
                     print(f"[{run_id}] [mod-ALERT] step {step}: modulation saturation > 0.2")
@@ -9853,6 +9903,8 @@ if __name__ == "__main__":
     parser.add_argument("--mod-lambda", type=float, default=0.0)
     parser.add_argument("--mod-temporal-lambda", type=float, default=0.0)
     parser.add_argument("--mod-lr-scale", type=float, default=1.0)
+    parser.add_argument("--workspace-probe-loss-weight", type=float, default=0.0)
+    parser.add_argument("--workspace-lr-scale", type=float, default=1.0)
     parser.add_argument("--mod-alpha-warmup-steps", type=int, default=3000)
     parser.add_argument("--eval-modulation-mode", choices=("checkpoint", "off", "shuffle"), default="checkpoint")
     parser.add_argument(
@@ -12443,6 +12495,8 @@ if __name__ == "__main__":
             modulation_lambda=args.mod_lambda,
             modulation_temporal_lambda=args.mod_temporal_lambda,
             modulation_lr_scale=args.mod_lr_scale,
+            workspace_probe_loss_weight=args.workspace_probe_loss_weight,
+            workspace_lr_scale=args.workspace_lr_scale,
             modulation_alpha_warmup_steps=args.mod_alpha_warmup_steps,
             eval_modulation_mode=args.eval_modulation_mode,
         )

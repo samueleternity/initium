@@ -45,6 +45,7 @@ class ParallelWorkspace(nn.Module):
         self.Wo = nn.Linear(d_model, d_model)
         self.read_gate = nn.Parameter(torch.zeros(()))
         self.readout_norm = nn.LayerNorm(d_model, elementwise_affine=False)
+        self.probe = nn.Linear(d_model, 16)
         nn.init.zeros_(self.Wo.weight)
         nn.init.zeros_(self.Wo.bias)
 
@@ -52,6 +53,24 @@ class ParallelWorkspace(nn.Module):
         return torch.zeros(batch, self.num_slots, self.d_model, device=device, dtype=torch.float32)
 
     def forward(self, h, state, valid_mask=None, bypass=False, shuffle_readback=False):
+        seg = 128
+        if torch.is_grad_enabled() or h.shape[1] <= seg:
+            return self._forward_seg(h, state, valid_mask, bypass, shuffle_readback)
+        deltas, readouts = [], []
+        for s in range(0, h.shape[1], seg):
+            d, state, aux = self._forward_seg(
+                h[:, s : s + seg],
+                state,
+                None if valid_mask is None else valid_mask[:, s : s + seg],
+                bypass,
+                shuffle_readback,
+            )
+            deltas.append(d)
+            if "readout" in aux:
+                readouts.append(aux["readout"])
+        return torch.cat(deltas, 1), state, ({"readout": torch.cat(readouts, 1)} if readouts else {})
+
+    def _forward_seg(self, h, state, valid_mask=None, bypass=False, shuffle_readback=False):
         """h: (B,T,D); state: (B,S,D). Returns (delta (B,T,D) fp32, new_state, aux)."""
         with torch.autocast(device_type=h.device.type, enabled=False):
             h = h.float()
@@ -69,4 +88,8 @@ class ParallelWorkspace(nn.Module):
             alpha = (self.Wq(h) @ self.read_keys.t() * self.scale).softmax(-1)
             r = torch.einsum("bts,btsd->btd", alpha, cr)
             delta = torch.sigmoid(self.read_gate) * self.Wo(r)
-        return delta, new_state, {"readout": r}
+        aux = {"readout": r}
+        if torch.is_grad_enabled():
+            si = w.argmax(-1)
+            aux["written"] = c.gather(2, si[..., None, None].expand(-1, -1, 1, c.shape[-1])).squeeze(2)
+        return delta, new_state, aux

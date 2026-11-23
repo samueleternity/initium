@@ -17,7 +17,7 @@ class ModulationHead(nn.Module):
     """
 
     def __init__(self, d_model, d_inner, d_state, mod_blocks, targets, source="workspace",
-                 rank=32, alphas=None, lam=0.0, temporal_lam=0.0):
+                 rank=32, alphas=None, lam=0.0, temporal_lam=0.0, route_dim=0):
         super().__init__()
         if source not in ("workspace", "backbone", "static"):
             raise ValueError("modulation source must be workspace, backbone or static")
@@ -30,6 +30,7 @@ class ModulationHead(nn.Module):
         self.mod_blocks = tuple(int(b) for b in mod_blocks)
         self.targets = tuple(targets)
         self.source = source
+        self.route_dim = int(route_dim) if source == "workspace" else 0
         self.alphas = a
         self.lam, self.temporal_lam = float(lam), float(temporal_lam)
         self.alpha_scale = 1.0  # warmup multiplier, set by the trainer
@@ -40,14 +41,14 @@ class ModulationHead(nn.Module):
         else:
             self.norm_h = nn.LayerNorm(d_model)
             self.norm_r = nn.LayerNorm(d_model) if source == "workspace" else None
-            self.trunk = nn.Linear(d_model * (2 if source == "workspace" else 1), rank)
+            self.trunk = nn.Linear(d_model * (2 if source == "workspace" else 1) + self.route_dim, rank)
             self.out = nn.ModuleDict({k: nn.Linear(rank, self.dims[k.split("_")[1]], bias=False) for k in keys})
             for m in self.out.values():
                 nn.init.zeros_(m.weight)
         self._aux = None
         self.last_diagnostics: dict[str, torch.Tensor] = {}
 
-    def forward(self, h, r, valid_mask=None):
+    def forward(self, h, r, valid_mask=None, c=None):
         with torch.autocast(device_type=h.device.type, enabled=False):
             z = None
             if self.source != "static":
@@ -56,6 +57,10 @@ class ModulationHead(nn.Module):
                     if r is None:
                         raise ValueError("workspace-sourced modulation needs the workspace readout")
                     z = torch.cat((self.norm_r(r.float()), z), dim=-1)
+                    if self.route_dim:
+                        if c is None:
+                            raise ValueError("route-code modulation needs aux['route_code']")
+                        z = torch.cat((z, c.float()), dim=-1)
                 z = torch.tanh(self.trunk(z))
             m2 = (torch.ones(h.shape[:2], device=h.device) if valid_mask is None
                   else valid_mask.to(device=h.device, dtype=torch.float32))

@@ -659,6 +659,7 @@ class MambaBackboneParallel(nn.Module):
         aux: dict = {}
         mod = None
         mod_stats: dict = {}
+        routed = route_code = None
         for i, block in enumerate(self.blocks):
             if mod is not None and i in mod_blocks:
                 h, st = block.forward_modulated(h, mod[i])
@@ -667,7 +668,17 @@ class MambaBackboneParallel(nn.Module):
             else:
                 h = self._run_block(block, h)
             if self.moe_blocks is not None and isinstance(self.moe_blocks[i], MoEBlock):
-                h = self.moe_blocks[i](h, token_mask=token_mask)
+                if i == ws_block and getattr(workspace, "moe_feed", False):
+                    h, _ex, _ix, _wt = self.moe_blocks[i](
+                        h, return_selected_details=True, token_mask=token_mask
+                    )
+                    routed = (_ex * _wt.unsqueeze(-1).to(_ex.dtype)).sum(2) * self.moe_blocks[i].residual_scale
+                    route_code = torch.zeros(
+                        (*_ix.shape[:2], self.moe_blocks[i].moe.num_experts),
+                        device=_ix.device, dtype=torch.float32,
+                    ).scatter_add_(2, _ix.long(), _wt.float())
+                else:
+                    h = self.moe_blocks[i](h, token_mask=token_mask)
             if i == ws_block:
                 delta, ws_state, aux = workspace(
                     h,
@@ -675,7 +686,10 @@ class MambaBackboneParallel(nn.Module):
                     valid_mask=input_valid_mask,
                     bypass=bypass,
                     shuffle_readback=shuffle_readback,
+                    routed=routed,
                 )
+                if route_code is not None:
+                    aux["route_code"] = route_code
                 h = h + delta.to(h.dtype)
                 if modulation_fn is not None:
                     mod = modulation_fn(h, aux)

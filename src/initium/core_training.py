@@ -921,6 +921,7 @@ def load_frozen_workspace_warm_start(
         "workspace_block_index",
         "workspace_key_dim",
         "workspace_scan_chunk",
+        "workspace_parallel_moe_feed", "modulation_route_code",
         "modulation_enabled", "modulation_targets", "modulation_blocks", "modulation_source",
         "modulation_rank", "modulation_alphas", "modulation_lambda",
         "modulation_temporal_lambda", "modulation_alpha_warmup_steps",
@@ -1338,6 +1339,8 @@ def run(
     workspace_probe_loss_weight: float = 0.0,
     workspace_lr_scale: float = 1.0,
     modulation_alpha_warmup_steps: int = 3000,
+    workspace_parallel_moe_feed: bool = False,
+    modulation_route_code: bool = False,
     eval_modulation_mode: str = "checkpoint",
 ):
     original_run_id = run_id
@@ -1627,6 +1630,18 @@ def run(
             )
         if min(workspace_num_slots, workspace_key_dim, workspace_scan_chunk) < 1:
             raise ValueError("parallel workspace slots/key-dim/scan-chunk must be positive")
+    if (workspace_parallel_moe_feed or modulation_route_code) and not (
+        workspace_parallel_dense and moe_enabled and split_graph_moe_placement in ("all", "backbone")
+    ):
+        raise ValueError(
+            "MoE feed / route-code modulation require --workspace-parallel-dense and backbone MoE"
+        )
+    if modulation_route_code and not (
+        workspace_parallel_moe_feed and modulation_enabled and modulation_source == "workspace"
+    ):
+        raise ValueError(
+            "--mod-route-code requires --workspace-parallel-moe-feed, --modulation and --mod-source workspace"
+        )
     if split_graph_backbone_only and memory_type != "dnc":
         raise ValueError("--split-graph-backbone-only cannot be combined with a memory module")
     if memory_type != "dnc" and dynamic_n_mode:
@@ -2239,9 +2254,14 @@ def run(
     )
     modulation_warm_start = bool(
         resume_requested
-        and modulation_enabled
         and not eval_only
-        and not any(k.startswith("modulation_head.") for k in checkpoint_state)
+        and (
+            (modulation_enabled and not any(k.startswith("modulation_head.") for k in checkpoint_state))
+            or (
+                workspace_parallel_moe_feed
+                and not any(k.startswith("parallel_workspace.Wm.") for k in checkpoint_state)
+            )
+        )
     )
     workspace_condition_warm_start = bool(
         modulation_warm_start
@@ -4190,6 +4210,8 @@ def run(
             workspace_block_index=workspace_block_index,
             workspace_key_dim=workspace_key_dim,
             workspace_scan_chunk=workspace_scan_chunk,
+            workspace_parallel_moe_feed=workspace_parallel_moe_feed,
+            modulation_route_code=modulation_route_code,
             modulation_enabled=modulation_enabled,
             modulation_targets=tuple(modulation_targets),
             modulation_blocks=tuple(modulation_blocks),
@@ -4622,6 +4644,8 @@ def run(
         "workspace_block_index": workspace_block_index,
         "workspace_key_dim": workspace_key_dim,
         "workspace_scan_chunk": workspace_scan_chunk,
+        "workspace_parallel_moe_feed": workspace_parallel_moe_feed,
+        "modulation_route_code": modulation_route_code,
         "modulation_enabled": modulation_enabled,
         "modulation_targets": tuple(modulation_targets),
         "modulation_blocks": tuple(modulation_blocks),
@@ -5532,7 +5556,7 @@ def run(
             )
         elif modulation_warm_start:
             _inc = rnn.load_state_dict(ckpt["rnn_state_dict"], strict=False)
-            if _inc.unexpected_keys or any(not k.startswith("modulation_head.") for k in _inc.missing_keys):
+            if _inc.unexpected_keys or any(not k.startswith(("modulation_head.", "parallel_workspace.Wm.", "parallel_workspace.moe_norm.")) for k in _inc.missing_keys):
                 raise ValueError(
                     "Modulation warm start only permits new modulation_head.* parameters "
                     f"(missing={_inc.missing_keys[:8]}, unexpected={_inc.unexpected_keys[:8]})."
@@ -9888,6 +9912,10 @@ if __name__ == "__main__":
     )
     parser.add_argument("--workspace-block-index", type=int, default=1)
     parser.add_argument("--workspace-key-dim", type=int, default=64)
+    parser.add_argument("--workspace-parallel-moe-feed", action="store_true",
+                        help="Phase C: parallel workspace writes from h + proj(routed MoE output) at block k (needs --moe, --workspace-parallel-dense).")
+    parser.add_argument("--mod-route-code", action="store_true",
+                        help="Phase C: modulation head also sees the (B,T,E) MoE route code (needs --mod-source workspace and --workspace-parallel-moe-feed).")
     parser.add_argument("--workspace-scan-chunk", type=int, default=32)
     parser.add_argument("--modulation", action="store_true",
                         help="Phase B: workspace-conditioned Mamba parameter modulation (needs --workspace-parallel-dense).")
@@ -12162,6 +12190,10 @@ if __name__ == "__main__":
             run_id += f"_wpdense{args.workspace_num_slots}s_k{args.workspace_block_index}"
         if args.modulation:
             run_id += f"_mod{''.join(args.mod_targets)}_b{''.join(map(str, args.mod_blocks))}_{args.mod_source}"
+        if args.workspace_parallel_moe_feed:
+            run_id += "_moefeed"
+        if args.mod_route_code:
+            run_id += "_routecode"
         if args.dnc_implementation == "optimized":
             run_id += "_optimizeddnc" if args.dnc_compile_memory else "_dncfastalloc"
         elif args.dnc_compile_memory:
@@ -12498,6 +12530,8 @@ if __name__ == "__main__":
             workspace_probe_loss_weight=args.workspace_probe_loss_weight,
             workspace_lr_scale=args.workspace_lr_scale,
             modulation_alpha_warmup_steps=args.mod_alpha_warmup_steps,
+            workspace_parallel_moe_feed=args.workspace_parallel_moe_feed,
+            modulation_route_code=args.mod_route_code,
             eval_modulation_mode=args.eval_modulation_mode,
         )
         all_summaries.append(summary)

@@ -322,6 +322,8 @@ class SplitGraphDNC(nn.Module):
         workspace_block_index: int = 1,
         workspace_key_dim: int = 64,
         workspace_scan_chunk: int = 32,
+        workspace_parallel_moe_feed: bool = False,
+        modulation_route_code: bool = False,
         modulation_enabled: bool = False,
         modulation_targets: tuple = ("dt",),
         modulation_blocks: tuple = (3,),
@@ -933,11 +935,18 @@ class SplitGraphDNC(nn.Module):
         if workspace_parallel_dense:
             if workspace_enabled or mamba_variant != "mamba1":
                 raise ValueError("parallel workspace requires mamba1 and excludes the sequential workspace")
+            if workspace_parallel_moe_feed and not backbone_moe_enabled:
+                raise ValueError("--workspace-parallel-moe-feed requires active backbone MoE")
+            if workspace_parallel_moe_feed and moe_backbone_block_isolation not in (None, workspace_block_index):
+                raise ValueError("MoE block isolation must equal the workspace block for the MoE feed")
+            if modulation_route_code and not workspace_parallel_moe_feed:
+                raise ValueError("route-code modulation requires the MoE feed")
             if not 0 <= self.workspace_block_index < num_backbone_blocks or workspace_num_slots < 1:
                 raise ValueError("invalid parallel workspace block index or slot count")
             _pw_rng = torch.random.get_rng_state()
             self.parallel_workspace = ParallelWorkspace(
-                hidden_size, workspace_num_slots, workspace_key_dim, workspace_scan_chunk
+                hidden_size, workspace_num_slots, workspace_key_dim, workspace_scan_chunk,
+                moe_feed=workspace_parallel_moe_feed,
             )
             torch.random.set_rng_state(_pw_rng)
             if modulation_enabled:
@@ -953,7 +962,8 @@ class SplitGraphDNC(nn.Module):
                 self.modulation_head = ModulationHead(
                     hidden_size, _mx.d_inner, _mx.d_state, modulation_blocks, modulation_targets,
                     source=modulation_source, rank=modulation_rank, alphas=modulation_alphas,
-                    lam=modulation_lambda, temporal_lam=modulation_temporal_lambda,
+                    lam=modulation_lambda, temporal_lam=modulation_temporal_lambda,                    
+                    route_dim=(moe_num_experts if modulation_route_code else 0),
                 )
                 torch.random.set_rng_state(_mod_rng)
         if workspace_adaptive_enabled or workspace_adaptive_v2_enabled:
@@ -1030,7 +1040,7 @@ class SplitGraphDNC(nn.Module):
         shuffle = self.eval_modulation_mode == "shuffle"
 
         def fn(h, aux):
-            mod = head(h, aux.get("readout"), valid_mask)
+            mod = head(h, aux.get("readout"), valid_mask, aux.get("route_code"))
             if shuffle and h.shape[0] > 1:
                 mod = {b: {t: v.roll(1, 0) for t, v in d.items()} for b, d in mod.items()}
             return mod

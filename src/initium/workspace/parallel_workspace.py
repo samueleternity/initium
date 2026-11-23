@@ -30,7 +30,7 @@ def _affine_scan(a: torch.Tensor, b: torch.Tensor, c0: torch.Tensor, chunk: int)
 
 
 class ParallelWorkspace(nn.Module):
-    def __init__(self, d_model: int, num_slots: int = 5, key_dim: int = 64, chunk: int = 32):
+    def __init__(self, d_model: int, num_slots: int = 5, key_dim: int = 64, chunk: int = 32, moe_feed: bool = False):
         super().__init__()
         if min(d_model, num_slots, key_dim, chunk) < 1:
             raise ValueError("parallel workspace dimensions must be positive")
@@ -48,14 +48,19 @@ class ParallelWorkspace(nn.Module):
         self.probe = nn.Linear(d_model, 16)
         nn.init.zeros_(self.Wo.weight)
         nn.init.zeros_(self.Wo.bias)
+        self.moe_feed = bool(moe_feed)
+        if self.moe_feed:
+            self.moe_norm = nn.LayerNorm(d_model)
+            self.Wm = nn.Linear(d_model, d_model, bias=False)
+            nn.init.zeros_(self.Wm.weight)
 
     def init_state(self, batch: int, device=None) -> torch.Tensor:
         return torch.zeros(batch, self.num_slots, self.d_model, device=device, dtype=torch.float32)
 
-    def forward(self, h, state, valid_mask=None, bypass=False, shuffle_readback=False):
+    def forward(self, h, state, valid_mask=None, bypass=False, shuffle_readback=False, routed=None):
         seg = 128
         if torch.is_grad_enabled() or h.shape[1] <= seg:
-            return self._forward_seg(h, state, valid_mask, bypass, shuffle_readback)
+            return self._forward_seg(h, state, valid_mask, bypass, shuffle_readback, routed)
         deltas, readouts = [], []
         for s in range(0, h.shape[1], seg):
             d, state, aux = self._forward_seg(
@@ -64,21 +69,23 @@ class ParallelWorkspace(nn.Module):
                 None if valid_mask is None else valid_mask[:, s : s + seg],
                 bypass,
                 shuffle_readback,
+                None if routed is None else routed[:, s : s + seg],
             )
             deltas.append(d)
             if "readout" in aux:
                 readouts.append(aux["readout"])
         return torch.cat(deltas, 1), state, ({"readout": torch.cat(readouts, 1)} if readouts else {})
 
-    def _forward_seg(self, h, state, valid_mask=None, bypass=False, shuffle_readback=False):
+    def _forward_seg(self, h, state, valid_mask=None, bypass=False, shuffle_readback=False, routed=None):
         """h: (B,T,D); state: (B,S,D). Returns (delta (B,T,D) fp32, new_state, aux)."""
         with torch.autocast(device_type=h.device.type, enabled=False):
             h = h.float()
-            w = (self.Wk(h) @ self.slot_keys.t() * self.scale).softmax(-1)
-            u = (torch.sigmoid(self.Wu(h)) * w).clamp(max=1.0 - 1e-3)
+            src = h if routed is None else h + self.Wm(self.moe_norm(routed.float()))
+            w = (self.Wk(src) @ self.slot_keys.t() * self.scale).softmax(-1)
+            u = (torch.sigmoid(self.Wu(src)) * w).clamp(max=1.0 - 1e-3)
             if valid_mask is not None:  # padding never writes
                 u = u * valid_mask.unsqueeze(-1).to(u.dtype)
-            c = _affine_scan(1.0 - u, u.unsqueeze(-1) * self.Wv(h).unsqueeze(2), state.float(), self.chunk)
+            c = _affine_scan(1.0 - u, u.unsqueeze(-1) * self.Wv(src.unsqueeze(2), state.float(), self.chunk)
             new_state = c[:, -1]
             if bypass:
                 return torch.zeros_like(h), new_state, {}

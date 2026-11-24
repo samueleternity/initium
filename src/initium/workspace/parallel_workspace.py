@@ -80,21 +80,28 @@ class ParallelWorkspace(nn.Module):
         """h: (B,T,D); state: (B,S,D). Returns (delta (B,T,D) fp32, new_state, aux)."""
         with torch.autocast(device_type=h.device.type, enabled=False):
             h = h.float()
-            src = h if routed is None else h + self.Wm(self.moe_norm(routed.float()))
-            w = (self.Wk(src) @ self.slot_keys.t() * self.scale).softmax(-1)
-            u = (torch.sigmoid(self.Wu(src)) * w).clamp(max=1.0 - 1e-3)
+            rd = None if routed is None else self.Wm(self.moe_norm(routed.detach().float()))
+            src = h
+            w = (self.Wk(h) @ self.slot_keys.t() * self.scale).softmax(-1)
+            u = (torch.sigmoid(self.Wu(h)) * w).clamp(max=1.0 - 1e-3)
             if valid_mask is not None:  # padding never writes
                 u = u * valid_mask.unsqueeze(-1).to(u.dtype)
-            c = _affine_scan(1.0 - u, u.unsqueeze(-1) * self.Wv(src.unsqueeze(2), state.float(), self.chunk)
+            c = _affine_scan(1.0 - u, u.unsqueeze(-1) * self.Wv(src).unsqueeze(2), state.float(), self.chunk)
             new_state = c[:, -1]
             if bypass:
                 return torch.zeros_like(h), new_state, {}
             cr = self.readout_norm(c)
             if shuffle_readback and cr.shape[0] > 1:
                 cr = cr.roll(1, 0)
-            alpha = (self.Wq(h) @ self.read_keys.t() * self.scale).softmax(-1)
+            alpha = (self.Wq(h if rd is None else h + rd) @ self.read_keys.t() * self.scale).softmax(-1)
             r = torch.einsum("bts,btsd->btd", alpha, cr)
             delta = torch.sigmoid(self.read_gate) * self.Wo(r)
+            self.last_diag = {
+                "delta_rms": delta.detach().square().mean().sqrt(),
+                "Wo_rms": self.Wo.weight.detach().square().mean().sqrt(),
+                "read_gate": torch.sigmoid(self.read_gate.detach()),
+                **({"Wm_rms": self.Wm.weight.detach().square().mean().sqrt()} if self.moe_feed else {}),
+            }
         aux = {"readout": r}
         if torch.is_grad_enabled():
             si = w.argmax(-1)

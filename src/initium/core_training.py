@@ -8111,6 +8111,8 @@ def run(
                     print(f"[{run_id}] [mod-ALERT] step {step}: SSM last-state norm > 1e4")
                 if any(k.endswith("_sat") and v > 0.2 for k, v in _md.items()):
                     print(f"[{run_id}] [mod-ALERT] step {step}: modulation saturation > 0.2")
+            if getattr(getattr(rnn, "parallel_workspace", None), "last_diag", None):
+                parts.append("pws[" + " ".join(f"{k}={float(v):.3g}" for k, v in rnn.parallel_workspace.last_diag.items()) + "]")
             if dyn_n_str:
                 parts.append(dyn_n_str.strip(" |"))
             if bistable_grad_probe is not None:

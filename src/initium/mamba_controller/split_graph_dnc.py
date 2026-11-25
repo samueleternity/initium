@@ -332,6 +332,7 @@ class SplitGraphDNC(nn.Module):
         modulation_alphas: dict | None = None,
         modulation_lambda: float = 0.0,
         modulation_temporal_lambda: float = 0.0,
+        modulation_meta_responsiveness: bool = False,
         activation_checkpointing: bool = False,
         sgr_write_salience_enabled: bool = False,
         sgr_workspace_salience_enabled: bool = False,
@@ -964,6 +965,7 @@ class SplitGraphDNC(nn.Module):
                     source=modulation_source, rank=modulation_rank, alphas=modulation_alphas,
                     lam=modulation_lambda, temporal_lam=modulation_temporal_lambda,                    
                     route_dim=(moe_num_experts if modulation_route_code else 0),
+                    meta_responsiveness=modulation_meta_responsiveness,
                 )
                 torch.random.set_rng_state(_mod_rng)
         if workspace_adaptive_enabled or workspace_adaptive_v2_enabled:

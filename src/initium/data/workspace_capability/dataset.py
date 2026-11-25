@@ -807,6 +807,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
             track_level = (
                 int(lesson_idx.get(track, 0)) if isinstance(lesson_idx, dict) else int(lesson_idx)
             )
+            track_episode_start = len(episodes)
             required = self._curriculum_groups(track, track_level)
             counts = {group: 0 for group in required}
             attempts = 0
@@ -818,9 +819,19 @@ class WorkspaceCapabilityDataset(BaseDataset):
                         for group, count in counts.items()
                         if count < episodes_per_group
                     }
-                    raise RuntimeError(
-                        f"could not balance {track} curriculum evaluation groups: {missing}"
+                    if len(episodes) == track_episode_start:
+                        raise RuntimeError(
+                            f"could not generate curriculum evaluation episodes for {track}; "
+                            f"missing groups: {missing}"
+                        )
+                    print(
+                        f"[curriculum-eval] warning: could not fully balance {track} "
+                        f"lesson {track_level + 1} after {attempts} attempts; "
+                        f"using partial evaluation set ({missing} still short). "
+                        "Curriculum promotion still requires the configured episode count "
+                        "for every group."
                     )
+                    break
                 episode = self._make_episode(track, track_level, rng)
                 group = str(episode.metadata.get("progression_group", "all"))
                 attempts += 1

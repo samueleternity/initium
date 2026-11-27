@@ -1165,6 +1165,21 @@ def _host_memory_snapshot_mb() -> tuple[float | None, float | None, float | None
         return None, None, None
 
 
+def assign_group(name: str) -> str:
+    """Map each named trainable parameter to its controller/LR group."""
+    if name.startswith(("rnn.workspace.adaptive_v3.", "rnn.workspace.adaptive_v4.")):
+        return "adaptive_v3"
+    if name.startswith(("rnn.modulation_head.", "rnn.parallel_workspace.modulation_head.")):
+        return "modulation"
+    if name.startswith(("output_proj.", "output_norm.", "rnn.output_norm.")):
+        return "task_head"
+    if name.startswith(("rnn.workspace.", "rnn.parallel_workspace.")):
+        return "workspace"
+    if ".moe_blocks." in name or name.startswith("rnn.moe_blocks.") or ".moe." in name:
+        return "moe"
+    return "backbone"
+
+
 def run(
     beta_target: float,
     run_id: str,
@@ -5334,20 +5349,6 @@ def run(
         and n.endswith(".weight")
         and p.ndim == 2  # in/x/dt/out_proj only; excludes conv1d, norms, biases, A_log, D
     }
-
-    def assign_group(name: str) -> str:
-        """Map each named trainable parameter to its controller/LR group."""
-        if name.startswith(("rnn.workspace.adaptive_v3.", "rnn.workspace.adaptive_v4.")):
-            return "adaptive_v3"
-        if name.startswith(("rnn.modulation_head.", "rnn.parallel_workspace.modulation_head.")):
-            return "modulation"
-        if name.startswith(("output_proj.", "output_norm.", "rnn.output_norm.")):
-            return "task_head"
-        if name.startswith(("rnn.workspace.", "rnn.parallel_workspace.")):
-            return "workspace"
-        if ".moe_blocks." in name or name.startswith("rnn.moe_blocks.") or ".moe." in name:
-            return "moe"
-        return "backbone"
 
     group_static_lr = {
         "backbone": 1.0,

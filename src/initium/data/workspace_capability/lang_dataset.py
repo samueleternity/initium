@@ -209,7 +209,6 @@ class LanguageDataset(WorkspaceCapabilityDataset):
             "lang_define": {TASK_QA},
             "lang_induce": {l5.TASK_S2MR, l5.TASK_MR2S},
             "lang_logic": {l5.TASK_LOGIC},
-            lt.LANG_PWS_LOGIC: {l5.TASK_LOGIC},
         }.get(episode.track)
         if not markers or episode.metadata.get("prev"):
             return episode

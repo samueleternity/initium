@@ -8179,7 +8179,7 @@ def run(
             _nm_diag = neuromodulator.diagnostics()
             _nm_mults = neuromodulator.multipliers()
             _nm_lr: dict[str, float] = {}
-            for _group in cast(list[dict[str, Any]], optimizer.param_groups):
+            for _group in optimizer.param_groups:
                 _name = str(_group.get("nm_group", "backbone"))
                 _nm_lr[_name] = float(_group["lr"])
             for _name, _mult in _nm_mults.items():

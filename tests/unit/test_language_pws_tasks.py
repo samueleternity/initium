@@ -1,6 +1,7 @@
 """Generator and curriculum contracts for PWS-oriented language induction and logic."""
 
 import random
+from types import SimpleNamespace
 
 from initium.data.workspace_capability.curriculum import difficulty_for
 from initium.data.workspace_capability.episode import (
@@ -12,7 +13,7 @@ from initium.data.workspace_capability.episode import (
     validate_episode,
 )
 from initium.data.workspace_capability.lang_dataset import LanguageDataset
-from initium.data.workspace_capability.tracks import _lang_text, lang5_tracks
+from initium.data.workspace_capability.tracks import _lang_grammar, _lang_text, lang5_tracks
 
 
 class _TestTokenizer:
@@ -30,6 +31,10 @@ class _TestTokenizer:
 def _use_test_tokenizer(monkeypatch):
     tokenizer = _TestTokenizer()
     monkeypatch.setattr(_lang_text, "tokenizer", lambda: tokenizer)
+    # PWS tasks do not require corpus annotation, but pseudo-word sampling
+    # checks the grammar surface vocabulary. Keep these unit tests independent
+    # of generated Stage 3/4 corpus artifacts.
+    monkeypatch.setattr(_lang_grammar, "grammar", lambda: SimpleNamespace(surf={}))
     return tokenizer
 
 

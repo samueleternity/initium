@@ -1,9 +1,10 @@
 """Interactive Stage 5 language inference for workspace-capability checkpoints.
 
 Run with ``python -m initium.inference.lang_chat CHECKPOINT.pt``. The model is
-queried through the Stage 5 ``lang_act`` prompt convention and only workspace
-state is carried between turns; the Mamba sequence state is recomputed per
-turn, as in the training/evaluation code.
+queried through the Stage 5 ``lang_act`` prompt convention. Semantic-workspace
+checkpoints use their annotated slot interface; parallel-dense checkpoints use
+plain token IDs and carry latent workspace state between turns. Mamba sequence
+state is recomputed per turn, as in the training/evaluation code.
 """
 
 from __future__ import annotations
@@ -116,6 +117,15 @@ class LanguageChat:
     ):
         self.rnn = loaded.rnn
         self.output_proj = loaded.output_proj
+        self.parallel_dense = bool(loaded.config.get("workspace_parallel_dense", False))
+        self.teacher_forced_answers = bool(
+            loaded.config.get("workspace_teacher_forced_answers", False)
+        )
+        if getattr(self.rnn, "modulation_head", None) is not None:
+            warmup_steps = int(loaded.config.get("modulation_alpha_warmup_steps", 0))
+            self.rnn.modulation_head.alpha_scale = min(
+                1.0, loaded.step / max(1, warmup_steps)
+            )
         self.device = device
         self.tk = _lang_text.tokenizer()
         self.state = None
@@ -127,7 +137,7 @@ class LanguageChat:
         self.last_trace: dict = {}
         self.seeded_facts: list[tuple[str, str]] = []
         self.rnn.workspace_eval_bypass = False
-        if getattr(self.rnn, "allocator", None) is not None:
+        if not self.parallel_dense and getattr(self.rnn, "allocator", None) is not None:
             # Routing is opt-in: the training run used label-authoritative
             # addresses, so allocator-routed inference is an explicit probe.
             self.rnn.allocator_use_prob = 1.0 if allocator_routing else 0.0
@@ -166,6 +176,12 @@ class LanguageChat:
             is_stop = cleaned in _STOPS or not cleaned
             source_ok = not is_stop
             copy_mask.extend([source_ok] * len(pieces))
+            if self.parallel_dense:
+                # Dense workspace addresses are learned from token context;
+                # this model has no semantic entity-ID write interface.
+                ids.extend([-1] * len(pieces))
+                writes.extend([False] * len(pieces))
+                continue
             previously_known = cleaned in self.entity_keys
             key = self._key_for(cleaned) if not is_stop else -1
             # Training annotates one semantic address per word, at its final
@@ -185,23 +201,29 @@ class LanguageChat:
                 f"input is {len(tokens)} tokens; Stage 5 supports at most {_MAX_SEQUENCE}"
             )
         x = torch.tensor(tokens, dtype=torch.long, device=self.device).unsqueeze(0)
-        eids = torch.tensor(entity_ids, dtype=torch.long, device=self.device).unsqueeze(0)
-        wm = torch.tensor(write_mask, dtype=torch.bool, device=self.device).unsqueeze(0)
         hx = _clone_tree(state) if state is not None else (None, None, None)
-        output, new_state = self.rnn(
-            x,
-            hx,
-            reset_experience=state is None,
-            pass_through_memory=True,
-            entity_ids=eids,
-            entity_write_mask=wm,
-            # The training collator supplies these labels for annotated
-            # entity mentions. In chat, the lexical key map gives us the
-            # corresponding observed mentions, so carry their contextual
-            # features into the same match-key state used by slot readout.
-            workspace_match_entity_ids=eids,
-            workspace_match_write_mask=eids.ge(0),
-        )
+        if self.parallel_dense:
+            output, new_state = self.rnn(
+                x,
+                hx,
+                reset_experience=state is None,
+                pass_through_memory=True,
+            )
+        else:
+            eids = torch.tensor(entity_ids, dtype=torch.long, device=self.device).unsqueeze(0)
+            wm = torch.tensor(write_mask, dtype=torch.bool, device=self.device).unsqueeze(0)
+            output, new_state = self.rnn(
+                x,
+                hx,
+                reset_experience=state is None,
+                pass_through_memory=True,
+                entity_ids=eids,
+                entity_write_mask=wm,
+                # In legacy semantic workspaces, map observed mentions into
+                # the slot readout's match-key state.
+                workspace_match_entity_ids=eids,
+                workspace_match_write_mask=eids.ge(0),
+            )
         features = output.transpose(0, 1).contiguous()
         logits = self.output_proj(features).float()
         answer_mask = torch.zeros(x.shape, dtype=torch.float32, device=self.device)
@@ -219,7 +241,7 @@ class LanguageChat:
             device=self.device,
         )
         source_ids = x
-        if getattr(self.rnn, "workspace_slot_readout_enabled", False):
+        if not self.parallel_dense and getattr(self.rnn, "workspace_slot_readout_enabled", False):
             logits = self.rnn.apply_slot_readout(
                 logits,
                 features,
@@ -240,8 +262,9 @@ class LanguageChat:
         write_at: dict[int, int] = {}
         entity_ids_by_name = {name: i for i, name in enumerate(names)}
         self.entity_keys.clear()
-        for name, key in entity_ids_by_name.items():
-            self.entity_keys[name] = key
+        if not self.parallel_dense:
+            for name, key in entity_ids_by_name.items():
+                self.entity_keys[name] = key
         for i, (name, place) in enumerate(zip(names, places)):
             sentence = [name, "is", "in", "the", place + "."]
             base = len(words)
@@ -252,7 +275,10 @@ class LanguageChat:
             pieces = list(self.tk.word(word))
             body.extend(pieces)
             key = write_at.get(wi)
-            if key is None:
+            if self.parallel_dense:
+                body_ids.extend([-1] * len(pieces))
+                body_writes.extend([False] * len(pieces))
+            elif key is None:
                 entity = entity_ids_by_name.get(word.strip(_PUNCT), -1)
                 body_ids.extend(
                     [-1] * (len(pieces) - 1) + [entity] if entity >= 0 else [-1] * len(pieces)
@@ -292,7 +318,7 @@ class LanguageChat:
             prior_state = _clone_tree(self.state)
         generated: list[int] = []
         chosen_probabilities: list[float] = []
-        final_state = None
+        emitted_eos = False
         for _ in range(self.max_new_tokens):
             # Training keeps one ANSWER input at the first answer position,
             # then teacher-forces the preceding gold token at each later
@@ -303,10 +329,10 @@ class LanguageChat:
             ids = base_ids + [-1] * len(answer_prefix)
             writes = base_writes + [False] * len(answer_prefix)
             self.last_trace["copy_mask"] = base_copy + [False] * len(answer_prefix)
-            logits, candidate_state = self._forward(tokens, ids, writes, prior_state)
-            final_state = candidate_state
+            logits, _ = self._forward(tokens, ids, writes, prior_state)
             next_token = int(logits.argmax(-1).item())
             if next_token == EOS:
+                emitted_eos = True
                 break
             if next_token < 0 or next_token >= self.tk.total:
                 # Stage 5 answers may contain typed MR/control tokens, but the
@@ -316,8 +342,25 @@ class LanguageChat:
                 token_log_probability = logits[next_token] - torch.logsumexp(logits, dim=-1)
                 chosen_probabilities.append(float(token_log_probability.exp().item()))
             generated.append(next_token)
-        if final_state is not None:
-            self.state = final_state
+        # A following training segment receives the state produced by the
+        # previous episode's complete input sequence. With the default
+        # unforced-answer policy, those answer positions are ANSWER placeholders;
+        # when teacher forcing was enabled, they contain the preceding gold
+        # answer tokens. Rebuild that carry state rather than persisting the
+        # generated text, which training never fed back into later turns.
+        answer_positions = len(generated) + int(emitted_eos)
+        if answer_positions:
+            if self.teacher_forced_answers:
+                carry_answer_inputs = [ANSWER] + generated[: max(0, answer_positions - 1)]
+            else:
+                carry_answer_inputs = [ANSWER] * answer_positions
+            carry_tokens = base_tokens + carry_answer_inputs
+            carry_ids = base_ids + [-1] * len(carry_answer_inputs)
+            carry_writes = base_writes + [False] * len(carry_answer_inputs)
+            self.last_trace["copy_mask"] = base_copy + [False] * len(carry_answer_inputs)
+            _carry_logits, self.state = self._forward(
+                carry_tokens, carry_ids, carry_writes, prior_state
+            )
         answer_text = self.tk.decode(generated).strip()
         if self.answer_diagnostics:
             content_words = [
@@ -354,6 +397,15 @@ class LanguageChat:
         slot_state = self.state[0].get("_initium_workspace_state")
         if slot_state is None:
             print("Checkpoint returned no carried workspace state.")
+            return
+        if self.parallel_dense:
+            norms = slot_state[0].float().norm(dim=-1)
+            shown = sorted(
+                enumerate(norms.tolist()), key=lambda item: item[1], reverse=True
+            )[:40]
+            print(f"Parallel workspace slot-value norms (top {len(shown)}):")
+            for slot_index, norm in shown:
+                print(f"  slot={slot_index:03d} value_norm={norm:.4g}")
             return
         address_dim = self.rnn.workspace._address_dim
         address = slot_state[:, :, :address_dim]
@@ -404,6 +456,14 @@ def parse_args(argv=None):
             "checking vocabulary size; tokenizer identity cannot be proven"
         ),
     )
+    parser.add_argument(
+        "--tokenizer-dir",
+        default=None,
+        help=(
+            "directory containing the exact training-time manifest.json and spm.model; "
+            "the checkpoint tokenizer hash is still verified"
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -417,21 +477,31 @@ def main(argv=None):
         raise SystemExit("checkpoint must be trained on workspace-capability lang_all/lang_stage5")
     if not config.get("split_graph_enabled"):
         raise SystemExit("Stage 5 language chat requires a split-graph checkpoint")
-    if not config.get("workspace_token_id_input") or not config.get("workspace_slot_readout"):
-        raise SystemExit(
-            "checkpoint must include Stage 5 token-ID input and workspace slot readout"
-        )
-    if not config.get("workspace_semantic_entity_addressing"):
-        raise SystemExit("checkpoint must use semantic entity addressing")
-    if int(config.get("workspace_semantic_entity_count", 64)) != 128:
-        raise SystemExit("checkpoint must use the Stage 5 128-key semantic workspace")
-    if int(config.get("workspace_num_slots", 0)) < 128:
-        raise SystemExit("checkpoint must have at least 128 workspace slots")
+    if not config.get("workspace_token_id_input"):
+        raise SystemExit("Stage 5 language chat requires token-ID input")
+    parallel_dense = bool(config.get("workspace_parallel_dense", False))
+    if parallel_dense:
+        if int(config.get("workspace_num_slots", 0)) < 1:
+            raise SystemExit("parallel dense workspace checkpoint must have at least one slot")
+        if args.allocator_routing:
+            raise SystemExit("--allocator-routing applies only to semantic workspace checkpoints")
+    else:
+        if not config.get("workspace_slot_readout"):
+            raise SystemExit(
+                "checkpoint must include either parallel dense workspace or semantic slot readout"
+            )
+        if not config.get("workspace_semantic_entity_addressing"):
+            raise SystemExit("checkpoint must use semantic entity addressing")
+        if int(config.get("workspace_semantic_entity_count", 64)) != 128:
+            raise SystemExit("checkpoint must use the Stage 5 128-key semantic workspace")
+        if int(config.get("workspace_num_slots", 0)) < 128:
+            raise SystemExit("checkpoint must have at least 128 workspace slots")
     device = torch.device(args.device or ("cuda:0" if torch.cuda.is_available() else "cpu"))
     loaded = load_model(
         ckpt,
         device,
         allow_legacy_tokenizer_manifest_mismatch=args.allow_legacy_tokenizer_manifest_mismatch,
+        language_tokenizer_dir=args.tokenizer_dir,
     )
     chat = LanguageChat(
         loaded,
@@ -442,12 +512,13 @@ def main(argv=None):
     )
     print(
         f"Loaded {loaded.run_id} step={loaded.step} on {device}; "
-        "Stage 5 lang_act chat probe. This is a closed-task model, not an open-domain LM."
+        "Stage 5 language chat probe. This is a closed-task model, not an open-domain LM."
     )
     if args.seed_world:
         chat.seed_world()
     print(
-        "Commands: /help /seed /reset /slots /facts /trace /allocator on|off /bypass on|off /quit"
+        "Commands: /help /seed /reset /slots /facts /trace /bypass on|off /quit"
+        + ("" if parallel_dense else " /allocator on|off")
     )
     if args.answer_diagnostics:
         print(

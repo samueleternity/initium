@@ -226,6 +226,21 @@ def _build_split_graph(c: _Cfg, input_dim, hidden, nr_cells, cell_size, read_hea
         workspace_enabled=c.get("workspace_enabled", cc.WORKSPACE_ENABLED),
         workspace_num_slots=c.get("workspace_num_slots", cc.WORKSPACE_NUM_SLOTS),
         workspace_token_id_input=c.get("workspace_token_id_input", False),
+        workspace_parallel_dense=c.get("workspace_parallel_dense", False),
+        workspace_block_index=c.get("workspace_block_index", 1),
+        workspace_key_dim=c.get("workspace_key_dim", 64),
+        workspace_scan_chunk=c.get("workspace_scan_chunk", 32),
+        workspace_parallel_moe_feed=c.get("workspace_parallel_moe_feed", False),
+        modulation_route_code=c.get("modulation_route_code", False),
+        modulation_enabled=c.get("modulation_enabled", False),
+        modulation_targets=tuple(c.get("modulation_targets", ("dt",))),
+        modulation_blocks=tuple(c.get("modulation_blocks", (3,))),
+        modulation_source=c.get("modulation_source", "workspace"),
+        modulation_rank=c.get("modulation_rank", 32),
+        modulation_alphas=c.get("modulation_alphas", None),
+        modulation_lambda=c.get("modulation_lambda", 0.0),
+        modulation_temporal_lambda=c.get("modulation_temporal_lambda", 0.0),
+        modulation_meta_responsiveness=c.get("modulation_meta_responsiveness", False),
         workspace_slot_readout=c.get("workspace_slot_readout", False),
         workspace_semantic_entity_count=c.get("workspace_semantic_entity_count", 64),
         workspace_allocator=c.get("workspace_allocator", False),
@@ -302,6 +317,7 @@ def load_model(
     deterministic_write: bool = False,
     *,
     allow_legacy_tokenizer_manifest_mismatch: bool = False,
+    language_tokenizer_dir: str | None = None,
 ) -> LoadedModel:
     raw = ckpt["model_config"]
     c = _Cfg(raw)
@@ -336,15 +352,24 @@ def load_model(
     if link_mode != "dense":
         patch_link_matrix(rnn, mode=link_mode, topk=raw.get("link_matrix_topk"))
 
-    # The language slot-text decoder is partly tied to the input token
-    # embedding. Its column manifest must be installed before loading weights,
-    # otherwise the workspace state is incomplete and cannot reproduce the
-    # training-time readout.
-    if raw.get("workspace_slot_readout") and isinstance(rnn, SplitGraphDNC):
-        from initium.data.workspace_capability.episode import TEXT_BASE
-        from initium.data.workspace_capability.lang_dataset import LanguageDataset
+    # Language checkpoints use a checkpoint-specific SentencePiece tokenizer.
+    # Validate it for token-ID models even without the legacy semantic
+    # slot-text readout (for example, a parallel dense workspace).
+    if isinstance(rnn, SplitGraphDNC) and (
+        raw.get("workspace_slot_readout") or raw.get("workspace_token_id_input")
+    ):
         from initium.data.workspace_capability.tracks import _lang_text
 
+        if language_tokenizer_dir is not None:
+            from pathlib import Path
+
+            tokenizer_dir = Path(language_tokenizer_dir).expanduser().resolve()
+            if not tokenizer_dir.is_dir():
+                raise FileNotFoundError(
+                    f"language tokenizer directory does not exist: {tokenizer_dir}"
+                )
+            _lang_text.DATA_DIR = tokenizer_dir
+            _lang_text.tokenizer.cache_clear()
         stage5 = int(raw.get("workspace_semantic_entity_count", 64)) == 128
         _lang_text.configure(stage5=stage5)
         expected_tokenizer_hash = raw.get("workspace_lang_tokenizer_sha256")
@@ -353,7 +378,9 @@ def load_model(
             if actual_tokenizer_hash != expected_tokenizer_hash:
                 raise ValueError(
                     "language checkpoint SentencePiece model mismatch: "
-                    f"checkpoint={expected_tokenizer_hash} local={actual_tokenizer_hash}"
+                    f"checkpoint={expected_tokenizer_hash} local={actual_tokenizer_hash}. "
+                    "Restore the matching manifest.json and spm.model, or pass their "
+                    "directory with --tokenizer-dir."
                 )
             expected_vocab_size = raw.get("workspace_lang_tokenizer_vocab_size")
             if (
@@ -372,7 +399,7 @@ def load_model(
             actual_manifest = _lang_text.manifest_sha256()
             if not expected_manifest:
                 raise ValueError(
-                    "language slot-readout checkpoint has neither a tokenizer hash "
+                    "language checkpoint has neither a tokenizer hash "
                     "nor a legacy corpus-manifest hash"
                 )
             if (
@@ -388,6 +415,8 @@ def load_model(
                     "the tokenizer is the same."
                 )
             if actual_manifest != expected_manifest:
+                from initium.data.workspace_capability.episode import TEXT_BASE
+
                 local_vocab_size = _lang_text.tokenizer_vocab_size()
                 output_vocab_size = int(ckpt["output_proj_state_dict"]["weight"].shape[0])
                 if local_vocab_size + TEXT_BASE != output_vocab_size:
@@ -400,25 +429,28 @@ def load_model(
                     "[inference] WARNING: accepting a legacy corpus-manifest mismatch "
                     "after vocabulary-size validation; tokenizer identity is not proven"
                 )
-        columns = LanguageDataset.slot_text_columns()
-        import hashlib
+        if raw.get("workspace_slot_readout"):
+            from initium.data.workspace_capability.lang_dataset import LanguageDataset
 
-        column_hash = hashlib.sha256(
-            ",".join(str(int(token)) for token in columns).encode("ascii")
-        ).hexdigest()
-        expected_hash = raw.get("workspace_slot_text_columns_sha256")
-        if expected_hash and column_hash != expected_hash:
-            raise ValueError(
-                "language slot-text columns differ from the checkpoint manifest; "
-                "use the Stage 5 tokenizer/code revision used for training"
-            )
-        expected_count = raw.get("workspace_slot_text_columns_count")
-        if expected_count is not None and len(columns) != int(expected_count):
-            raise ValueError(
-                f"language slot-text column count mismatch: checkpoint={expected_count}, local={len(columns)}"
-            )
-        assert rnn.workspace is not None
-        rnn.workspace.enable_slot_text(columns, tied_input_embedding=True)
+            columns = LanguageDataset.slot_text_columns()
+            import hashlib
+
+            column_hash = hashlib.sha256(
+                ",".join(str(int(token)) for token in columns).encode("ascii")
+            ).hexdigest()
+            expected_hash = raw.get("workspace_slot_text_columns_sha256")
+            if expected_hash and column_hash != expected_hash:
+                raise ValueError(
+                    "language slot-text columns differ from the checkpoint manifest; "
+                    "use the Stage 5 tokenizer/code revision used for training"
+                )
+            expected_count = raw.get("workspace_slot_text_columns_count")
+            if expected_count is not None and len(columns) != int(expected_count):
+                raise ValueError(
+                    f"language slot-text column count mismatch: checkpoint={expected_count}, local={len(columns)}"
+                )
+            assert rnn.workspace is not None
+            rnn.workspace.enable_slot_text(columns, tied_input_embedding=True)
 
     w = ckpt["output_proj_state_dict"]["weight"]
     output_proj = nn.Linear(w.shape[1], w.shape[0]).to(device)

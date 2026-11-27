@@ -359,11 +359,37 @@ process metrics remain in that file as well.
 ### Combined all-task run
 
 For focused Stage 5 language training, use `--workspace-task-track lang-stage5`.
-It selects the Stage 5 tracks (`lang_parse`, `lang_define`, `lang_induce`,
-`lang_logic`, `lang_discourse`, `lang_act`, and `lang_nlu_external` when its
+It selects the Stage 5 tracks (`lang_parse`, `lang_define`, `lang_induce_pws`,
+`lang_logic_pws`, `lang_discourse`, `lang_act`, and `lang_nlu_external` when its
 corpus is installed). Each selected track has its own curriculum lesson, so a
 weak track does not hold back promotion of the others. Existing `lang_all`
 behavior remains the full available language-track mixture.
+
+`lang_all` and `lang-stage5` use `lang_induce_pws`, a visible-context induction
+variant. Its first lesson presents two distinct noun-to-entity bindings in
+every episode and asks for one of them. Promotion evaluation balances the two
+target entities so a constant-label predictor cannot benefit from an uneven
+sample. Its demonstrations and query stay in one sequence, letting the
+backbone use its normal recurrent context instead of requiring cross-segment
+workspace retrieval. Later lessons add relation labels and structured single
+subject/relation/object questions before full ordered outputs and harder
+entity/relation/order combinations. The `lang_nlg` curriculum introduces
+retelling with one fact before growing the output, while `lang_define` keeps
+one invented noun through its early lessons. These tracks use a
+token-level continuation loss at each `MARK_R` value cue
+(`--language-induction-binding-loss-weight`, default `0.5`) and does not require
+semantic workspace keys. Progression reports per-entity-target accuracy and
+predicted entity-label counts to expose label collapse. The original
+semantic-key induction control remains available as
+`--workspace-task-track lang_induce` for standalone runs and is excluded from
+both combined language selectors.
+
+The combined selectors use `lang_logic_pws` as well. It presents each premise
+and derived proof fact as explicit sequence tokens, with shallow rule families
+introduced before deeper chains. Its answer uses a compact proof-fact trace,
+and progression measures verdict accuracy and proof-fact accuracy separately.
+The original `lang_logic` generator remains available for standalone control
+runs and is excluded from both combined selectors.
 
 For a Stage-5-focused run that must retain Stage-4 capabilities, use
 `--workspace-task-track lang_all` and omit

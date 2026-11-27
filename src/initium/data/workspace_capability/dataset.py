@@ -810,12 +810,30 @@ class WorkspaceCapabilityDataset(BaseDataset):
             track_episode_start = len(episodes)
             required = self._curriculum_groups(track, track_level)
             counts = {group: 0 for group in required}
+            balance_induction_targets = track == "lang_induce_pws" and track_level == 0
+            target_quota = {
+                0: (episodes_per_group + 1) // 2,
+                1: episodes_per_group // 2,
+            }
+            target_counts = {group: {0: 0, 1: 0} for group in required}
             attempts = 0
             max_attempts = max(256, len(required) * episodes_per_group * 64)
             while any(counts[group] < episodes_per_group for group in required):
                 if attempts >= max_attempts:
                     missing = {
-                        group: episodes_per_group - count
+                        group: {
+                            "total": episodes_per_group - count,
+                            **(
+                                {
+                                    f"target_{target}": target_quota[target]
+                                    - target_counts[group][target]
+                                    for target in (0, 1)
+                                    if target_counts[group][target] < target_quota[target]
+                                }
+                                if balance_induction_targets
+                                else {}
+                            ),
+                        }
                         for group, count in counts.items()
                         if count < episodes_per_group
                     }
@@ -835,9 +853,25 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 episode = self._make_episode(track, track_level, rng)
                 group = str(episode.metadata.get("progression_group", "all"))
                 attempts += 1
-                if group in counts and counts[group] < episodes_per_group:
+                target = episode.metadata.get("induction_eval_entity_target")
+                target = int(target) if target is not None else -1
+                target_is_needed = (
+                    not balance_induction_targets
+                    or (
+                        group in target_counts
+                        and target in (0, 1)
+                        and target_counts[group][target] < target_quota[target]
+                    )
+                )
+                if (
+                    group in counts
+                    and counts[group] < episodes_per_group
+                    and target_is_needed
+                ):
                     episodes.append(episode)
                     counts[group] += 1
+                    if balance_induction_targets:
+                        target_counts[group][target] += 1
         return episodes
 
     def evaluate_curriculum_id(self, model, device, lesson_idx, *, field_log=None):
@@ -3455,6 +3489,9 @@ class WorkspaceCapabilityDataset(BaseDataset):
         logic_quality_totals: dict[tuple[str, str], list[int]] = defaultdict(
             lambda: [0, 0, 0, 0, 0, 0]
         )
+        logic_proof_totals: dict[tuple[str, str], list[int]] = defaultdict(
+            lambda: [0, 0, 0, 0, 0, 0]
+        )
         query_type_totals: dict[tuple[str, str], list[int]] = defaultdict(lambda: [0, 0, 0, 0])
         gnw_process_totals: dict[tuple[str, str], list[int]] = defaultdict(
             lambda: [0, 0, 0, 0, 0, 0]
@@ -4283,7 +4320,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
                             (n_correct / max(n_answers, 1), bool(exact))
                         )
                         progression_group = str(episode.metadata.get("progression_group", "all"))
-                        if episode.track == "lang_logic":
+                        if episode.track in ("lang_logic", "lang_logic_pws"):
                             verdict_len = max(
                                 0, min(int(episode.metadata.get("verdict_len", 0)), n_answers)
                             )
@@ -4291,6 +4328,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
                                 quality = logic_quality_totals[(episode.track, progression_group)]
                                 quality[0] += int(pred[:verdict_len] == expected[:verdict_len])
                                 quality[1] += 1
+                            if episode.track == "lang_logic" and verdict_len:
                                 justification = expected[verdict_len:]
                                 predicted_justification = pred[verdict_len:]
                                 quality[2] += sum(
@@ -4301,6 +4339,43 @@ class WorkspaceCapabilityDataset(BaseDataset):
                                 if justification:
                                     quality[4] += int(predicted_justification == justification)
                                     quality[5] += 1
+                            elif episode.track == "lang_logic_pws":
+                                proof_start = max(
+                                    verdict_len,
+                                    min(int(episode.metadata.get("proof_start", verdict_len)), n_answers),
+                                )
+                                step_lengths = tuple(
+                                    max(0, int(length))
+                                    for length in episode.metadata.get(
+                                        "proof_step_token_lengths", ()
+                                    )
+                                )
+                                proof_length = min(sum(step_lengths), n_answers - proof_start)
+                                proof_expected = expected[proof_start : proof_start + proof_length]
+                                proof_predicted = pred[proof_start : proof_start + proof_length]
+                                proof_counts = logic_proof_totals[(episode.track, progression_group)]
+                                offset = 0
+                                for length in step_lengths:
+                                    step_length = min(length, proof_length - offset)
+                                    if step_length <= 0:
+                                        break
+                                    proof_counts[0] += int(
+                                        proof_predicted[offset : offset + step_length]
+                                        == proof_expected[offset : offset + step_length]
+                                    )
+                                    proof_counts[1] += 1
+                                    offset += step_length
+                                proof_counts[2] += sum(
+                                    int(a == b)
+                                    for a, b in zip(proof_predicted, proof_expected)
+                                )
+                                proof_counts[3] += len(proof_expected)
+                                if step_lengths:
+                                    proof_counts[4] += int(
+                                        proof_predicted == proof_expected
+                                        and proof_length == sum(step_lengths)
+                                    )
+                                    proof_counts[5] += 1
                         if episode.track == "rule_switching" and bool(
                             getattr(model, "workspace_rule_feedback_update_enabled", False)
                         ):
@@ -4648,12 +4723,30 @@ class WorkspaceCapabilityDataset(BaseDataset):
             group_metrics.update(
                 verdict_exact_match=100.0 * counts[0] / max(counts[1], 1),
                 verdict_episodes=int(counts[1]),
-                justification_token_accuracy=(
-                    100.0 * counts[2] / counts[3] if counts[3] else 100.0
+            )
+            if track == "lang_logic":
+                group_metrics.update(
+                    justification_token_accuracy=(
+                        100.0 * counts[2] / counts[3] if counts[3] else 100.0
+                    ),
+                    justification_exact_match=(
+                        100.0 * counts[4] / counts[5] if counts[5] else 100.0
+                    ),
+                    justification_tokens=int(counts[3]),
+                    justification_episodes=int(counts[5]),
+                )
+        for (track, group), counts in logic_proof_totals.items():
+            group_metrics = (
+                diagnostics["progression_groups"].setdefault(track, {}).setdefault(group, {})
+            )
+            group_metrics.update(
+                proof_fact_accuracy=(100.0 * counts[0] / max(counts[1], 1)),
+                proof_facts=int(counts[1]),
+                proof_token_accuracy=(100.0 * counts[2] / counts[3] if counts[3] else 100.0),
+                proof_trace_exact_match=(
+                    100.0 * counts[4] / counts[5] if counts[5] else 100.0
                 ),
-                justification_exact_match=(100.0 * counts[4] / counts[5] if counts[5] else 100.0),
-                justification_tokens=int(counts[3]),
-                justification_episodes=int(counts[5]),
+                proof_trace_episodes=int(counts[5]),
             )
         if gnw_process_totals:
             signatures = {}
@@ -5259,11 +5352,19 @@ class WorkspaceCapabilityDataset(BaseDataset):
             for group, metrics in sorted(groups.items()):
                 quality_text = ""
                 if "verdict_exact_match" in metrics:
-                    quality_text = (
-                        f" verdict={metrics['verdict_exact_match']:.1f}%"
-                        f" rationale_token={metrics['justification_token_accuracy']:.1f}%"
-                        f" rationale_exact={metrics['justification_exact_match']:.1f}%"
-                    )
+                    if "proof_fact_accuracy" in metrics:
+                        quality_text = (
+                            f" verdict={metrics['verdict_exact_match']:.1f}%"
+                            f" proof_fact={metrics['proof_fact_accuracy']:.1f}%"
+                            f" proof_trace_exact={metrics['proof_trace_exact_match']:.1f}%"
+                            f" proof_token={metrics['proof_token_accuracy']:.1f}%"
+                        )
+                    else:
+                        quality_text = (
+                            f" verdict={metrics['verdict_exact_match']:.1f}%"
+                            f" rationale_token={metrics['justification_token_accuracy']:.1f}%"
+                            f" rationale_exact={metrics['justification_exact_match']:.1f}%"
+                        )
                 print(
                     f"    [{track}{level_text}/{group}] exact={metrics['exact_match']:.1f}% "
                     f"answer={metrics['accuracy']:.1f}%{quality_text} n={metrics['episodes']}"

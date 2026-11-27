@@ -201,7 +201,7 @@ class LanguageDataset(WorkspaceCapabilityDataset):
 
     @staticmethod
     def _split_context_query(episode):
-        """Train context-only workspace carry for tasks whose facts and query shared one stream."""
+        """Split selected tasks to train context-only workspace carry."""
         markers = {
             "lang_template": {TASK_QA, TASK_RETELL, TASK_PARA},
             "lang_nlg": {TASK_RETELL, TASK_T2D},
@@ -209,6 +209,7 @@ class LanguageDataset(WorkspaceCapabilityDataset):
             "lang_define": {TASK_QA},
             "lang_induce": {l5.TASK_S2MR, l5.TASK_MR2S},
             "lang_logic": {l5.TASK_LOGIC},
+            lt.LANG_PWS_LOGIC: {l5.TASK_LOGIC},
         }.get(episode.track)
         if not markers or episode.metadata.get("prev"):
             return episode
@@ -233,6 +234,7 @@ class LanguageDataset(WorkspaceCapabilityDataset):
             "workspace_query_reads",
             "workspace_match_writes",
             "workspace_binding_aux",
+            "language_induction_binding_aux",
         )
         for field in position_fields:
             vals = episode.metadata.get(field, ())
@@ -704,6 +706,7 @@ class LanguageDataset(WorkspaceCapabilityDataset):
                 "workspace_event_writes",
                 "workspace_query_reads",
                 "workspace_binding_aux",
+                "language_induction_binding_aux",
             ):
                 for row in metadata.get(field, ()):
                     value = int(row[-1])
@@ -725,6 +728,10 @@ class LanguageDataset(WorkspaceCapabilityDataset):
         preds, clar = self._last_eval_preds, [*ltr._toks(["who", "do", "you", "mean?"]), EOS]
         acc: dict[str, list[int]] = defaultdict(lambda: [0, 0])
         induce_positions: dict[int, list[int]] = defaultdict(lambda: [0, 0])
+        induce_kinds: dict[str, list[int]] = defaultdict(lambda: [0, 0])
+        induce_entity_targets: dict[int, list[int]] = defaultdict(lambda: [0, 0])
+        induce_entity_predictions: dict[str, int] = defaultdict(int)
+        induce_entity_confusions: dict[tuple[int, str], int] = defaultdict(int)
         induce_eos = [0, 0]
         act_positions: dict[tuple[str, int], list[int]] = defaultdict(lambda: [0, 0])
         act_eos: dict[str, list[int]] = defaultdict(lambda: [0, 0])
@@ -740,19 +747,42 @@ class LanguageDataset(WorkspaceCapabilityDataset):
                 a = acc[f"coref_dist_{min(m['coref_dist'], 6)}"]
                 a[0] += ok
                 a[1] += 1
-            if e.track == "lang_logic":
+            if e.track in ("lang_logic", lt.LANG_PWS_LOGIC):
                 a = acc[f"derivation_depth_{m.get('depth', 0)}"]
                 a[0] += ok
                 a[1] += 1
-            if e.track == "lang_induce":
+            if e.track in ("lang_induce", lt.LANG_PWS_INDUCE):
+                answer_kinds = m.get("induction_answer_kinds", ())
                 for position, target in enumerate(e.answer):
                     if target == EOS:
                         induce_eos[0] += int(position < len(p) and p[position] == target)
                         induce_eos[1] += 1
                         continue
                     counts = induce_positions[position]
-                    counts[0] += int(position < len(p) and p[position] == target)
+                    correct = int(position < len(p) and p[position] == target)
+                    counts[0] += correct
                     counts[1] += 1
+                    if e.track == lt.LANG_PWS_INDUCE and position < len(answer_kinds):
+                        answer_kind = str(answer_kinds[position])
+                        if answer_kind in ("entity", "relation"):
+                            kind_counts = induce_kinds[answer_kind]
+                            kind_counts[0] += correct
+                            kind_counts[1] += 1
+                        if answer_kind == "entity" and ENTITY_BASE <= int(target) < (
+                            ENTITY_BASE + ENTITY_COUNT
+                        ):
+                            target_entity = int(target) - ENTITY_BASE
+                            target_counts = induce_entity_targets[target_entity]
+                            target_counts[0] += correct
+                            target_counts[1] += 1
+                            if position < len(p) and ENTITY_BASE <= int(p[position]) < (
+                                ENTITY_BASE + ENTITY_COUNT
+                            ):
+                                predicted_entity = str(int(p[position]) - ENTITY_BASE)
+                            else:
+                                predicted_entity = "other"
+                            induce_entity_predictions[predicted_entity] += 1
+                            induce_entity_confusions[(target_entity, predicted_entity)] += 1
             if e.track in ("lang_parse", "lang_define"):
                 group = str(m.get("progression_group", "all"))
                 for position, target in enumerate(e.answer):
@@ -794,6 +824,42 @@ class LanguageDataset(WorkspaceCapabilityDataset):
                 "accuracy_pct": 100.0 * induce_eos[0] / induce_eos[1],
                 "episodes": induce_eos[1],
             }
+        out.update(
+            {
+                f"induce_pws_{kind}_binding_accuracy": {
+                    "accuracy_pct": 100.0 * correct / max(count, 1),
+                    "episodes": count,
+                }
+                for kind, (correct, count) in sorted(induce_kinds.items())
+            }
+        )
+        out.update(
+            {
+                f"induce_pws_entity_target_{target}_accuracy": {
+                    "accuracy_pct": 100.0 * correct / max(count, 1),
+                    "episodes": count,
+                }
+                for target, (correct, count) in sorted(induce_entity_targets.items())
+            }
+        )
+        out.update(
+            {
+                f"induce_pws_entity_prediction_{prediction}_count": {
+                    "count": count,
+                    "targets": count,
+                }
+                for prediction, count in sorted(induce_entity_predictions.items())
+            }
+        )
+        out.update(
+            {
+                f"induce_pws_entity_target_{target}_prediction_{prediction}_count": {
+                    "count": count,
+                    "targets": count,
+                }
+                for (target, prediction), count in sorted(induce_entity_confusions.items())
+            }
+        )
         out.update(
             {
                 f"act_answer_position_{act}_{position}": {
@@ -967,7 +1033,11 @@ class LanguageDataset(WorkspaceCapabilityDataset):
             # The hardest track also needs enough updates to learn its binding
             # operation. Capping it below the ordinary ceiling caused its low
             # exact score to persist while it received less training.
-            cap_scale = 3.0 if track == "lang_induce" else (1.5 if track in stalled else 3.0)
+            cap_scale = (
+                3.0
+                if track in ("lang_induce", lt.LANG_PWS_INDUCE, lt.LANG_PWS_LOGIC)
+                else (1.5 if track in stalled else 3.0)
+            )
             self._track_weights[track] = min(weight, max(0.05, cap_scale * median))
         sampled_steps = dict(self._track_optimizer_step_counts)
         sampled_episodes = dict(self._track_sampled_episode_counts)
@@ -1031,14 +1101,20 @@ class LanguageDataset(WorkspaceCapabilityDataset):
                         (
                             "induce_answer_position_",
                             "induce_eos_accuracy",
+                            "induce_pws_",
                             "act_answer_position_",
                             "act_eos_accuracy_",
                         )
                     ):
                         print(
-                            f"  [lang/progression/{key}] "
-                            f"accuracy={values.get('accuracy_pct', values.get('exact_pct', 0.0)):.1f}% "
-                            f"n={values.get('episodes', 0)}"
+                            (
+                                f"  [lang/progression/{key}] count={values['count']} "
+                                f"n={values.get('targets', 0)}"
+                                if "count" in values
+                                else f"  [lang/progression/{key}] "
+                                f"accuracy={values.get('accuracy_pct', values.get('exact_pct', 0.0)):.1f}% "
+                                f"n={values.get('episodes', 0)}"
+                            )
                         )
             except (RuntimeError, ValueError, KeyError) as exc:
                 print(f"[lang-progression-diagnostics] skipped: {exc!r}")

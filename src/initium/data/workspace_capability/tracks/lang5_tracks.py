@@ -9,7 +9,10 @@ from __future__ import annotations
 from contextlib import contextmanager
 
 from initium.data.workspace_capability.episode import (
+    ENTITY_BASE,
+    MARK_O,
     MARK_R,
+    MARK_S,
     SEP,
     SPK_SYS,
     SPK_USER,
@@ -62,6 +65,7 @@ class Ep5(lg.Ep):
         super().__init__(marker, annotate)
         self.nc = self.clock = self.evict = self.evc = 0
         self.binding_aux: list[tuple[int, int]] = []
+        self.language_binding_aux: list[tuple[int, int]] = []
         self.match_writes: list[tuple[int, int]] = []
         self.closed = set()  # entities already answered about and not re-mentioned: recycled first
         self.last = {}
@@ -171,10 +175,20 @@ class Ep5(lg.Ep):
             if ctx:
                 self.evw.append((pos, k, self.piece(m[1])))
 
-    def bind_surface(self, ws, bindings, *, write=True, aux=False, match_key=False):
+    def bind_surface(
+        self,
+        ws,
+        bindings,
+        *,
+        write=True,
+        aux=False,
+        match_key=False,
+        language_aux=False,
+        language_aux_indices=None,
+    ):
         """Attach an oracle concept key and typed value to each mapped surface word."""
         sp = self._enc(ws)
-        if not self.ann:
+        if not self.ann and not language_aux:
             return
         for i, word in enumerate(ws):
             binding = bindings.get(word.strip(lg.PUNCT))
@@ -182,6 +196,12 @@ class Ep5(lg.Ep):
                 continue
             key, target = binding
             pos = self._pos(ws, sp, i)
+            if language_aux and (
+                language_aux_indices is None or i in language_aux_indices
+            ):
+                self.language_binding_aux.append((pos, int(target)))
+            if not self.ann:
+                continue
             if match_key and write is False:
                 self.match_writes.append((pos, int(key)))
             self.addr.append((pos, int(key), bool(write)))
@@ -190,12 +210,14 @@ class Ep5(lg.Ep):
             elif aux:
                 self.binding_aux.append((pos, int(target)))
 
-    def bind_mr(self, values, bindings, *, write=True, semantic_bindings=None):
+    def bind_mr(self, values, bindings, *, write=True, semantic_bindings=None, language_aux=False):
         """Append typed MR tokens and annotate their reverse lexical bindings."""
         for value in values:
             pos = len(self.t)
             self.t.append(int(value))
             binding = bindings.get(int(value))
+            if binding is not None and language_aux:
+                self.language_binding_aux.append((pos, int(binding[1])))
             if binding is None or not self.ann:
                 pass
             else:
@@ -262,6 +284,8 @@ class Ep5(lg.Ep):
     def done(self, track, answer, qtype, group, kind="text", **meta):
         if self.binding_aux:
             meta.setdefault("workspace_binding_aux", tuple(self.binding_aux))
+        if self.language_binding_aux:
+            meta.setdefault("language_induction_binding_aux", tuple(self.language_binding_aux))
         if self.match_writes:
             meta.setdefault("workspace_match_writes", tuple(self.match_writes))
         if track in ("lang_parse", "lang_define", "lang_logic", "lang_induce", "lang_act"):
@@ -290,6 +314,13 @@ class Ep5(lg.Ep):
             evictions=self.evict,
             closed_evictions=self.evc,
             **meta,
+        )
+
+    def supervise_language_continuation(self, targets):
+        """Supervise the next-token logits that predict a visible typed continuation."""
+        start = len(self.t) - 1
+        self.language_binding_aux.extend(
+            (start + offset, int(target)) for offset, target in enumerate(targets)
         )
 
 
@@ -439,7 +470,7 @@ def _g_define(cfg, rng):
 
 
 # ---------------------------------------------------------------- 5c induce
-def _g_induce(cfg, rng):
+def _g_induce_impl(cfg, rng, *, pws_oriented=False):
     grp, held = lt.sample_group(cfg, rng), bool(cfg["combos"])
     na, pa = cfg["rules"] >= 2 or held, cfg["rules"] >= 3 or held
     order_count = max(1, min(3, int(cfg.get("orders", 3))))
@@ -449,8 +480,11 @@ def _g_induce(cfg, rng):
     order, rem = divmod(c, 4)
     negpos, plupos = divmod(rem, 2)
     n = cfg["nouns"]
-    W = pseudo(rng, n + 5)
-    N, V, NP, PP = W[:n], W[n : n + 3], W[n + 3], W[n + 4]
+    relation_count = max(1, int(cfg.get("relations", 3))) if pws_oriented else 3
+    W = pseudo(rng, n + relation_count + 2)
+    N = W[:n]
+    V = W[n : n + relation_count]
+    NP, PP = W[n + relation_count], W[n + relation_count + 1]
     surface_to_semantic = {
         **{word: (48 + i, entity_token(i)) for i, word in enumerate(N)},
         **{word: (112 + i, relation_token(i)) for i, word in enumerate(V)},
@@ -500,7 +534,7 @@ def _g_induce(cfg, rng):
         ex.append(
             (
                 perm[i % n],
-                i % 3,
+                i % len(V),
                 rng.randrange(n),
                 na and (i == 0 or rng.random() < 0.35),
                 pa and (i == 1 or rng.random() < 0.35),
@@ -517,7 +551,9 @@ def _g_induce(cfg, rng):
         )
         if q not in ex:
             break
-    ep = Ep5(8)
+    # The PWS variant learns only from the visible sequence and token-level
+    # prediction targets; it deliberately emits no semantic workspace labels.
+    ep = Ep5(8, annotate=not pws_oriented)
     for e in ex:
         ws, mr = build(*e)
         # The pseudo-word's MR identity is not knowable at the word position.
@@ -525,6 +561,8 @@ def _g_induce(cfg, rng):
         # when the corresponding typed MR token is observed.
         ep.bind_surface(ws, surface_to_semantic, write=False, match_key=True)
         ep.ctl(MARK_R)
+        if pws_oriented:
+            ep.supervise_language_continuation(mr)
         ep.bind_mr(mr, mr_to_surface, write=True, semantic_bindings=semantic_by_token)
         ep.ctl(TURN_END)
     ws, mr = build(*q)
@@ -534,24 +572,168 @@ def _g_induce(cfg, rng):
         # binding auxiliary. The pseudo-words are episode-local, so the model
         # must resolve each surface form from the in-context demonstrations;
         # supervising its semantic slot key gives the read path that target.
-        ep.bind_surface(ws, surface_to_semantic, write=False, aux=True, match_key=True)
+        ep.bind_surface(
+            ws,
+            surface_to_semantic,
+            write=False,
+            aux=not pws_oriented,
+            match_key=not pws_oriented,
+            language_aux=pws_oriented,
+        )
         ans, kind = mr, "mr"
         output_keys = tuple(semantic_output_key.get(int(t), -1) for t in mr) + (-1,)
     else:
         ep.ctl(TASK_MR2S)
-        ep.bind_mr(mr, mr_to_surface, write=False)
+        ep.bind_mr(mr, mr_to_surface, write=False, language_aux=pws_oriented)
         ans, kind = _toks(ws), "text"
         output_keys = ep.output_keys(ws, surface_output_key)
+    metadata = dict(
+        heldout_combo=held,
+        grammar_checked=False,
+    )
+    if pws_oriented:
+        entity_targets = {entity_token(i) for i in range(n)}
+        relation_targets = {relation_token(i) for i in range(len(V))}
+        metadata["induction_answer_kinds"] = tuple(
+            "entity"
+            if int(token) in entity_targets
+            else "relation"
+            if int(token) in relation_targets
+            else "other"
+            for token in ans
+        )
+    else:
+        metadata.update(
+            workspace_output_keys=output_keys,
+            workspace_output_kv_targets=tuple(ans),
+        )
     return ep.done(
-        "lang_induce",
+        "lang_induce_pws" if pws_oriented else "lang_induce",
         ans,
         f"{grp}_c{c}",
         grp,
         kind=kind,
-        heldout_combo=held,
+        **metadata,
+    )
+
+
+def _g_induce(cfg, rng):
+    return _g_induce_impl(cfg, rng)
+
+
+def _g_induce_pws(cfg, rng):
+    if int(cfg.get("binding_stage", 3)) < 3:
+        return _g_induce_pws_binding(cfg, rng)
+    return _g_induce_impl(cfg, rng, pws_oriented=True)
+
+
+def _g_induce_pws_binding(cfg, rng):
+    """Teach structured lexical bindings before sentence roles and full outputs."""
+    noun_count = max(2, int(cfg["nouns"]))
+    stage = int(cfg.get("binding_stage", 1))
+    relation_count = 0 if stage <= 1 else max(1, int(cfg.get("relations", 1)))
+    words = pseudo(rng, noun_count + relation_count)
+    nouns, relations = words[:noun_count], words[noun_count:]
+    if stage == 0:
+        # Start with a contrastive pair: both entity classes are present in
+        # every context, and the query asks for one of the demonstrated keys.
+        # This makes success depend on retrieving the matching binding rather
+        # than learning a global preference for one entity token.
+        nouns = nouns[:2]
+        surface_to_semantic = {
+            nouns[0]: entity_token(0),
+            nouns[1]: entity_token(1),
+        }
+    else:
+        surface_to_semantic = {
+            **{word: entity_token(i) for i, word in enumerate(nouns)},
+            **{word: relation_token(i) for i, word in enumerate(relations)},
+        }
+    answer_kind_by_word = {
+        **{word: "entity" for word in nouns},
+        **{word: "relation" for word in relations},
+    }
+    ep = Ep5(8, annotate=False)
+    bindings = {
+        word: (i, target) for i, (word, target) in enumerate(surface_to_semantic.items())
+    }
+    mapping_examples = list(surface_to_semantic.items())
+    for _repeat in range(max(1, int(cfg.get("mapping_repeats", 1)))):
+        rng.shuffle(mapping_examples)
+        for word, target in mapping_examples:
+            ep.ctl(MARK_S)
+            ep.bind_surface([word], bindings, write=False)
+            ep.ctl(MARK_R)
+            ep.supervise_language_continuation((target,))
+            ep.ctl(int(target), TURN_END)
+
+    ep.ctl(TASK_S2MR)
+    if stage <= 1:
+        query_word = rng.choice(nouns)
+        ep.ctl(MARK_S)
+        ep.bind_surface(
+            [query_word],
+            bindings,
+            write=False,
+        )
+        ep.ctl(MARK_R)
+        ep.supervise_language_continuation((surface_to_semantic[query_word],))
+        answer_words = [query_word]
+        answer_kinds = (answer_kind_by_word[query_word],)
+        heldout_combo = False
+    elif stage == 2:
+        subject, verb, obj = (
+            rng.randrange(noun_count),
+            rng.randrange(relation_count),
+            rng.randrange(noun_count),
+        )
+        sentence_words = [nouns[subject], relations[verb], nouns[obj] + "."]
+        role = rng.choice(("subject", "relation", "object"))
+        role_index = {"subject": 0, "relation": 1, "object": 2}[role]
+        query_word = sentence_words[role_index]
+        for marker, word in zip((MARK_S, MARK_R, MARK_O), sentence_words):
+            ep.ctl(marker)
+            ep.bind_surface([word], bindings, write=False)
+        role_marker = (MARK_S, MARK_R, MARK_O)[role_index]
+        ep.ctl(role_marker)
+        ep.supervise_language_continuation(
+            (surface_to_semantic[query_word.strip(lg.PUNCT)],)
+        )
+        answer_words = [query_word]
+        answer_kinds = (answer_kind_by_word[query_word.strip(lg.PUNCT)],)
+        heldout_combo = True
+    else:
+        subject, verb, obj = (
+            rng.randrange(noun_count),
+            rng.randrange(relation_count),
+            rng.randrange(noun_count),
+        )
+        ep.ctl(MARK_S)
+        ep.bind_surface([nouns[subject]], bindings, write=False, language_aux=True)
+        ep.ctl(MARK_R)
+        ep.bind_surface([relations[verb]], bindings, write=False, language_aux=True)
+        ep.ctl(MARK_O)
+        ep.bind_surface([nouns[obj]], bindings, write=False, language_aux=True)
+        query_words = [nouns[subject], relations[verb], nouns[obj] + "."]
+        answer_words = query_words
+        answer_kinds = tuple(answer_kind_by_word[word.strip(lg.PUNCT)] for word in query_words)
+        heldout_combo = True
+    answer_tokens = [surface_to_semantic[word.strip(lg.PUNCT)] for word in answer_words]
+    return ep.done(
+        "lang_induce_pws",
+        answer_tokens,
+        f"ind_s2mr_binding_stage{stage}",
+        "ind_s2mr",
+        kind="mr",
+        heldout_combo=heldout_combo,
         grammar_checked=False,
-        workspace_output_keys=output_keys,
-        workspace_output_kv_targets=tuple(ans),
+        binding_stage=stage,
+        induction_answer_kinds=answer_kinds,
+        **(
+            {"induction_eval_entity_target": int(answer_tokens[0]) - ENTITY_BASE}
+            if stage == 0
+            else {}
+        ),
     )
 
 
@@ -562,7 +744,7 @@ def _join(parts):
     return out
 
 
-def _g_logic(cfg, rng):
+def _g_logic_impl(cfg, rng, *, pws_oriented=False):
     grp, d = lt.sample_group(cfg, rng), max(1, int(cfg["depth"]))
     C, pl, art = pseudo(rng, d + 3), lg.plural, lg.art
     x = rng.choice(lg.NAMES)
@@ -644,16 +826,33 @@ def _g_logic(cfg, rng):
     for i in range(min(cfg["distractors"], 5, max(0, 15 - 2 * d))):
         prem.append(inst(others[i], C[d + 2]))
     rng.shuffle(prem)
-    ep = Ep5(9)
+    ep = Ep5(9, annotate=not pws_oriented)
+
+    def commit_fact(fact):
+        if not pws_oriented:
+            ep._commit(*fact)
+            return
+        subject, relation, obj = fact
+        # PWS receives the predicate/state representation as ordinary visible
+        # tokens rather than through semantic entity-keyed workspace writes.
+        ep.ctl(
+            MARK_S,
+            *ep.tk.word(subject),
+            MARK_R,
+            _rel_tok(relation),
+            MARK_O,
+            *ep.tk.word(obj),
+        )
+
     for ws, f in prem:
         ep.manual(ws, surf)
-        ep._commit(*f)
+        commit_fact(f)
     ep.ctl(TASK_LOGIC)
     ep.manual(q, surf, ctx=False)
     for (
         f
     ) in derived:  # derivation scaffold: placeholder tokens whose slots must hold the derived facts
-        ep._commit(*f)
+        commit_fact(f)
     plural_forms = {pl(category) for category in C}
     key_by_word = {
         word: ep.ent.get(binding[0], -1)
@@ -661,20 +860,65 @@ def _g_logic(cfg, rng):
         if word not in plural_forms
     }
     # Verdict correctness and rationale fidelity are different capabilities.
-    # Abstention phrases and counting answers are complete verdicts; yes/no
-    # answers place the verdict in the first token and cite premises after it.
+    # The PWS variant emits a compact structured proof trace instead of asking
+    # the model to reproduce a variable-length natural-language citation.
     verdict_len = len(ans) if ans[0] not in ("yes,", "no,") else 1
-    return ep.done(
-        "lang_logic",
-        _toks(ans),
-        f"{grp}_d{d}",
-        grp,
+    answer_tokens = _toks(ans)
+    metadata = dict(
         grammar_checked=False,
         depth=d,
         verdict_len=verdict_len,
-        workspace_output_keys=ep.output_keys(ans, key_by_word),
-        workspace_output_kv_targets=tuple(_toks(ans)),
     )
+    answer_kind = "text"
+    if pws_oriented:
+        proof_facts = list(derived) if derived else [fact for _sentence, fact in prem]
+        if not derived:
+            proof_facts.sort(key=lambda fact: (str(fact[0]), int(fact[1]), str(fact[2])))
+        proof_steps = []
+        for subject, relation, obj in proof_facts:
+            proof_steps.append(
+                (
+                    MARK_S,
+                    *ep.tk.word(subject),
+                    MARK_R,
+                    _rel_tok(relation),
+                    MARK_O,
+                    *ep.tk.word(obj),
+                )
+            )
+        # Measure verdict tokens after SentencePiece encoding, then supervise a
+        # deterministic sequence of explicit proof facts.
+        verdict_len = len(_toks(ans[:1])) if ans[0] in ("yes,", "no,") else len(answer_tokens)
+        verdict_tokens = _toks(ans[:1]) if ans[0] in ("yes,", "no,") else answer_tokens
+        answer_tokens = [*verdict_tokens, *(token for fact in proof_steps for token in fact)]
+        metadata.update(
+            verdict_len=verdict_len,
+            logic_proof_trace=True,
+            proof_start=verdict_len,
+            proof_step_token_lengths=tuple(len(fact) for fact in proof_steps),
+        )
+        answer_kind = "mr"
+    else:
+        metadata.update(
+            workspace_output_keys=ep.output_keys(ans, key_by_word),
+            workspace_output_kv_targets=tuple(_toks(ans)),
+        )
+    return ep.done(
+        "lang_logic_pws" if pws_oriented else "lang_logic",
+        answer_tokens,
+        f"{grp}_d{d}",
+        grp,
+        kind=answer_kind,
+        **metadata,
+    )
+
+
+def _g_logic(cfg, rng):
+    return _g_logic_impl(cfg, rng)
+
+
+def _g_logic_pws(cfg, rng):
+    return _g_logic_impl(cfg, rng, pws_oriented=True)
 
 
 # ---------------------------------------------------------------- 5e/5f shared world
@@ -991,7 +1235,9 @@ GENERATORS = {
     "lang_parse": _g_parse,
     "lang_define": _g_define,
     "lang_induce": _g_induce,
+    "lang_induce_pws": _g_induce_pws,
     "lang_logic": _g_logic,
+    "lang_logic_pws": _g_logic_pws,
     "lang_discourse": _g_discourse,
     "lang_act": _g_act,
     "lang_nlu_external": _g_nlu,

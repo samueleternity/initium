@@ -24,10 +24,25 @@ LANG_SINGLE = (
     "lang_act",
     "lang_nlu_external",
 )
-LANG_V5_TRACKS = LANG_SINGLE[6:]
+LANG_PWS_INDUCE = "lang_induce_pws"
+LANG_PWS_LOGIC = "lang_logic_pws"
+LANG_ALL_TRACKS = tuple(
+    {
+        "lang_induce": LANG_PWS_INDUCE,
+        "lang_logic": LANG_PWS_LOGIC,
+    }.get(track, track)
+    for track in LANG_SINGLE
+)
+LANG_V5_TRACKS = LANG_ALL_TRACKS[6:]
 LANG_V5_SELECTOR = "lang_stage5"
 RETIRED = ("lang_open",)
-LANG_TRACK_NAMES = (*LANG_SINGLE, "lang_all", LANG_V5_SELECTOR)
+LANG_TRACK_NAMES = (
+    *LANG_SINGLE,
+    LANG_PWS_INDUCE,
+    LANG_PWS_LOGIC,
+    "lang_all",
+    LANG_V5_SELECTOR,
+)
 DATA_DIR = Path(__file__).resolve().parent.parent / "stage4"
 EXTERNAL_FILES = {
     "nlg": "nlg.jsonl",
@@ -92,7 +107,7 @@ def ext_available(name):
 def available_tracks():
     return tuple(
         t
-        for t in LANG_SINGLE
+        for t in LANG_ALL_TRACKS
         if t not in RETIRED
         and (
             t != "lang_nlu_external" or all(ext_available(n) for n in ("nlu_triples", "nli", "qa"))

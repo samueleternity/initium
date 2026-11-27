@@ -1370,6 +1370,7 @@ def run(
     neuromod_combine: tuple[str, ...] = (),
     eval_earlier_lessons: bool = False,
     neuromod_retention_control: bool = False,
+    language_induction_binding_loss_weight: float = 0.5,
 ):
     original_run_id = run_id
     progression_eval_only = bool(workspace_progression_eval_only)
@@ -1514,6 +1515,11 @@ def run(
         raise ValueError("workspace_retrieval_value_loss_weight must be finite and >= 0")
     if not math.isfinite(workspace_key_value_loss_weight) or workspace_key_value_loss_weight < 0:
         raise ValueError("workspace_key_value_loss_weight must be finite and >= 0")
+    if (
+        not math.isfinite(language_induction_binding_loss_weight)
+        or language_induction_binding_loss_weight < 0
+    ):
+        raise ValueError("language_induction_binding_loss_weight must be finite and >= 0")
     if workspace_operation_executor and not (
         workspace_key_value_loss_weight > 0
         and workspace_enabled
@@ -4888,6 +4894,10 @@ def run(
         extra_model_config["workspace_key_value_loss_weight"] = float(
             workspace_key_value_loss_weight
         )
+    if language_induction_binding_loss_weight > 0 and getattr(dataset, "_lang_ready", False):
+        extra_model_config["language_induction_binding_loss_weight"] = float(
+            language_induction_binding_loss_weight
+        )
     if workspace_operation_executor:
         extra_model_config["workspace_operation_executor"] = True
     if sgr_prediction_enabled:
@@ -6229,16 +6239,40 @@ def run(
 
         language_answer_positions_cpu = None
         language_sparse_positions_cpu = None
+        language_induction_binding_aux_targets_cpu = None
+        output_dim = int(getattr(dataset, "output_dim", 0))
+        batch_examples = getattr(dataset, "last_batch_examples", ())
+        if (
+            language_induction_binding_loss_weight > 0
+            and getattr(dataset, "_lang_ready", False)
+            and any(
+                episode.metadata.get("language_induction_binding_aux")
+                for episode in batch_examples
+            )
+        ):
+            language_induction_binding_aux_targets_cpu = torch.full(
+                answer_mask.shape, -100, dtype=torch.long
+            )
         if language_sparse_projection:
             language_answer_positions_cpu = answer_mask.bool().nonzero(as_tuple=False)
             sparse_mask_cpu = answer_mask.bool().clone()
-            output_dim = int(getattr(dataset, "output_dim", 0))
-            for row, episode in enumerate(dataset.last_batch_examples):
-                input_limit = min(input_seq.shape[1], len(episode.inputs))
+        for row, episode in enumerate(batch_examples):
+            input_limit = min(input_seq.shape[1], len(episode.inputs))
+            if language_sparse_projection:
                 for position, target_id in episode.metadata.get("workspace_binding_aux", ()):
                     position, target_id = int(position), int(target_id)
                     if 0 <= position < input_limit and 0 <= target_id < output_dim:
                         sparse_mask_cpu[row, position] = True
+            for position, target_id in episode.metadata.get(
+                "language_induction_binding_aux", ()
+            ):
+                position, target_id = int(position), int(target_id)
+                if 0 <= position < input_limit and 0 <= target_id < output_dim:
+                    if language_sparse_projection:
+                        sparse_mask_cpu[row, position] = True
+                    if language_induction_binding_aux_targets_cpu is not None:
+                        language_induction_binding_aux_targets_cpu[row, position] = target_id
+        if language_sparse_projection:
             language_sparse_positions_cpu = sparse_mask_cpu.nonzero(as_tuple=False)
 
         workspace_forward_kwargs = {}
@@ -6834,6 +6868,31 @@ def run(
                 if sparse_positions is not None
                 else dataset.loss(output, target_digits, answer_mask)
             )
+            language_induction_binding_loss = None
+            if language_induction_binding_aux_targets_cpu is not None:
+                aux_targets = language_induction_binding_aux_targets_cpu.to(
+                    device, non_blocking=True
+                )
+                aux_positions = language_induction_binding_aux_targets_cpu.ge(0).nonzero(
+                    as_tuple=False
+                )
+                if aux_positions.shape[0] > 0:
+                    aux_positions = aux_positions.to(device, non_blocking=True)
+                    aux_rows, aux_times = aux_positions[:, 0], aux_positions[:, 1]
+                    if sparse_positions is not None:
+                        sparse_index = torch.full(
+                            aux_targets.shape, -1, device=device, dtype=torch.long
+                        )
+                        sparse_index[
+                            sparse_positions[:, 0], sparse_positions[:, 1]
+                        ] = torch.arange(sparse_positions.shape[0], device=device)
+                        aux_logits = output[sparse_index[aux_rows, aux_times]]
+                    else:
+                        aux_logits = output[aux_rows, aux_times]
+                    language_induction_binding_loss = nn.functional.cross_entropy(
+                        aux_logits,
+                        aux_targets[aux_rows, aux_times],
+                    ).to(dtype=task_loss.dtype)
             if workspace_key_value_loss_weight > 0:
                 assert key_value_metadata is not None
                 workspace_key_value_loss = dataset.workspace_key_value_loss(
@@ -7288,6 +7347,11 @@ def run(
             + (
                 workspace_key_value_loss_weight * workspace_key_value_loss
                 if workspace_key_value_loss is not None
+                else 0.0
+            )
+            + (
+                language_induction_binding_loss_weight * language_induction_binding_loss
+                if language_induction_binding_loss is not None
                 else 0.0
             )
             + beta_eff * kl_loss
@@ -10731,6 +10795,16 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--language-induction-binding-loss-weight",
+        type=float,
+        default=0.5,
+        metavar="WEIGHT",
+        help=(
+            "Auxiliary token-level prediction loss for the PWS-oriented language induction "
+            "track; it uses visible sequence context and does not require semantic workspace keys."
+        ),
+    )
+    parser.add_argument(
         "--workspace-operation-executor",
         action="store_true",
         help=(
@@ -11410,7 +11484,9 @@ if __name__ == "__main__":
             "lang_parse",
             "lang_define",
             "lang_induce",
+            "lang_induce_pws",
             "lang_logic",
+            "lang_logic_pws",
             "lang_discourse",
             "lang_act",
             "lang_nlu_external",
@@ -12278,6 +12354,11 @@ if __name__ == "__main__":
         or args.workspace_key_value_loss_weight < 0
     ):
         parser.error("--workspace-key-value-loss-weight must be finite and >= 0")
+    if (
+        not math.isfinite(args.language_induction_binding_loss_weight)
+        or args.language_induction_binding_loss_weight < 0
+    ):
+        parser.error("--language-induction-binding-loss-weight must be finite and >= 0")
     if args.workspace_key_value_loss_weight > 0 and not (
         args.workspace
         and args.workspace_entity_keyed_writes
@@ -13002,6 +13083,7 @@ if __name__ == "__main__":
             workspace_retrieval_exact_readout=args.workspace_retrieval_exact_readout,
             workspace_retrieval_value_loss_weight=args.workspace_retrieval_value_loss_weight,
             workspace_key_value_loss_weight=args.workspace_key_value_loss_weight,
+            language_induction_binding_loss_weight=args.language_induction_binding_loss_weight,
             workspace_operation_executor=args.workspace_operation_executor,
             workspace_operation_diagnostics=args.workspace_operation_diagnostics,
             workspace_exact_value_comparison=args.workspace_exact_value_comparison,

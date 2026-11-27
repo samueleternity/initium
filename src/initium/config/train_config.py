@@ -7,12 +7,13 @@ controller_config.py.
 """
 
 import math
+import os
 
 # ---- Loop / optimisation ----------------------------------------------------
 BATCH_SIZE = 16  # bucketed, so padding waste stays low even >1
 TOTAL_STEPS = 120000
 LOG_EVERY = 100
-EVAL_EVERY = 3000  # curriculum-advance eval cadence
+EVAL_EVERY = 1500  # curriculum-advance eval cadence
 LR = 3e-4
 LR_MIN = 3e-5
 LR_DECAY_STEPS = TOTAL_STEPS  # cosine anneal length. Derived from TOTAL_STEPS here on
@@ -62,3 +63,6 @@ PRIOR_MAX_LOGVAR = math.log(6)  # symmetric ceiling
 # ---- Checkpointing ----------------------------------------------------------
 CHECKPOINT_DIR = "./checkpoints"
 CHECKPOINT_EVERY = 2000  # periodic safety checkpoint, in addition to end-of-run
+
+LR_SCALE = float(os.environ.get("LR_SCALE", "1"))
+BACKBONE_WD = float(os.environ.get("BACKBONE_WD", "0"))

@@ -221,3 +221,4 @@ __marimo__/
 documents/*
 dnc-context/*
 tmp/*
+.tmp/*

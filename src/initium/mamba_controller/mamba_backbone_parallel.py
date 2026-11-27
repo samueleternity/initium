@@ -65,6 +65,7 @@ mamba_controller.py.
 from __future__ import annotations
 
 import os as _os
+from typing import cast
 
 import torch
 import torch.nn as nn
@@ -306,6 +307,89 @@ class _ParallelBlock(nn.Module):
             numeric_observer("mixer_output", mixer_output)
             numeric_observer("residual_branch_after_rms_limit", residual)
         return x.float() + residual
+
+    def forward_modulated(self, x: torch.Tensor, mod: dict):
+        """Mamba-1 block with per-token modulation (values pre-scaled by ModulationHead).
+
+        mod keys (optional): dt (B,L,d_inner) log-mult; a (B,L) log-mult (scalar A-scale);
+        B, C (B,L,d_state) and D (B,L,d_inner) additive offsets. All-zero mod == normal block.
+        """
+        if self.variant != "mamba1" or rearrange is None or selective_scan_fn is None:
+            raise RuntimeError("modulated blocks require Mamba-1 with einops and selective_scan_fn")
+        _F = torch.nn.functional
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            mixer = self.mixer
+            normed = self.norm(x.float())
+            batch, seq, _ = normed.shape
+            xb, z = mixer.in_proj(normed).transpose(1, 2).chunk(2, dim=1)
+            xb = mixer.act(mixer.conv1d(xb)[..., :seq])
+            dtl, Bm, Cm = torch.split(
+                mixer.x_proj(rearrange(xb, "b d l -> (b l) d")),
+                [mixer.dt_rank, mixer.d_state, mixer.d_state],
+                dim=-1,
+            )
+            dt = rearrange(
+                mixer.dt_proj.weight @ dtl.transpose(0, 1), "d (b l) -> b d l", b=batch, l=seq
+            )
+            dt = _F.softplus(dt + mixer.dt_proj.bias.float().view(1, -1, 1))
+            Bm = rearrange(Bm, "(b l) n -> b n l", b=batch, l=seq)
+            Cm = rearrange(Cm, "(b l) n -> b n l", b=batch, l=seq)
+            if mod.get("dt") is not None:
+                dt = dt * torch.exp(mod["dt"]).transpose(1, 2)
+            if mod.get("a") is not None:
+                s = torch.exp(mod["a"]).unsqueeze(
+                    1
+                )  # (b,1,l): A_bar=exp(s*dt*A), B_bar=dt*B unchanged
+                dt = dt * s
+                Bm = Bm / s
+            if mod.get("B") is not None:
+                Bm = Bm * (1 + mod["B"]).transpose(1, 2)
+            if mod.get("C") is not None:
+                Cm = Cm * (1 + mod["C"]).transpose(1, 2)
+            dt = dt.clamp(1e-6, 100.0).contiguous()
+            Bm, Cm = Bm.contiguous(), Cm.contiguous()
+            A = -torch.exp(mixer.A_log.float())
+            if mod.get("D") is not None:
+                y, last = selective_scan_fn(
+                    xb,
+                    dt,
+                    A,
+                    Bm,
+                    Cm,
+                    None,
+                    z=None,
+                    delta_bias=None,
+                    delta_softplus=False,
+                    return_last_state=True,
+                )
+                y = (
+                    y + mixer.D.float().view(1, -1, 1) * (1 + mod["D"]).transpose(1, 2) * xb
+                ) * _F.silu(z)
+            else:
+                y, last = selective_scan_fn(
+                    xb,
+                    dt,
+                    A,
+                    Bm,
+                    Cm,
+                    mixer.D.float(),
+                    z=z,
+                    delta_bias=None,
+                    delta_softplus=False,
+                    return_last_state=True,
+                )
+            y = rearrange(y, "b d l -> b l d")
+            out = _F.linear(
+                y,
+                mixer.out_proj.weight.float(),
+                None if mixer.out_proj.bias is None else mixer.out_proj.bias.float(),
+            )
+        result = x.float() + limit_mixer_residual_rms(out)
+        stats = {
+            "last_state_norm": last.detach().float().flatten(1).norm(dim=1).mean(),
+            "eff_dt_mean": dt.detach().mean(),
+        }
+        return result, stats
 
 
 class MambaBackboneParallel(nn.Module):
@@ -584,6 +668,71 @@ class MambaBackboneParallel(nn.Module):
                 if numeric_observer is not None:
                     numeric_observer("inter_layer_memory.output", h)
         return self.normalize_output(h)
+
+    def forward_with_parallel_workspace(
+        self,
+        x: torch.Tensor,
+        *,
+        workspace,
+        ws_block: int,
+        ws_state: torch.Tensor,
+        token_mask: torch.Tensor | None = None,
+        input_token_ids: torch.Tensor | None = None,
+        input_valid_mask: torch.Tensor | None = None,
+        bypass: bool = False,
+        shuffle_readback: bool = False,
+        modulation_fn=None,
+        mod_blocks=(),
+    ):
+        """Backbone with a dense parallel workspace after block ``ws_block``; blocks in
+        ``mod_blocks`` (all > ws_block) are modulated by ``modulation_fn(h_k, aux)``."""
+        h = self._adapt_input(x, input_token_ids=input_token_ids, input_valid_mask=input_valid_mask)
+        aux: dict = {}
+        mod = None
+        mod_stats: dict = {}
+        routed = route_code = None
+        for i, block in enumerate(self.blocks):
+            if mod is not None and i in mod_blocks:
+                parallel_block = cast(_ParallelBlock, block)
+                h, st = parallel_block.forward_modulated(h, mod[i])
+                for k, v in st.items():
+                    mod_stats[f"b{i}_{k}"] = v
+            else:
+                h = self._run_block(block, h)
+            moe_block = None if self.moe_blocks is None else self.moe_blocks[i]
+            if isinstance(moe_block, MoEBlock):
+                if i == ws_block and getattr(workspace, "moe_feed", False):
+                    moe_result = moe_block(h, return_selected_details=True, token_mask=token_mask)
+                    h, _ex, _ix, _wt = cast(
+                        tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+                        moe_result,
+                    )
+                    routed = (_ex * _wt.unsqueeze(-1).to(_ex.dtype)).sum(
+                        2
+                    ) * moe_block.residual_scale
+                    route_code = torch.zeros(
+                        (*_ix.shape[:2], moe_block.moe.num_experts),
+                        device=_ix.device,
+                        dtype=torch.float32,
+                    ).scatter_add_(2, _ix.long(), _wt.float())
+                else:
+                    h = moe_block(h, token_mask=token_mask)
+            if i == ws_block:
+                delta, ws_state, aux = workspace(
+                    h,
+                    ws_state,
+                    valid_mask=input_valid_mask,
+                    bypass=bypass,
+                    shuffle_readback=shuffle_readback,
+                    routed=routed,
+                )
+                if route_code is not None:
+                    aux["route_code"] = route_code
+                h = h + delta.to(h.dtype)
+                if modulation_fn is not None:
+                    mod = modulation_fn(h, aux)
+        self.last_modulation_stats = mod_stats
+        return self.normalize_output(h), ws_state, aux
 
     def forward_sgr(
         self,

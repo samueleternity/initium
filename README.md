@@ -345,6 +345,23 @@ python -m initium.inference.run_inference path/to/checkpoint.pt --dataset-type g
 
 The loader checks checkpoint/task compatibility and refuses unsupported task types or dimensions. Graph, text, audio, and video task runners are registered; multimodal execution is also represented in the code but its input dimensions depend on the selected modality combination. Verify the checkpoint's recorded dataset configuration before comparing results across task types.
 
+Stage 5 language checkpoints use the interactive `lang_act` probe, which
+supports both semantic slot workspaces and parallel dense workspace
+checkpoints:
+
+```bash
+python -m initium.inference.lang_chat path/to/checkpoint.pt --seed-world
+```
+
+For a parallel dense checkpoint, the probe supplies token IDs without
+semantic entity annotations and carries the learned latent workspace between
+turns. This is a closed-task language probe, not an open-domain language-model
+interface. The generic `run_inference` task registry remains for graph, text,
+audio, video, and multimodal tasks. If the checkpoint reports a SentencePiece
+hash mismatch, provide the training-time directory containing both
+`manifest.json` and `spm.model` with `--tokenizer-dir`; inference verifies the
+checkpoint hash before loading the tokenizer.
+
 ## Experiments and current evidence
 
 The supplied experiment records describe a staged investigation of a KL penalty on DNC memory writes. They are summarized here as results rather than by the names of the individual working files, so this overview can remain useful if those files are renamed or reorganized. -> If anyone wishes to see the original files, you can create an issue and will be contacted afterwards.

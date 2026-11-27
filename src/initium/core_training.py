@@ -36,7 +36,7 @@ import shutil
 import sys
 import time
 from contextlib import contextmanager, nullcontext
-from typing import Any, TextIO
+from typing import Any, TextIO, cast
 
 # Support both ``python -m initium.core_training`` and direct execution of
 # ``src/initium/core_training.py`` from a source checkout.
@@ -114,6 +114,7 @@ from initium.config.controller_config import (
 )
 from initium.config.train_config import (
     AMP_INIT_SCALE,
+    BACKBONE_WD,
     BATCH_SIZE,
     BETA_CTRL_ACC_TARGET,
     BETA_CTRL_EMA_DECAY,
@@ -135,6 +136,7 @@ from initium.config.train_config import (
     LR,
     LR_DECAY_STEPS,
     LR_MIN,
+    LR_SCALE,
     MODEL_CELL_SIZE,
     MODEL_HIDDEN_SIZE,
     MODEL_NR_CELLS,
@@ -188,6 +190,7 @@ from initium.memory_manipulation.stochastic_write_head_v2 import (
     update_all_prior_snapshots,
 )
 from initium.MoE.moe_layer import SwitchMoE, pop_total_moe_aux_loss
+from initium.training.neuromodulator import Neuromodulator
 from initium.workspace.broadcast import WorkspaceBroadcast
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -568,6 +571,9 @@ def save_checkpoint(
     split_graph_variant=SPLIT_GRAPH_MAMBA_VARIANT,
     extra_model_config=None,
     sgr_prediction_decoder=None,
+    neuromod_state=None,
+    consolidation_state=None,
+    retention_state=None,
 ):
     """Save everything needed to resume training or re-run eval later:
     - model + output-projection + optimizer state
@@ -745,6 +751,9 @@ def save_checkpoint(
         "prior_state": get_prior_state(stochastic_heads),  # v5 (Phase 2)
         "ood_rng_state": ood_rng.getstate(),  # v6
         "dynamic_n_state": dynamic_n_state,  # Dynamic-N (macro-scale); None if not dynamic_n_mode
+        "neuromod_state": neuromod_state,
+        "consolidation_state": consolidation_state,
+        "retention_state": retention_state,
         "rng_state": {
             "python": random.getstate(),
             "numpy": np.random.get_state(),
@@ -914,9 +923,39 @@ def load_frozen_workspace_warm_start(
         "dnc_compile_memory",  # exact execution optimization; state-dict compatible
         "dnc_link_sharpness",  # parameter-free read-addressing experiment
         "dnc_allocation_topk",  # parameter-free allocation experiment
-        "batch_size",  # training hyperparameter, not model architecture
+        "batch_size",
+        "workspace_parallel_dense",
+        "workspace_block_index",
+        "workspace_key_dim",
+        "workspace_scan_chunk",
+        "workspace_parallel_moe_feed",
+        "modulation_route_code",
+        "modulation_enabled",
+        "modulation_targets",
+        "modulation_blocks",
+        "modulation_source",
+        "modulation_rank",
+        "modulation_alphas",
+        "modulation_lambda",
+        "modulation_temporal_lambda",
+        "modulation_alpha_warmup_steps",
+        "modulation_meta_responsiveness",
         "bf16",  # training precision; state-dict-compatible
         "workspace_length_bucket_microbatches",  # batching policy
+        "neuromod_mode",
+        "neuromod_range",
+        "neuromod_every",
+        "neuromod_slew",
+        "neuromod_groups",
+        "neuromod_seed",
+        "neuromod_consolidation_lambda",
+        "neuromod_loss_outlier_gating",
+        "neuromod_prediction_error_gating",
+        "neuromod_gate_kappa",
+        "neuromod_prediction_beta",
+        "neuromod_combine",
+        "eval_earlier_lessons",
+        "neuromod_retention_control",
     }
     missing_config = sorted(
         key
@@ -1126,6 +1165,21 @@ def _host_memory_snapshot_mb() -> tuple[float | None, float | None, float | None
         return None, None, None
 
 
+def assign_group(name: str) -> str:
+    """Map each named trainable parameter to its controller/LR group."""
+    if name.startswith(("rnn.workspace.adaptive_v3.", "rnn.workspace.adaptive_v4.")):
+        return "adaptive_v3"
+    if name.startswith(("rnn.modulation_head.", "rnn.parallel_workspace.modulation_head.")):
+        return "modulation"
+    if name.startswith(("output_proj.", "output_norm.", "rnn.output_norm.")):
+        return "task_head"
+    if name.startswith(("rnn.workspace.", "rnn.parallel_workspace.")):
+        return "workspace"
+    if ".moe_blocks." in name or name.startswith("rnn.moe_blocks.") or ".moe." in name:
+        return "moe"
+    return "backbone"
+
+
 def run(
     beta_target: float,
     run_id: str,
@@ -1313,6 +1367,40 @@ def run(
     workspace_allocator: bool = False,
     workspace_allocator_anneal_steps: int = 20_000,
     workspace_allocator_label_addresses_only: bool = False,
+    workspace_parallel_dense: bool = False,
+    workspace_block_index: int = 1,
+    workspace_key_dim: int = 64,
+    workspace_scan_chunk: int = 32,
+    modulation_enabled: bool = False,
+    modulation_targets: tuple = ("dt",),
+    modulation_blocks: tuple = (3,),
+    modulation_source: str = "workspace",
+    modulation_rank: int = 32,
+    modulation_alphas: dict | None = None,
+    modulation_lambda: float = 0.0,
+    modulation_temporal_lambda: float = 0.0,
+    modulation_lr_scale: float = 1.0,
+    workspace_probe_loss_weight: float = 0.0,
+    workspace_lr_scale: float = 1.0,
+    modulation_alpha_warmup_steps: int = 3000,
+    workspace_parallel_moe_feed: bool = False,
+    modulation_route_code: bool = False,
+    eval_modulation_mode: str = "checkpoint",
+    neuromod: str = "off",
+    neuromod_range: float = 2.0,
+    neuromod_every: int = 50,
+    neuromod_slew: float = 0.05,
+    neuromod_groups: tuple[str, ...] = ("backbone", "moe", "workspace", "modulation", "task_head"),
+    neuromod_seed: int = 0,
+    neuromod_consolidation_lambda: float = 0.1,
+    neuromod_loss_outlier_gating: bool = False,
+    neuromod_prediction_error_gating: bool = False,
+    neuromod_gate_kappa: float = 2.0,
+    neuromod_prediction_beta: float = 0.5,
+    neuromod_combine: tuple[str, ...] = (),
+    eval_earlier_lessons: bool = False,
+    neuromod_retention_control: bool = False,
+    language_induction_binding_loss_weight: float = 0.5,
 ):
     original_run_id = run_id
     progression_eval_only = bool(workspace_progression_eval_only)
@@ -1326,6 +1414,48 @@ def run(
         )
     if log_every <= 0:
         raise ValueError("log_every must be positive")
+    _valid_nm_arms = {"lr", "plasticity", "gate", "responsiveness", "consolidation", "random"}
+    neuromod_arms = set(neuromod_combine)
+    if neuromod != "off":
+        neuromod_arms.add(neuromod)
+    unknown_nm_arms = neuromod_arms - _valid_nm_arms
+    if unknown_nm_arms:
+        raise ValueError(f"unknown neuromodulator arms: {sorted(unknown_nm_arms)}")
+    if "random" in neuromod_arms and len(neuromod_arms) > 1:
+        raise ValueError(
+            "random multipliers are a signal-free control and cannot be combined with other arms"
+        )
+    nm_controller_mode = (
+        "plasticity"
+        if "plasticity" in neuromod_arms
+        else "lr"
+        if "lr" in neuromod_arms
+        else "consolidation"
+        if "consolidation" in neuromod_arms
+        else "random"
+        if "random" in neuromod_arms
+        else "off"
+    )
+    nm_consolidation_enabled = "consolidation" in neuromod_arms
+    nm_gate_enabled = "gate" in neuromod_arms
+    nm_responsiveness_enabled = "responsiveness" in neuromod_arms
+    nm_run_tag = "+".join(sorted(neuromod_arms)) if neuromod_arms else "off"
+    if nm_responsiveness_enabled and not modulation_enabled:
+        raise ValueError("neuromod responsiveness requires the modulation head")
+    if neuromod_prediction_error_gating and sgr_prediction_loss_weight <= 0:
+        raise ValueError("prediction-error gating requires --sgr-pred-loss-weight > 0")
+    if neuromod_prediction_error_gating and (neuromod_loss_outlier_gating or nm_gate_enabled):
+        raise ValueError(
+            "prediction-error gating is a separate N3 arm; do not combine it with loss or gradient gating"
+        )
+    if neuromod_gate_kappa <= 0.0:
+        raise ValueError("neuromod gate kappa must be positive")
+    if not 0.0 <= neuromod_prediction_beta <= 0.5:
+        raise ValueError("prediction-error beta must be in [0, 0.5]")
+    if neuromod_retention_control and (
+        not eval_earlier_lessons or "plasticity" not in neuromod_arms
+    ):
+        raise ValueError("retention control requires plasticity mode and --eval-earlier-lessons")
     if bf16 and fp32:
         raise ValueError("--bf16 and --fp32 are mutually exclusive")
     if bf16 and (device.type != "cuda" or not torch.cuda.is_bf16_supported()):
@@ -1363,10 +1493,6 @@ def run(
             "Stage 5 lang tracks and lang_all use keys up to 127: pass --workspace-semantic-entity-count 128 --workspace-num-slots 128"
         )
     if str(workspace_task_track).replace("-", "_") in _lang_text.LANG_TRACK_NAMES:
-        if sgr_prediction_loss_weight > 0:
-            raise ValueError(
-                "language tracks forbid next-token prediction loss (Stage 5 hard rule 1)"
-            )
         if workspace_task_track == "lang_open" and not eval_only:
             raise ValueError("lang_open is retired from training (eval-only probe)")
     if workspace_allocator and (
@@ -1427,6 +1553,11 @@ def run(
         raise ValueError("workspace_retrieval_value_loss_weight must be finite and >= 0")
     if not math.isfinite(workspace_key_value_loss_weight) or workspace_key_value_loss_weight < 0:
         raise ValueError("workspace_key_value_loss_weight must be finite and >= 0")
+    if (
+        not math.isfinite(language_induction_binding_loss_weight)
+        or language_induction_binding_loss_weight < 0
+    ):
+        raise ValueError("language_induction_binding_loss_weight must be finite and >= 0")
     if workspace_operation_executor and not (
         workspace_key_value_loss_weight > 0
         and workspace_enabled
@@ -1576,6 +1707,45 @@ def run(
         )
     if memory_type != "dnc" and not split_graph_enabled:
         raise ValueError("non-DNC memory types require --split-graph")
+    if workspace_parallel_dense:
+        if (
+            workspace_enabled
+            or workspace_compile_recurrence
+            or workspace_gate_variant != "continuous"
+            or workspace_entity_keyed_writes
+            or workspace_semantic_entity_addressing
+        ):
+            raise ValueError(
+                "--workspace-parallel-dense excludes --workspace, compiled recurrence, "
+                "bistable gating and keyed/semantic addressing"
+            )
+        if (
+            not split_graph_enabled
+            or split_graph_variant != "mamba1"
+            or memory_type != "none"
+            or workspace_block_index < 0
+            or split_graph_num_blocks <= workspace_block_index + 1
+        ):
+            raise ValueError(
+                "--workspace-parallel-dense requires --split-graph mamba1, --memory-type none "
+                "and --split-graph-num-blocks > --workspace-block-index + 1"
+            )
+        if min(workspace_num_slots, workspace_key_dim, workspace_scan_chunk) < 1:
+            raise ValueError("parallel workspace slots/key-dim/scan-chunk must be positive")
+    if (workspace_parallel_moe_feed or modulation_route_code) and not (
+        workspace_parallel_dense
+        and moe_enabled
+        and split_graph_moe_placement in ("all", "backbone")
+    ):
+        raise ValueError(
+            "MoE feed / route-code modulation require --workspace-parallel-dense and backbone MoE"
+        )
+    if modulation_route_code and not (
+        workspace_parallel_moe_feed and modulation_enabled and modulation_source == "workspace"
+    ):
+        raise ValueError(
+            "--mod-route-code requires --workspace-parallel-moe-feed, --modulation and --mod-source workspace"
+        )
     if split_graph_backbone_only and memory_type != "dnc":
         raise ValueError("--split-graph-backbone-only cannot be combined with a memory module")
     if memory_type != "dnc" and dynamic_n_mode:
@@ -2186,8 +2356,23 @@ def run(
         and checkpoint_config.get("workspace_gate_variant", "continuous") == "continuous"
         and not eval_only
     )
+    modulation_warm_start = bool(
+        resume_requested
+        and not eval_only
+        and (
+            (
+                modulation_enabled
+                and not any(k.startswith("modulation_head.") for k in checkpoint_state)
+            )
+            or (
+                workspace_parallel_moe_feed
+                and not any(k.startswith("parallel_workspace.Wm.") for k in checkpoint_state)
+            )
+        )
+    )
     workspace_condition_warm_start = bool(
-        phase4_gate_control_warm_start
+        modulation_warm_start
+        or phase4_gate_control_warm_start
         or workspace_mode_warm_start
         or workspace_bptt_warm_start
         or workspace_reconsideration_warm_start
@@ -2449,8 +2634,29 @@ def run(
             mem_check_writer.writerow(mem_check_header)
 
     workspace_check_file: TextIO | None = None
+    retention_log_file: TextIO | None = None
+    retention_log_writer: Any | None = None
+    retention_best_by_lesson: dict[str, float] = {}
+    if eval_earlier_lessons:
+        retention_log_path = os.path.join(LOG_DIR, f"run_{run_id}_retention.csv")
+        retention_log_file = open(retention_log_path, "a" if resuming else "w", newline="")
+        retention_log_writer = csv.writer(retention_log_file)
+        if not resuming or os.path.getsize(retention_log_path) == 0:
+            retention_log_writer.writerow(
+                [
+                    "step",
+                    "lesson",
+                    "track",
+                    "exact_match_pct",
+                    "peak_exact_match_pct",
+                    "forgetting_pp",
+                ]
+            )
+
     workspace_check_writer: Any | None = None
-    if workspace_enabled and callable(getattr(dataset, "evaluate_workspace_ablated", None)):
+    if (workspace_enabled or workspace_parallel_dense) and callable(
+        getattr(dataset, "evaluate_workspace_ablated", None)
+    ):
         workspace_check_path = os.path.join(LOG_DIR, f"run_{run_id}_workspace_dependency.csv")
         workspace_check_header = [
             "step",
@@ -3248,9 +3454,12 @@ def run(
                         )
         workspace_task_file.flush()
 
+    latest_workspace_dependency_drop = None
+
     def write_workspace_dependency(
         step_value, lesson_value, baseline_accuracy, baseline_exact, baseline_diagnostics
     ):
+        nonlocal latest_workspace_dependency_drop
         if workspace_check_writer is None or workspace_check_file is None:
             return
         if not callable(getattr(dataset, "evaluate_workspace_ablated", None)):
@@ -3407,6 +3616,15 @@ def run(
                             base_blink[query_type]["episode_exact_match"],
                         )
                     )
+            if getattr(rnn, "modulation_head", None) is not None:
+                for _mode, _name in (("off", "modulation_off"), ("shuffle", "modulation_shuffled")):
+                    segment_diagnostics.set_channel(f"eval-id-{_name}")
+                    _restore_rng_state(id_eval_rng_state)
+                    _macc, _mex = dataset.evaluate_modulation_ablated(
+                        rnn, device, curriculum, lesson_value - 1, _mode
+                    )
+                    segment_diagnostics.emit(f"eval-id-{_name}")
+                    rows.append(("all", _name, _macc, _mex, baseline_accuracy, baseline_exact))
             feature_ablation_due = (
                 int(step_value) == int(total_steps)
                 or int(step_value) % max(int(EVAL_EVERY) * 10, 1) == 0
@@ -3474,6 +3692,11 @@ def run(
                 f"{baseline_accuracy - shuffled_accuracy:.2f} pp | exact "
                 f"{baseline_exact:.2f} -> {ablated_exact:.2f}/{shuffled_exact:.2f} "
                 f"(drops {baseline_exact - ablated_exact:.2f}/{baseline_exact - shuffled_exact:.2f} pp)"
+            )
+            latest_workspace_dependency_drop = max(
+                0.0,
+                (baseline_accuracy - ablated_accuracy) / 100.0,
+                (baseline_accuracy - shuffled_accuracy) / 100.0,
             )
             adaptive_ablated_evaluator = getattr(
                 dataset, "evaluate_workspace_adaptive_ablated", None
@@ -4116,6 +4339,21 @@ def run(
             workspace_slot_readout=workspace_slot_readout,
             workspace_semantic_entity_count=workspace_semantic_entity_count,
             workspace_allocator=workspace_allocator,
+            workspace_parallel_dense=workspace_parallel_dense,
+            workspace_block_index=workspace_block_index,
+            workspace_key_dim=workspace_key_dim,
+            workspace_scan_chunk=workspace_scan_chunk,
+            workspace_parallel_moe_feed=workspace_parallel_moe_feed,
+            modulation_route_code=modulation_route_code,
+            modulation_enabled=modulation_enabled,
+            modulation_targets=tuple(modulation_targets),
+            modulation_blocks=tuple(modulation_blocks),
+            modulation_source=modulation_source,
+            modulation_rank=modulation_rank,
+            modulation_alphas=modulation_alphas,
+            modulation_lambda=modulation_lambda,
+            modulation_temporal_lambda=modulation_temporal_lambda,
+            modulation_meta_responsiveness=nm_responsiveness_enabled,
             workspace_entity_keyed_writes=workspace_entity_keyed_writes,
             workspace_semantic_entity_addressing=workspace_semantic_entity_addressing,
             workspace_permutation_transactional=workspace_permutation_transactional,
@@ -4536,6 +4774,22 @@ def run(
         "activation_offload_cpu_budget_mb": activation_offload_cpu_budget_mb,
         "workspace_enabled": workspace_enabled,
         "workspace_num_slots": workspace_num_slots,
+        "workspace_parallel_dense": workspace_parallel_dense,
+        "workspace_block_index": workspace_block_index,
+        "workspace_key_dim": workspace_key_dim,
+        "workspace_scan_chunk": workspace_scan_chunk,
+        "workspace_parallel_moe_feed": workspace_parallel_moe_feed,
+        "modulation_route_code": modulation_route_code,
+        "modulation_enabled": modulation_enabled,
+        "modulation_targets": tuple(modulation_targets),
+        "modulation_blocks": tuple(modulation_blocks),
+        "modulation_source": modulation_source,
+        "modulation_rank": modulation_rank,
+        "modulation_alphas": dict(modulation_alphas or {}),
+        "modulation_lambda": modulation_lambda,
+        "modulation_temporal_lambda": modulation_temporal_lambda,
+        "modulation_meta_responsiveness": nm_responsiveness_enabled,
+        "modulation_alpha_warmup_steps": modulation_alpha_warmup_steps,
         "workspace_adaptive_v3_enabled": workspace_adaptive_v3_enabled,
         "workspace_adaptive_v4_enabled": workspace_adaptive_v4_enabled,
         "workspace_adaptive_v3_rank": workspace_adaptive_v3_rank,
@@ -4596,6 +4850,24 @@ def run(
     }
     if workspace_adaptive_enabled:
         extra_model_config["workspace_adaptive_enabled"] = True
+    extra_model_config.update(
+        {
+            "neuromod_mode": nm_run_tag,
+            "neuromod_range": float(neuromod_range),
+            "neuromod_every": int(neuromod_every),
+            "neuromod_slew": float(neuromod_slew),
+            "neuromod_groups": tuple(neuromod_groups),
+            "neuromod_seed": int(neuromod_seed),
+            "neuromod_consolidation_lambda": float(neuromod_consolidation_lambda),
+            "neuromod_loss_outlier_gating": bool(neuromod_loss_outlier_gating),
+            "neuromod_prediction_error_gating": bool(neuromod_prediction_error_gating),
+            "neuromod_gate_kappa": float(neuromod_gate_kappa),
+            "neuromod_prediction_beta": float(neuromod_prediction_beta),
+            "neuromod_combine": tuple(sorted(neuromod_arms)),
+            "eval_earlier_lessons": bool(eval_earlier_lessons),
+            "neuromod_retention_control": bool(neuromod_retention_control),
+        }
+    )
     if workspace_semantic_entity_count != 64:
         extra_model_config["workspace_semantic_entity_count"] = int(workspace_semantic_entity_count)
     if workspace_allocator:
@@ -4607,10 +4879,38 @@ def run(
         extra_model_config["workspace_lexical_unkeyed"] = bool(workspace_lexical_unkeyed)
     if getattr(dataset, "task_track", None) in _lang_text.LANG_TRACK_NAMES:
         extra_model_config["workspace_lang_manifest_sha256"] = _lang_text.manifest_sha256()
-        extra_model_config["workspace_lang_tokenizer_sha256"] = _lang_text.tokenizer_sha256()
-        extra_model_config["workspace_lang_tokenizer_vocab_size"] = (
-            _lang_text.tokenizer_vocab_size()
-        )
+        tokenizer_hash_fn = getattr(_lang_text, "tokenizer_sha256", None)
+        tokenizer_hash = tokenizer_hash_fn() if callable(tokenizer_hash_fn) else None
+        if tokenizer_hash is None:
+            # Older copies of _lang_text expose the tokenizer and manifest but
+            # predate the small tokenizer metadata helpers. Keep checkpoint
+            # creation compatible with those source checkouts.
+            tokenizer_data_dir = getattr(_lang_text, "DATA_DIR", None)
+            tokenizer_model_path = (
+                os.path.join(str(tokenizer_data_dir), "spm.model")
+                if tokenizer_data_dir is not None
+                else None
+            )
+            if tokenizer_model_path and os.path.isfile(tokenizer_model_path):
+                with open(tokenizer_model_path, "rb") as tokenizer_model_file:
+                    tokenizer_hash = hashlib.sha256(tokenizer_model_file.read()).hexdigest()
+        if tokenizer_hash is not None:
+            extra_model_config["workspace_lang_tokenizer_sha256"] = tokenizer_hash
+        tokenizer_vocab_fn = getattr(_lang_text, "tokenizer_vocab_size", None)
+        tokenizer_vocab_size: int
+        if callable(tokenizer_vocab_fn):
+            tokenizer_vocab_size = int(tokenizer_vocab_fn())
+        else:
+            tokenizer_fn = getattr(_lang_text, "tokenizer", None)
+            tokenizer_obj = tokenizer_fn() if callable(tokenizer_fn) else None
+            tokenizer_vocab_size_value = getattr(tokenizer_obj, "text_size", None)
+            if tokenizer_vocab_size_value is None:
+                tokenizer_vocab_size = int(dataset.input_dim) - int(
+                    getattr(_lang_text, "TEXT_BASE", 0)
+                )
+            else:
+                tokenizer_vocab_size = int(tokenizer_vocab_size_value)
+        extra_model_config["workspace_lang_tokenizer_vocab_size"] = tokenizer_vocab_size
         if workspace_slot_readout:
             _slot_columns = dataset.slot_text_columns()
             _slot_manifest = ",".join(str(int(token)) for token in _slot_columns).encode("ascii")
@@ -4645,6 +4945,10 @@ def run(
     if workspace_key_value_loss_weight > 0:
         extra_model_config["workspace_key_value_loss_weight"] = float(
             workspace_key_value_loss_weight
+        )
+    if language_induction_binding_loss_weight > 0 and getattr(dataset, "_lang_ready", False):
+        extra_model_config["language_induction_binding_loss_weight"] = float(
+            language_induction_binding_loss_weight
         )
     if workspace_operation_executor:
         extra_model_config["workspace_operation_executor"] = True
@@ -5034,30 +5338,114 @@ def run(
                 "Frozen gate-only training has parameters outside the selected write gate: "
                 + ", ".join(unexpected_trainable)
             )
-    fused_optimizer_enabled = device.type == "cuda"
+    fused_optimizer_enabled = bool(device.type == "cuda")
+    _bb_wd = BACKBONE_WD
+    _wd_ids = {
+        id(p)
+        for n, p in trainable_named_parameters
+        if _bb_wd > 0
+        and ".backbone.blocks." in n
+        and ".mixer." in n
+        and n.endswith(".weight")
+        and p.ndim == 2  # in/x/dt/out_proj only; excludes conv1d, norms, biases, A_log, D
+    }
+
+    group_static_lr = {
+        "backbone": 1.0,
+        "moe": 1.0,
+        "workspace": float(workspace_lr_scale if workspace_parallel_dense else 1.0),
+        "modulation": float(modulation_lr_scale if modulation_enabled else 1.0),
+        "task_head": 1.0,
+        "adaptive_v3": float(workspace_adaptive_v3_learning_rate_scale),
+    }
+    _parameter_group_map: dict[tuple[str, float], dict[str, Any]] = {}
+    for name, parameter in trainable_named_parameters:
+        nm_group = assign_group(name)
+        weight_decay = _bb_wd if id(parameter) in _wd_ids else 0.0
+        key = (nm_group, weight_decay)
+        group = _parameter_group_map.setdefault(
+            key,
+            {
+                "params": [],
+                "weight_decay": weight_decay,
+                "nm_group": nm_group,
+                "lr_multiplier": group_static_lr[nm_group],
+            },
+        )
+        group["params"].append(parameter)
+    parameter_groups = list(_parameter_group_map.values())
+    # Preserve the pre-neuromodulator optimizer layout for `off` runs. This
+    # keeps old optimizer checkpoints loadable while the shared name helper
+    # still supplies labels for the new signal-driven groups.
+    _legacy_parameter_groups: list[dict[str, Any]] = []
+    if workspace_adaptive_v3_enabled:
+        _v3_params = [p for n, p in trainable_named_parameters if assign_group(n) == "adaptive_v3"]
+        _v3_ids = {id(p) for p in _v3_params}
+        _base_params = [p for p in trainable_parameters if id(p) not in _v3_ids]
+        if _base_params:
+            _legacy_parameter_groups.append({"params": _base_params, "lr_multiplier": 1.0})
+        if _v3_params:
+            _legacy_parameter_groups.append(
+                {"params": _v3_params, "lr_multiplier": workspace_adaptive_v3_learning_rate_scale}
+            )
+    else:
+        _legacy_parameter_groups = [
+            {
+                "params": [p for p in trainable_parameters if id(p) in _wd_ids],
+                "weight_decay": _bb_wd,
+            },
+            {
+                "params": [p for p in trainable_parameters if id(p) not in _wd_ids],
+                "weight_decay": 0.0,
+            },
+        ]
+        _legacy_parameter_groups = [g for g in _legacy_parameter_groups if g["params"]]
+    if workspace_parallel_dense and workspace_lr_scale != 1.0:
+        _workspace_ids = {id(p) for p in rnn.parallel_workspace.parameters()}
+        for _group in list(_legacy_parameter_groups):
+            _workspace_params = [p for p in _group["params"] if id(p) in _workspace_ids]
+            if _workspace_params:
+                _group["params"] = [p for p in _group["params"] if id(p) not in _workspace_ids]
+                _legacy_parameter_groups.append(
+                    {
+                        **{k: v for k, v in _group.items() if k != "params"},
+                        "params": _workspace_params,
+                        "lr_multiplier": float(_group.get("lr_multiplier", 1.0))
+                        * workspace_lr_scale,
+                    }
+                )
+    if modulation_enabled and modulation_lr_scale != 1.0:
+        _modulation_ids = {id(p) for p in rnn.modulation_head.parameters()}
+        for _group in list(_legacy_parameter_groups):
+            _modulation_params = [p for p in _group["params"] if id(p) in _modulation_ids]
+            if _modulation_params:
+                _group["params"] = [p for p in _group["params"] if id(p) not in _modulation_ids]
+                _legacy_parameter_groups.append(
+                    {
+                        **{k: v for k, v in _group.items() if k != "params"},
+                        "params": _modulation_params,
+                        "lr_multiplier": float(_group.get("lr_multiplier", 1.0))
+                        * modulation_lr_scale,
+                    }
+                )
+    _name_by_id = {id(p): n for n, p in trainable_named_parameters}
+    for _group in _legacy_parameter_groups:
+        _group.setdefault("lr_multiplier", 1.0)
+        _group["nm_group"] = (
+            assign_group(_name_by_id[id(_group["params"][0])]) if _group["params"] else "backbone"
+        )
+    if _wd_ids:
+        print(f"[{run_id}] AdamW backbone mixer weight decay={_bb_wd:g} on {len(_wd_ids)} tensors")
     optimizer_kwargs: dict[str, Any] = (
         {"lr": LR, "fused": True} if fused_optimizer_enabled else {"lr": LR}
     )
+    if nm_controller_mode == "off":
+        parameter_groups = _legacy_parameter_groups
     if workspace_adaptive_v3_enabled:
-        v3_parameters = [
-            parameter
-            for name, parameter in trainable_named_parameters
-            if name.startswith(("rnn.workspace.adaptive_v3.", "rnn.workspace.adaptive_v4."))
-        ]
-        v3_ids = {id(parameter) for parameter in v3_parameters}
-        base_parameters = [
-            parameter for parameter in trainable_parameters if id(parameter) not in v3_ids
-        ]
-        parameter_groups = []
-        if base_parameters:
-            parameter_groups.append({"params": base_parameters, "lr_multiplier": 1.0})
-        if v3_parameters:
-            parameter_groups.append(
-                {
-                    "params": v3_parameters,
-                    "lr_multiplier": workspace_adaptive_v3_learning_rate_scale,
-                }
-            )
+        for _group in parameter_groups:
+            # The legacy V3 optimizer is Adam (no weight decay), even though
+            # the corresponding non-V3 optimizer is AdamW.
+            _group["weight_decay"] = 0.0
         try:
             optimizer = torch.optim.Adam(parameter_groups, **optimizer_kwargs)
         except (TypeError, RuntimeError) as exc:
@@ -5069,14 +5457,14 @@ def run(
             optimizer = torch.optim.Adam(parameter_groups, **optimizer_kwargs)
     else:
         try:
-            optimizer = torch.optim.Adam(trainable_parameters, **optimizer_kwargs)
+            optimizer = torch.optim.AdamW(parameter_groups, **optimizer_kwargs)
         except (TypeError, RuntimeError) as exc:
             if not fused_optimizer_enabled:
                 raise
             print(f"[{run_id}] fused Adam unavailable ({exc}); using standard Adam")
             optimizer_kwargs = {"lr": LR}
             fused_optimizer_enabled = False
-            optimizer = torch.optim.Adam(trainable_parameters, **optimizer_kwargs)
+            optimizer = torch.optim.AdamW(parameter_groups, **optimizer_kwargs)
     # Option 3 (Concept 24/LB-17): multi-axis efficiency accounting.
     # param_count is fixed for the life of this run -- static Option 2's
     # nr_cells resize never changes it (every Memory sublayer is sized by
@@ -5087,6 +5475,45 @@ def run(
     )
     if sgr_prediction_decoder is not None:
         param_count += sum(p.numel() for p in sgr_prediction_decoder.parameters())
+
+    neuromodulator = Neuromodulator(
+        groups=list(neuromod_groups),
+        r=neuromod_range,
+        update_every=neuromod_every,
+        slew=neuromod_slew,
+        mode=nm_controller_mode,
+        seed=seed if neuromod_seed == 0 else neuromod_seed,
+    )
+    neuromod_log_path = os.path.join(LOG_DIR, f"run_{run_id}_neuromod.csv")
+    neuromod_log_file = open(neuromod_log_path, "a" if resuming else "w", newline="")
+    neuromod_log_writer = csv.writer(neuromod_log_file)
+    if not resuming or os.path.getsize(neuromod_log_path) == 0:
+        neuromod_log_writer.writerow(
+            [
+                "step",
+                "lesson",
+                "group",
+                "multiplier",
+                "effective_lr",
+                "loss_fast",
+                "loss_slow",
+                "gn_ema",
+            ]
+        )
+    consolidation_params = {
+        name: parameter
+        for name, parameter in trainable_named_parameters
+        if assign_group(name) in ("backbone", "modulation")
+    }
+    consolidation_importance = (
+        {
+            name: torch.zeros_like(parameter, memory_format=torch.preserve_format)
+            for name, parameter in consolidation_params.items()
+        }
+        if nm_consolidation_enabled
+        else {}
+    )
+    consolidation_anchor: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
     # Mamba and the rest of the backbone must also run outside autocast when
     # diagnosing FP16 instability. Workspace internals already promote several
     # operations to FP32, which does not protect the backbone's recurrent path.
@@ -5222,7 +5649,7 @@ def run(
     # fix was -- a resume past WARMUP_STEPS just lands in the cosine part,
     # no separate warmup state to save/restore.
     effective_training_batch_size = int(batch_size) * int(workspace_length_bucket_microbatches)
-    lr_batch_scale = math.sqrt(effective_training_batch_size / max(1, int(BATCH_SIZE)))
+    lr_batch_scale = math.sqrt(effective_training_batch_size / max(1, int(BATCH_SIZE))) * LR_SCALE
     if lr_batch_scale != 1.0:
         print(
             f"[{run_id}] batch-scaled LR: effective batch "
@@ -5240,8 +5667,13 @@ def run(
 
     def set_lr(step_now):
         lr_now = lr_at_step(step_now) * lr_batch_scale
-        for g in optimizer.param_groups:
-            g["lr"] = lr_now * float(g.get("lr_multiplier", 1.0))
+        nm_multipliers = neuromodulator.multipliers()
+        for g in cast(list[dict[str, Any]], optimizer.param_groups):
+            g["lr"] = (
+                lr_now
+                * float(g.get("lr_multiplier", 1.0))
+                * nm_multipliers.get(g.get("nm_group", "backbone"), 1.0)
+            )
         return lr_now
 
     step = 0
@@ -5257,6 +5689,8 @@ def run(
         10**9
     )  # idle at run start (so the dip ramp is already at 1.0 immediately);
     # reset to `step` on every lesson advance instead
+    lesson_event_pending = False
+    latest_retention_drop = 0.0
     if resume_requested:
         ckpt = resume_checkpoint
         if ckpt is None:
@@ -5392,6 +5826,22 @@ def run(
                 f"at checkpoint step {ckpt['step']}; restored existing model and "
                 "workspace weights, initialized the skill bank, and reset the optimizer."
             )
+        elif modulation_warm_start:
+            _inc = rnn.load_state_dict(ckpt["rnn_state_dict"], strict=False)
+            if _inc.unexpected_keys or any(
+                not k.startswith(
+                    ("modulation_head.", "parallel_workspace.Wm.", "parallel_workspace.moe_norm.")
+                )
+                for k in _inc.missing_keys
+            ):
+                raise ValueError(
+                    "Modulation warm start only permits new modulation_head.* parameters "
+                    f"(missing={_inc.missing_keys[:8]}, unexpected={_inc.unexpected_keys[:8]})."
+                )
+            output_proj.load_state_dict(ckpt["output_proj_state_dict"])
+            print(
+                f"[{run_id}] Modulation head initialized fresh on top of {resume_from} (step {step}); optimizer reset."
+            )
         elif workspace_condition_warm_start:
             rnn.load_state_dict(ckpt["rnn_state_dict"])
             output_proj.load_state_dict(ckpt["output_proj_state_dict"])
@@ -5487,6 +5937,25 @@ def run(
                     f"run) -- usage EMA/cooldown/growth_history starting "
                     f"fresh instead of resuming the prior leg's."
                 )
+        if not frozen_workspace_warm_start and ckpt.get("neuromod_state") is not None:
+            neuromodulator.load_state_dict(ckpt["neuromod_state"])
+        if eval_earlier_lessons and isinstance(ckpt.get("retention_state"), dict):
+            retention_best_by_lesson.update(
+                {str(key): float(value) for key, value in ckpt["retention_state"].items()}
+            )
+        if (
+            not frozen_workspace_warm_start
+            and nm_consolidation_enabled
+            and ckpt.get("consolidation_state")
+        ):
+            for name, values in ckpt["consolidation_state"].items():
+                if name in consolidation_params:
+                    consolidation_importance[name].copy_(values["importance"].to(device))
+                    if values.get("anchor") is not None:
+                        consolidation_anchor[name] = (
+                            values["anchor"].to(device),
+                            values["anchor_importance"].to(device),
+                        )
         # v5 (Phase 2): restore (mu_g, Sigma_g, last_snapshot_step) for every
         # installed stochastic write head. Without this, resuming would
         # silently continue training/evaluating against whatever prior
@@ -5592,6 +6061,8 @@ def run(
     )
     rnn.train(not eval_only)
     output_proj.train(not eval_only)
+    if getattr(rnn, "modulation_head", None) is not None:
+        rnn.eval_modulation_mode = eval_modulation_mode
     if (
         init_from is not None and not resume_requested
     ):  # weights only: fresh optimizer/curriculum/step
@@ -5754,6 +6225,8 @@ def run(
         step < total_steps or bool(getattr(dataset, "has_pending_chain_segments", False))
     ) and not eval_only:
         adaptive_v3_teacher_weight_for_step = adaptive_v3_teacher_weight_current
+        if getattr(rnn, "modulation_head", None) is not None:
+            rnn.modulation_head.alpha_scale = min(1.0, step / max(1, modulation_alpha_warmup_steps))
         moe_diagnostics_due = bool(moe_diagnostics_enabled and running_micro_steps + 1 >= log_every)
         for module in moe_diagnostic_modules:
             if module.diagnostics_enabled != moe_diagnostics_due:
@@ -5841,16 +6314,37 @@ def run(
 
         language_answer_positions_cpu = None
         language_sparse_positions_cpu = None
+        language_induction_binding_aux_targets_cpu = None
+        output_dim = int(getattr(dataset, "output_dim", 0))
+        batch_examples = getattr(dataset, "last_batch_examples", ())
+        if (
+            language_induction_binding_loss_weight > 0
+            and getattr(dataset, "_lang_ready", False)
+            and any(
+                episode.metadata.get("language_induction_binding_aux") for episode in batch_examples
+            )
+        ):
+            language_induction_binding_aux_targets_cpu = torch.full(
+                answer_mask.shape, -100, dtype=torch.long
+            )
         if language_sparse_projection:
             language_answer_positions_cpu = answer_mask.bool().nonzero(as_tuple=False)
             sparse_mask_cpu = answer_mask.bool().clone()
-            output_dim = int(getattr(dataset, "output_dim", 0))
-            for row, episode in enumerate(dataset.last_batch_examples):
-                input_limit = min(input_seq.shape[1], len(episode.inputs))
+        for row, episode in enumerate(batch_examples):
+            input_limit = min(input_seq.shape[1], len(episode.inputs))
+            if language_sparse_projection:
                 for position, target_id in episode.metadata.get("workspace_binding_aux", ()):
                     position, target_id = int(position), int(target_id)
                     if 0 <= position < input_limit and 0 <= target_id < output_dim:
                         sparse_mask_cpu[row, position] = True
+            for position, target_id in episode.metadata.get("language_induction_binding_aux", ()):
+                position, target_id = int(position), int(target_id)
+                if 0 <= position < input_limit and 0 <= target_id < output_dim:
+                    if language_sparse_projection:
+                        sparse_mask_cpu[row, position] = True
+                    if language_induction_binding_aux_targets_cpu is not None:
+                        language_induction_binding_aux_targets_cpu[row, position] = target_id
+        if language_sparse_projection:
             language_sparse_positions_cpu = sparse_mask_cpu.nonzero(as_tuple=False)
 
         workspace_forward_kwargs = {}
@@ -6055,6 +6549,11 @@ def run(
                 device, non_blocking=True
             )
         running_batch_prepare_seconds += time.perf_counter() - batch_prepare_started
+        ws_probe_targets = ws_probe_mask = None
+        if workspace_parallel_dense and workspace_probe_loss_weight > 0:
+            _pm = dataset.workspace_retrieval_metadata(input_seq)
+            ws_probe_targets = _pm["retrieval_value_targets"].to(device, non_blocking=True)
+            ws_probe_mask = _pm["retrieval_value_mask"].to(device, non_blocking=True)
         input_seq = input_seq.to(device, non_blocking=True)
         target_digits = target_digits.to(device, non_blocking=True)
         answer_mask = answer_mask.to(device, non_blocking=True)
@@ -6441,6 +6940,31 @@ def run(
                 if sparse_positions is not None
                 else dataset.loss(output, target_digits, answer_mask)
             )
+            language_induction_binding_loss = None
+            if language_induction_binding_aux_targets_cpu is not None:
+                aux_targets = language_induction_binding_aux_targets_cpu.to(
+                    device, non_blocking=True
+                )
+                aux_positions = language_induction_binding_aux_targets_cpu.ge(0).nonzero(
+                    as_tuple=False
+                )
+                if aux_positions.shape[0] > 0:
+                    aux_positions = aux_positions.to(device, non_blocking=True)
+                    aux_rows, aux_times = aux_positions[:, 0], aux_positions[:, 1]
+                    if sparse_positions is not None:
+                        sparse_index = torch.full(
+                            aux_targets.shape, -1, device=device, dtype=torch.long
+                        )
+                        sparse_index[sparse_positions[:, 0], sparse_positions[:, 1]] = torch.arange(
+                            sparse_positions.shape[0], device=device
+                        )
+                        aux_logits = output[sparse_index[aux_rows, aux_times]]
+                    else:
+                        aux_logits = output[aux_rows, aux_times]
+                    language_induction_binding_loss = nn.functional.cross_entropy(
+                        aux_logits,
+                        aux_targets[aux_rows, aux_times],
+                    ).to(dtype=task_loss.dtype)
             if workspace_key_value_loss_weight > 0:
                 assert key_value_metadata is not None
                 workspace_key_value_loss = dataset.workspace_key_value_loss(
@@ -6857,9 +7381,29 @@ def run(
                 f"[{run_id}] non-finite adaptive workspace V3 loss at step {step}; stopping."
             )
         alloc_loss = rnn.pop_allocator_loss() if isinstance(rnn, SplitGraphDNC) else None
+        mod_aux_loss = (
+            rnn.modulation_head.pop_aux_loss()
+            if getattr(rnn, "modulation_head", None) is not None
+            else None
+        )
         global_ramp = min(1.0, (step - anneal_start_step) / max(1, KL_ANNEAL_STEPS))
         lesson_dip_ramp = min(1.0, (step - lesson_dip_start_step) / max(1, LESSON_KL_DIP_STEPS))
         beta_eff = beta_target * global_ramp * lesson_dip_ramp
+        ws_probe_loss = None
+        _wsa = getattr(rnn, "_ws_aux", None)
+        if (
+            ws_probe_targets is not None
+            and ws_probe_mask is not None
+            and _wsa
+            and "written" in _wsa
+            and ws_probe_mask.any()
+        ):
+            _pl = rnn.parallel_workspace.probe(_wsa["written"]).float()
+            ws_probe_loss = nn.functional.cross_entropy(
+                _pl.transpose(1, 2),
+                ws_probe_targets.long().masked_fill(~ws_probe_mask.bool(), -100),
+                ignore_index=-100,
+            )
         loss = (
             task_loss
             + (sgr_prediction_loss_weight * prediction_loss if prediction_loss is not None else 0.0)
@@ -6883,12 +7427,37 @@ def run(
                 if workspace_key_value_loss is not None
                 else 0.0
             )
+            + (
+                language_induction_binding_loss_weight * language_induction_binding_loss
+                if language_induction_binding_loss is not None
+                else 0.0
+            )
             + beta_eff * kl_loss
             + moe_aux_loss
             + (adaptive_skill_loss if adaptive_skill_loss is not None else 0.0)
             + (adaptive_v3_loss if adaptive_v3_loss is not None else 0.0)
             + (alloc_loss if alloc_loss is not None else 0.0)
+            + (mod_aux_loss if mod_aux_loss is not None else 0.0)
+            + (workspace_probe_loss_weight * ws_probe_loss if ws_probe_loss is not None else 0.0)
         )
+        if nm_consolidation_enabled and consolidation_anchor:
+            nm_multipliers = neuromodulator.multipliers()
+            consolidation_penalty = loss.new_zeros(())
+            for name, parameter in consolidation_params.items():
+                anchor_entry = consolidation_anchor.get(name)
+                if anchor_entry is None:
+                    continue
+                anchor_value, importance = anchor_entry
+                group_scale = nm_multipliers.get(assign_group(name), 1.0)
+                if nm_controller_mode != "consolidation":
+                    group_scale *= (
+                        neuromod_range if assign_group(name) == "backbone" else 1.0 / neuromod_range
+                    )
+                consolidation_penalty = (
+                    consolidation_penalty
+                    + (group_scale * importance * (parameter.float() - anchor_value).square()).sum()
+                )
+            loss = loss + 0.5 * neuromod_consolidation_lambda * consolidation_penalty
         if split_graph_forward_trace is not None and split_graph_forward_trace.active:
             split_graph_forward_trace.observe("training.total_loss", loss)
         if check_finite_this_step and not _first_nonfinite_report(loss, "total_loss", step):
@@ -6923,6 +7492,14 @@ def run(
             rnn.memories[0].set_backward_trace(False, step=step)
         if optimizer_update_due:
             scaler.unscale_(optimizer)
+            if nm_consolidation_enabled:
+                for _name, _parameter in consolidation_params.items():
+                    if _parameter.grad is not None:
+                        consolidation_importance[_name].mul_(0.99).addcmul_(
+                            _parameter.grad.detach().float(),
+                            _parameter.grad.detach().float(),
+                            value=0.01,
+                        )
             bistable_debug_gradient_stats: dict[str, tuple[float, float, int]] = {}
             bistable_debug_parameter_before: dict[str, torch.Tensor] = {}
             if workspace_bistable_debug and isinstance(rnn, SplitGraphDNC):
@@ -7116,6 +7693,43 @@ def run(
                     )
             else:
                 consecutive_nonfinite_grad_steps = 0
+                if (
+                    nm_gate_enabled
+                    and neuromodulator.gn_ema is not None
+                    and grad_norm_value > neuromod_gate_kappa * max(neuromodulator.gn_ema, 1e-8)
+                ):
+                    # N3 keeps Adam's moments advancing while attenuating a
+                    # gradient-spike update after the ordinary global clip.
+                    for parameter in trainable_parameters:
+                        if parameter.grad is not None:
+                            parameter.grad.mul_(0.25)
+                if (
+                    neuromod_loss_outlier_gating
+                    and neuromodulator.loss_observations >= 2
+                    and neuromodulator.loss_fast is not None
+                ):
+                    _loss_value = float(task_loss.detach().float().mean().item())
+                    _loss_std = math.sqrt(max(neuromodulator.loss_var or 0.0, 0.0))
+                    if _loss_value > float(neuromodulator.loss_fast) + 3.0 * _loss_std:
+                        for parameter in trainable_parameters:
+                            if parameter.grad is not None:
+                                parameter.grad.mul_(0.25)
+                if neuromod_prediction_error_gating:
+                    _pred_error = (
+                        prediction_loss
+                        if torch.is_tensor(prediction_loss)
+                        else last_train_sgr_signal_diagnostics.get("mean")
+                    )
+                    if _pred_error is not None:
+                        _pred_error_value = float(_pred_error.detach().float().item())
+                        _pred_z = neuromodulator.pred_error_z(_pred_error_value)
+                        _gate_scale = min(
+                            1.5,
+                            max(0.5, 1.0 + neuromod_prediction_beta * math.tanh(_pred_z)),
+                        )
+                        for parameter in trainable_parameters:
+                            if parameter.grad is not None:
+                                parameter.grad.mul_(_gate_scale)
                 scaler.step(optimizer)
                 scaler.update()
                 bistable_optimizer_updated = True
@@ -7219,6 +7833,46 @@ def run(
                     total.add_(diag_val.detach())
         if optimizer_update_due:
             step += 1
+            _gate_ema_required = (
+                nm_gate_enabled or neuromod_loss_outlier_gating or neuromod_prediction_error_gating
+            )
+            _nm_update_due = bool(neuromod_arms) and step % neuromod_every == 0
+            if _gate_ema_required or _nm_update_due:
+                _nm_loss = (
+                    task_loss.detach().float().mean().item()
+                    if torch.is_tensor(task_loss)
+                    else float(task_loss)
+                )
+                neuromodulator.observe(
+                    _nm_loss,
+                    grad_norm_value,
+                    grad_norm_value > max_grad_norm,
+                    pred_error=(
+                        float(prediction_loss.detach().float().mean().item())
+                        if torch.is_tensor(prediction_loss)
+                        else (
+                            float(last_train_sgr_signal_diagnostics["mean"].detach().float().item())
+                            if "mean" in last_train_sgr_signal_diagnostics
+                            else None
+                        )
+                    ),
+                )
+            if _nm_update_due:
+                neuromodulator.update(
+                    step,
+                    lesson_event=lesson_event_pending,
+                    eval_signals={
+                        "retention_drop": (
+                            latest_retention_drop if neuromod_retention_control else 0.0
+                        ),
+                        "workspace_dependency_drop": latest_workspace_dependency_drop,
+                        "moe_cv_load": float(moe_diag.get("moe_cv_load", 0.0)),
+                        "moe_capacity_drop_frac": float(
+                            moe_diag.get("moe_capacity_drop_frac", 0.0)
+                        ),
+                    },
+                )
+                lesson_event_pending = False
         if (
             optimizer_update_due
             and workspace_adaptive_v3_enabled
@@ -7522,6 +8176,26 @@ def run(
             )
             avg_grad_norm = running_grad_norm / max(running_finite_grad_steps, 1)
             avg_postclip_grad_norm = running_postclip_grad_norm / max(running_finite_grad_steps, 1)
+            _nm_diag = neuromodulator.diagnostics()
+            _nm_mults = neuromodulator.multipliers()
+            _nm_lr: dict[str, float] = {}
+            for _group in optimizer.param_groups:
+                _name = str(_group.get("nm_group", "backbone"))
+                _nm_lr[_name] = float(_group["lr"])
+            for _name, _mult in _nm_mults.items():
+                neuromod_log_writer.writerow(
+                    [
+                        step,
+                        curriculum.lesson + 1,
+                        _name,
+                        _mult,
+                        _nm_lr.get(_name),
+                        _nm_diag["loss_fast"],
+                        _nm_diag["loss_slow"],
+                        _nm_diag["gn_ema"],
+                    ]
+                )
+            neuromod_log_file.flush()
             kl_contrib = (
                 beta_eff * avg_kl
             )  # actual beta*L_KL added to total loss, vs. avg_kl (pre-beta, raw clamped sum)
@@ -7552,6 +8226,22 @@ def run(
                 f"[{run_id}] Step {step}/{total_steps} | {lesson_status}",
                 f"L_task {avg_task:.4f}",
             ]
+            parts.append(
+                "neuro[mult "
+                + " ".join(
+                    f"{label}={_nm_mults.get(group, 1.0):.3f}"
+                    for label, group in (
+                        ("backbone", "backbone"),
+                        ("moe", "moe"),
+                        ("ws", "workspace"),
+                        ("mod", "modulation"),
+                        ("head", "task_head"),
+                    )
+                )
+                + f" | {_nm_diag['loss_fast'] if _nm_diag['loss_fast'] is not None else float('nan'):.4g}/"
+                + f"{_nm_diag['loss_slow'] if _nm_diag['loss_slow'] is not None else float('nan'):.4g} "
+                + f"gn_ema={_nm_diag['gn_ema'] if _nm_diag['gn_ema'] is not None else float('nan'):.4g}]"
+            )
             if getattr(dataset, "name", None) == "workspace-capability":
                 parts.append(
                     f"seq_max/mean {dataset.last_batch_sequence_max}/"
@@ -7906,6 +8596,30 @@ def run(
                             f"scale={scale_text}{routing_info} "
                             f"balance={adaptive_diag['balance_loss'].item():.4g}]"
                         )
+            if getattr(rnn, "modulation_head", None) is not None:
+                _md = {k: float(v) for k, v in rnn.modulation_head.last_diagnostics.items()}
+                _ms = {
+                    k: float(v)
+                    for k, v in getattr(rnn.backbone, "last_modulation_stats", {}).items()
+                }
+                parts.append(
+                    "mod[" + " ".join(f"{k}={v:.3g}" for k, v in {**_md, **_ms}.items()) + "]"
+                )
+                if any(
+                    k.endswith("last_state_norm") and v > 1e4 for k, v in _ms.items()
+                ) and not getattr(run, "_ls_alerted", False):
+                    setattr(run, "_ls_alerted", True)  # noqa: B010  # type: ignore[attr-defined]
+                    print(f"[{run_id}] [mod-ALERT] step {step}: SSM last-state norm > 1e4")
+                if any(k.endswith("_sat") and v > 0.2 for k, v in _md.items()):
+                    print(f"[{run_id}] [mod-ALERT] step {step}: modulation saturation > 0.2")
+            if getattr(getattr(rnn, "parallel_workspace", None), "last_diag", None):
+                parts.append(
+                    "pws["
+                    + " ".join(
+                        f"{k}={float(v):.3g}" for k, v in rnn.parallel_workspace.last_diag.items()
+                    )
+                    + "]"
+                )
             if dyn_n_str:
                 parts.append(dyn_n_str.strip(" |"))
             if bistable_grad_probe is not None:
@@ -8270,6 +8984,24 @@ def run(
                 rnn, device, step=step, optimizer=optimizer
             )
             id_task_diagnostics = getattr(dataset, "last_eval_diagnostics", None)
+            if eval_earlier_lessons:
+                current_track_scores = (id_task_diagnostics or {}).get("tracks", {})
+                current_eval_levels = (id_task_diagnostics or {}).get(
+                    "evaluation_track_lessons", {}
+                )
+                if current_track_scores:
+                    for _track, _metrics in current_track_scores.items():
+                        _level = int(current_eval_levels.get(_track, pre_advance_lesson))
+                        _key = f"{_track}:{_level}"
+                        retention_best_by_lesson[_key] = max(
+                            retention_best_by_lesson.get(_key, 0.0),
+                            float(_metrics.get("exact_match", 0.0)),
+                        )
+                else:
+                    _key = f"all:{pre_advance_lesson}"
+                    retention_best_by_lesson[_key] = max(
+                        retention_best_by_lesson.get(_key, 0.0), float(id_perfect_frac)
+                    )
             write_workspace_task_metrics(step, pre_advance_lesson + 1, "id", id_task_diagnostics)
             if surprise_recall_logger is not None:
                 surprise_recall_logger.write_evaluation(
@@ -8321,12 +9053,88 @@ def run(
 
             if curriculum.lesson != pre_advance_lesson:
                 lesson_dip_start_step = step
+                lesson_event_pending = True
+                if nm_consolidation_enabled:
+                    consolidation_anchor = {
+                        name: (parameter.detach().clone(), consolidation_importance[name].clone())
+                        for name, parameter in consolidation_params.items()
+                    }
+                    for _importance in consolidation_importance.values():
+                        _importance.zero_()
                 if kl_on:
                     print(
                         f"[{run_id}] Step {step} lesson advance {pre_advance_lesson + 1}->"
                         f"{curriculum.lesson + 1}: KL briefly dipping and ramping back up "
                         f"over the next {LESSON_KL_DIP_STEPS} steps (global anneal unaffected)."
                     )
+            latest_retention_drop = 0.0
+            if eval_earlier_lessons and curriculum.lesson > 0:
+                _saved_eval_diagnostics = getattr(dataset, "last_eval_diagnostics", None)
+                _saved_track_weights = getattr(dataset, "_track_weights", None)
+                _saved_eval_lesson = getattr(dataset, "_last_id_eval_lesson", None)
+                _saved_eval_episodes = getattr(dataset, "_last_id_eval_episodes", None)
+                for _level in range(min(curriculum.lesson, len(curriculum.table))):
+                    _eval_track_levels = None
+                    _restore_rng_state(id_eval_rng_state)
+                    _retention_channel = f"eval-retention-lesson-{_level + 1}"
+                    segment_diagnostics.set_channel(_retention_channel)
+                    if callable(getattr(dataset, "evaluate_curriculum_id", None)):
+                        if curriculum.track_lessons is not None:
+                            _levels = {
+                                _track: min(_level, int(_current_level))
+                                for _track, _current_level in curriculum.track_lessons.items()
+                            }
+                            _eval_track_levels = _levels
+                            _result = dataset.evaluate_curriculum_id(
+                                rnn, device, _levels, field_log={}
+                            )
+                        else:
+                            _result = dataset.evaluate_curriculum_id(
+                                rnn, device, _level, field_log={}
+                            )
+                    else:
+                        _result = dataset.evaluate_id(
+                            rnn,
+                            device,
+                            _level,
+                            num_episodes=64,
+                            rng=random.Random(seed + 910_000 + _level),
+                        )
+                    _eval_accuracy, _eval_exact = float(_result[0]), float(_result[1])
+                    segment_diagnostics.emit(_retention_channel)
+                    _diag = getattr(dataset, "last_eval_diagnostics", {}) or {}
+                    _track_metrics = _diag.get("tracks", {})
+                    _rows = (
+                        [
+                            (
+                                str(_track),
+                                float(_metrics.get("exact_match", _eval_exact)),
+                                int((_eval_track_levels or {}).get(_track, _level)),
+                            )
+                            for _track, _metrics in _track_metrics.items()
+                        ]
+                        if _track_metrics
+                        else [("all", _eval_exact, _level)]
+                    )
+                    for _track, _exact, _track_level in _rows:
+                        _key = f"{_track}:{_track_level}"
+                        _peak = max(retention_best_by_lesson.get(_key, _exact), _exact)
+                        retention_best_by_lesson[_key] = _peak
+                        _drop = max(0.0, _peak - _exact)
+                        latest_retention_drop = max(latest_retention_drop, _drop / 100.0)
+                        if retention_log_writer is not None:
+                            retention_log_writer.writerow(
+                                [step, _track_level + 1, _track, _exact, _peak, _drop]
+                            )
+                _restore_rng_state(id_eval_rng_state)
+                dataset.last_eval_diagnostics = _saved_eval_diagnostics
+                if hasattr(dataset, "_track_weights"):
+                    dataset._track_weights = _saved_track_weights
+                if hasattr(dataset, "_last_id_eval_lesson"):
+                    dataset._last_id_eval_lesson = _saved_eval_lesson
+                    dataset._last_id_eval_episodes = _saved_eval_episodes
+                if retention_log_file is not None:
+                    retention_log_file.flush()
             if beta_mode == "dynamic":
                 # Hard safety ceiling -- enforced every eval cycle unconditionally,
                 # independent of the health gate below. Without this, starting
@@ -8890,6 +9698,26 @@ def run(
                 split_graph_variant=split_graph_variant,
                 extra_model_config=extra_model_config,
                 sgr_prediction_decoder=sgr_prediction_decoder,
+                neuromod_state=neuromodulator.state_dict(),
+                consolidation_state=(
+                    {
+                        name: {
+                            "anchor": consolidation_anchor[name][0].detach().cpu(),
+                            "anchor_importance": consolidation_anchor[name][1].detach().cpu(),
+                            "importance": consolidation_importance[name].detach().cpu(),
+                        }
+                        if name in consolidation_anchor
+                        else {
+                            "anchor": None,
+                            "anchor_importance": None,
+                            "importance": consolidation_importance[name].detach().cpu(),
+                        }
+                        for name in consolidation_params
+                    }
+                    if nm_consolidation_enabled
+                    else None
+                ),
+                retention_state=retention_best_by_lesson if eval_earlier_lessons else None,
             )
             latest_path = os.path.join(CHECKPOINT_DIR, f"{run_id}_latest.pt")
             shutil.copyfile(ckpt_path, latest_path)
@@ -9350,6 +10178,9 @@ def run(
     log_writer.writerow(["SUMMARY"] + list(summary.keys()))
     log_writer.writerow([""] + list(summary.values()))
     log_file.close()
+    neuromod_log_file.close()
+    if retention_log_file is not None:
+        retention_log_file.close()
     if workspace_telemetry_log_file is not None:
         workspace_telemetry_log_file.close()
     ood_log_file.close()
@@ -9455,6 +10286,51 @@ if __name__ == "__main__":
         type=int,
         default=SEED,
         help="random seed for torch/random/numpy (default: SEED module constant)",
+    )
+    parser.add_argument(
+        "--neuromod",
+        choices=("off", "lr", "plasticity", "gate", "responsiveness", "consolidation", "random"),
+        default="off",
+    )
+    parser.add_argument("--neuromod-range", type=float, default=2.0)
+    parser.add_argument("--neuromod-every", type=int, default=50)
+    parser.add_argument("--neuromod-slew", type=float, default=0.05)
+    parser.add_argument(
+        "--neuromod-groups",
+        nargs="+",
+        choices=("backbone", "moe", "workspace", "modulation", "task_head"),
+        default=("backbone", "moe", "workspace", "modulation", "task_head"),
+    )
+    parser.add_argument("--neuromod-seed", type=int, default=0)
+    parser.add_argument("--neuromod-consolidation-lambda", type=float, default=0.1)
+    parser.add_argument(
+        "--neuromod-loss-outlier-gating",
+        action="store_true",
+        help="N3: attenuate clipped optimizer updates for task-loss outliers.",
+    )
+    parser.add_argument(
+        "--neuromod-prediction-error-gating",
+        action="store_true",
+        help="N3 separate arm: scale updates from the standardized detached SGR prediction error.",
+    )
+    parser.add_argument("--neuromod-gate-kappa", type=float, default=2.0)
+    parser.add_argument("--neuromod-prediction-beta", type=float, default=0.5)
+    parser.add_argument(
+        "--neuromod-combine",
+        nargs="+",
+        choices=("lr", "plasticity", "gate", "responsiveness", "consolidation"),
+        default=(),
+        help="N6: compose arms on top of --neuromod (for example: --neuromod-combine plasticity gate consolidation responsiveness).",
+    )
+    parser.add_argument(
+        "--eval-earlier-lessons",
+        action="store_true",
+        help="Evaluate completed curriculum lessons during periodic evaluation and log retention drops.",
+    )
+    parser.add_argument(
+        "--neuromod-retention-control",
+        action="store_true",
+        help="N2: use measured earlier-lesson retention drops to lower backbone plasticity.",
     )
     parser.add_argument(
         "--controller",
@@ -9699,6 +10575,51 @@ if __name__ == "__main__":
         type=int,
         default=WORKSPACE_NUM_SLOTS,
         help="Persistent workspace slot count (0 is the plumbing/bypass control).",
+    )
+    parser.add_argument(
+        "--workspace-parallel-dense",
+        action="store_true",
+        help="Dense parallel workspace (chunked affine scan over all tokens) after block --workspace-block-index. Excludes --workspace; requires --split-graph mamba1 and --memory-type none. Uses --workspace-num-slots.",
+    )
+    parser.add_argument("--workspace-block-index", type=int, default=1)
+    parser.add_argument("--workspace-key-dim", type=int, default=64)
+    parser.add_argument(
+        "--workspace-parallel-moe-feed",
+        action="store_true",
+        help="Phase C: parallel workspace writes from h + proj(routed MoE output) at block k (needs --moe, --workspace-parallel-dense).",
+    )
+    parser.add_argument(
+        "--mod-route-code",
+        action="store_true",
+        help="Phase C: modulation head also sees the (B,T,E) MoE route code (needs --mod-source workspace and --workspace-parallel-moe-feed).",
+    )
+    parser.add_argument("--workspace-scan-chunk", type=int, default=32)
+    parser.add_argument(
+        "--modulation",
+        action="store_true",
+        help="Phase B: workspace-conditioned Mamba parameter modulation (needs --workspace-parallel-dense).",
+    )
+    parser.add_argument(
+        "--mod-targets", nargs="+", choices=("dt", "a", "B", "C", "D"), default=["dt"]
+    )
+    parser.add_argument("--mod-blocks", nargs="+", type=int, default=[3])
+    parser.add_argument(
+        "--mod-source", choices=("workspace", "backbone", "static"), default="workspace"
+    )
+    parser.add_argument("--mod-rank", type=int, default=32)
+    parser.add_argument("--mod-alpha-dt", type=float, default=0.5)
+    parser.add_argument("--mod-alpha-a", type=float, default=0.5)
+    parser.add_argument("--mod-alpha-B", type=float, default=0.3)
+    parser.add_argument("--mod-alpha-C", type=float, default=0.3)
+    parser.add_argument("--mod-alpha-D", type=float, default=0.3)
+    parser.add_argument("--mod-lambda", type=float, default=0.0)
+    parser.add_argument("--mod-temporal-lambda", type=float, default=0.0)
+    parser.add_argument("--mod-lr-scale", type=float, default=1.0)
+    parser.add_argument("--workspace-probe-loss-weight", type=float, default=0.0)
+    parser.add_argument("--workspace-lr-scale", type=float, default=1.0)
+    parser.add_argument("--mod-alpha-warmup-steps", type=int, default=3000)
+    parser.add_argument(
+        "--eval-modulation-mode", choices=("checkpoint", "off", "shuffle"), default="checkpoint"
     )
     parser.add_argument(
         "--workspace-autoadaptive",
@@ -10003,6 +10924,16 @@ if __name__ == "__main__":
             "reads. Supervises explicit event values and keyed answer queries, and routes "
             "those answer positions through retrieved slot values. Requires workspace, "
             "entity-keyed writes, and semantic entity addressing."
+        ),
+    )
+    parser.add_argument(
+        "--language-induction-binding-loss-weight",
+        type=float,
+        default=0.5,
+        metavar="WEIGHT",
+        help=(
+            "Auxiliary token-level prediction loss for the PWS-oriented language induction "
+            "track; it uses visible sequence context and does not require semantic workspace keys."
         ),
     )
     parser.add_argument(
@@ -10685,7 +11616,9 @@ if __name__ == "__main__":
             "lang_parse",
             "lang_define",
             "lang_induce",
+            "lang_induce_pws",
             "lang_logic",
+            "lang_logic_pws",
             "lang_discourse",
             "lang_act",
             "lang_nlu_external",
@@ -10922,6 +11855,41 @@ if __name__ == "__main__":
         )
     if not 0.0 <= args.workspace_scheduled_sampling <= 1.0:
         parser.error("--workspace-scheduled-sampling must be in [0, 1]")
+    if args.neuromod_range < 1.0:
+        parser.error("--neuromod-range must be at least 1.0")
+    if args.neuromod_every < 1:
+        parser.error("--neuromod-every must be positive")
+    if args.neuromod_slew < 0.0:
+        parser.error("--neuromod-slew must be non-negative")
+    if args.neuromod_consolidation_lambda < 0.0:
+        parser.error("--neuromod-consolidation-lambda must be non-negative")
+    if args.neuromod_gate_kappa <= 0.0:
+        parser.error("--neuromod-gate-kappa must be positive")
+    if not 0.0 <= args.neuromod_prediction_beta <= 0.5:
+        parser.error("--neuromod-prediction-beta must be in [0, 0.5]")
+    if args.neuromod_prediction_error_gating and args.sgr_pred_loss_weight <= 0.0:
+        parser.error("--neuromod-prediction-error-gating requires --sgr-pred-loss-weight > 0")
+    if args.neuromod_prediction_error_gating and (
+        args.sgr_dnc_write_salience or args.sgr_workspace_write_salience
+    ):
+        parser.error("prediction-error gating must run separately from in-graph SGR write salience")
+    if args.neuromod_prediction_error_gating and (
+        args.neuromod_loss_outlier_gating
+        or args.neuromod == "gate"
+        or "gate" in args.neuromod_combine
+    ):
+        parser.error("prediction-error gating is a separate arm from gradient/loss gating")
+    _configured_nm_arms = set(args.neuromod_combine)
+    if args.neuromod != "off":
+        _configured_nm_arms.add(args.neuromod)
+    if "random" in _configured_nm_arms and len(_configured_nm_arms) > 1:
+        parser.error("random multipliers cannot be combined with signal-driven arms")
+    if "responsiveness" in _configured_nm_arms and not args.modulation:
+        parser.error("responsiveness requires --modulation")
+    if args.neuromod_retention_control and (
+        not args.eval_earlier_lessons or "plasticity" not in _configured_nm_arms
+    ):
+        parser.error("--neuromod-retention-control requires plasticity and --eval-earlier-lessons")
     if args.workspace_scheduled_sampling > 0 and not (
         args.workspace_teacher_forced_answers and args.workspace_token_id_input
     ):
@@ -11326,6 +12294,8 @@ if __name__ == "__main__":
         )
     if args.eval_only and args.run_id_suffix is None:
         args.run_id_suffix = f"eval-{args.eval_workspace_mode}"
+        if args.eval_modulation_mode != "checkpoint":
+            args.run_id_suffix += f"-mod{args.eval_modulation_mode}"
         if args.eval_seed is not None:
             args.run_id_suffix += f"-seed{args.eval_seed}"
 
@@ -11382,6 +12352,18 @@ if __name__ == "__main__":
         parser.error("--workspace requires backbone MoE; use --moe-placement backbone or all")
     if args.workspace_num_slots < 0:
         parser.error("--workspace-num-slots must be >= 0")
+    if args.modulation:
+        if not args.workspace_parallel_dense:
+            parser.error("--modulation requires --workspace-parallel-dense")
+        if (
+            min(args.mod_blocks) <= args.workspace_block_index
+            or max(args.mod_blocks) >= args.split_graph_num_blocks
+        ):
+            parser.error(
+                "--mod-blocks must be > --workspace-block-index and < --split-graph-num-blocks"
+            )
+    if args.eval_modulation_mode != "checkpoint" and not (args.eval_only and args.modulation):
+        parser.error("--eval-modulation-mode requires --eval-only --modulation")
     if args.workspace_entity_keyed_writes and (not args.workspace or args.workspace_num_slots < 1):
         parser.error("--workspace-entity-keyed-writes requires --workspace and at least one slot")
     if args.workspace_semantic_entity_addressing and not args.workspace_entity_keyed_writes:
@@ -11507,6 +12489,11 @@ if __name__ == "__main__":
         or args.workspace_key_value_loss_weight < 0
     ):
         parser.error("--workspace-key-value-loss-weight must be finite and >= 0")
+    if (
+        not math.isfinite(args.language_induction_binding_loss_weight)
+        or args.language_induction_binding_loss_weight < 0
+    ):
+        parser.error("--language-induction-binding-loss-weight must be finite and >= 0")
     if args.workspace_key_value_loss_weight > 0 and not (
         args.workspace
         and args.workspace_entity_keyed_writes
@@ -11939,6 +12926,27 @@ if __name__ == "__main__":
                 run_id += f"_allocK{args.dnc_allocation_topk}"
             if args.split_graph_combiner_mode == "controller":
                 run_id = f"{run_id}_combctrl{args.split_graph_combiner_variant.replace('+', '')}"
+        if args.workspace_parallel_dense:
+            run_id += f"_wpdense{args.workspace_num_slots}s_k{args.workspace_block_index}"
+        if args.modulation:
+            run_id += f"_mod{''.join(args.mod_targets)}_b{''.join(map(str, args.mod_blocks))}_{args.mod_source}"
+        if args.workspace_parallel_moe_feed:
+            run_id += "_moefeed"
+        if args.mod_route_code:
+            run_id += "_routecode"
+        _run_nm_arms = set(args.neuromod_combine)
+        if args.neuromod != "off":
+            _run_nm_arms.add(args.neuromod)
+        if _run_nm_arms:
+            run_id += f"_nm{'+'.join(sorted(_run_nm_arms))}_r{args.neuromod_range:g}"
+        if args.neuromod_loss_outlier_gating:
+            run_id += "_n3lossoutlier"
+        if args.neuromod_prediction_error_gating:
+            run_id += f"_n3prederr_b{args.neuromod_prediction_beta:g}"
+        if args.eval_earlier_lessons:
+            run_id += "_earlierlessons"
+        if args.neuromod_retention_control:
+            run_id += "_retentionctrl"
         if args.dnc_implementation == "optimized":
             run_id += "_optimizeddnc" if args.dnc_compile_memory else "_dncfastalloc"
         elif args.dnc_compile_memory:
@@ -12210,6 +13218,7 @@ if __name__ == "__main__":
             workspace_retrieval_exact_readout=args.workspace_retrieval_exact_readout,
             workspace_retrieval_value_loss_weight=args.workspace_retrieval_value_loss_weight,
             workspace_key_value_loss_weight=args.workspace_key_value_loss_weight,
+            language_induction_binding_loss_weight=args.language_induction_binding_loss_weight,
             workspace_operation_executor=args.workspace_operation_executor,
             workspace_operation_diagnostics=args.workspace_operation_diagnostics,
             workspace_exact_value_comparison=args.workspace_exact_value_comparison,
@@ -12253,6 +13262,45 @@ if __name__ == "__main__":
             workspace_allocator=args.workspace_allocator,
             workspace_allocator_anneal_steps=args.workspace_allocator_anneal_steps,
             workspace_allocator_label_addresses_only=args.workspace_allocator_label_addresses_only,
+            workspace_parallel_dense=args.workspace_parallel_dense,
+            workspace_block_index=args.workspace_block_index,
+            workspace_key_dim=args.workspace_key_dim,
+            workspace_scan_chunk=args.workspace_scan_chunk,
+            modulation_enabled=args.modulation,
+            modulation_targets=tuple(args.mod_targets),
+            modulation_blocks=tuple(args.mod_blocks),
+            modulation_source=args.mod_source,
+            modulation_rank=args.mod_rank,
+            modulation_alphas={
+                "dt": args.mod_alpha_dt,
+                "a": args.mod_alpha_a,
+                "B": args.mod_alpha_B,
+                "C": args.mod_alpha_C,
+                "D": args.mod_alpha_D,
+            },
+            modulation_lambda=args.mod_lambda,
+            modulation_temporal_lambda=args.mod_temporal_lambda,
+            modulation_lr_scale=args.mod_lr_scale,
+            workspace_probe_loss_weight=args.workspace_probe_loss_weight,
+            workspace_lr_scale=args.workspace_lr_scale,
+            neuromod=args.neuromod,
+            neuromod_range=args.neuromod_range,
+            neuromod_every=args.neuromod_every,
+            neuromod_slew=args.neuromod_slew,
+            neuromod_groups=tuple(args.neuromod_groups),
+            neuromod_seed=args.neuromod_seed,
+            neuromod_consolidation_lambda=args.neuromod_consolidation_lambda,
+            neuromod_loss_outlier_gating=args.neuromod_loss_outlier_gating,
+            neuromod_prediction_error_gating=args.neuromod_prediction_error_gating,
+            neuromod_gate_kappa=args.neuromod_gate_kappa,
+            neuromod_prediction_beta=args.neuromod_prediction_beta,
+            neuromod_combine=tuple(args.neuromod_combine),
+            eval_earlier_lessons=args.eval_earlier_lessons,
+            neuromod_retention_control=args.neuromod_retention_control,
+            modulation_alpha_warmup_steps=args.mod_alpha_warmup_steps,
+            workspace_parallel_moe_feed=args.workspace_parallel_moe_feed,
+            modulation_route_code=args.mod_route_code,
+            eval_modulation_mode=args.eval_modulation_mode,
         )
         all_summaries.append(summary)
 

@@ -81,7 +81,27 @@ def _world(cfg, rng, grp):
     facts = G.facts[band]
     pool = [f for f in facts if _pair_ok(f[0], f[1], cfg["combos"])] or facts
     if grp == "paraphrase":
-        pool = [f for f in pool if f[1] in (0, 2, 5, 6)] or pool
+        paraphrase_relations = (0, 2, 5, 6)
+
+        def can_paraphrase(fact):
+            target_pos = G.pos[fact[2]]
+            rows_by_class = {}
+            for row in ROWS:
+                if row.rel == fact[1] and row_ok(row, target_pos) and allowed(row, cfg):
+                    rows_by_class[row.cls] = rows_by_class.get(row.cls, 0) + 1
+                    if rows_by_class[row.cls] >= 2:
+                        return True
+            return False
+
+        preferred_pool = [f for f in pool if f[1] in paraphrase_relations]
+        paraphrase_pool = [f for f in preferred_pool if can_paraphrase(f)]
+        if not paraphrase_pool and preferred_pool:
+            # Keep the generator viable when the preferred relation families
+            # have no allowed surface-form pair at this lesson's difficulty.
+            paraphrase_pool = [f for f in pool if can_paraphrase(f)]
+        if not paraphrase_pool:
+            raise OverflowError
+        pool = paraphrase_pool
     f0 = rng.choice(pool)
     n = max(1, cfg["facts"]) + (grp == "unsupported")
     used, ctx = {(f0[0], f0[1])}, [f0]

@@ -28,7 +28,11 @@ _LEX_WORDS = (
 )
 _LEX_SENSES = ("s_s2w", "s_w2s", "s_s2c", "s_disambig")
 
-_LANG = _lang_text.LANG_SINGLE
+_LANG = (
+    *_lang_text.LANG_SINGLE,
+    _lang_text.LANG_PWS_INDUCE,
+    _lang_text.LANG_PWS_LOGIC,
+)
 
 
 def _lang_scale(c):
@@ -71,6 +75,9 @@ def _lang_config(track, level):
         ]
     elif track == "lang_nlg":
         c["groups"] = ("d2t", "t2d", "retell_all")[: (1, 2, 3, 3, 3, 3)[L]] + ext
+        # Introduce retell_all with one fact; grow the retell target only after
+        # the model has learned the group-level instruction and output format.
+        c["facts"] = (1, 1, 1, 2, 3, 4)[L]
     elif track == "lang_story_qa":
         g = (
             "where_person",
@@ -97,7 +104,9 @@ def _lang_config(track, level):
         ]
     elif track == "lang_define":
         c["groups"] = ("def_new", "def_prop", "def_redef", "def_unknown")[: (1, 2, 3, 4, 4, 4)[L]]
-        c["pseudo"] = (1, 2, 2, 3, 3, 4)[L]
+        # Hold definition lookup to one invented noun through the early
+        # lessons; add competing nouns after basic retrieval is reliable.
+        c["pseudo"] = (1, 1, 1, 2, 2, 3)[L]
     elif track == "lang_induce":
         # Keep lesson 1 focused on lexical/role binding under one canonical
         # order. Expand word-order induction only after the basic mapping is
@@ -109,6 +118,19 @@ def _lang_config(track, level):
             rules=(1, 2, 2, 3, 3, 3)[L],
             orders=(1, 1, 3, 3, 3, 3)[L],
         )
+    elif track == _lang_text.LANG_PWS_INDUCE:
+        # PWS induction learns entity-only key/value retrieval first, adds
+        # relation bindings and single-role probes, then full ordered outputs.
+        c.update(
+            groups=("ind_s2mr",),
+            binding_stage=(0, 1, 2, 3, 3, 3)[L],
+            mapping_repeats=(1, 1, 2, 2, 2, 2)[L],
+            examples=(3, 3, 5, 6, 8, 10)[L],
+            nouns=(2, 2, 2, 3, 4, 6)[L],
+            relations=(2, 2, 2, 2, 3, 3)[L],
+            rules=(1, 1, 1, 1, 2, 3)[L],
+            orders=(1, 1, 1, 1, 2, 3)[L],
+        )
     elif track == "lang_logic":
         c.update(
             groups=("l_chain", "l_neg", "l_unknown", "l_contra", "l_count", "l_some", "l_cond")[
@@ -116,6 +138,16 @@ def _lang_config(track, level):
             ],
             depth=(1, 1, 2, 2, 3, 4)[L],
         )
+    elif track == _lang_text.LANG_PWS_LOGIC:
+        logic_groups = (
+            ("l_chain",),
+            ("l_chain", "l_neg"),
+            ("l_chain", "l_neg", "l_unknown", "l_contra"),
+            ("l_chain", "l_neg", "l_unknown", "l_contra", "l_count"),
+            ("l_chain", "l_neg", "l_unknown", "l_contra", "l_count", "l_some"),
+            ("l_chain", "l_neg", "l_unknown", "l_contra", "l_count", "l_some", "l_cond"),
+        )
+        c.update(groups=logic_groups[L], depth=(1, 1, 1, 1, 2, 3)[L])
     elif track == "lang_discourse":
         c.update(
             groups=("d_where", "d_pron", "d_dist", "d_update", "d_retell")[: (1, 2, 3, 4, 5, 5)[L]],
@@ -567,6 +599,29 @@ class WorkspaceCapabilityCurriculum:
                             f"{group}:verdict={verdict if verdict is not None else float('nan'):.2f},"
                             f"rationale={justification if justification is not None else float('nan'):.2f}"
                         )
+                    elif (
+                        track == _lang_text.LANG_PWS_LOGIC
+                        and "verdict_exact_match" in metrics
+                        and "proof_fact_accuracy" in metrics
+                    ):
+                        verdict = self._smoothed_promotion_score(
+                            f"{track}:{level}:{group}:verdict",
+                            metrics["verdict_exact_match"] / 100.0,
+                        )
+                        proof = self._smoothed_promotion_score(
+                            f"{track}:{level}:{group}:proof_fact",
+                            metrics["proof_fact_accuracy"] / 100.0,
+                        )
+                        group_ready = (
+                            verdict is not None
+                            and verdict >= self.dataset.advance_threshold
+                            and proof is not None
+                            and proof >= self.dataset.advance_threshold
+                        )
+                        score_notes.append(
+                            f"{group}:verdict={verdict if verdict is not None else float('nan'):.2f},"
+                            f"proof_fact={proof if proof is not None else float('nan'):.2f}"
+                        )
                     else:
                         smoothed = self._smoothed_promotion_score(
                             f"{track}:{level}:{group}:exact",
@@ -579,7 +634,7 @@ class WorkspaceCapabilityCurriculum:
                             f"{group}={smoothed if smoothed is not None else float('nan'):.2f}"
                         )
                     ready = ready and group_ready
-                if track == "lang_logic":
+                if track in ("lang_logic", _lang_text.LANG_PWS_LOGIC):
                     overall_ready = True  # Group verdict+rationale scores are the logic gate.
                 else:
                     current_overall = per_track.get(track, {}).get("exact_match", 0.0) / 100.0

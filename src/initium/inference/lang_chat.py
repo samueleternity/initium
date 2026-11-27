@@ -123,9 +123,7 @@ class LanguageChat:
         )
         if getattr(self.rnn, "modulation_head", None) is not None:
             warmup_steps = int(loaded.config.get("modulation_alpha_warmup_steps", 0))
-            self.rnn.modulation_head.alpha_scale = min(
-                1.0, loaded.step / max(1, warmup_steps)
-            )
+            self.rnn.modulation_head.alpha_scale = min(1.0, loaded.step / max(1, warmup_steps))
         self.device = device
         self.tk = _lang_text.tokenizer()
         self.state = None
@@ -400,9 +398,7 @@ class LanguageChat:
             return
         if self.parallel_dense:
             norms = slot_state[0].float().norm(dim=-1)
-            shown = sorted(
-                enumerate(norms.tolist()), key=lambda item: item[1], reverse=True
-            )[:40]
+            shown = sorted(enumerate(norms.tolist()), key=lambda item: item[1], reverse=True)[:40]
             print(f"Parallel workspace slot-value norms (top {len(shown)}):")
             for slot_index, norm in shown:
                 print(f"  slot={slot_index:03d} value_norm={norm:.4g}")

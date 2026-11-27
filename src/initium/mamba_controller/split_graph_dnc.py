@@ -935,18 +935,28 @@ class SplitGraphDNC(nn.Module):
             raise ValueError("modulation requires workspace_parallel_dense")
         if workspace_parallel_dense:
             if workspace_enabled or mamba_variant != "mamba1":
-                raise ValueError("parallel workspace requires mamba1 and excludes the sequential workspace")
+                raise ValueError(
+                    "parallel workspace requires mamba1 and excludes the sequential workspace"
+                )
             if workspace_parallel_moe_feed and not backbone_moe_enabled:
                 raise ValueError("--workspace-parallel-moe-feed requires active backbone MoE")
-            if workspace_parallel_moe_feed and moe_backbone_block_isolation not in (None, workspace_block_index):
-                raise ValueError("MoE block isolation must equal the workspace block for the MoE feed")
+            if workspace_parallel_moe_feed and moe_backbone_block_isolation not in (
+                None,
+                workspace_block_index,
+            ):
+                raise ValueError(
+                    "MoE block isolation must equal the workspace block for the MoE feed"
+                )
             if modulation_route_code and not workspace_parallel_moe_feed:
                 raise ValueError("route-code modulation requires the MoE feed")
             if not 0 <= self.workspace_block_index < num_backbone_blocks or workspace_num_slots < 1:
                 raise ValueError("invalid parallel workspace block index or slot count")
             _pw_rng = torch.random.get_rng_state()
             self.parallel_workspace = ParallelWorkspace(
-                hidden_size, workspace_num_slots, workspace_key_dim, workspace_scan_chunk,
+                hidden_size,
+                workspace_num_slots,
+                workspace_key_dim,
+                workspace_scan_chunk,
                 moe_feed=workspace_parallel_moe_feed,
             )
             torch.random.set_rng_state(_pw_rng)
@@ -957,13 +967,22 @@ class SplitGraphDNC(nn.Module):
                     min(modulation_blocks) > self.workspace_block_index
                     and max(modulation_blocks) < num_backbone_blocks
                 ):
-                    raise ValueError("modulation blocks must lie in (workspace_block_index, num_blocks)")
+                    raise ValueError(
+                        "modulation blocks must lie in (workspace_block_index, num_blocks)"
+                    )
                 _mx = self.backbone.blocks[0].mixer
                 _mod_rng = torch.random.get_rng_state()
                 self.modulation_head = ModulationHead(
-                    hidden_size, _mx.d_inner, _mx.d_state, modulation_blocks, modulation_targets,
-                    source=modulation_source, rank=modulation_rank, alphas=modulation_alphas,
-                    lam=modulation_lambda, temporal_lam=modulation_temporal_lambda,                    
+                    hidden_size,
+                    _mx.d_inner,
+                    _mx.d_state,
+                    modulation_blocks,
+                    modulation_targets,
+                    source=modulation_source,
+                    rank=modulation_rank,
+                    alphas=modulation_alphas,
+                    lam=modulation_lambda,
+                    temporal_lam=modulation_temporal_lambda,
                     route_dim=(moe_num_experts if modulation_route_code else 0),
                     meta_responsiveness=modulation_meta_responsiveness,
                 )
@@ -1705,7 +1724,9 @@ class SplitGraphDNC(nn.Module):
                 bypass=self.workspace_eval_bypass,
                 shuffle_readback=self.workspace_eval_shuffle_readback,
                 modulation_fn=self._modulation_fn(ws_valid),
-                mod_blocks=tuple(self.modulation_head.mod_blocks) if self.modulation_head is not None else (),
+                mod_blocks=tuple(self.modulation_head.mod_blocks)
+                if self.modulation_head is not None
+                else (),
             )
         elif self.workspace is not None:
             backbone_stages = (

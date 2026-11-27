@@ -65,6 +65,7 @@ mamba_controller.py.
 from __future__ import annotations
 
 import os as _os
+from typing import cast
 
 import torch
 import torch.nn as nn
@@ -327,14 +328,18 @@ class _ParallelBlock(nn.Module):
                 [mixer.dt_rank, mixer.d_state, mixer.d_state],
                 dim=-1,
             )
-            dt = rearrange(mixer.dt_proj.weight @ dtl.transpose(0, 1), "d (b l) -> b d l", b=batch, l=seq)
+            dt = rearrange(
+                mixer.dt_proj.weight @ dtl.transpose(0, 1), "d (b l) -> b d l", b=batch, l=seq
+            )
             dt = _F.softplus(dt + mixer.dt_proj.bias.float().view(1, -1, 1))
             Bm = rearrange(Bm, "(b l) n -> b n l", b=batch, l=seq)
             Cm = rearrange(Cm, "(b l) n -> b n l", b=batch, l=seq)
             if mod.get("dt") is not None:
                 dt = dt * torch.exp(mod["dt"]).transpose(1, 2)
             if mod.get("a") is not None:
-                s = torch.exp(mod["a"]).unsqueeze(1)  # (b,1,l): A_bar=exp(s*dt*A), B_bar=dt*B unchanged
+                s = torch.exp(mod["a"]).unsqueeze(
+                    1
+                )  # (b,1,l): A_bar=exp(s*dt*A), B_bar=dt*B unchanged
                 dt = dt * s
                 Bm = Bm / s
             if mod.get("B") is not None:
@@ -345,21 +350,47 @@ class _ParallelBlock(nn.Module):
             Bm, Cm = Bm.contiguous(), Cm.contiguous()
             A = -torch.exp(mixer.A_log.float())
             if mod.get("D") is not None:
-                y, last = selective_scan_fn(xb, dt, A, Bm, Cm, None, z=None, delta_bias=None,
-                                            delta_softplus=False, return_last_state=True)
-                y = (y + mixer.D.float().view(1, -1, 1) * (1 + mod["D"]).transpose(1, 2) * xb) * _F.silu(z)
+                y, last = selective_scan_fn(
+                    xb,
+                    dt,
+                    A,
+                    Bm,
+                    Cm,
+                    None,
+                    z=None,
+                    delta_bias=None,
+                    delta_softplus=False,
+                    return_last_state=True,
+                )
+                y = (
+                    y + mixer.D.float().view(1, -1, 1) * (1 + mod["D"]).transpose(1, 2) * xb
+                ) * _F.silu(z)
             else:
-                y, last = selective_scan_fn(xb, dt, A, Bm, Cm, mixer.D.float(), z=z, delta_bias=None,
-                                            delta_softplus=False, return_last_state=True)
+                y, last = selective_scan_fn(
+                    xb,
+                    dt,
+                    A,
+                    Bm,
+                    Cm,
+                    mixer.D.float(),
+                    z=z,
+                    delta_bias=None,
+                    delta_softplus=False,
+                    return_last_state=True,
+                )
             y = rearrange(y, "b d l -> b l d")
-            out = _F.linear(y, mixer.out_proj.weight.float(),
-                            None if mixer.out_proj.bias is None else mixer.out_proj.bias.float())
+            out = _F.linear(
+                y,
+                mixer.out_proj.weight.float(),
+                None if mixer.out_proj.bias is None else mixer.out_proj.bias.float(),
+            )
         result = x.float() + limit_mixer_residual_rms(out)
         stats = {
             "last_state_norm": last.detach().float().flatten(1).norm(dim=1).mean(),
             "eff_dt_mean": dt.detach().mean(),
         }
         return result, stats
+
 
 class MambaBackboneParallel(nn.Module):
     """Stack of `num_blocks` whole-sequence Mamba blocks. Pure sequence-to-
@@ -662,23 +693,30 @@ class MambaBackboneParallel(nn.Module):
         routed = route_code = None
         for i, block in enumerate(self.blocks):
             if mod is not None and i in mod_blocks:
-                h, st = block.forward_modulated(h, mod[i])
+                parallel_block = cast(_ParallelBlock, block)
+                h, st = parallel_block.forward_modulated(h, mod[i])
                 for k, v in st.items():
                     mod_stats[f"b{i}_{k}"] = v
             else:
                 h = self._run_block(block, h)
-            if self.moe_blocks is not None and isinstance(self.moe_blocks[i], MoEBlock):
+            moe_block = None if self.moe_blocks is None else self.moe_blocks[i]
+            if isinstance(moe_block, MoEBlock):
                 if i == ws_block and getattr(workspace, "moe_feed", False):
-                    h, _ex, _ix, _wt = self.moe_blocks[i](
-                        h, return_selected_details=True, token_mask=token_mask
+                    moe_result = moe_block(h, return_selected_details=True, token_mask=token_mask)
+                    h, _ex, _ix, _wt = cast(
+                        tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+                        moe_result,
                     )
-                    routed = (_ex * _wt.unsqueeze(-1).to(_ex.dtype)).sum(2) * self.moe_blocks[i].residual_scale
+                    routed = (_ex * _wt.unsqueeze(-1).to(_ex.dtype)).sum(
+                        2
+                    ) * moe_block.residual_scale
                     route_code = torch.zeros(
-                        (*_ix.shape[:2], self.moe_blocks[i].moe.num_experts),
-                        device=_ix.device, dtype=torch.float32,
+                        (*_ix.shape[:2], moe_block.moe.num_experts),
+                        device=_ix.device,
+                        dtype=torch.float32,
                     ).scatter_add_(2, _ix.long(), _wt.float())
                 else:
-                    h = self.moe_blocks[i](h, token_mask=token_mask)
+                    h = moe_block(h, token_mask=token_mask)
             if i == ws_block:
                 delta, ws_state, aux = workspace(
                     h,

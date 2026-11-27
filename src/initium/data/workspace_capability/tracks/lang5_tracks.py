@@ -196,9 +196,7 @@ class Ep5(lg.Ep):
                 continue
             key, target = binding
             pos = self._pos(ws, sp, i)
-            if language_aux and (
-                language_aux_indices is None or i in language_aux_indices
-            ):
+            if language_aux and (language_aux_indices is None or i in language_aux_indices):
                 self.language_binding_aux.append((pos, int(target)))
             if not self.ann:
                 continue
@@ -654,9 +652,7 @@ def _g_induce_pws_binding(cfg, rng):
         **{word: "relation" for word in relations},
     }
     ep = Ep5(8, annotate=False)
-    bindings = {
-        word: (i, target) for i, (word, target) in enumerate(surface_to_semantic.items())
-    }
+    bindings = {word: (i, target) for i, (word, target) in enumerate(surface_to_semantic.items())}
     mapping_examples = list(surface_to_semantic.items())
     for _repeat in range(max(1, int(cfg.get("mapping_repeats", 1)))):
         rng.shuffle(mapping_examples)
@@ -696,9 +692,7 @@ def _g_induce_pws_binding(cfg, rng):
             ep.bind_surface([word], bindings, write=False)
         role_marker = (MARK_S, MARK_R, MARK_O)[role_index]
         ep.ctl(role_marker)
-        ep.supervise_language_continuation(
-            (surface_to_semantic[query_word.strip(lg.PUNCT)],)
-        )
+        ep.supervise_language_continuation((surface_to_semantic[query_word.strip(lg.PUNCT)],))
         answer_words = [query_word]
         answer_kinds = (answer_kind_by_word[query_word.strip(lg.PUNCT)],)
         heldout_combo = True

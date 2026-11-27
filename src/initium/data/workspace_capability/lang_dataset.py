@@ -1107,14 +1107,12 @@ class LanguageDataset(WorkspaceCapabilityDataset):
                         )
                     ):
                         print(
-                            (
-                                f"  [lang/progression/{key}] count={values['count']} "
-                                f"n={values.get('targets', 0)}"
-                                if "count" in values
-                                else f"  [lang/progression/{key}] "
-                                f"accuracy={values.get('accuracy_pct', values.get('exact_pct', 0.0)):.1f}% "
-                                f"n={values.get('episodes', 0)}"
-                            )
+                            f"  [lang/progression/{key}] count={values['count']} "
+                            f"n={values.get('targets', 0)}"
+                            if "count" in values
+                            else f"  [lang/progression/{key}] "
+                            f"accuracy={values.get('accuracy_pct', values.get('exact_pct', 0.0)):.1f}% "
+                            f"n={values.get('episodes', 0)}"
                         )
             except (RuntimeError, ValueError, KeyError) as exc:
                 print(f"[lang-progression-diagnostics] skipped: {exc!r}")

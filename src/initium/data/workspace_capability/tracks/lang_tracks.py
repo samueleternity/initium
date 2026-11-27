@@ -87,11 +87,7 @@ def _world(cfg, rng, grp):
             target_pos = G.pos[fact[2]]
             rows_by_class = {}
             for row in ROWS:
-                if (
-                    row.rel == fact[1]
-                    and row_ok(row, target_pos)
-                    and allowed(row, cfg)
-                ):
+                if row.rel == fact[1] and row_ok(row, target_pos) and allowed(row, cfg):
                     rows_by_class[row.cls] = rows_by_class.get(row.cls, 0) + 1
                     if rows_by_class[row.cls] >= 2:
                         return True

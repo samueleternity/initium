@@ -16,9 +16,21 @@ class ModulationHead(nn.Module):
     All outputs are zero at init and zero on padded tokens.
     """
 
-    def __init__(self, d_model, d_inner, d_state, mod_blocks, targets, source="workspace",
-                 rank=32, alphas=None, lam=0.0, temporal_lam=0.0, route_dim=0,
-                 meta_responsiveness=False):
+    def __init__(
+        self,
+        d_model,
+        d_inner,
+        d_state,
+        mod_blocks,
+        targets,
+        source="workspace",
+        rank=32,
+        alphas=None,
+        lam=0.0,
+        temporal_lam=0.0,
+        route_dim=0,
+        meta_responsiveness=False,
+    ):
         super().__init__()
         if source not in ("workspace", "backbone", "static"):
             raise ValueError("modulation source must be workspace, backbone or static")
@@ -39,12 +51,18 @@ class ModulationHead(nn.Module):
         self.dims = {"dt": d_inner, "a": 1, "B": d_state, "C": d_state, "D": d_inner}
         keys = [f"{b}_{t}" for b in self.mod_blocks for t in self.targets]
         if source == "static":
-            self.static = nn.ParameterDict({k: nn.Parameter(torch.zeros(self.dims[k.split("_")[1]])) for k in keys})
+            self.static = nn.ParameterDict(
+                {k: nn.Parameter(torch.zeros(self.dims[k.split("_")[1]])) for k in keys}
+            )
         else:
             self.norm_h = nn.LayerNorm(d_model)
             self.norm_r = nn.LayerNorm(d_model) if source == "workspace" else None
-            self.trunk = nn.Linear(d_model * (2 if source == "workspace" else 1) + self.route_dim, rank)
-            self.out = nn.ModuleDict({k: nn.Linear(rank, self.dims[k.split("_")[1]], bias=False) for k in keys})
+            self.trunk = nn.Linear(
+                d_model * (2 if source == "workspace" else 1) + self.route_dim, rank
+            )
+            self.out = nn.ModuleDict(
+                {k: nn.Linear(rank, self.dims[k.split("_")[1]], bias=False) for k in keys}
+            )
             for m in self.out.values():
                 nn.init.zeros_(m.weight)
         if self.meta_responsiveness:
@@ -73,8 +91,11 @@ class ModulationHead(nn.Module):
             if self.responsiveness is not None:
                 context = r.float() if self.source == "workspace" else h.float()
                 rho = torch.exp(0.5 * torch.tanh(self.responsiveness(context)))
-            m2 = (torch.ones(h.shape[:2], device=h.device) if valid_mask is None
-                  else valid_mask.to(device=h.device, dtype=torch.float32))
+            m2 = (
+                torch.ones(h.shape[:2], device=h.device)
+                if valid_mask is None
+                else valid_mask.to(device=h.device, dtype=torch.float32)
+            )
             m3 = m2.unsqueeze(-1)
             denom = m2.sum().clamp_min(1.0)
             reg = h.new_zeros((), dtype=torch.float32)
@@ -84,7 +105,11 @@ class ModulationHead(nn.Module):
                 for t in self.targets:
                     k = f"{b}_{t}"
                     if z is None:
-                        u = torch.tanh(self.static[k]).view(1, 1, -1).expand(h.shape[0], h.shape[1], -1)
+                        u = (
+                            torch.tanh(self.static[k])
+                            .view(1, 1, -1)
+                            .expand(h.shape[0], h.shape[1], -1)
+                        )
                     else:
                         u = torch.tanh(self.out[k](z))
                     u = u * m3
@@ -93,11 +118,17 @@ class ModulationHead(nn.Module):
                             reg = reg + self.lam * ((u * u).mean(-1) * m2).sum() / denom
                         if self.temporal_lam > 0 and u.shape[1] > 1:
                             dm = m2[:, 1:] * m2[:, :-1]
-                            reg = reg + self.temporal_lam * (((u[:, 1:] - u[:, :-1]) ** 2).mean(-1) * dm).sum() / dm.sum().clamp_min(1.0)
+                            reg = reg + self.temporal_lam * (
+                                ((u[:, 1:] - u[:, :-1]) ** 2).mean(-1) * dm
+                            ).sum() / dm.sum().clamp_min(1.0)
                         with torch.no_grad():
                             ud = u.detach()
-                            diag[f"b{b}_{t}_rms"] = (ud.square().sum() / (denom * ud.shape[-1])).sqrt()
-                            diag[f"b{b}_{t}_sat"] = ((ud.abs() > 0.95).float().mean(-1) * m2).sum() / denom
+                            diag[f"b{b}_{t}_rms"] = (
+                                ud.square().sum() / (denom * ud.shape[-1])
+                            ).sqrt()
+                            diag[f"b{b}_{t}_sat"] = (
+                                (ud.abs() > 0.95).float().mean(-1) * m2
+                            ).sum() / denom
                     v = u * (self.alphas[t] * self.alpha_scale)
                     if rho is not None:
                         v = v * rho

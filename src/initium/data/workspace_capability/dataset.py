@@ -855,19 +855,12 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 attempts += 1
                 target = episode.metadata.get("induction_eval_entity_target")
                 target = int(target) if target is not None else -1
-                target_is_needed = (
-                    not balance_induction_targets
-                    or (
-                        group in target_counts
-                        and target in (0, 1)
-                        and target_counts[group][target] < target_quota[target]
-                    )
+                target_is_needed = not balance_induction_targets or (
+                    group in target_counts
+                    and target in (0, 1)
+                    and target_counts[group][target] < target_quota[target]
                 )
-                if (
-                    group in counts
-                    and counts[group] < episodes_per_group
-                    and target_is_needed
-                ):
+                if group in counts and counts[group] < episodes_per_group and target_is_needed:
                     episodes.append(episode)
                     counts[group] += 1
                     if balance_induction_targets:
@@ -3415,22 +3408,16 @@ class WorkspaceCapabilityDataset(BaseDataset):
             workspace is not None and getattr(workspace, "entity_keyed_writes", False)
         )
         if ablate_workspace:
-            if (
-                not hasattr(model, "workspace_eval_bypass")
-                or (
-                    getattr(model, "workspace", None) is None
-                    and getattr(model, "parallel_workspace", None) is None
-                )
+            if not hasattr(model, "workspace_eval_bypass") or (
+                getattr(model, "workspace", None) is None
+                and getattr(model, "parallel_workspace", None) is None
             ):
                 raise ValueError("workspace ablation requires a model with active workspace")
             model.workspace_eval_bypass = True
         if shuffle_workspace_readback:
-            if (
-                not hasattr(model, "workspace_eval_shuffle_readback")
-                or (
-                    getattr(model, "workspace", None) is None
-                    and getattr(model, "parallel_workspace", None) is None
-                )
+            if not hasattr(model, "workspace_eval_shuffle_readback") or (
+                getattr(model, "workspace", None) is None
+                and getattr(model, "parallel_workspace", None) is None
             ):
                 raise ValueError(
                     "workspace readback shuffle requires a model with active workspace"
@@ -4342,7 +4329,10 @@ class WorkspaceCapabilityDataset(BaseDataset):
                             elif episode.track == "lang_logic_pws":
                                 proof_start = max(
                                     verdict_len,
-                                    min(int(episode.metadata.get("proof_start", verdict_len)), n_answers),
+                                    min(
+                                        int(episode.metadata.get("proof_start", verdict_len)),
+                                        n_answers,
+                                    ),
                                 )
                                 step_lengths = tuple(
                                     max(0, int(length))
@@ -4353,7 +4343,9 @@ class WorkspaceCapabilityDataset(BaseDataset):
                                 proof_length = min(sum(step_lengths), n_answers - proof_start)
                                 proof_expected = expected[proof_start : proof_start + proof_length]
                                 proof_predicted = pred[proof_start : proof_start + proof_length]
-                                proof_counts = logic_proof_totals[(episode.track, progression_group)]
+                                proof_counts = logic_proof_totals[
+                                    (episode.track, progression_group)
+                                ]
                                 offset = 0
                                 for length in step_lengths:
                                     step_length = min(length, proof_length - offset)
@@ -4366,8 +4358,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
                                     proof_counts[1] += 1
                                     offset += step_length
                                 proof_counts[2] += sum(
-                                    int(a == b)
-                                    for a, b in zip(proof_predicted, proof_expected)
+                                    int(a == b) for a, b in zip(proof_predicted, proof_expected)
                                 )
                                 proof_counts[3] += len(proof_expected)
                                 if step_lengths:
@@ -4743,9 +4734,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
                 proof_fact_accuracy=(100.0 * counts[0] / max(counts[1], 1)),
                 proof_facts=int(counts[1]),
                 proof_token_accuracy=(100.0 * counts[2] / counts[3] if counts[3] else 100.0),
-                proof_trace_exact_match=(
-                    100.0 * counts[4] / counts[5] if counts[5] else 100.0
-                ),
+                proof_trace_exact_match=(100.0 * counts[4] / counts[5] if counts[5] else 100.0),
                 proof_trace_episodes=int(counts[5]),
             )
         if gnw_process_totals:
@@ -6391,6 +6380,7 @@ class WorkspaceCapabilityDataset(BaseDataset):
             return self._evaluate_episodes(model, device, self._paired_id_episodes(lesson_idx))[:2]
         finally:
             model.eval_modulation_mode = prior
+
     def evaluate_workspace_feature_ablated(
         self, model, device, curriculum, lesson_idx, feature_name: str
     ):

@@ -26,7 +26,15 @@ class Neuromodulator:
     ):
         if r < 1.0 or update_every < 1 or not 0.0 <= slew:
             raise ValueError("range must be >= 1, update_every >= 1, and slew >= 0")
-        if mode not in {"off", "lr", "plasticity", "gate", "responsiveness", "consolidation", "random"}:
+        if mode not in {
+            "off",
+            "lr",
+            "plasticity",
+            "gate",
+            "responsiveness",
+            "consolidation",
+            "random",
+        }:
             raise ValueError(f"unknown neuromodulator mode: {mode}")
         self.groups = tuple(dict.fromkeys(groups))
         self.r = float(r)
@@ -58,9 +66,7 @@ class Neuromodulator:
         if math.isfinite(loss):
             if self.loss_fast is not None:
                 residual = loss - self.loss_fast
-                self.loss_var = self._ema(
-                    self.loss_var, residual * residual, self.ema_slow_decay
-                )
+                self.loss_var = self._ema(self.loss_var, residual * residual, self.ema_slow_decay)
             else:
                 self.loss_var = 0.0
             self.loss_fast = self._ema(self.loss_fast, loss, self.ema_fast_decay)
@@ -79,9 +85,7 @@ class Neuromodulator:
                 )
             else:
                 self.pred_error_var = 0.0
-            self.pred_error_ema = self._ema(
-                self.pred_error_ema, value, self.ema_fast_decay
-            )
+            self.pred_error_ema = self._ema(self.pred_error_ema, value, self.ema_fast_decay)
 
     def pred_error_z(self, value: float) -> float:
         if self.pred_error_ema is None or self.pred_error_var is None:
@@ -93,8 +97,7 @@ class Neuromodulator:
             return 1.0
         progress = (self.loss_slow - self.loss_fast) / max(abs(self.loss_slow), 1e-8)
         unstable = (
-            self.gn_slow is not None and self.gn_slow > 0
-            and self.gn_ema > 2.0 * self.gn_slow
+            self.gn_slow is not None and self.gn_slow > 0 and self.gn_ema > 2.0 * self.gn_slow
         ) or (self.clipped_ema is not None and self.clipped_ema > 0.2)
         if unstable:
             return 1.0 / self.r
@@ -185,7 +188,19 @@ class Neuromodulator:
     def load_state_dict(self, state: dict):
         if tuple(state.get("groups", self.groups)) != self.groups:
             raise ValueError("neuromodulator checkpoint groups do not match configured groups")
-        for key in ("mult", "loss_fast", "loss_slow", "loss_var", "loss_observations", "gn_ema", "gn_slow", "clipped_ema", "pred_error_ema", "pred_error_var", "step"):
+        for key in (
+            "mult",
+            "loss_fast",
+            "loss_slow",
+            "loss_var",
+            "loss_observations",
+            "gn_ema",
+            "gn_slow",
+            "clipped_ema",
+            "pred_error_ema",
+            "pred_error_var",
+            "step",
+        ):
             if key in state:
                 setattr(self, key, dict(state[key]) if key == "mult" else state[key])
         if "rng_state" in state:

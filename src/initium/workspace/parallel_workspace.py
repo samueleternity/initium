@@ -7,7 +7,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def _affine_scan(a: torch.Tensor, b: torch.Tensor, c0: torch.Tensor, chunk: int) -> torch.Tensor:
+def _affine_scan(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    c0: torch.Tensor,
+    chunk: int,
+    tril_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
     """c_t = a_t * c_{t-1} + b_t. a: (B,T,S), b: (B,T,S,D), c0: (B,S,D) -> (B,T,S,D)."""
     B, T, S, D = b.shape
     pad = (-T) % chunk
@@ -17,7 +23,9 @@ def _affine_scan(a: torch.Tensor, b: torch.Tensor, c0: torch.Tensor, chunk: int)
     n = (T + pad) // chunk
     L = a.log().clamp_min(-9.0).view(B, n, chunk, S).cumsum(2)
     diff = L.unsqueeze(3) - L.unsqueeze(2)  # (B,n,i,j,S) = L_i - L_j
-    tril = torch.ones(chunk, chunk, dtype=torch.bool, device=b.device).tril().view(1, 1, chunk, chunk, 1)
+    if tril_mask is None:
+        tril_mask = torch.ones(chunk, chunk, dtype=torch.bool, device=b.device).tril()
+    tril = tril_mask.view(1, 1, chunk, chunk, 1)
     decay = diff.masked_fill(~tril, float("-inf")).exp()
     loc = torch.einsum("bnijs,bnjsd->bnisd", decay, b.view(B, n, chunk, S, D))
     tot, ends = L[:, :, -1].exp(), loc[:, :, -1]
@@ -30,12 +38,26 @@ def _affine_scan(a: torch.Tensor, b: torch.Tensor, c0: torch.Tensor, chunk: int)
 
 
 class ParallelWorkspace(nn.Module):
-    def __init__(self, d_model: int, num_slots: int = 5, key_dim: int = 64, chunk: int = 32, moe_feed: bool = False):
+    def __init__(
+        self,
+        d_model: int,
+        num_slots: int = 5,
+        key_dim: int = 64,
+        chunk: int = 32,
+        moe_feed: bool = False,
+    ):
         super().__init__()
         if min(d_model, num_slots, key_dim, chunk) < 1:
             raise ValueError("parallel workspace dimensions must be positive")
         self.d_model, self.num_slots, self.key_dim, self.chunk = d_model, num_slots, key_dim, chunk
         self.scale = key_dim**-0.5
+        # This mask is invariant across batches and steps. A non-persistent
+        # buffer follows .to(device) without changing checkpoint state dicts.
+        self.register_buffer(
+            "_scan_tril_mask",
+            torch.ones(chunk, chunk, dtype=torch.bool).tril(),
+            persistent=False,
+        )
         self.slot_keys = nn.Parameter(torch.randn(num_slots, key_dim))
         self.read_keys = nn.Parameter(torch.randn(num_slots, key_dim))
         self.Wk = nn.Linear(d_model, key_dim)
@@ -74,9 +96,15 @@ class ParallelWorkspace(nn.Module):
             deltas.append(d)
             if "readout" in aux:
                 readouts.append(aux["readout"])
-        return torch.cat(deltas, 1), state, ({"readout": torch.cat(readouts, 1)} if readouts else {})
+        return (
+            torch.cat(deltas, 1),
+            state,
+            ({"readout": torch.cat(readouts, 1)} if readouts else {}),
+        )
 
-    def _forward_seg(self, h, state, valid_mask=None, bypass=False, shuffle_readback=False, routed=None):
+    def _forward_seg(
+        self, h, state, valid_mask=None, bypass=False, shuffle_readback=False, routed=None
+    ):
         """h: (B,T,D); state: (B,S,D). Returns (delta (B,T,D) fp32, new_state, aux)."""
         with torch.autocast(device_type=h.device.type, enabled=False):
             h = h.float()
@@ -86,24 +114,38 @@ class ParallelWorkspace(nn.Module):
             u = (torch.sigmoid(self.Wu(h)) * w).clamp(max=1.0 - 1e-3)
             if valid_mask is not None:  # padding never writes
                 u = u * valid_mask.unsqueeze(-1).to(u.dtype)
-            c = _affine_scan(1.0 - u, u.unsqueeze(-1) * self.Wv(src).unsqueeze(2), state.float(), self.chunk)
+            c = _affine_scan(
+                1.0 - u,
+                u.unsqueeze(-1) * self.Wv(src).unsqueeze(2),
+                state.float(),
+                self.chunk,
+                self._scan_tril_mask,
+            )
             new_state = c[:, -1]
             if bypass:
                 return torch.zeros_like(h), new_state, {}
             cr = self.readout_norm(c)
             if shuffle_readback and cr.shape[0] > 1:
                 cr = cr.roll(1, 0)
-            alpha = (self.Wq(h if rd is None else h + rd) @ self.read_keys.t() * self.scale).softmax(-1)
+            alpha = (
+                self.Wq(h if rd is None else h + rd) @ self.read_keys.t() * self.scale
+            ).softmax(-1)
             r = torch.einsum("bts,btsd->btd", alpha, cr)
             delta = torch.sigmoid(self.read_gate) * self.Wo(r)
             self.last_diag = {
                 "delta_rms": delta.detach().square().mean().sqrt(),
                 "Wo_rms": self.Wo.weight.detach().square().mean().sqrt(),
                 "read_gate": torch.sigmoid(self.read_gate.detach()),
-                **({"Wm_rms": self.Wm.weight.detach().square().mean().sqrt()} if self.moe_feed else {}),
+                **(
+                    {"Wm_rms": self.Wm.weight.detach().square().mean().sqrt()}
+                    if self.moe_feed
+                    else {}
+                ),
             }
         aux = {"readout": r}
         if torch.is_grad_enabled():
             si = w.argmax(-1)
-            aux["written"] = c.gather(2, si[..., None, None].expand(-1, -1, 1, c.shape[-1])).squeeze(2)
+            aux["written"] = c.gather(
+                2, si[..., None, None].expand(-1, -1, 1, c.shape[-1])
+            ).squeeze(2)
         return delta, new_state, aux

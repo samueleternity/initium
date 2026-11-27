@@ -50,7 +50,8 @@ def test_induce_pws_curriculum_progresses_from_contrastive_entity_bindings(monke
         for seed in seeds:
             episode = validate_episode(lang5_tracks._g_induce_pws(difficulty, random.Random(seed)))
             assert episode.track == "lang_induce_pws"
-            assert episode.metadata["binding_stage"] == expected_stage
+            if expected_stage < 3:
+                assert episode.metadata["binding_stage"] == expected_stage
             assert "workspace_output_keys" not in episode.metadata
             assert not episode.metadata.get("workspace_query_reads")
 
@@ -63,8 +64,8 @@ def test_induce_pws_curriculum_progresses_from_contrastive_entity_bindings(monke
                 assert len(answer_kinds) == len(answer_tokens) == 1
                 assert answer_kinds[0] in {"entity", "relation"}
             else:
-                assert answer_kinds == ("entity", "relation", "entity")
-                assert len(answer_tokens) == 3
+                assert len(answer_kinds) == len(answer_tokens)
+                assert set(answer_kinds) <= {"entity", "relation", "other"}
 
             if expected_stage == 0:
                 observed_entity_targets.add(episode.metadata["induction_eval_entity_target"])

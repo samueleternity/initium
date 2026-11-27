@@ -8608,7 +8608,7 @@ def run(
                 if any(
                     k.endswith("last_state_norm") and v > 1e4 for k, v in _ms.items()
                 ) and not getattr(run, "_ls_alerted", False):
-                    run._ls_alerted = True
+                    setattr(run, "_ls_alerted", True)
                     print(f"[{run_id}] [mod-ALERT] step {step}: SSM last-state norm > 1e4")
                 if any(k.endswith("_sat") and v > 0.2 for k, v in _md.items()):
                     print(f"[{run_id}] [mod-ALERT] step {step}: modulation saturation > 0.2")
